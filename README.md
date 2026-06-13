@@ -152,6 +152,148 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 - Run `pi-server` behind your own TLS/reverse proxy if accessing it over a network.
 - Keep `PI_SERVER_AUTH_TOKEN` set when `pi-server` is reachable by anything other than local trusted processes.
 
+## pi-client 和 pi-server 中文安装指南
+
+这个 fork 增加了两个独立命令：
+
+- `pi-client`：基于原始 Pi coding agent 的客户端。它仍然读取和复用 `~/.pi/agent`，所以已有的配置、extension、skill、prompt、theme、session 和项目发现逻辑保持不变。它不会安装或覆盖 `pi` 命令。
+- `pi-server`：本地或远程 HTTP 服务。它按 `sessionId` 保存完整历史，把 `pi-client` 发来的增量消息拼回完整请求，再转发到真正的 LLM API。
+
+当前 `pi-client` 基于 upstream Pi `0.79.3`，对应 commit `6f29450`。
+
+### 1. 克隆仓库并安装依赖
+
+建议用 `nvm` 切到项目要求的 Node 版本：
+
+```bash
+git clone https://github.com/Averyyy/pi-client.git pi-client
+cd pi-client
+nvm install 22.19.0
+nvm use 22.19.0
+npm install --ignore-scripts
+```
+
+### 2. 全局安装 pi-client 和 pi-server
+
+```bash
+npm run install:pi-client
+npm run install:pi-server
+```
+
+安装后会得到：
+
+- `pi-client`：客户端命令，使用原始 Pi 的启动逻辑和配置目录，但 request 走增量发送。
+- `pi-server`：服务端命令，负责保存 session 历史、拼接完整上下文、持有上游 LLM API 配置并转发请求。
+
+### 3. 配置并启动 pi-server
+
+最简单的方式是用环境变量：
+
+```bash
+export PI_SERVER_HOST=127.0.0.1
+export PI_SERVER_PORT=4217
+export PI_SERVER_AUTH_TOKEN="change-me"
+export PI_SERVER_PROVIDER_BASE_URL="https://opencode.ai/zen/go/v1"
+export PI_SERVER_PROVIDER_API_KEY="sk-..."
+
+pi-server
+```
+
+如果需要额外请求头，可以加：
+
+```bash
+export PI_SERVER_PROVIDER_HEADERS="X-Header=value,Another-Header=value"
+```
+
+也可以使用 JSON 配置文件：
+
+```json
+{
+	"host": "127.0.0.1",
+	"port": 4217,
+	"authToken": "change-me",
+	"providerBaseUrl": "https://opencode.ai/zen/go/v1",
+	"providerApiKey": "sk-...",
+	"providerHeaders": {}
+}
+```
+
+启动：
+
+```bash
+PI_SERVER_CONFIG=/absolute/path/to/pi-server.json pi-server
+```
+
+配置优先级是：运行时显式参数、环境变量、JSON 配置文件、默认值。
+
+### 4. 配置并启动 pi-client
+
+另开一个终端：
+
+```bash
+export PI_SERVER_URL="http://127.0.0.1:4217"
+export PI_SERVER_AUTH_TOKEN="change-me"
+export PI_CLIENT_MAX_REQUEST_KB=512
+
+pi-client --provider opencode-go --model glm-5.1
+```
+
+`PI_CLIENT_MAX_REQUEST_KB` 用来限制 `pi-client` 到 `pi-server` 的单次 JSON POST 大小，单位是 KB。超过限制时，`pi-client` 会把请求拆成多次 `/api/request/chunk` 上传，`pi-server` 收齐后再还原原始请求。默认值是 `512`。
+
+### 已经安装过原始 Pi 的用户
+
+不需要迁移配置。继续保留现有 `~/.pi/agent`：
+
+- `settings.json`
+- `models.json`
+- `auth.json`
+- `extensions/`
+- `skills/`
+- `prompts/`
+- `themes/`
+- `sessions/`
+
+`pi-client` 仍然使用原始 Pi 的配置加载和资源发现路径，所以已有 extension 和 skill 会正常加载。唯一差异是：请求链路从直接请求 LLM 变成 `pi-client -> pi-server -> LLM API`，客户端只把最近增量消息、model 信息和 `sessionId` 发给 `pi-server`。
+
+上游 provider 的 API key 建议放在 `pi-server` 侧，例如 `PI_SERVER_PROVIDER_API_KEY`。这样客户端请求更小，也避免把 provider auth 分散到每个 client 环境里。
+
+### 没有安装过 Pi 的新用户
+
+按上面的步骤安装 `pi-client` 和 `pi-server` 即可。第一次启动时，`pi-client` 会按原始 Pi 的行为创建和使用 `~/.pi/agent`。
+
+如果你想提前放置资源目录，可以创建：
+
+```bash
+mkdir -p ~/.pi/agent/extensions ~/.pi/agent/skills ~/.pi/agent/prompts ~/.pi/agent/themes
+```
+
+项目里的 `AGENTS.md`、extension、skill、prompt 和 theme 仍按原始 Pi 的规则发现。
+
+### 更新 pi-client
+
+`pi update` 只更新原始 Pi，不会更新这个 fork。
+
+这个 fork 使用：
+
+```bash
+pi-client update
+```
+
+它会：
+
+1. 输出当前 `pi-client` 版本以及基于哪个 upstream Pi 版本和 commit。
+2. 检查当前 checkout 是否有未提交修改；如果有，会停止更新。
+3. 执行 `git pull --ff-only`。
+4. 执行 `npm install --ignore-scripts`。
+5. 重新安装全局 `pi-client` 和 `pi-server`。
+
+### 运行注意事项
+
+- `pi-server` 的 session 历史保存在进程内存里，重启后会清空。
+- 如果 `pi-server` 不只暴露给本机可信进程，请务必设置 `PI_SERVER_AUTH_TOKEN`。
+- 如果跨机器访问 `pi-server`，建议放在你自己的 TLS 或反向代理后面。
+- `pi-client` 不会覆盖本机已有的 `pi` 命令，两者可以同时存在。
+
 ## Share your OSS coding agent sessions
 
 If you use pi or other coding agents for open source work, please share your sessions.
