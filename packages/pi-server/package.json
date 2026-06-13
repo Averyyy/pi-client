@@ -1,0 +1,53 @@
+{
+	"name": "@earendil-works/pi-server",
+	"version": "0.79.3",
+	"description": "Proxy server for pi-client that stores session state and forwards incremental requests to upstream LLM providers",
+	"type": "module",
+	"bin": {
+		"pi-server": "dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "file:../ai",
+		"@earendil-works/pi-agent-core": "file:../agent"
+	},
+	"keywords": [
+		"pi-server",
+		"proxy",
+		"llm",
+		"agent"
+	],
+	"author": "Pi Contributors",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/pi-server"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"devDependencies": {
+		"@types/node": "24.12.4",
+		"shx": "0.4.0",
+		"typescript": "5.9.3",
+		"vitest": "3.2.4"
+	}
+}

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pi-client` server mode transport for sending incremental session/model/message deltas to `pi-server`.
+- Added chunked `pi-server` request upload support controlled by `PI_CLIENT_MAX_REQUEST_KB`.
+- Added a `pi-client` CLI entrypoint that preserves the original Pi config, extension, skill, prompt, and theme loading path.
+
 ## [0.79.3] - 2026-06-13
 
 ### Fixed

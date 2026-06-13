@@ -34,6 +34,8 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
+		"install:pi-client": "npm run build -w packages/coding-agent && npm run build -w packages/pi-client && npm install -g --ignore-scripts ./packages/pi-client",
+		"install:pi-server": "npm run build -w packages/pi-server && npm install -g --ignore-scripts ./packages/pi-server",
 		"prepare": "husky"
 	},
 	"devDependencies": {

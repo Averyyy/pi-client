@@ -1,0 +1,309 @@
+import type { Server } from "node:http";
+import type { Model } from "@earendil-works/pi-ai";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createPiServer, resolveStreamOptions, type ServerConfig } from "../src/server.ts";
+import { clearAllSessions, getSession } from "../src/session-store.ts";
+
+interface ServerResponse {
+	status?: string;
+	sessionId?: string;
+	staticContextHash?: string;
+	messageCount?: number;
+	error?: string;
+	deleted?: string;
+}
+
+describe("pi-server HTTP", () => {
+	let server: Server;
+	let baseUrl: string;
+
+	beforeEach(() => {
+		clearAllSessions();
+		server = createPiServer({ authToken: "test-token" } as Partial<ServerConfig>);
+		server.listen(0);
+		const addr = server.address();
+		if (typeof addr === "object" && addr !== null) {
+			baseUrl = `http://127.0.0.1:${addr.port}`;
+		} else {
+			throw new Error("Failed to get server address");
+		}
+	});
+
+	afterEach(() => {
+		return new Promise<void>((resolve) => {
+			server.close(() => resolve());
+		});
+	});
+
+	it("responds to health check", async () => {
+		const res = await fetch(`${baseUrl}/health`);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.status).toBe("ok");
+	});
+
+	it("rejects requests without auth token when configured", async () => {
+		const res = await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionId: "test" }),
+		});
+		expect(res.status).toBe(401);
+	});
+
+	it("accepts requests with correct auth token", async () => {
+		const res = await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "test-auth" }),
+		});
+		expect(res.status).toBe(200);
+	});
+
+	it("initializes session with static context", async () => {
+		const res = await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "test-init",
+				staticContext: {
+					systemPrompt: "You are helpful.",
+					tools: [],
+				},
+			}),
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.sessionId).toBe("test-init");
+		expect(body.staticContextHash).toBeTruthy();
+		expect(body.messageCount).toBe(0);
+	});
+
+	it("reassembles chunked requests and dispatches them to the target endpoint", async () => {
+		const originalBody = {
+			sessionId: "chunked-init",
+			staticContext: {
+				systemPrompt: "You are helpful. ".repeat(300),
+				tools: [],
+			},
+		};
+		const encoded = Buffer.from(JSON.stringify(originalBody), "utf-8").toString("base64");
+		const midpoint = Math.ceil(encoded.length / 2);
+		const requestId = "request-1";
+
+		const first = await fetch(`${baseUrl}/api/request/chunk`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				requestId,
+				target: "/api/session/init",
+				index: 0,
+				total: 2,
+				chunk: encoded.slice(0, midpoint),
+			}),
+		});
+		expect(first.status).toBe(200);
+		expect(await first.json()).toEqual({ received: true, requestId, index: 0, total: 2 });
+
+		const second = await fetch(`${baseUrl}/api/request/chunk`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				requestId,
+				target: "/api/session/init",
+				index: 1,
+				total: 2,
+				chunk: encoded.slice(midpoint),
+			}),
+		});
+		expect(second.status).toBe(200);
+
+		const responseBody = (await second.json()) as ServerResponse;
+		expect(responseBody.sessionId).toBe("chunked-init");
+		expect(responseBody.messageCount).toBe(0);
+		expect(getSession("chunked-init")?.staticContext?.systemPrompt).toBe(originalBody.staticContext.systemPrompt);
+	});
+
+	it("rejects stream without static context", async () => {
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "test-no-ctx",
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				delta: [],
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.error).toContain("static context");
+	});
+
+	it("returns 404 for unknown routes with auth", async () => {
+		const res = await fetch(`${baseUrl}/unknown`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(res.status).toBe(404);
+	});
+
+	it("deletes only the requested session, not all sessions", async () => {
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "session-a",
+				staticContext: { systemPrompt: "A" },
+			}),
+		});
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "session-b",
+				staticContext: { systemPrompt: "B" },
+			}),
+		});
+
+		expect(getSession("session-a")).toBeDefined();
+		expect(getSession("session-b")).toBeDefined();
+
+		const res = await fetch(`${baseUrl}/api/session/session-a`, {
+			method: "DELETE",
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.deleted).toBe("session-a");
+
+		expect(getSession("session-a")).toBeUndefined();
+		expect(getSession("session-b")).toBeDefined();
+	});
+});
+
+describe("resolveStreamOptions", () => {
+	const baseModel: Model<"openai-completions"> = {
+		id: "test-model",
+		name: "Test",
+		api: "openai-completions",
+		provider: "opencode-go",
+		baseUrl: "https://original.example.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	};
+
+	it("returns original model when no provider overrides are set", () => {
+		const config: ServerConfig = {
+			host: "127.0.0.1",
+			port: 4217,
+			authToken: undefined,
+			providerApiKey: undefined,
+			providerBaseUrl: undefined,
+			providerHeaders: {},
+		};
+		const { model, options } = resolveStreamOptions(config, baseModel, {
+			sessionId: "s1",
+			model: baseModel,
+			delta: [],
+		});
+		expect(model.baseUrl).toBe("https://original.example.com");
+		expect(options.apiKey).toBeUndefined();
+	});
+
+	it("overrides model baseUrl when providerBaseUrl is configured", () => {
+		const config: ServerConfig = {
+			host: "127.0.0.1",
+			port: 4217,
+			authToken: undefined,
+			providerApiKey: undefined,
+			providerBaseUrl: "https://proxy.example.com/v1",
+			providerHeaders: {},
+		};
+		const { model, options } = resolveStreamOptions(config, baseModel, {
+			sessionId: "s1",
+			model: baseModel,
+			delta: [],
+		});
+		expect(model.baseUrl).toBe("https://proxy.example.com/v1");
+		expect(model.id).toBe("test-model");
+		expect(options.apiKey).toBeUndefined();
+	});
+
+	it("sets apiKey on options when providerApiKey is configured", () => {
+		const config: ServerConfig = {
+			host: "127.0.0.1",
+			port: 4217,
+			authToken: undefined,
+			providerApiKey: "sk-override",
+			providerBaseUrl: undefined,
+			providerHeaders: {},
+		};
+		const { model, options } = resolveStreamOptions(config, baseModel, {
+			sessionId: "s1",
+			model: baseModel,
+			delta: [],
+		});
+		expect(options.apiKey).toBe("sk-override");
+		expect(model.baseUrl).toBe("https://original.example.com");
+	});
+
+	it("merges providerHeaders into options", () => {
+		const config: ServerConfig = {
+			host: "127.0.0.1",
+			port: 4217,
+			authToken: undefined,
+			providerApiKey: undefined,
+			providerBaseUrl: undefined,
+			providerHeaders: { "X-Custom": "value1" },
+		};
+		const { options } = resolveStreamOptions(config, baseModel, {
+			sessionId: "s1",
+			model: baseModel,
+			delta: [],
+			options: { headers: { "X-Other": "value2" } },
+		});
+		expect(options.headers).toEqual({ "X-Custom": "value1", "X-Other": "value2" });
+	});
+
+	it("applies all overrides together", () => {
+		const config: ServerConfig = {
+			host: "127.0.0.1",
+			port: 4217,
+			authToken: undefined,
+			providerApiKey: "sk-test",
+			providerBaseUrl: "https://proxy.example.com/v1",
+			providerHeaders: { "X-Auth": "bearer" },
+		};
+		const { model, options } = resolveStreamOptions(config, baseModel, {
+			sessionId: "s1",
+			model: baseModel,
+			delta: [],
+		});
+		expect(model.baseUrl).toBe("https://proxy.example.com/v1");
+		expect(options.apiKey).toBe("sk-test");
+		expect(options.headers).toEqual({ "X-Auth": "bearer" });
+	});
+});

@@ -581,6 +581,9 @@
 			"cpu": [
 				"arm64"
 			],
+			"libc": [
+				"glibc"
+			],
 			"optional": true
 		},
 		"node_modules/@mariozechner/clipboard-darwin-universal": {
