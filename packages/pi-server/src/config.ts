@@ -5,18 +5,12 @@ export interface ServerConfig {
 	host: string;
 	port: number;
 	authToken: string | undefined;
-	providerApiKey: string | undefined;
-	providerBaseUrl: string | undefined;
-	providerHeaders: Record<string, string>;
 }
 
 const DEFAULT_CONFIG: ServerConfig = {
 	host: "127.0.0.1",
 	port: 4217,
 	authToken: undefined,
-	providerApiKey: undefined,
-	providerBaseUrl: undefined,
-	providerHeaders: {},
 };
 
 function loadConfigFile(): Partial<ServerConfig> {
@@ -34,19 +28,6 @@ function loadConfigFile(): Partial<ServerConfig> {
 	}
 }
 
-function parseHeadersEnv(value: string | undefined): Record<string, string> | undefined {
-	if (!value) return undefined;
-	const headers: Record<string, string> = {};
-	for (const pair of value.split(",")) {
-		const eq = pair.indexOf("=");
-		if (eq === -1) continue;
-		const key = pair.slice(0, eq).trim();
-		const val = pair.slice(eq + 1).trim();
-		if (key) headers[key] = val;
-	}
-	return headers;
-}
-
 export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
 	const fileConfig = loadConfigFile();
 
@@ -59,20 +40,5 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
 			DEFAULT_CONFIG.port,
 		authToken:
 			overrides?.authToken ?? process.env.PI_SERVER_AUTH_TOKEN ?? fileConfig.authToken ?? DEFAULT_CONFIG.authToken,
-		providerApiKey:
-			overrides?.providerApiKey ??
-			process.env.PI_SERVER_PROVIDER_API_KEY ??
-			fileConfig.providerApiKey ??
-			DEFAULT_CONFIG.providerApiKey,
-		providerBaseUrl:
-			overrides?.providerBaseUrl ??
-			process.env.PI_SERVER_PROVIDER_BASE_URL ??
-			fileConfig.providerBaseUrl ??
-			DEFAULT_CONFIG.providerBaseUrl,
-		providerHeaders:
-			overrides?.providerHeaders ??
-			parseHeadersEnv(process.env.PI_SERVER_PROVIDER_HEADERS) ??
-			fileConfig.providerHeaders ??
-			DEFAULT_CONFIG.providerHeaders,
 	};
 }

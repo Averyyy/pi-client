@@ -1,5 +1,14 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { ProxyAssistantMessageEvent } from "@earendil-works/pi-agent-core";
+import {
+	COMPACTION_SUMMARY_PREFIX,
+	COMPACTION_SUMMARY_SUFFIX,
+	type CompactionSettings,
+	compact,
+	DEFAULT_COMPACTION_SETTINGS,
+	type ProxyAssistantMessageEvent,
+	prepareCompaction,
+	type SessionTreeEntry,
+} from "@earendil-works/pi-agent-core";
 import { type Context, type Message, type Model, type SimpleStreamOptions, streamSimple } from "@earendil-works/pi-ai";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
@@ -9,8 +18,10 @@ import {
 	appendAssistantResponse,
 	appendMessages,
 	deleteSession as deleteSessionFromStore,
+	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
+	replaceMessages,
 	type SessionStaticContext,
 	setStaticContext,
 } from "./session-store.ts";
@@ -28,6 +39,21 @@ interface StreamRequestBody {
 	delta: Message[];
 	options?: SimpleStreamOptions;
 	staticContext?: SessionStaticContext;
+}
+
+interface SessionSyncBody {
+	sessionId: string;
+	messages: Message[];
+	staticContext?: SessionStaticContext;
+}
+
+interface SessionCompactBody {
+	sessionId: string;
+	model: Model<any>;
+	options?: SimpleStreamOptions;
+	settings?: CompactionSettings;
+	customInstructions?: string;
+	dropLastAssistantError?: boolean;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -58,19 +84,12 @@ interface ResolvedStream {
 	options: SimpleStreamOptions;
 }
 
-export function resolveStreamOptions(config: ServerConfig, model: Model<any>, body: StreamRequestBody): ResolvedStream {
-	const options: SimpleStreamOptions = { ...(body.options ?? {}) };
-	let resolvedModel = model;
-	if (config.providerApiKey) {
-		options.apiKey = config.providerApiKey;
-	}
-	if (config.providerBaseUrl) {
-		resolvedModel = { ...model, baseUrl: config.providerBaseUrl };
-	}
-	if (config.providerHeaders) {
-		options.headers = { ...config.providerHeaders, ...(options.headers ?? {}) };
-	}
-	return { model: resolvedModel, options };
+export function resolveStreamOptions(
+	_config: ServerConfig,
+	model: Model<any>,
+	body: StreamRequestBody,
+): ResolvedStream {
+	return { model, options: { ...(body.options ?? {}) } };
 }
 
 function handleSessionInit(body: SessionInitBody, res: ServerResponse): void {
@@ -110,6 +129,119 @@ function handleSessionUpdate(
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
 	});
+}
+
+function handleSessionSync(body: SessionSyncBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	if (!Array.isArray(body.messages)) {
+		sendJson(res, 400, { error: "messages is required" });
+		return;
+	}
+	if (body.staticContext) {
+		setStaticContext(body.sessionId, body.staticContext);
+	}
+	const session = replaceMessages(body.sessionId, body.messages);
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+	});
+}
+
+function messagesToEntries(messages: Message[]): SessionTreeEntry[] {
+	let parentId: string | null = null;
+	return messages.map((message, index) => {
+		const id = `message-${index}`;
+		const entry: SessionTreeEntry = {
+			type: "message",
+			id,
+			parentId,
+			timestamp: new Date(message.timestamp).toISOString(),
+			message,
+		};
+		parentId = id;
+		return entry;
+	});
+}
+
+function createCompactionSummaryMessage(summary: string): Message {
+	return {
+		role: "user",
+		content: [{ type: "text", text: `${COMPACTION_SUMMARY_PREFIX}${summary}${COMPACTION_SUMMARY_SUFFIX}` }],
+		timestamp: Date.now(),
+	};
+}
+
+async function handleSessionCompact(body: SessionCompactBody, res: ServerResponse): Promise<void> {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	if (!body.model) {
+		sendJson(res, 400, { error: "model is required" });
+		return;
+	}
+
+	const session = getSession(body.sessionId);
+	if (!session) {
+		sendJson(res, 404, { error: "session not found" });
+		return;
+	}
+
+	if (body.dropLastAssistantError) {
+		dropLastAssistantError(body.sessionId);
+	}
+
+	const entries = messagesToEntries(session.messages);
+	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS);
+	if (!preparationResult.ok) {
+		sendJson(res, 400, { error: preparationResult.error.message });
+		return;
+	}
+	if (!preparationResult.value) {
+		sendJson(res, 400, { error: "Nothing to compact" });
+		return;
+	}
+
+	const options = body.options ?? {};
+	const result = await compact(
+		preparationResult.value,
+		body.model,
+		options.apiKey ?? "",
+		options.headers,
+		body.customInstructions,
+		undefined,
+		options.reasoning,
+	);
+	if (!result.ok) {
+		sendJson(res, 500, { error: result.error.message });
+		return;
+	}
+
+	const firstKeptIndex = entries.findIndex((entry) => entry.id === result.value.firstKeptEntryId);
+	if (firstKeptIndex === -1) {
+		sendJson(res, 500, { error: "Compaction result referenced an unknown kept message" });
+		return;
+	}
+
+	const nextSession = replaceMessages(body.sessionId, [
+		createCompactionSummaryMessage(result.value.summary),
+		...session.messages.slice(firstKeptIndex),
+	]);
+	sendJson(res, 200, { success: true, messageCount: nextSession.messages.length });
+}
+
+function handleDropLastAssistantError(body: SessionInitBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	const dropped = dropLastAssistantError(body.sessionId);
+	const session = getOrCreateSession(body.sessionId);
+	sendJson(res, 200, { success: true, dropped, messageCount: session.messages.length });
 }
 
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
@@ -180,7 +312,12 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	});
 }
 
-function handlePostRequest(config: ServerConfig, pathname: string, body: unknown, res: ServerResponse): boolean {
+async function handlePostRequest(
+	config: ServerConfig,
+	pathname: string,
+	body: unknown,
+	res: ServerResponse,
+): Promise<boolean> {
 	if (pathname === "/api/session/init") {
 		handleSessionInit(body as SessionInitBody, res);
 		return true;
@@ -188,6 +325,21 @@ function handlePostRequest(config: ServerConfig, pathname: string, body: unknown
 
 	if (pathname === "/api/session/update") {
 		handleSessionUpdate(body as SessionInitBody & { staticContext: SessionStaticContext }, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/sync") {
+		handleSessionSync(body as SessionSyncBody, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/drop-last-assistant-error") {
+		handleDropLastAssistantError(body as SessionInitBody, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/compact") {
+		await handleSessionCompact(body as SessionCompactBody, res);
 		return true;
 	}
 
@@ -223,7 +375,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 					sendJson(res, 200, chunkResult.ack);
 					return;
 				}
-				handlePostRequest(config, chunkResult.target, JSON.parse(chunkResult.bodyJson) as unknown, res);
+				await handlePostRequest(config, chunkResult.target, JSON.parse(chunkResult.bodyJson) as unknown, res);
 			} catch (err) {
 				if (!res.headersSent) {
 					sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -238,7 +390,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		if (req.method === "POST") {
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
-				if (handlePostRequest(config, url.pathname, body, res)) return;
+				if (await handlePostRequest(config, url.pathname, body, res)) return;
 			} catch (err) {
 				if (!res.headersSent) {
 					sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });

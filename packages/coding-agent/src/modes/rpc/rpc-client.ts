@@ -296,7 +296,7 @@ export class RpcClient {
 	/**
 	 * Compact session context.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
 		const response = await this.send({ type: "compact", customInstructions });
 		return this.getData(response);
 	}

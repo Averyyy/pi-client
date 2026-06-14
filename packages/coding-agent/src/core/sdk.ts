@@ -302,7 +302,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		streamFn:
 			process.env.PI_SERVER_MODE === "true"
 				? async (model, context, options) => {
-						return streamPiServer(model, context, options);
+						const auth = await modelRegistry.getApiKeyAndHeaders(model);
+						if (!auth.ok) {
+							throw new Error(auth.error);
+						}
+						const providerRetrySettings = settingsManager.getProviderRetrySettings();
+						const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+						const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+						const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
+						const websocketConnectTimeoutMs =
+							options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+						return streamPiServer(model, context, {
+							...options,
+							apiKey: auth.apiKey,
+							timeoutMs,
+							websocketConnectTimeoutMs,
+							maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+							maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+							headers: mergeProviderAttributionHeaders(
+								model,
+								settingsManager,
+								options?.sessionId,
+								auth.headers,
+								options?.headers,
+							),
+						});
 					}
 				: async (model, context, options) => {
 						const auth = await modelRegistry.getApiKeyAndHeaders(model);

@@ -193,7 +193,8 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const result = await session.compact();
 
-		expect(result.summary).toBe(customSummary);
+		expect(result).toBeDefined();
+		expect(result!.summary).toBe(customSummary);
 
 		const compactEvents = capturedEvents.filter((e) => e.type === "session_compact");
 		expect(compactEvents.length).toBe(1);
@@ -265,8 +266,9 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const result = await session.compact();
 
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
+		expect(result).toBeDefined();
+		expect(result!.summary).toBeDefined();
+		expect(result!.summary.length).toBeGreaterThan(0);
 
 		const compactEvents = capturedEvents.filter((e): e is SessionCompactEvent => e.type === "session_compact");
 		expect(compactEvents.length).toBe(1);
@@ -409,7 +411,8 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const result = await session.compact();
 
-		expect(result.summary).toBe(customSummary);
-		expect(result.tokensBefore).toBe(999);
+		expect(result).toBeDefined();
+		expect(result!.summary).toBe(customSummary);
+		expect(result!.tokensBefore).toBe(999);
 	}, 120000);
 });

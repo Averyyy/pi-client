@@ -93,9 +93,10 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		// Manually compact
 		const result = await session.compact();
 
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
-		expect(result.tokensBefore).toBeGreaterThan(0);
+		expect(result).toBeDefined();
+		expect(result!.summary).toBeDefined();
+		expect(result!.summary.length).toBeGreaterThan(0);
+		expect(result!.tokensBefore).toBeGreaterThan(0);
 
 		// Verify messages were compacted (should have summary + recent)
 		const messages = session.messages;
@@ -172,8 +173,9 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		// Compact should work even without file persistence
 		const result = await session.compact();
 
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
+		expect(result).toBeDefined();
+		expect(result!.summary).toBeDefined();
+		expect(result!.summary.length).toBeGreaterThan(0);
 
 		// In-memory entries should have the compaction
 		const entries = sessionManager.getEntries();

@@ -157,7 +157,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_follow_up_mode"; success: true }
 
 	// Compaction
-	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult }
+	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult | undefined }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
 
 	// Retry

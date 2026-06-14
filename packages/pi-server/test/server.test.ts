@@ -11,6 +11,7 @@ interface ServerResponse {
 	messageCount?: number;
 	error?: string;
 	deleted?: string;
+	dropped?: boolean;
 }
 
 describe("pi-server HTTP", () => {
@@ -136,6 +137,96 @@ describe("pi-server HTTP", () => {
 		expect(getSession("chunked-init")?.staticContext?.systemPrompt).toBe(originalBody.staticContext.systemPrompt);
 	});
 
+	it("syncs a replaced local message history", async () => {
+		const messages = [
+			{ role: "user" as const, content: "new branch", timestamp: 1000 },
+			{
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: "branch answer" }],
+				api: "openai-completions" as const,
+				provider: "opencode-go" as const,
+				model: "glm-5.1",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop" as const,
+				timestamp: 2000,
+			},
+		];
+
+		const res = await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "sync-history",
+				messages,
+				staticContext: { systemPrompt: "Synced system prompt" },
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.messageCount).toBe(2);
+		expect(getSession("sync-history")?.messages).toEqual(messages);
+		expect(getSession("sync-history")?.staticContext?.systemPrompt).toBe("Synced system prompt");
+	});
+
+	it("drops only the last assistant error message", async () => {
+		const errorMessage = {
+			role: "assistant" as const,
+			content: [],
+			api: "openai-completions" as const,
+			provider: "opencode-go" as const,
+			model: "glm-5.1",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error" as const,
+			errorMessage: "retryable",
+			timestamp: 2000,
+		};
+
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "drop-error",
+				messages: [{ role: "user", content: "hello", timestamp: 1000 }, errorMessage],
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/session/drop-last-assistant-error`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "drop-error" }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.dropped).toBe(true);
+		expect(body.messageCount).toBe(1);
+		expect(getSession("drop-error")?.messages.map((message) => message.role)).toEqual(["user"]);
+	});
+
 	it("rejects stream without static context", async () => {
 		const res = await fetch(`${baseUrl}/api/stream`, {
 			method: "POST",
@@ -220,9 +311,6 @@ describe("resolveStreamOptions", () => {
 			host: "127.0.0.1",
 			port: 4217,
 			authToken: undefined,
-			providerApiKey: undefined,
-			providerBaseUrl: undefined,
-			providerHeaders: {},
 		};
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
@@ -233,77 +321,23 @@ describe("resolveStreamOptions", () => {
 		expect(options.apiKey).toBeUndefined();
 	});
 
-	it("overrides model baseUrl when providerBaseUrl is configured", () => {
-		const config: ServerConfig = {
+	it("ignores server-side provider request config", () => {
+		const config = {
 			host: "127.0.0.1",
 			port: 4217,
 			authToken: undefined,
-			providerApiKey: undefined,
-			providerBaseUrl: "https://proxy.example.com/v1",
-			providerHeaders: {},
-		};
+			providerApiKey: "sk-server",
+			providerBaseUrl: "https://server-proxy.example.com/v1",
+			providerHeaders: { "X-Server": "yes" },
+		} as ServerConfig;
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
 			model: baseModel,
 			delta: [],
+			options: { headers: { "X-Client": "yes" } },
 		});
-		expect(model.baseUrl).toBe("https://proxy.example.com/v1");
-		expect(model.id).toBe("test-model");
-		expect(options.apiKey).toBeUndefined();
-	});
-
-	it("sets apiKey on options when providerApiKey is configured", () => {
-		const config: ServerConfig = {
-			host: "127.0.0.1",
-			port: 4217,
-			authToken: undefined,
-			providerApiKey: "sk-override",
-			providerBaseUrl: undefined,
-			providerHeaders: {},
-		};
-		const { model, options } = resolveStreamOptions(config, baseModel, {
-			sessionId: "s1",
-			model: baseModel,
-			delta: [],
-		});
-		expect(options.apiKey).toBe("sk-override");
 		expect(model.baseUrl).toBe("https://original.example.com");
-	});
-
-	it("merges providerHeaders into options", () => {
-		const config: ServerConfig = {
-			host: "127.0.0.1",
-			port: 4217,
-			authToken: undefined,
-			providerApiKey: undefined,
-			providerBaseUrl: undefined,
-			providerHeaders: { "X-Custom": "value1" },
-		};
-		const { options } = resolveStreamOptions(config, baseModel, {
-			sessionId: "s1",
-			model: baseModel,
-			delta: [],
-			options: { headers: { "X-Other": "value2" } },
-		});
-		expect(options.headers).toEqual({ "X-Custom": "value1", "X-Other": "value2" });
-	});
-
-	it("applies all overrides together", () => {
-		const config: ServerConfig = {
-			host: "127.0.0.1",
-			port: 4217,
-			authToken: undefined,
-			providerApiKey: "sk-test",
-			providerBaseUrl: "https://proxy.example.com/v1",
-			providerHeaders: { "X-Auth": "bearer" },
-		};
-		const { model, options } = resolveStreamOptions(config, baseModel, {
-			sessionId: "s1",
-			model: baseModel,
-			delta: [],
-		});
-		expect(model.baseUrl).toBe("https://proxy.example.com/v1");
-		expect(options.apiKey).toBe("sk-test");
-		expect(options.headers).toEqual({ "X-Auth": "bearer" });
+		expect(options.apiKey).toBeUndefined();
+		expect(options.headers).toEqual({ "X-Client": "yes" });
 	});
 });

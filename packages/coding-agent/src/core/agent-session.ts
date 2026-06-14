@@ -23,7 +23,14 @@ import type {
 	AgentTool,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Message,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+} from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -81,6 +88,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
+import { compactPiServer, dropLastPiServerAssistantError } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
@@ -249,6 +257,14 @@ interface ToolDefinitionEntry {
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
+function isPiServerMode(): boolean {
+	return process.env.PI_SERVER_MODE === "true";
+}
+
+function toProviderReasoning(thinkingLevel: ThinkingLevel): SimpleStreamOptions["reasoning"] {
+	return thinkingLevel === "off" ? undefined : thinkingLevel;
+}
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -275,6 +291,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _lastServerCompactionTimestamp: number | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1638,7 +1655,7 @@ export class AgentSession {
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1650,6 +1667,35 @@ export class AgentSession {
 			}
 
 			const { apiKey, headers } = await this._getCompactionRequestAuth(this.model);
+
+			if (isPiServerMode()) {
+				await compactPiServer(
+					this.model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						customInstructions,
+						settings: this.settingsManager.getCompactionSettings(),
+						signal: this._compactionAbortController.signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+					},
+				);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+				});
+				return undefined;
+			}
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
@@ -1815,8 +1861,10 @@ export class AgentSession {
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const localCompactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : 0;
+		const compactionTimestamp = Math.max(localCompactionTimestamp, this._lastServerCompactionTimestamp ?? 0);
 		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
+			compactionTimestamp > 0 && assistantMessage.timestamp <= compactionTimestamp;
 		if (assistantIsFromBeforeCompaction) {
 			return false;
 		}
@@ -1859,9 +1907,9 @@ export class AgentSession {
 			// trigger compaction right after one just finished.
 			const usageMsg = messages[estimate.lastUsageIndex];
 			if (
-				compactionEntry &&
+				compactionTimestamp > 0 &&
 				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()
+				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
 			) {
 				return false;
 			}
@@ -1914,6 +1962,29 @@ export class AgentSession {
 				headers = authResult.headers;
 			} else {
 				({ apiKey, headers } = await this._getCompactionRequestAuth(this.model));
+			}
+
+			if (isPiServerMode()) {
+				await compactPiServer(
+					this.model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						settings,
+						dropLastAssistantError: reason === "overflow",
+						signal: this._autoCompactionAbortController.signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+					},
+				);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({ type: "compaction_end", reason, result: undefined, aborted: false, willRetry });
+				return willRetry ? true : this.agent.hasQueuedMessages();
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
@@ -2517,6 +2588,13 @@ export class AgentSession {
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 			this.agent.state.messages = messages.slice(0, -1);
+			if (isPiServerMode()) {
+				await dropLastPiServerAssistantError(this.sessionId, {
+					systemPrompt: this.systemPrompt,
+					messages: this.agent.state.messages as Message[],
+					tools: this.agent.state.tools,
+				});
+			}
 		}
 
 		// Wait with exponential backoff (abortable)

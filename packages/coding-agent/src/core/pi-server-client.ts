@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import type { ProxyAssistantMessageEvent } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -34,6 +35,7 @@ function getAuthToken(): string {
 
 const sessionSentCounts = new Map<string, number>();
 const sessionStaticContextHashes = new Map<string, string>();
+const sessionLocalContextHashes = new Map<string, string>();
 
 export function hashStaticContext(ctx: Context): string {
 	const parts: string[] = [];
@@ -53,18 +55,25 @@ function getDelta(context: Context, sessionId: string): Message[] {
 	return delta as Message[];
 }
 
-function markSent(sessionId: string, count: number): void {
-	sessionSentCounts.set(sessionId, count);
+function hashMessages(messages: Message[]): string {
+	return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+}
+
+function markLocalSynced(sessionId: string, messages: Message[]): void {
+	sessionSentCounts.set(sessionId, messages.length);
+	sessionLocalContextHashes.set(sessionId, hashMessages(messages));
 }
 
 export function resetSessionTracking(sessionId: string): void {
 	sessionSentCounts.delete(sessionId);
 	sessionStaticContextHashes.delete(sessionId);
+	sessionLocalContextHashes.delete(sessionId);
 }
 
 export function resetAllSessionTracking(): void {
 	sessionSentCounts.clear();
 	sessionStaticContextHashes.clear();
+	sessionLocalContextHashes.clear();
 }
 
 interface SessionInitResponse {
@@ -100,7 +109,141 @@ async function ensureSessionInit(sessionId: string, context: Context): Promise<v
 	sessionStaticContextHashes.set(sessionId, currentHash);
 
 	if (result.messageCount > 0 && !sessionSentCounts.has(sessionId)) {
-		markSent(sessionId, result.messageCount);
+		sessionSentCounts.set(sessionId, result.messageCount);
+	}
+}
+
+function getStaticContext(context: Context) {
+	return {
+		systemPrompt: context.systemPrompt,
+		tools: context.tools,
+	};
+}
+
+function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStreamOptions {
+	return {
+		temperature: options?.temperature,
+		maxTokens: options?.maxTokens,
+		reasoning: options?.reasoning,
+		cacheRetention: options?.cacheRetention,
+		sessionId: options?.sessionId,
+		apiKey: options?.apiKey,
+		headers: options?.headers,
+		metadata: options?.metadata,
+		transport: options?.transport,
+		thinkingBudgets: options?.thinkingBudgets,
+		timeoutMs: options?.timeoutMs,
+		websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs,
+		maxRetries: options?.maxRetries,
+		maxRetryDelayMs: options?.maxRetryDelayMs,
+	};
+}
+
+async function syncPiServerSessionIfNeeded(
+	sessionId: string,
+	context: Context,
+	options: { serverUrl: string; authToken: string; signal?: AbortSignal; syncWhenUnsent?: boolean },
+): Promise<boolean> {
+	const sentCount = sessionSentCounts.get(sessionId) ?? 0;
+	const syncedHash = sessionLocalContextHashes.get(sessionId);
+	if (sentCount === 0) {
+		if (!options.syncWhenUnsent || context.messages.length === 0) return false;
+	} else {
+		const prefix = context.messages.slice(0, sentCount) as Message[];
+		if (syncedHash !== undefined && context.messages.length >= sentCount && hashMessages(prefix) === syncedHash) {
+			return false;
+		}
+	}
+
+	const response = await postJsonToPiServer(
+		"/api/session/sync",
+		{
+			sessionId,
+			messages: context.messages,
+			staticContext: getStaticContext(context),
+		},
+		options,
+	);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Session sync failed (${response.status}): ${errorBody}`);
+	}
+	markLocalSynced(sessionId, context.messages as Message[]);
+	return true;
+}
+
+export interface PiServerCompactOptions extends SimpleStreamOptions {
+	customInstructions?: string;
+	settings?: unknown;
+	dropLastAssistantError?: boolean;
+}
+
+export async function compactPiServer(
+	model: Model<any>,
+	context: Context,
+	options?: PiServerCompactOptions,
+): Promise<void> {
+	const sessionId = options?.sessionId ?? "default";
+	const serverUrl = getServerUrl();
+	const authToken = getAuthToken();
+
+	await ensureSessionInit(sessionId, context);
+	await syncPiServerSessionIfNeeded(sessionId, context, {
+		serverUrl,
+		authToken,
+		signal: options?.signal,
+		syncWhenUnsent: true,
+	});
+
+	const response = await postJsonToPiServer(
+		"/api/session/compact",
+		{
+			sessionId,
+			model,
+			options: serializeOptions(options),
+			settings: options?.settings,
+			customInstructions: options?.customInstructions,
+			dropLastAssistantError: options?.dropLastAssistantError,
+		},
+		{ serverUrl, authToken, signal: options?.signal },
+	);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Server compaction failed (${response.status}): ${errorBody}`);
+	}
+	markLocalSynced(sessionId, context.messages as Message[]);
+}
+
+interface DropLastAssistantErrorResponse {
+	dropped?: boolean;
+}
+
+export async function dropLastPiServerAssistantError(sessionId: string, context: Context): Promise<void> {
+	const serverUrl = getServerUrl();
+	const authToken = getAuthToken();
+	const response = await postJsonToPiServer(
+		"/api/session/drop-last-assistant-error",
+		{ sessionId },
+		{ serverUrl, authToken },
+	);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Dropping server assistant error failed (${response.status}): ${errorBody}`);
+	}
+
+	const result = (await response.json()) as DropLastAssistantErrorResponse;
+	if (result.dropped) {
+		markLocalSynced(sessionId, context.messages as Message[]);
+		return;
+	}
+
+	const didSync = await syncPiServerSessionIfNeeded(sessionId, context, {
+		serverUrl,
+		authToken,
+		syncWhenUnsent: true,
+	});
+	if (!didSync) {
+		markLocalSynced(sessionId, context.messages as Message[]);
 	}
 }
 
@@ -109,7 +252,8 @@ export async function streamPiServer(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): Promise<PiServerEventStream> {
-	const sessionId = options?.sessionId ?? "default";
+	const sessionId = options?.sessionId ?? randomUUID();
+	const isEphemeralSession = options?.sessionId === undefined;
 	const stream = new PiServerEventStream();
 
 	const partial: AssistantMessage = {
@@ -134,11 +278,11 @@ export async function streamPiServer(
 		try {
 			await ensureSessionInit(sessionId, context);
 
-			const delta = getDelta(context, sessionId);
-			const sentCount = sessionSentCounts.get(sessionId) ?? 0;
-
 			const serverUrl = getServerUrl();
 			const authToken = getAuthToken();
+			const requestOptions = { serverUrl, authToken, signal: options?.signal };
+			const didSync = await syncPiServerSessionIfNeeded(sessionId, context, requestOptions);
+			const delta = didSync ? [] : getDelta(context, sessionId);
 
 			const response = await postJsonToPiServer(
 				"/api/stream",
@@ -146,20 +290,9 @@ export async function streamPiServer(
 					sessionId,
 					model,
 					delta,
-					options: {
-						temperature: options?.temperature,
-						maxTokens: options?.maxTokens,
-						reasoning: options?.reasoning,
-						cacheRetention: options?.cacheRetention,
-						sessionId: options?.sessionId,
-						headers: options?.headers,
-						metadata: options?.metadata,
-						transport: options?.transport,
-						thinkingBudgets: options?.thinkingBudgets,
-						maxRetryDelayMs: options?.maxRetryDelayMs,
-					},
+					options: serializeOptions(options),
 				},
-				{ serverUrl, authToken, signal: options?.signal },
+				requestOptions,
 			);
 
 			if (!response.ok) {
@@ -208,7 +341,10 @@ export async function streamPiServer(
 				throw new Error("Request aborted by user");
 			}
 
-			markSent(sessionId, sentCount + delta.length + 1);
+			markLocalSynced(sessionId, [...(context.messages as Message[]), partial]);
+			if (isEphemeralSession) {
+				resetSessionTracking(sessionId);
+			}
 
 			stream.end();
 		} catch (error) {

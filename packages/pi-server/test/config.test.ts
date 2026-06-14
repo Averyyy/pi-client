@@ -34,23 +34,28 @@ describe("config", () => {
 		expect(config.host).toBe("127.0.0.1");
 		expect(config.port).toBe(4217);
 		expect(config.authToken).toBeUndefined();
+	});
+
+	it("does not load upstream provider request config", () => {
+		process.env.PI_SERVER_PROVIDER_API_KEY = "sk-server";
+		process.env.PI_SERVER_PROVIDER_BASE_URL = "https://server.example.com/v1";
+		process.env.PI_SERVER_PROVIDER_HEADERS = "X-Server=yes";
+
+		const config = loadConfig() as unknown as Record<string, unknown>;
 		expect(config.providerApiKey).toBeUndefined();
 		expect(config.providerBaseUrl).toBeUndefined();
+		expect(config.providerHeaders).toBeUndefined();
 	});
 
 	it("overrides from env vars", () => {
 		process.env.PI_SERVER_HOST = "0.0.0.0";
 		process.env.PI_SERVER_PORT = "9999";
 		process.env.PI_SERVER_AUTH_TOKEN = "test-token";
-		process.env.PI_SERVER_PROVIDER_API_KEY = "sk-test";
-		process.env.PI_SERVER_PROVIDER_BASE_URL = "https://api.example.com/v1";
 
 		const config = loadConfig();
 		expect(config.host).toBe("0.0.0.0");
 		expect(config.port).toBe(9999);
 		expect(config.authToken).toBe("test-token");
-		expect(config.providerApiKey).toBe("sk-test");
-		expect(config.providerBaseUrl).toBe("https://api.example.com/v1");
 	});
 
 	it("overrides from explicit config object", () => {
@@ -58,16 +63,6 @@ describe("config", () => {
 		expect(config.host).toBe("192.168.1.1");
 		expect(config.port).toBe(8080);
 		expect(config.authToken).toBe("my-token");
-	});
-
-	it("parses provider headers from env", () => {
-		process.env.PI_SERVER_PROVIDER_HEADERS = "X-Custom=value1,X-Another=value2";
-
-		const config = loadConfig();
-		expect(config.providerHeaders).toEqual({
-			"X-Custom": "value1",
-			"X-Another": "value2",
-		});
 	});
 
 	it("loads config from JSON file via PI_SERVER_CONFIG", () => {
@@ -80,7 +75,6 @@ describe("config", () => {
 				host: "10.0.0.1",
 				port: 5555,
 				authToken: "file-token",
-				providerBaseUrl: "https://file.example.com/v1",
 			}),
 		);
 
@@ -89,7 +83,6 @@ describe("config", () => {
 		expect(config.host).toBe("10.0.0.1");
 		expect(config.port).toBe(5555);
 		expect(config.authToken).toBe("file-token");
-		expect(config.providerBaseUrl).toBe("https://file.example.com/v1");
 
 		rmSync(tmpDir, { recursive: true, force: true });
 	});

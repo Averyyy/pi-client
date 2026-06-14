@@ -64,6 +64,21 @@ export function appendAssistantResponse(sessionId: string, message: Message): Se
 	return session;
 }
 
+export function replaceMessages(sessionId: string, messages: Message[]): SessionState {
+	const session = getOrCreateSession(sessionId);
+	session.messages = [...messages];
+	return session;
+}
+
+export function dropLastAssistantError(sessionId: string): boolean {
+	const session = getSession(sessionId);
+	if (!session) return false;
+	const last = session.messages[session.messages.length - 1];
+	if (last?.role !== "assistant" || last.stopReason !== "error") return false;
+	session.messages.pop();
+	return true;
+}
+
 export function deleteSession(sessionId: string): boolean {
 	return sessions.delete(sessionId);
 }
