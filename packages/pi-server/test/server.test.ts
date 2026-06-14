@@ -227,6 +227,23 @@ describe("pi-server HTTP", () => {
 		expect(getSession("drop-error")?.messages.map((message) => message.role)).toEqual(["user"]);
 	});
 
+	it("does not create a session when dropping a missing assistant error", async () => {
+		const res = await fetch(`${baseUrl}/api/session/drop-last-assistant-error`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "missing-drop-error" }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.dropped).toBe(false);
+		expect(body.messageCount).toBe(0);
+		expect(getSession("missing-drop-error")).toBeUndefined();
+	});
+
 	it("rejects stream without static context", async () => {
 		const res = await fetch(`${baseUrl}/api/stream`, {
 			method: "POST",

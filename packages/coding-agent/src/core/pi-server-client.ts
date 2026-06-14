@@ -175,7 +175,6 @@ async function syncPiServerSessionIfNeeded(
 export interface PiServerCompactOptions extends SimpleStreamOptions {
 	customInstructions?: string;
 	settings?: unknown;
-	dropLastAssistantError?: boolean;
 }
 
 export async function compactPiServer(
@@ -203,7 +202,6 @@ export async function compactPiServer(
 			options: serializeOptions(options),
 			settings: options?.settings,
 			customInstructions: options?.customInstructions,
-			dropLastAssistantError: options?.dropLastAssistantError,
 		},
 		{ serverUrl, authToken, signal: options?.signal },
 	);

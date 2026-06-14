@@ -11,4 +11,4 @@
 - `/api/request/chunk` endpoint for reassembling oversized client requests before dispatch.
 - `DELETE /api/session/:id` endpoint for removing one server-side session.
 - `/health` endpoint for health checks.
-- Configurable via `PI_SERVER_CONFIG` or environment variables: `PI_SERVER_HOST`, `PI_SERVER_PORT`, `PI_SERVER_AUTH_TOKEN`, `PI_SERVER_PROVIDER_API_KEY`, `PI_SERVER_PROVIDER_BASE_URL`, `PI_SERVER_PROVIDER_HEADERS`.
+- Configurable via `PI_SERVER_CONFIG` or environment variables: `PI_SERVER_HOST`, `PI_SERVER_PORT`, `PI_SERVER_AUTH_TOKEN`.

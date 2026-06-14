@@ -560,6 +560,9 @@ describe("pi-server-client", () => {
 			expect(streamBody!.body.delta).toHaveLength(1);
 			expect(streamBody!.body.delta[0].content).toBe("new question");
 
+			const compactBody = capturedBodies.find((b) => b.url.endsWith("/api/session/compact"));
+			expect(compactBody).toBeUndefined();
+
 			vi.unstubAllGlobals();
 		});
 
@@ -629,7 +632,9 @@ describe("pi-server-client", () => {
 				"other branch",
 				"compact this branch",
 			]);
-			expect(capturedBodies.at(-1)?.url.endsWith("/api/session/compact")).toBe(true);
+			const compactBody = capturedBodies.at(-1);
+			expect(compactBody?.url.endsWith("/api/session/compact")).toBe(true);
+			expect(compactBody?.body.dropLastAssistantError).toBeUndefined();
 
 			vi.unstubAllGlobals();
 		});

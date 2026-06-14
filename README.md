@@ -33,7 +33,7 @@ To learn more about pi:
 
 This fork adds a `pi-client` CLI and a separate `pi-server`.
 
-`pi-client` shares the same `~/.pi/agent` configuration, extensions, skills, prompts, themes, sessions, and project discovery behavior as the original `pi` CLI. It does not install a `pi` binary. The only request-path difference is that `pi-client` sends incremental requests to `pi-server`; `pi-server` reconstructs the full conversation by `sessionId` and forwards it to the configured LLM API.
+`pi-client` shares the same `~/.pi/agent` configuration, extensions, skills, prompts, themes, sessions, and project discovery behavior as the original `pi` CLI. It does not install a `pi` binary. The only request-path difference is that `pi-client` sends incremental requests to `pi-server`; `pi-server` reconstructs the full conversation by `sessionId` and forwards it to the client-selected LLM API.
 
 ### 1. Clone and install dependencies
 
@@ -57,7 +57,7 @@ npm run install:pi-server
 This installs:
 
 - `pi-client`: the forked client CLI. It does not overwrite an existing `pi` install.
-- `pi-server`: the local HTTP server that owns provider auth and upstream LLM forwarding.
+- `pi-server`: the local HTTP proxy that stores session state and forwards upstream LLM requests using request metadata supplied by `pi-client`.
 
 This fork is based on upstream Pi `0.79.3` at commit `6f29450`.
 
@@ -69,18 +69,8 @@ Environment configuration:
 export PI_SERVER_HOST=127.0.0.1
 export PI_SERVER_PORT=4217
 export PI_SERVER_AUTH_TOKEN="change-me"
-export PI_SERVER_PROVIDER_BASE_URL="https://opencode.ai/zen/go/v1"
-export PI_SERVER_PROVIDER_API_KEY="sk-..."
-# Optional, comma-separated:
-export PI_SERVER_PROVIDER_HEADERS="X-Header=value,Another-Header=value"
 
 pi-server
-```
-
-For OpenCode Go, use the OpenAI-compatible root base URL:
-
-```bash
-PI_SERVER_PROVIDER_BASE_URL="https://opencode.ai/zen/go/v1"
 ```
 
 `pi-server` also supports a JSON config file:
@@ -89,10 +79,7 @@ PI_SERVER_PROVIDER_BASE_URL="https://opencode.ai/zen/go/v1"
 {
 	"host": "127.0.0.1",
 	"port": 4217,
-	"authToken": "change-me",
-	"providerBaseUrl": "https://opencode.ai/zen/go/v1",
-	"providerApiKey": "sk-...",
-	"providerHeaders": {}
+	"authToken": "change-me"
 }
 ```
 
@@ -116,6 +103,8 @@ export PI_CLIENT_MAX_REQUEST_KB=512
 pi-client --provider opencode-go --model glm-5.1
 ```
 
+Configure provider models, base URLs, API keys, and headers on the client side through the normal Pi `~/.pi/agent/models.json` and auth settings. For OpenCode Go, use the OpenAI-compatible base URL there, for example `https://opencode.ai/zen/go/v1`.
+
 `PI_CLIENT_MAX_REQUEST_KB` caps every client-to-server JSON POST body. When a request is larger than this limit, `pi-client` splits it into multiple `/api/request/chunk` uploads and `pi-server` reassembles the original request before dispatching it. The default is `512` KB.
 
 ### Existing pi users
@@ -131,11 +120,11 @@ No config migration is needed. Keep your existing `~/.pi/agent` files in place:
 - `themes/`
 - `sessions/`
 
-`pi-client` uses the same Pi config directory and original startup path, so existing extensions and skills still load normally. Provider API keys can move to `pi-server` via `PI_SERVER_PROVIDER_API_KEY`, which keeps large client requests small and centralizes upstream auth.
+`pi-client` uses the same Pi config directory and original startup path, so existing extensions, skills, provider models, and auth settings still load normally. `pi-server` does not have provider-specific configuration; it receives the selected model and request auth from `pi-client`.
 
 ### New users without pi installed
 
-Install `pi-client` and `pi-server` with the commands above, then start `pi-server` with provider settings. `pi-client` will create/use `~/.pi/agent` the same way the original Pi CLI does.
+Install `pi-client` and `pi-server` with the commands above, then start `pi-server` with host/port/auth-token settings. Configure providers in `pi-client` the same way the original Pi CLI does; `pi-client` will create/use `~/.pi/agent`.
 
 Optional directories for user resources:
 
@@ -183,7 +172,7 @@ npm run install:pi-server
 安装后会得到：
 
 - `pi-client`：客户端命令，使用原始 Pi 的启动逻辑和配置目录，但 request 走增量发送。
-- `pi-server`：服务端命令，负责保存 session 历史、拼接完整上下文、持有上游 LLM API 配置并转发请求。
+- `pi-server`：服务端命令，负责保存 session 历史、拼接完整上下文，并使用 `pi-client` 传来的 model/request auth 转发请求。
 
 ### 3. 配置并启动 pi-server
 
@@ -193,16 +182,8 @@ npm run install:pi-server
 export PI_SERVER_HOST=127.0.0.1
 export PI_SERVER_PORT=4217
 export PI_SERVER_AUTH_TOKEN="change-me"
-export PI_SERVER_PROVIDER_BASE_URL="https://opencode.ai/zen/go/v1"
-export PI_SERVER_PROVIDER_API_KEY="sk-..."
 
 pi-server
-```
-
-如果需要额外请求头，可以加：
-
-```bash
-export PI_SERVER_PROVIDER_HEADERS="X-Header=value,Another-Header=value"
 ```
 
 也可以使用 JSON 配置文件：
@@ -211,10 +192,7 @@ export PI_SERVER_PROVIDER_HEADERS="X-Header=value,Another-Header=value"
 {
 	"host": "127.0.0.1",
 	"port": 4217,
-	"authToken": "change-me",
-	"providerBaseUrl": "https://opencode.ai/zen/go/v1",
-	"providerApiKey": "sk-...",
-	"providerHeaders": {}
+	"authToken": "change-me"
 }
 ```
 
@@ -238,6 +216,8 @@ export PI_CLIENT_MAX_REQUEST_KB=512
 pi-client --provider opencode-go --model glm-5.1
 ```
 
+provider 的 model、base URL、API key 和 headers 仍在 client 侧按原始 Pi 的方式配置，也就是 `~/.pi/agent/models.json` 和 auth 相关配置。比如 OpenCode Go 的 OpenAI-compatible base URL 应该配置在 client 侧：`https://opencode.ai/zen/go/v1`。
+
 `PI_CLIENT_MAX_REQUEST_KB` 用来限制 `pi-client` 到 `pi-server` 的单次 JSON POST 大小，单位是 KB。超过限制时，`pi-client` 会把请求拆成多次 `/api/request/chunk` 上传，`pi-server` 收齐后再还原原始请求。默认值是 `512`。
 
 ### 已经安装过原始 Pi 的用户
@@ -255,7 +235,7 @@ pi-client --provider opencode-go --model glm-5.1
 
 `pi-client` 仍然使用原始 Pi 的配置加载和资源发现路径，所以已有 extension 和 skill 会正常加载。唯一差异是：请求链路从直接请求 LLM 变成 `pi-client -> pi-server -> LLM API`，客户端只把最近增量消息、model 信息和 `sessionId` 发给 `pi-server`。
 
-上游 provider 的 API key 建议放在 `pi-server` 侧，例如 `PI_SERVER_PROVIDER_API_KEY`。这样客户端请求更小，也避免把 provider auth 分散到每个 client 环境里。
+上游 provider 的 API key、base URL 和 headers 保持在 client 侧配置。`pi-server` 定位是无 provider 配置的 proxy，只接收 `pi-client` 每次请求带来的 model 和 request auth。
 
 ### 没有安装过 Pi 的新用户
 

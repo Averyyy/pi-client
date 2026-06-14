@@ -53,7 +53,10 @@ interface SessionCompactBody {
 	options?: SimpleStreamOptions;
 	settings?: CompactionSettings;
 	customInstructions?: string;
-	dropLastAssistantError?: boolean;
+}
+
+interface SessionIdBody {
+	sessionId: string;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -191,10 +194,6 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 		return;
 	}
 
-	if (body.dropLastAssistantError) {
-		dropLastAssistantError(body.sessionId);
-	}
-
 	const entries = messagesToEntries(session.messages);
 	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS);
 	if (!preparationResult.ok) {
@@ -234,14 +233,14 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 	sendJson(res, 200, { success: true, messageCount: nextSession.messages.length });
 }
 
-function handleDropLastAssistantError(body: SessionInitBody, res: ServerResponse): void {
+function handleDropLastAssistantError(body: SessionIdBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
 	}
 	const dropped = dropLastAssistantError(body.sessionId);
-	const session = getOrCreateSession(body.sessionId);
-	sendJson(res, 200, { success: true, dropped, messageCount: session.messages.length });
+	const messageCount = getSession(body.sessionId)?.messages.length ?? 0;
+	sendJson(res, 200, { success: true, dropped, messageCount });
 }
 
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
@@ -334,7 +333,7 @@ async function handlePostRequest(
 	}
 
 	if (pathname === "/api/session/drop-last-assistant-error") {
-		handleDropLastAssistantError(body as SessionInitBody, res);
+		handleDropLastAssistantError(body as SessionIdBody, res);
 		return true;
 	}
 

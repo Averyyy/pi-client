@@ -1977,7 +1977,6 @@ export class AgentSession {
 						apiKey,
 						headers,
 						settings,
-						dropLastAssistantError: reason === "overflow",
 						signal: this._autoCompactionAbortController.signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
 					},
