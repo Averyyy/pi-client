@@ -34,6 +34,25 @@ interface CapturedChunkBody {
 	total: number;
 }
 
+type JsonObject = Record<string, unknown>;
+
+function parseJsonObject(rawBody: string): JsonObject {
+	if (!rawBody) return {};
+	const parsed = JSON.parse(rawBody) as unknown;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("Expected JSON object request body");
+	}
+	return parsed as JsonObject;
+}
+
+function getNumberProperty(value: JsonObject, key: string): number {
+	const property = value[key];
+	if (typeof property !== "number") {
+		throw new Error(`Expected numeric ${key}`);
+	}
+	return property;
+}
+
 const testModel: Model<any> = {
 	id: "test-model",
 	name: "Test Model",
@@ -563,6 +582,96 @@ describe("pi-server-client", () => {
 			const streamBody = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
 			expect(streamBody).toBeDefined();
 			expect(streamBody!.body.delta).toEqual([]);
+
+			vi.unstubAllGlobals();
+		});
+
+		it("chunks oversized full-context sync requests under the configured request size", async () => {
+			process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+			const maxBytes = 2 * 1024;
+			const capturedRequests: { url: string; bodyBytes: number; body: JsonObject }[] = [];
+
+			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
+				const rawBody = (init?.body as string | undefined) ?? "";
+				const body = parseJsonObject(rawBody);
+				capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
+
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-large-sync",
+							messageCount: 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/request/chunk")) {
+					const index = getNumberProperty(body, "index");
+					const total = getNumberProperty(body, "total");
+					if (index !== total - 1) {
+						return new Response(JSON.stringify({ received: true }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					if (body.target === "/api/session/sync") {
+						return new Response(
+							JSON.stringify({
+								sessionId: "large-sync-test",
+								staticContextHash: "hash-large-sync",
+								messageCount: 1,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+				}
+
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						},
+					]);
+				}
+
+				return new Response("Not found", { status: 404 });
+			});
+
+			vi.stubGlobal("fetch", mockFetch);
+
+			const stream1 = await streamPiServer(
+				testModel,
+				{
+					systemPrompt: "You are helpful.",
+					messages: [{ role: "user", content: "first branch", timestamp: 1000 }],
+				},
+				{ sessionId: "large-sync-test" },
+			);
+			for await (const _event of stream1) {
+			}
+
+			capturedRequests.length = 0;
+
+			const stream2 = await streamPiServer(
+				testModel,
+				{
+					systemPrompt: "You are helpful.",
+					messages: [{ role: "user", content: "x".repeat(1024 * 1024), timestamp: 2000 }],
+				},
+				{ sessionId: "large-sync-test" },
+			);
+			for await (const _event of stream2) {
+			}
+
+			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
+			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
+			expect(capturedRequests.some((request) => request.body.target === "/api/session/sync")).toBe(true);
 
 			vi.unstubAllGlobals();
 		});

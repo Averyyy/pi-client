@@ -40,23 +40,6 @@ function makeHeaders(authToken: string): Record<string, string> {
 	};
 }
 
-async function postRawJson(endpoint: string, rawJson: string, options: PiServerRequestOptions): Promise<Response> {
-	return fetch(`${options.serverUrl}${endpoint}`, {
-		method: "POST",
-		headers: makeHeaders(options.authToken),
-		body: rawJson,
-		signal: options.signal,
-	});
-}
-
-export async function getJsonFromPiServer(endpoint: string, options: PiServerRequestOptions): Promise<Response> {
-	return fetch(`${options.serverUrl}${endpoint}`, {
-		method: "GET",
-		headers: makeHeaders(options.authToken),
-		signal: options.signal,
-	});
-}
-
 function chunkBodyFits(
 	target: string,
 	requestId: string,
@@ -100,35 +83,56 @@ function splitEncodedBody(target: string, requestId: string, encoded: string, ma
 	return chunks;
 }
 
-export async function postJsonToPiServer(
-	endpoint: string,
-	body: unknown,
-	options: PiServerRequestOptions,
-): Promise<Response> {
-	const rawJson = JSON.stringify(body);
-	const maxBytes = getMaxRequestBytes();
-	if (Buffer.byteLength(rawJson, "utf-8") <= maxBytes) {
-		return postRawJson(endpoint, rawJson, options);
+export class ChunkRequest {
+	options: PiServerRequestOptions;
+
+	constructor(options: PiServerRequestOptions) {
+		this.options = options;
 	}
 
-	const requestId = randomUUID();
-	const encoded = Buffer.from(rawJson, "utf-8").toString("base64");
-	const chunks = splitEncodedBody(endpoint, requestId, encoded, maxBytes);
-	let response: Response | undefined;
+	async getJson(endpoint: string): Promise<Response> {
+		return fetch(`${this.options.serverUrl}${endpoint}`, {
+			method: "GET",
+			headers: makeHeaders(this.options.authToken),
+			signal: this.options.signal,
+		});
+	}
 
-	for (let index = 0; index < chunks.length; index++) {
-		const chunkBody: ChunkBody = {
-			requestId,
-			target: endpoint,
-			index,
-			total: chunks.length,
-			chunk: chunks[index],
-		};
-		response = await postRawJson(CHUNK_ENDPOINT, JSON.stringify(chunkBody), options);
-		if (!response.ok || index === chunks.length - 1) {
-			return response;
+	async postJson(endpoint: string, body: unknown): Promise<Response> {
+		const rawJson = JSON.stringify(body);
+		const maxBytes = getMaxRequestBytes();
+		if (Buffer.byteLength(rawJson, "utf-8") <= maxBytes) {
+			return this.#postRawJson(endpoint, rawJson);
 		}
+
+		const requestId = randomUUID();
+		const encoded = Buffer.from(rawJson, "utf-8").toString("base64");
+		const chunks = splitEncodedBody(endpoint, requestId, encoded, maxBytes);
+		let response: Response | undefined;
+
+		for (let index = 0; index < chunks.length; index++) {
+			const chunkBody: ChunkBody = {
+				requestId,
+				target: endpoint,
+				index,
+				total: chunks.length,
+				chunk: chunks[index],
+			};
+			response = await this.#postRawJson(CHUNK_ENDPOINT, JSON.stringify(chunkBody));
+			if (!response.ok || index === chunks.length - 1) {
+				return response;
+			}
+		}
+
+		throw new Error("No chunk response received from pi-server");
 	}
 
-	throw new Error("No chunk response received from pi-server");
+	async #postRawJson(endpoint: string, rawJson: string): Promise<Response> {
+		return fetch(`${this.options.serverUrl}${endpoint}`, {
+			method: "POST",
+			headers: makeHeaders(this.options.authToken),
+			body: rawJson,
+			signal: this.options.signal,
+		});
+	}
 }

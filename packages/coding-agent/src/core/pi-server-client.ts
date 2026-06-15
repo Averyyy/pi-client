@@ -10,7 +10,7 @@ import {
 	parseStreamingJson,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { getJsonFromPiServer, postJsonToPiServer } from "./pi-server-request.ts";
+import { ChunkRequest } from "./pi-server-request.ts";
 
 class PiServerEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -31,6 +31,14 @@ function getServerUrl(): string {
 
 function getAuthToken(): string {
 	return process.env.PI_SERVER_AUTH_TOKEN ?? "";
+}
+
+function createPiServerRequest(signal?: AbortSignal): ChunkRequest {
+	return new ChunkRequest({
+		serverUrl: getServerUrl(),
+		authToken: getAuthToken(),
+		signal,
+	});
 }
 
 const sessionSentCounts = new Map<string, number>();
@@ -89,7 +97,7 @@ interface SessionHistoryResponse {
 	messages: Message[];
 }
 
-async function ensureSessionInit(sessionId: string, context: Context): Promise<void> {
+async function ensureSessionInit(sessionId: string, context: Context, request: ChunkRequest): Promise<void> {
 	const currentHash = hashStaticContext(context);
 	const previousHash = sessionStaticContextHashes.get(sessionId);
 
@@ -102,10 +110,7 @@ async function ensureSessionInit(sessionId: string, context: Context): Promise<v
 
 	const endpoint = previousHash === undefined ? "/api/session/init" : "/api/session/update";
 
-	const serverUrl = getServerUrl();
-	const authToken = getAuthToken();
-
-	const response = await postJsonToPiServer(endpoint, { sessionId, staticContext }, { serverUrl, authToken });
+	const response = await request.postJson(endpoint, { sessionId, staticContext });
 
 	if (!response.ok) {
 		const errorBody = await response.text();
@@ -149,9 +154,9 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 async function markSyncedFromServerHistoryIfPossible(
 	sessionId: string,
 	context: Context,
-	options: { serverUrl: string; authToken: string; signal?: AbortSignal },
+	request: ChunkRequest,
 ): Promise<boolean> {
-	const response = await getJsonFromPiServer(`/api/session/${encodeURIComponent(sessionId)}/history`, options);
+	const response = await request.getJson(`/api/session/${encodeURIComponent(sessionId)}/history`);
 	if (!response.ok) {
 		const errorBody = await response.text();
 		throw new Error(`Session history failed (${response.status}): ${errorBody}`);
@@ -174,7 +179,8 @@ async function markSyncedFromServerHistoryIfPossible(
 async function syncPiServerSessionIfNeeded(
 	sessionId: string,
 	context: Context,
-	options: { serverUrl: string; authToken: string; signal?: AbortSignal; syncWhenUnsent?: boolean },
+	request: ChunkRequest,
+	options: { syncWhenUnsent?: boolean } = {},
 ): Promise<boolean> {
 	const sentCount = sessionSentCounts.get(sessionId) ?? 0;
 	const syncedHash = sessionLocalContextHashes.get(sessionId);
@@ -186,20 +192,16 @@ async function syncPiServerSessionIfNeeded(
 			return false;
 		}
 		if (syncedHash === undefined) {
-			const didLoadHistory = await markSyncedFromServerHistoryIfPossible(sessionId, context, options);
+			const didLoadHistory = await markSyncedFromServerHistoryIfPossible(sessionId, context, request);
 			if (didLoadHistory) return false;
 		}
 	}
 
-	const response = await postJsonToPiServer(
-		"/api/session/sync",
-		{
-			sessionId,
-			messages: context.messages,
-			staticContext: getStaticContext(context),
-		},
-		options,
-	);
+	const response = await request.postJson("/api/session/sync", {
+		sessionId,
+		messages: context.messages,
+		staticContext: getStaticContext(context),
+	});
 	if (!response.ok) {
 		const errorBody = await response.text();
 		throw new Error(`Session sync failed (${response.status}): ${errorBody}`);
@@ -219,28 +221,20 @@ export async function compactPiServer(
 	options?: PiServerCompactOptions,
 ): Promise<void> {
 	const sessionId = options?.sessionId ?? "default";
-	const serverUrl = getServerUrl();
-	const authToken = getAuthToken();
+	const request = createPiServerRequest(options?.signal);
 
-	await ensureSessionInit(sessionId, context);
-	await syncPiServerSessionIfNeeded(sessionId, context, {
-		serverUrl,
-		authToken,
-		signal: options?.signal,
+	await ensureSessionInit(sessionId, context, request);
+	await syncPiServerSessionIfNeeded(sessionId, context, request, {
 		syncWhenUnsent: true,
 	});
 
-	const response = await postJsonToPiServer(
-		"/api/session/compact",
-		{
-			sessionId,
-			model,
-			options: serializeOptions(options),
-			settings: options?.settings,
-			customInstructions: options?.customInstructions,
-		},
-		{ serverUrl, authToken, signal: options?.signal },
-	);
+	const response = await request.postJson("/api/session/compact", {
+		sessionId,
+		model,
+		options: serializeOptions(options),
+		settings: options?.settings,
+		customInstructions: options?.customInstructions,
+	});
 	if (!response.ok) {
 		const errorBody = await response.text();
 		throw new Error(`Server compaction failed (${response.status}): ${errorBody}`);
@@ -253,13 +247,8 @@ interface DropLastAssistantErrorResponse {
 }
 
 export async function dropLastPiServerAssistantError(sessionId: string, context: Context): Promise<void> {
-	const serverUrl = getServerUrl();
-	const authToken = getAuthToken();
-	const response = await postJsonToPiServer(
-		"/api/session/drop-last-assistant-error",
-		{ sessionId },
-		{ serverUrl, authToken },
-	);
+	const request = createPiServerRequest();
+	const response = await request.postJson("/api/session/drop-last-assistant-error", { sessionId });
 	if (!response.ok) {
 		const errorBody = await response.text();
 		throw new Error(`Dropping server assistant error failed (${response.status}): ${errorBody}`);
@@ -271,9 +260,7 @@ export async function dropLastPiServerAssistantError(sessionId: string, context:
 		return;
 	}
 
-	const didSync = await syncPiServerSessionIfNeeded(sessionId, context, {
-		serverUrl,
-		authToken,
+	const didSync = await syncPiServerSessionIfNeeded(sessionId, context, request, {
 		syncWhenUnsent: true,
 	});
 	if (!didSync) {
@@ -310,24 +297,18 @@ export async function streamPiServer(
 
 	(async () => {
 		try {
-			await ensureSessionInit(sessionId, context);
+			const request = createPiServerRequest(options?.signal);
+			await ensureSessionInit(sessionId, context, request);
 
-			const serverUrl = getServerUrl();
-			const authToken = getAuthToken();
-			const requestOptions = { serverUrl, authToken, signal: options?.signal };
-			const didSync = await syncPiServerSessionIfNeeded(sessionId, context, requestOptions);
+			const didSync = await syncPiServerSessionIfNeeded(sessionId, context, request);
 			const delta = didSync ? [] : getDelta(context, sessionId);
 
-			const response = await postJsonToPiServer(
-				"/api/stream",
-				{
-					sessionId,
-					model,
-					delta,
-					options: serializeOptions(options),
-				},
-				requestOptions,
-			);
+			const response = await request.postJson("/api/stream", {
+				sessionId,
+				model,
+				delta,
+				options: serializeOptions(options),
+			});
 
 			if (!response.ok) {
 				let errorMessage = `pi-server error: ${response.status} ${response.statusText}`;
