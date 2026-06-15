@@ -560,7 +560,7 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 
-				if (isPiServerMode()) {
+				if (isPiServerMode() && assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					await syncPiServerTree(
 						this.sessionId,
 						{
@@ -576,6 +576,10 @@ export class AgentSession {
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
+		if (isPiServerMode()) {
+			return false;
+		}
+
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
@@ -980,7 +984,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+		if (!isPiServerMode() && this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
 			return true;
 		}
 

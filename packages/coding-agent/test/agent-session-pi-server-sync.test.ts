@@ -203,4 +203,294 @@ describe("AgentSession pi-server sync", () => {
 			}
 		}
 	});
+
+	it("does not run a second tree sync after a pi-server stream error", async () => {
+		const tempDir = join(tmpdir(), `pi-stream-error-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.endsWith("/api/stream")) {
+						return new Response(
+							'data: {"type":"error","reason":"error","errorMessage":"connection lost","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0}}\n\n',
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-error",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(cwd),
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("will fail");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
+			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("chunks the first tree bootstrap for a long session created outside pi-client", async () => {
+		const tempDir = join(tmpdir(), `pi-long-legacy-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		for (let index = 0; index < 30; index++) {
+			sessionManager.appendMessage({
+				role: "user",
+				content: `legacy question ${index} ${"x".repeat(1200)}`,
+				timestamp: 1000 + index * 2,
+			});
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: `legacy answer ${index} ${"y".repeat(1200)}` }],
+				api: model!.api,
+				provider: model!.provider,
+				model: model!.id,
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1001 + index * 2,
+			});
+		}
+
+		const maxBytes = 2 * 1024;
+		const capturedRequests: { url: string; bodyBytes: number; body: Record<string, unknown> }[] = [];
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const rawBody = (init?.body as string | undefined) ?? "";
+					const body = parseJsonObject(rawBody);
+					capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
+
+					if (url.endsWith("/api/stream")) {
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					if (url.endsWith("/api/request/chunk")) {
+						const target = body.target;
+						if (typeof target !== "string") {
+							throw new Error("Expected chunk target");
+						}
+						const index = body.index;
+						const total = body.total;
+						if (typeof index !== "number" || typeof total !== "number") {
+							throw new Error("Expected numeric chunk index and total");
+						}
+						if (index !== total - 1) {
+							return new Response(JSON.stringify({ received: true }), {
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							});
+						}
+						return new Response(
+							JSON.stringify({
+								sessionId: body.sessionId,
+								leafId: body.leafId,
+								staticContextHash: "hash-long-legacy",
+								entryCount: 61,
+								target,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-long-legacy",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("fresh question");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
+			const chunkTargets = capturedRequests
+				.filter((request) => request.url.endsWith("/api/request/chunk"))
+				.map((request) => request.body.target);
+			expect(chunkTargets).toContain("/api/session/tree/sync");
+			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
+			expect(streamRequest?.body).not.toHaveProperty("messages");
+			expect(streamRequest?.body).not.toHaveProperty("entries");
+			expect(streamRequest?.body).not.toHaveProperty("delta");
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("does not retry or resync after aborting a pi-server stream", async () => {
+		const tempDir = join(tmpdir(), `pi-stream-abort-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+		let streamRequestStarted = () => {};
+		const streamRequestPromise = new Promise<void>((resolve) => {
+			streamRequestStarted = resolve;
+		});
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.endsWith("/api/stream")) {
+						streamRequestStarted();
+						const signal = init?.signal;
+						return await new Promise<Response>((_resolve, reject) => {
+							if (signal?.aborted) {
+								reject(new Error("Request aborted by test"));
+								return;
+							}
+							signal?.addEventListener("abort", () => reject(new Error("Request aborted by test")), {
+								once: true,
+							});
+						});
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-abort",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(cwd),
+				resourceLoader: createTestResourceLoader(),
+			});
+			const events: Array<{ type: string; willRetry?: boolean }> = [];
+			session.subscribe((event) => {
+				if (event.type === "agent_end") {
+					events.push({ type: event.type, willRetry: event.willRetry });
+				} else if (event.type === "auto_retry_start") {
+					events.push({ type: event.type });
+				}
+			});
+			try {
+				const promptPromise = session.prompt("abort me");
+				await streamRequestPromise;
+				await session.abort();
+				await promptPromise;
+			} finally {
+				session.dispose();
+			}
+
+			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
+			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
+			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
 });
