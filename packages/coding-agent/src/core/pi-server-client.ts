@@ -10,7 +10,7 @@ import {
 	parseStreamingJson,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { postJsonToPiServer } from "./pi-server-request.ts";
+import { getJsonFromPiServer, postJsonToPiServer } from "./pi-server-request.ts";
 
 class PiServerEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -82,6 +82,13 @@ interface SessionInitResponse {
 	messageCount: number;
 }
 
+interface SessionHistoryResponse {
+	sessionId: string;
+	staticContextHash: string;
+	messageCount: number;
+	messages: Message[];
+}
+
 async function ensureSessionInit(sessionId: string, context: Context): Promise<void> {
 	const currentHash = hashStaticContext(context);
 	const previousHash = sessionStaticContextHashes.get(sessionId);
@@ -139,6 +146,31 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 	};
 }
 
+async function markSyncedFromServerHistoryIfPossible(
+	sessionId: string,
+	context: Context,
+	options: { serverUrl: string; authToken: string; signal?: AbortSignal },
+): Promise<boolean> {
+	const response = await getJsonFromPiServer(`/api/session/${encodeURIComponent(sessionId)}/history`, options);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Session history failed (${response.status}): ${errorBody}`);
+	}
+
+	const history = (await response.json()) as SessionHistoryResponse;
+	if (history.messages.length > context.messages.length) {
+		return false;
+	}
+
+	const localPrefix = context.messages.slice(0, history.messages.length) as Message[];
+	if (hashMessages(localPrefix) !== hashMessages(history.messages)) {
+		return false;
+	}
+
+	markLocalSynced(sessionId, localPrefix);
+	return true;
+}
+
 async function syncPiServerSessionIfNeeded(
 	sessionId: string,
 	context: Context,
@@ -152,6 +184,10 @@ async function syncPiServerSessionIfNeeded(
 		const prefix = context.messages.slice(0, sentCount) as Message[];
 		if (syncedHash !== undefined && context.messages.length >= sentCount && hashMessages(prefix) === syncedHash) {
 			return false;
+		}
+		if (syncedHash === undefined) {
+			const didLoadHistory = await markSyncedFromServerHistoryIfPossible(sessionId, context, options);
+			if (didLoadHistory) return false;
 		}
 	}
 

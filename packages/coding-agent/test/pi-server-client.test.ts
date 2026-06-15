@@ -281,6 +281,93 @@ describe("pi-server-client", () => {
 			vi.unstubAllGlobals();
 		});
 
+		it("loads server history to avoid full sync uploads when local tracking is missing", async () => {
+			const capturedBodies: { url: string; body: any; method: string }[] = [];
+			const assistantMsg: Message = {
+				role: "assistant",
+				content: [{ type: "text", text: "Hi there!" }],
+				api: "openai-completions",
+				provider: "test-provider",
+				model: "test-model",
+				usage: {
+					input: 10,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2000,
+			};
+
+			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				const body = init?.body ? JSON.parse(init.body as string) : {};
+				capturedBodies.push({ url, body, method });
+
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-existing",
+							messageCount: 2,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/session/history-seed/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "history-seed",
+							staticContextHash: "hash-existing",
+							messageCount: 2,
+							messages: [{ role: "user", content: "Hello", timestamp: 1000 }, assistantMsg],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						},
+					]);
+				}
+
+				return new Response("Not found", { status: 404 });
+			});
+
+			vi.stubGlobal("fetch", mockFetch);
+
+			const context: Context = {
+				systemPrompt: "You are helpful.",
+				messages: [
+					{ role: "user", content: "Hello", timestamp: 1000 },
+					assistantMsg,
+					{ role: "user", content: "How are you?", timestamp: 3000 },
+				],
+			};
+
+			const stream = await streamPiServer(testModel, context, { sessionId: "history-seed" });
+			for await (const _event of stream) {
+			}
+
+			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/history-seed/history"))).toBe(true);
+			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
+
+			const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"));
+			expect(streamBody).toBeDefined();
+			expect(streamBody!.body.delta).toEqual([{ role: "user", content: "How are you?", timestamp: 3000 }]);
+
+			vi.unstubAllGlobals();
+		});
+
 		it("sends session init on first request", async () => {
 			const capturedBodies: { url: string; body: any }[] = [];
 

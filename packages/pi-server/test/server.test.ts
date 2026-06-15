@@ -1,5 +1,5 @@
 import type { Server } from "node:http";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPiServer, resolveStreamOptions, type ServerConfig } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
@@ -12,6 +12,8 @@ interface ServerResponse {
 	error?: string;
 	deleted?: string;
 	dropped?: boolean;
+	staticContext?: { systemPrompt?: string };
+	messages?: Message[];
 }
 
 describe("pi-server HTTP", () => {
@@ -177,6 +179,64 @@ describe("pi-server HTTP", () => {
 		expect(body.messageCount).toBe(2);
 		expect(getSession("sync-history")?.messages).toEqual(messages);
 		expect(getSession("sync-history")?.staticContext?.systemPrompt).toBe("Synced system prompt");
+	});
+
+	it("returns full session history without a request body", async () => {
+		const messages: Message[] = [
+			{ role: "user", content: "large local history", timestamp: 1000 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "stored on server" }],
+				api: "openai-completions",
+				provider: "opencode-go",
+				model: "glm-5.1",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2000,
+			},
+		];
+
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "full-history",
+				messages,
+				staticContext: { systemPrompt: "History system prompt" },
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/session/full-history/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.sessionId).toBe("full-history");
+		expect(body.messageCount).toBe(2);
+		expect(body.staticContext?.systemPrompt).toBe("History system prompt");
+		expect(body.messages).toEqual(messages);
+	});
+
+	it("returns 404 when full session history is missing", async () => {
+		const res = await fetch(`${baseUrl}/api/session/missing-history/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+
+		expect(res.status).toBe(404);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.error).toContain("session not found");
+		expect(getSession("missing-history")).toBeUndefined();
 	});
 
 	it("drops only the last assistant error message", async () => {

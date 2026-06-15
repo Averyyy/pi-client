@@ -138,6 +138,7 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 
 - Update this fork with `pi-client update`. It updates the checkout with `git pull --ff-only`, refreshes dependencies with `npm install --ignore-scripts`, then reinstalls both `pi-client` and `pi-server`. The update stops if the checkout has uncommitted changes.
 - `pi-server` stores session history in process memory. Restarting `pi-server` clears server-side session state.
+- Read full server-side history with `GET /api/session/:id/history`. This is a response-only large payload path; the client POST size cap still applies only to client-to-server request bodies.
 - Run `pi-server` behind your own TLS/reverse proxy if accessing it over a network.
 - Keep `PI_SERVER_AUTH_TOKEN` set when `pi-server` is reachable by anything other than local trusted processes.
 
@@ -270,6 +271,7 @@ pi-client update
 ### 运行注意事项
 
 - `pi-server` 的 session 历史保存在进程内存里，重启后会清空。
+- `GET /api/session/:id/history` 可以读取服务端完整历史。这是只读的大响应路径；`PI_CLIENT_MAX_REQUEST_KB` 仍只限制 client 到 server 的请求体大小。
 - 如果 `pi-server` 不只暴露给本机可信进程，请务必设置 `PI_SERVER_AUTH_TOKEN`。
 - 如果跨机器访问 `pi-server`，建议放在你自己的 TLS 或反向代理后面。
 - `pi-client` 不会覆盖本机已有的 `pi` 命令，两者可以同时存在。

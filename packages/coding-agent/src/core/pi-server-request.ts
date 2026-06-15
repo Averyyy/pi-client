@@ -49,6 +49,14 @@ async function postRawJson(endpoint: string, rawJson: string, options: PiServerR
 	});
 }
 
+export async function getJsonFromPiServer(endpoint: string, options: PiServerRequestOptions): Promise<Response> {
+	return fetch(`${options.serverUrl}${endpoint}`, {
+		method: "GET",
+		headers: makeHeaders(options.authToken),
+		signal: options.signal,
+	});
+}
+
 function chunkBodyFits(
 	target: string,
 	requestId: string,

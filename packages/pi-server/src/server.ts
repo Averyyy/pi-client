@@ -243,6 +243,21 @@ function handleDropLastAssistantError(body: SessionIdBody, res: ServerResponse):
 	sendJson(res, 200, { success: true, dropped, messageCount });
 }
 
+function handleSessionHistory(sessionId: string, res: ServerResponse): void {
+	const session = getSession(sessionId);
+	if (!session) {
+		sendJson(res, 404, { error: "session not found" });
+		return;
+	}
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContext: session.staticContext,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+		messages: session.messages,
+	});
+}
+
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
@@ -363,6 +378,12 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 
 		if (!authenticate(config, req)) {
 			sendJson(res, 401, { error: "Unauthorized" });
+			return;
+		}
+
+		if (req.method === "GET" && url.pathname.startsWith("/api/session/") && url.pathname.endsWith("/history")) {
+			const encodedSessionId = url.pathname.slice("/api/session/".length, -"/history".length);
+			handleSessionHistory(decodeURIComponent(encodedSessionId), res);
 			return;
 		}
 
