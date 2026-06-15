@@ -47,6 +47,12 @@ interface SessionSyncBody {
 	staticContext?: SessionStaticContext;
 }
 
+interface SessionAppendBody {
+	sessionId: string;
+	messages: Message[];
+	staticContext?: SessionStaticContext;
+}
+
 interface SessionCompactBody {
 	sessionId: string;
 	model: Model<any>;
@@ -154,6 +160,26 @@ function handleSessionSync(body: SessionSyncBody, res: ServerResponse): void {
 	});
 }
 
+function handleSessionAppend(body: SessionAppendBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	if (!Array.isArray(body.messages)) {
+		sendJson(res, 400, { error: "messages is required" });
+		return;
+	}
+	if (body.staticContext) {
+		setStaticContext(body.sessionId, body.staticContext);
+	}
+	const session = appendMessages(body.sessionId, body.messages);
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+	});
+}
+
 function messagesToEntries(messages: Message[]): SessionTreeEntry[] {
 	let parentId: string | null = null;
 	return messages.map((message, index) => {
@@ -243,18 +269,20 @@ function handleDropLastAssistantError(body: SessionIdBody, res: ServerResponse):
 	sendJson(res, 200, { success: true, dropped, messageCount });
 }
 
-function handleSessionHistory(sessionId: string, res: ServerResponse): void {
+function handleSessionHistory(sessionId: string, from: number | undefined, res: ServerResponse): void {
 	const session = getSession(sessionId);
 	if (!session) {
 		sendJson(res, 404, { error: "session not found" });
 		return;
 	}
+	const baseMessageCount = from ?? 0;
 	sendJson(res, 200, {
 		sessionId: session.sessionId,
 		staticContext: session.staticContext,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
-		messages: session.messages,
+		baseMessageCount,
+		messages: session.messages.slice(baseMessageCount),
 	});
 }
 
@@ -347,6 +375,11 @@ async function handlePostRequest(
 		return true;
 	}
 
+	if (pathname === "/api/session/append") {
+		handleSessionAppend(body as SessionAppendBody, res);
+		return true;
+	}
+
 	if (pathname === "/api/session/drop-last-assistant-error") {
 		handleDropLastAssistantError(body as SessionIdBody, res);
 		return true;
@@ -383,7 +416,13 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 
 		if (req.method === "GET" && url.pathname.startsWith("/api/session/") && url.pathname.endsWith("/history")) {
 			const encodedSessionId = url.pathname.slice("/api/session/".length, -"/history".length);
-			handleSessionHistory(decodeURIComponent(encodedSessionId), res);
+			const fromParam = url.searchParams.get("from");
+			const from = fromParam === null ? undefined : Number(fromParam);
+			if (from !== undefined && (!Number.isInteger(from) || from < 0)) {
+				sendJson(res, 400, { error: "from must be a non-negative integer" });
+				return;
+			}
+			handleSessionHistory(decodeURIComponent(encodedSessionId), from, res);
 			return;
 		}
 

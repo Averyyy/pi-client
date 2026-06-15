@@ -251,6 +251,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	).filter((name) => !excludedToolNameSet?.has(name));
 
 	let agent: Agent;
+	let agentSession: AgentSession | undefined;
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -326,6 +327,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								auth.headers,
 								options?.headers,
 							),
+							onHistoryReconciled: (reconciliation) => {
+								if (agentSession) {
+									agentSession.reconcilePiServerHistory(reconciliation);
+								} else {
+									agent.state.messages = reconciliation.messages as AgentMessage[];
+								}
+							},
 						});
 					}
 				: async (model, context, options) => {
@@ -417,6 +425,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
+	agentSession = session;
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

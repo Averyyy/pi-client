@@ -14,6 +14,7 @@ interface ServerResponse {
 	dropped?: boolean;
 	staticContext?: { systemPrompt?: string };
 	messages?: Message[];
+	baseMessageCount?: number;
 }
 
 describe("pi-server HTTP", () => {
@@ -226,6 +227,61 @@ describe("pi-server HTTP", () => {
 		expect(body.messageCount).toBe(2);
 		expect(body.staticContext?.systemPrompt).toBe("History system prompt");
 		expect(body.messages).toEqual(messages);
+	});
+
+	it("returns session history after the requested message offset", async () => {
+		const messages: Message[] = [
+			{ role: "user", content: "one", timestamp: 1000 },
+			{ role: "user", content: "two", timestamp: 2000 },
+			{ role: "user", content: "three", timestamp: 3000 },
+		];
+
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "delta-history", messages }),
+		});
+
+		const res = await fetch(`${baseUrl}/api/session/delta-history/history?from=1`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.messageCount).toBe(3);
+		expect(body.baseMessageCount).toBe(1);
+		expect(body.messages).toEqual(messages.slice(1));
+	});
+
+	it("appends client-only messages without replacing server history", async () => {
+		const first: Message = { role: "user", content: "server base", timestamp: 1000 };
+		const second: Message = { role: "user", content: "client delta", timestamp: 2000 };
+
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "append-history", messages: [first] }),
+		});
+
+		const res = await fetch(`${baseUrl}/api/session/append`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "append-history", messages: [second] }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.messageCount).toBe(2);
+		expect(getSession("append-history")?.messages).toEqual([first, second]);
 	});
 
 	it("returns 404 when full session history is missing", async () => {

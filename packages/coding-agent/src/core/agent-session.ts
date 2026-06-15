@@ -88,6 +88,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
+import type { PiServerHistoryReconciliation } from "./pi-server-client.ts";
 import { compactPiServer, dropLastPiServerAssistantError } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -144,6 +145,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "history_reconciled"; reason: PiServerHistoryReconciliation["reason"]; messages: Message[] }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -576,6 +578,16 @@ export class AgentSession {
 			}
 		}
 		return false;
+	}
+
+	reconcilePiServerHistory(reconciliation: PiServerHistoryReconciliation): void {
+		this.agent.state.messages = reconciliation.messages as AgentMessage[];
+		this.sessionManager.replaceMessages(reconciliation.messages);
+		this._emit({
+			type: "history_reconciled",
+			reason: reconciliation.reason,
+			messages: reconciliation.messages,
+		});
 	}
 
 	/** Extract text content from a message */

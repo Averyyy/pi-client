@@ -2,7 +2,15 @@ import { Buffer } from "node:buffer";
 
 export const CHUNK_ENDPOINT = "/api/request/chunk";
 
-const ALLOWED_TARGETS = new Set(["/api/session/init", "/api/session/update", "/api/stream"]);
+const ALLOWED_TARGETS = new Set([
+	"/api/session/init",
+	"/api/session/update",
+	"/api/session/sync",
+	"/api/session/append",
+	"/api/session/drop-last-assistant-error",
+	"/api/session/compact",
+	"/api/stream",
+]);
 
 export interface RequestChunkBody {
 	requestId: string;

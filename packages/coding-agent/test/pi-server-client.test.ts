@@ -4,6 +4,7 @@ import {
 	compactPiServer,
 	dropLastPiServerAssistantError,
 	hashStaticContext,
+	type PiServerHistoryReconciliation,
 	resetAllSessionTracking,
 	resetSessionTracking,
 	streamPiServer,
@@ -232,6 +233,17 @@ describe("pi-server-client", () => {
 					);
 				}
 
+				if (url.endsWith("/api/session/append")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-1",
+							messageCount: 3,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
 				if (url.endsWith("/api/stream")) {
 					return makeMockResponse([
 						{ type: "start" },
@@ -292,10 +304,14 @@ describe("pi-server-client", () => {
 			const updateBody = capturedBodies.find((b) => b.url.endsWith("/api/session/update"));
 			expect(updateBody).toBeUndefined();
 
+			const appendBody = capturedBodies.find((b) => b.url.endsWith("/api/session/append"));
+			expect(appendBody).toBeDefined();
+			expect(appendBody!.body.messages).toHaveLength(1);
+			expect(appendBody!.body.messages[0].content).toBe("How are you?");
+
 			const streamBody2 = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
 			expect(streamBody2).toBeDefined();
-			expect(streamBody2!.body.delta).toHaveLength(1);
-			expect(streamBody2!.body.delta[0].content).toBe("How are you?");
+			expect(streamBody2!.body.delta).toEqual([]);
 
 			vi.unstubAllGlobals();
 		});
@@ -348,6 +364,17 @@ describe("pi-server-client", () => {
 					);
 				}
 
+				if (url.endsWith("/api/session/append")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-existing",
+							messageCount: 3,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
 				if (url.endsWith("/api/stream")) {
 					return makeMockResponse([
 						{ type: "start" },
@@ -379,10 +406,109 @@ describe("pi-server-client", () => {
 
 			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/history-seed/history"))).toBe(true);
 			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
+			const appendBody = capturedBodies.find((request) => request.url.endsWith("/api/session/append"));
+			expect(appendBody).toBeDefined();
+			expect(appendBody!.body.messages).toEqual([{ role: "user", content: "How are you?", timestamp: 3000 }]);
 
 			const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"));
 			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toEqual([{ role: "user", content: "How are you?", timestamp: 3000 }]);
+			expect(streamBody!.body.delta).toEqual([]);
+
+			vi.unstubAllGlobals();
+		});
+
+		it("downloads server-only history without uploading local history", async () => {
+			const serverMessages: Message[] = [
+				{ role: "user", content: "server question", timestamp: 1000 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "server answer" }],
+					api: "openai-completions",
+					provider: "test-provider",
+					model: "test-model",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2000,
+				},
+			];
+			const capturedRequests: { url: string; body: JsonObject; method: string }[] = [];
+			const reconciliations: PiServerHistoryReconciliation[] = [];
+
+			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedRequests.push({ url, body, method });
+
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "server-new-test",
+							staticContextHash: "hash-server-new",
+							messageCount: serverMessages.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.includes("/api/session/server-new-test/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "server-new-test",
+							staticContextHash: "hash-server-new",
+							messageCount: serverMessages.length,
+							messages: serverMessages,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						},
+					]);
+				}
+
+				return new Response("Not found", { status: 404 });
+			});
+
+			vi.stubGlobal("fetch", mockFetch);
+
+			const stream = await streamPiServer(
+				testModel,
+				{
+					systemPrompt: "You are helpful.",
+					messages: [],
+				},
+				{
+					sessionId: "server-new-test",
+					onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
+				},
+			);
+			for await (const _event of stream) {
+			}
+
+			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
+			const streamBody = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
+			expect(streamBody).toBeDefined();
+			expect(streamBody!.body.delta).toEqual([]);
+			expect(reconciliations).toEqual([
+				{
+					reason: "server_newer",
+					messages: serverMessages,
+				},
+			]);
 
 			vi.unstubAllGlobals();
 		});
@@ -502,8 +628,29 @@ describe("pi-server-client", () => {
 			vi.unstubAllGlobals();
 		});
 
-		it("syncs the full local context when history is no longer append-only", async () => {
+		it("uses server history when local history is no longer append-only", async () => {
 			const capturedBodies: { url: string; body: any }[] = [];
+			const serverHistory: Message[] = [
+				{ role: "user", content: "first branch", timestamp: 1000 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "server answer" }],
+					api: "openai-completions",
+					provider: "test-provider",
+					model: "test-model",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2000,
+				},
+			];
+			const reconciliations: PiServerHistoryReconciliation[] = [];
 
 			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
 				const body = init?.body ? JSON.parse(init.body as string) : {};
@@ -515,6 +662,18 @@ describe("pi-server-client", () => {
 							sessionId: body.sessionId,
 							staticContextHash: "hash-sync",
 							messageCount: body.messages?.length ?? 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/session/sync-test/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "sync-test",
+							staticContextHash: "hash-sync",
+							messageCount: serverHistory.length,
+							messages: serverHistory,
 						}),
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
@@ -571,13 +730,16 @@ describe("pi-server-client", () => {
 				],
 			};
 
-			const stream2 = await streamPiServer(testModel, context2, { sessionId: "sync-test" });
+			const stream2 = await streamPiServer(testModel, context2, {
+				sessionId: "sync-test",
+				onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
+			});
 			for await (const _event of stream2) {
 			}
 
 			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeDefined();
-			expect(syncBody!.body.messages.map((message: Message) => message.role)).toEqual(["user", "assistant", "user"]);
+			expect(syncBody).toBeUndefined();
+			expect(reconciliations).toEqual([{ reason: "server_authoritative", messages: serverHistory }]);
 
 			const streamBody = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
 			expect(streamBody).toBeDefined();
@@ -586,7 +748,7 @@ describe("pi-server-client", () => {
 			vi.unstubAllGlobals();
 		});
 
-		it("chunks oversized full-context sync requests under the configured request size", async () => {
+		it("chunks oversized incremental stream requests under the configured request size", async () => {
 			process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
 			const maxBytes = 2 * 1024;
 			const capturedRequests: { url: string; bodyBytes: number; body: JsonObject }[] = [];
@@ -617,14 +779,13 @@ describe("pi-server-client", () => {
 						});
 					}
 
-					if (body.target === "/api/session/sync") {
+					if (body.target === "/api/stream") {
 						return new Response(
-							JSON.stringify({
-								sessionId: "large-sync-test",
-								staticContextHash: "hash-large-sync",
-								messageCount: 1,
-							}),
-							{ status: 200, headers: { "Content-Type": "application/json" } },
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
 						);
 					}
 				}
@@ -645,20 +806,7 @@ describe("pi-server-client", () => {
 
 			vi.stubGlobal("fetch", mockFetch);
 
-			const stream1 = await streamPiServer(
-				testModel,
-				{
-					systemPrompt: "You are helpful.",
-					messages: [{ role: "user", content: "first branch", timestamp: 1000 }],
-				},
-				{ sessionId: "large-sync-test" },
-			);
-			for await (const _event of stream1) {
-			}
-
-			capturedRequests.length = 0;
-
-			const stream2 = await streamPiServer(
+			const stream = await streamPiServer(
 				testModel,
 				{
 					systemPrompt: "You are helpful.",
@@ -666,12 +814,12 @@ describe("pi-server-client", () => {
 				},
 				{ sessionId: "large-sync-test" },
 			);
-			for await (const _event of stream2) {
+			for await (const _event of stream) {
 			}
 
 			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
 			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
-			expect(capturedRequests.some((request) => request.body.target === "/api/session/sync")).toBe(true);
+			expect(capturedRequests.some((request) => request.body.target === "/api/stream")).toBe(true);
 
 			vi.unstubAllGlobals();
 		});
@@ -688,6 +836,17 @@ describe("pi-server-client", () => {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
 					});
+				}
+
+				if (url.endsWith("/api/session/append")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-compact",
+							messageCount: 3,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
 				}
 
 				if (url.endsWith("/api/stream")) {
@@ -753,8 +912,11 @@ describe("pi-server-client", () => {
 
 			const streamBody = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
 			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toHaveLength(1);
-			expect(streamBody!.body.delta[0].content).toBe("new question");
+			expect(streamBody!.body.delta).toEqual([]);
+			const appendBody = capturedBodies.find((b) => b.url.endsWith("/api/session/append"));
+			expect(appendBody).toBeDefined();
+			expect(appendBody!.body.messages).toHaveLength(1);
+			expect(appendBody!.body.messages[0].content).toBe("new question");
 
 			const compactBody = capturedBodies.find((b) => b.url.endsWith("/api/session/compact"));
 			expect(compactBody).toBeUndefined();
@@ -764,6 +926,8 @@ describe("pi-server-client", () => {
 
 		it("syncs diverged history before server-side compact", async () => {
 			const capturedBodies: { url: string; body: any }[] = [];
+			const serverHistory: Message[] = [{ role: "user", content: "original branch", timestamp: 1000 }];
+			const reconciliations: PiServerHistoryReconciliation[] = [];
 
 			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
 				const body = init?.body ? JSON.parse(init.body as string) : {};
@@ -775,6 +939,18 @@ describe("pi-server-client", () => {
 							sessionId: body.sessionId,
 							staticContextHash: "hash-compact-sync",
 							messageCount: body.messages?.length ?? 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/session/compact-sync-test/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "compact-sync-test",
+							staticContextHash: "hash-compact-sync",
+							messageCount: serverHistory.length,
+							messages: serverHistory,
 						}),
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
@@ -820,14 +996,15 @@ describe("pi-server-client", () => {
 					{ role: "user", content: "compact this branch", timestamp: 3000 },
 				],
 			};
-			await compactPiServer(testModel, divergedContext, { sessionId: "compact-sync-test", apiKey: "sk-client" });
+			await compactPiServer(testModel, divergedContext, {
+				sessionId: "compact-sync-test",
+				apiKey: "sk-client",
+				onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
+			});
 
 			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeDefined();
-			expect(syncBody!.body.messages.map((message: Message) => message.content)).toEqual([
-				"other branch",
-				"compact this branch",
-			]);
+			expect(syncBody).toBeUndefined();
+			expect(reconciliations).toEqual([{ reason: "server_authoritative", messages: serverHistory }]);
 			const compactBody = capturedBodies.at(-1);
 			expect(compactBody?.url.endsWith("/api/session/compact")).toBe(true);
 			expect(compactBody?.body.dropLastAssistantError).toBeUndefined();
@@ -849,12 +1026,13 @@ describe("pi-server-client", () => {
 					});
 				}
 
-				if (url.endsWith("/api/session/sync")) {
+				if (url.endsWith("/api/session/drop-sync-test/history")) {
 					return new Response(
 						JSON.stringify({
-							sessionId: body.sessionId,
+							sessionId: "drop-sync-test",
 							staticContextHash: "hash-drop-sync",
-							messageCount: body.messages?.length ?? 0,
+							messageCount: 1,
+							messages: [{ role: "user", content: "retry without error", timestamp: 1000 }],
 						}),
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
@@ -871,8 +1049,7 @@ describe("pi-server-client", () => {
 			});
 
 			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeDefined();
-			expect(syncBody!.body.messages).toEqual([{ role: "user", content: "retry without error", timestamp: 1000 }]);
+			expect(syncBody).toBeUndefined();
 
 			vi.unstubAllGlobals();
 		});
