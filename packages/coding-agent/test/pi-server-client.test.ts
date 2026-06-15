@@ -1,21 +1,28 @@
-import type { Context, Message, Model, Tool } from "@earendil-works/pi-ai";
+import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import type { Context, Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	compactPiServer,
-	dropLastPiServerAssistantError,
 	hashStaticContext,
-	type PiServerHistoryReconciliation,
 	resetAllSessionTracking,
 	resetSessionTracking,
 	streamPiServer,
+	syncPiServerTree,
 } from "../src/core/pi-server-client.ts";
 
-function makeSSEData(event: object): string {
-	return `data: ${JSON.stringify(event)}\n\n`;
+type JsonObject = Record<string, unknown>;
+
+function parseJsonObject(rawBody: string): JsonObject {
+	if (!rawBody) return {};
+	const parsed = JSON.parse(rawBody) as unknown;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("Expected JSON object request body");
+	}
+	return parsed as JsonObject;
 }
 
 function makeMockResponse(events: object[], status = 200): Response {
-	const sseBody = events.map((e) => makeSSEData(e)).join("");
+	const sseBody = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 	const encoder = new TextEncoder();
 	const stream = new ReadableStream<Uint8Array>({
 		start(controller) {
@@ -29,32 +36,49 @@ function makeMockResponse(events: object[], status = 200): Response {
 	});
 }
 
-interface CapturedChunkBody {
-	target?: string;
-	index: number;
-	total: number;
+function textMessage(content: string, timestamp: number): Message {
+	return { role: "user", content, timestamp };
 }
 
-type JsonObject = Record<string, unknown>;
-
-function parseJsonObject(rawBody: string): JsonObject {
-	if (!rawBody) return {};
-	const parsed = JSON.parse(rawBody) as unknown;
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		throw new Error("Expected JSON object request body");
-	}
-	return parsed as JsonObject;
+function assistantMessage(content: string, timestamp: number): Message {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: content }],
+		api: "openai-completions",
+		provider: "test-provider",
+		model: "test-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp,
+	};
 }
 
-function getNumberProperty(value: JsonObject, key: string): number {
-	const property = value[key];
-	if (typeof property !== "number") {
-		throw new Error(`Expected numeric ${key}`);
-	}
-	return property;
+function messageEntry(id: string, parentId: string | null, message: Message): SessionTreeEntry {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: new Date(message.timestamp).toISOString(),
+		message,
+	};
 }
 
-const testModel: Model<any> = {
+function baseTree(): SessionTreeEntry[] {
+	return [
+		messageEntry("u1", null, textMessage("one", 1000)),
+		messageEntry("a1", "u1", assistantMessage("first answer", 2000)),
+		messageEntry("u2", "a1", textMessage("two", 3000)),
+	];
+}
+
+const testModel: Model<"openai-completions"> = {
 	id: "test-model",
 	name: "Test Model",
 	api: "openai-completions",
@@ -67,18 +91,6 @@ const testModel: Model<any> = {
 	maxTokens: 4096,
 };
 
-const testTool: Tool = {
-	name: "read",
-	description: "Read a file",
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string", description: "File path" },
-		},
-		required: ["path"],
-	},
-};
-
 describe("pi-server-client", () => {
 	beforeEach(() => {
 		resetAllSessionTracking();
@@ -87,971 +99,222 @@ describe("pi-server-client", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
 		delete process.env.PI_CLIENT_MAX_REQUEST_KB;
 	});
 
-	describe("session tracking", () => {
-		it("resets individual session tracking", () => {
-			resetSessionTracking("test-session");
-			expect(true).toBe(true);
-		});
-
-		it("resets all session tracking", () => {
-			resetAllSessionTracking();
-			expect(true).toBe(true);
-		});
+	it("resets individual session tracking", () => {
+		resetSessionTracking("test-session");
+		expect(true).toBe(true);
 	});
 
-	describe("hashStaticContext", () => {
-		it("includes tool parameters in the hash", () => {
-			const ctx1: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [],
-				tools: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
-			};
-			const ctx2: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [],
-				tools: [
-					{
-						name: "read",
-						description: "Read a file",
-						parameters: { type: "object", properties: { path: { type: "string" } } },
-					},
-				],
-			};
-			expect(hashStaticContext(ctx1)).not.toBe(hashStaticContext(ctx2));
-		});
-
-		it("produces same hash for identical contexts", () => {
-			const ctx: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [],
-				tools: [testTool],
-			};
-			expect(hashStaticContext(ctx)).toBe(hashStaticContext(ctx));
-		});
-
-		it("produces different hash for different system prompts", () => {
-			const ctx1: Context = { systemPrompt: "v1", messages: [] };
-			const ctx2: Context = { systemPrompt: "v2", messages: [] };
-			expect(hashStaticContext(ctx1)).not.toBe(hashStaticContext(ctx2));
-		});
-
-		it("produces different hash for different tool names", () => {
-			const ctx1: Context = { messages: [], tools: [{ name: "read", description: "Read", parameters: {} as any }] };
-			const ctx2: Context = { messages: [], tools: [{ name: "write", description: "Read", parameters: {} as any }] };
-			expect(hashStaticContext(ctx1)).not.toBe(hashStaticContext(ctx2));
-		});
+	it("includes tool parameters in the static context hash", () => {
+		const ctx1: Context = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
+		};
+		const ctx2: Context = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [
+				{
+					name: "read",
+					description: "Read a file",
+					parameters: { type: "object", properties: { path: { type: "string" } } },
+				},
+			],
+		};
+		expect(hashStaticContext(ctx1)).not.toBe(hashStaticContext(ctx2));
 	});
 
-	describe("streamPiServer delta behavior", () => {
-		it("chunks oversized session init and stream requests under the configured request size", async () => {
-			process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
-			const maxBytes = 2 * 1024;
-			const capturedRequests: { url: string; bodyBytes: number; body: CapturedChunkBody }[] = [];
+	it("syncs the tree once, then appends only new entries", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		const nextEntry = messageEntry("u2", "a1", textMessage("two", 3000));
 
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const rawBody = init?.body as string;
-				const body = JSON.parse(rawBody) as CapturedChunkBody;
-				capturedRequests.push({
-					url,
-					bodyBytes: Buffer.byteLength(rawBody, "utf-8"),
-					body,
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
 				});
+			}),
+		);
+
+		await syncPiServerTree("tree-append", context, { entries, leafId: "a1" });
+		capturedBodies.length = 0;
+		await syncPiServerTree("tree-append", context, { entries: [...entries, nextEntry], leafId: "u2" });
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/append"]);
+		expect(capturedBodies[0].body.entries).toEqual([nextEntry]);
+		expect(capturedBodies[0].body.leafId).toBe("u2");
+	});
+
+	it("switches pi-server tree leaf without uploading entries after the tree is already synced", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = baseTree();
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		await syncPiServerTree("tree-switch", context, { entries, leafId: "u2" });
+		capturedBodies.length = 0;
+		await syncPiServerTree("tree-switch", context, { entries, leafId: "a1" });
+
+		expect(capturedBodies).toHaveLength(1);
+		expect(new URL(capturedBodies[0].url).pathname).toBe("/api/session/tree/switch");
+		expect(capturedBodies[0].body).toEqual({ sessionId: "tree-switch", leafId: "a1" });
+	});
+
+	it("streams through pi-server without sending messages in the stream request", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = baseTree().slice(0, 1);
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{ type: "text_start", contentIndex: 0 },
+						{ type: "text_delta", contentIndex: 0, delta: "ok" },
+						{ type: "text_end", contentIndex: 0 },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+						},
+					]);
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "stream-tree", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"))?.body;
+		expect(streamBody).toBeDefined();
+		expect(streamBody).not.toHaveProperty("messages");
+		expect(streamBody).not.toHaveProperty("delta");
+		expect(streamBody).not.toHaveProperty("entries");
+		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
+	});
+
+	it("chunks oversized tree sync requests under the configured request size", async () => {
+		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+		const maxBytes = 2 * 1024;
+		const capturedRequests: { url: string; bodyBytes: number; body: JsonObject }[] = [];
+		const entries = [messageEntry("u1", null, textMessage("x".repeat(1024 * 1024), 1000))];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const rawBody = (init?.body as string | undefined) ?? "";
+				const body = parseJsonObject(rawBody);
+				capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
 
 				if (url.endsWith("/api/request/chunk")) {
+					if (typeof body.index !== "number" || typeof body.total !== "number") {
+						throw new Error("Chunk request is missing numeric index/total");
+					}
 					if (body.index !== body.total - 1) {
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
 						});
 					}
-
-					if (body.target === "/api/session/init") {
-						return new Response(
-							JSON.stringify({
-								sessionId: "chunk-test",
-								staticContextHash: "hash-chunk",
-								messageCount: 0,
-							}),
-							{ status: 200, headers: { "Content-Type": "application/json" } },
-						);
-					}
-
-					if (body.target === "/api/stream") {
-						return makeMockResponse([
-							{ type: "start" },
-							{
-								type: "done",
-								reason: "stop",
-								usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-							},
-						]);
-					}
 				}
 
-				return new Response("Unexpected request", { status: 500 });
-			});
+				return new Response(JSON.stringify({ sessionId: "chunk-tree", leafId: "u1", entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
 
-			vi.stubGlobal("fetch", mockFetch);
+		await syncPiServerTree(
+			"chunk-tree",
+			{ systemPrompt: "You are helpful.", messages: [] },
+			{ entries, leafId: "u1" },
+		);
 
-			const context: Context = {
-				systemPrompt: "system ".repeat(400),
-				messages: [{ role: "user", content: "hello ".repeat(400), timestamp: 1000 }],
-				tools: [testTool],
-			};
+		expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
+		expect(capturedRequests.some((request) => request.url.endsWith("/api/request/chunk"))).toBe(true);
+		expect(capturedRequests.some((request) => request.body.target === "/api/session/tree/sync")).toBe(true);
+		expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
+	});
 
-			const stream = await streamPiServer(testModel, context, { sessionId: "chunk-test", maxTokens: 128 });
-			for await (const _event of stream) {
-			}
+	it("syncs the tree before server-side compact", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = baseTree();
 
-			expect(capturedRequests.length).toBeGreaterThan(2);
-			expect(capturedRequests.every((request) => request.url.endsWith("/api/request/chunk"))).toBe(true);
-			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
-			expect(capturedRequests.some((request) => request.body.target === "/api/session/init")).toBe(true);
-			expect(capturedRequests.some((request) => request.body.target === "/api/stream")).toBe(true);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("sends only new messages on second request for same session", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/init")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-1",
-							messageCount: 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/append")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-1",
-							messageCount: 3,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{ type: "text_start", contentIndex: 0 },
-						{ type: "text_delta", contentIndex: 0, delta: "Hi there!" },
-						{ type: "text_end", contentIndex: 0 },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const userMsg1: Message = { role: "user", content: "Hello", timestamp: 1000 };
-			const context1: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [userMsg1],
-			};
-
-			const stream1 = await streamPiServer(testModel, context1, { sessionId: "delta-test" });
-			const events1: any[] = [];
-			for await (const event of stream1) {
-				events1.push(event);
-			}
-
-			const initBody = capturedBodies.find((b) => b.url.endsWith("/api/session/init"));
-			expect(initBody).toBeDefined();
-			expect(initBody!.body.sessionId).toBe("delta-test");
-
-			const streamBody1 = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
-			expect(streamBody1).toBeDefined();
-			expect(streamBody1!.body.delta).toHaveLength(1);
-			expect(streamBody1!.body.delta[0].content).toBe("Hello");
-
-			capturedBodies.length = 0;
-
-			const doneEvent = events1.find((event) => event.type === "done");
-			expect(doneEvent).toBeDefined();
-			const assistantMsg = doneEvent!.message as Message;
-			const userMsg2: Message = { role: "user", content: "How are you?", timestamp: 3000 };
-			const context2: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [userMsg1, assistantMsg, userMsg2],
-			};
-
-			const stream2 = await streamPiServer(testModel, context2, { sessionId: "delta-test" });
-			const events2: any[] = [];
-			for await (const event of stream2) {
-				events2.push(event);
-			}
-
-			const updateBody = capturedBodies.find((b) => b.url.endsWith("/api/session/update"));
-			expect(updateBody).toBeUndefined();
-
-			const appendBody = capturedBodies.find((b) => b.url.endsWith("/api/session/append"));
-			expect(appendBody).toBeDefined();
-			expect(appendBody!.body.messages).toHaveLength(1);
-			expect(appendBody!.body.messages[0].content).toBe("How are you?");
-
-			const streamBody2 = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
-			expect(streamBody2).toBeDefined();
-			expect(streamBody2!.body.delta).toEqual([]);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("loads server history to avoid full sync uploads when local tracking is missing", async () => {
-			const capturedBodies: { url: string; body: any; method: string }[] = [];
-			const assistantMsg: Message = {
-				role: "assistant",
-				content: [{ type: "text", text: "Hi there!" }],
-				api: "openai-completions",
-				provider: "test-provider",
-				model: "test-model",
-				usage: {
-					input: 10,
-					output: 5,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 15,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: 2000,
-			};
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const method = init?.method ?? "GET";
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body, method });
-
-				if (url.endsWith("/api/session/init")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-existing",
-							messageCount: 2,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/history-seed/history")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "history-seed",
-							staticContextHash: "hash-existing",
-							messageCount: 2,
-							messages: [{ role: "user", content: "Hello", timestamp: 1000 }, assistantMsg],
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/append")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-existing",
-							messageCount: 3,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const context: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [
-					{ role: "user", content: "Hello", timestamp: 1000 },
-					assistantMsg,
-					{ role: "user", content: "How are you?", timestamp: 3000 },
-				],
-			};
-
-			const stream = await streamPiServer(testModel, context, { sessionId: "history-seed" });
-			for await (const _event of stream) {
-			}
-
-			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/history-seed/history"))).toBe(true);
-			expect(capturedBodies.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
-			const appendBody = capturedBodies.find((request) => request.url.endsWith("/api/session/append"));
-			expect(appendBody).toBeDefined();
-			expect(appendBody!.body.messages).toEqual([{ role: "user", content: "How are you?", timestamp: 3000 }]);
-
-			const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"));
-			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toEqual([]);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("downloads server-only history without uploading local history", async () => {
-			const serverMessages: Message[] = [
-				{ role: "user", content: "server question", timestamp: 1000 },
-				{
-					role: "assistant",
-					content: [{ type: "text", text: "server answer" }],
-					api: "openai-completions",
-					provider: "test-provider",
-					model: "test-model",
-					usage: {
-						input: 1,
-						output: 1,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 2,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "stop",
-					timestamp: 2000,
-				},
-			];
-			const capturedRequests: { url: string; body: JsonObject; method: string }[] = [];
-			const reconciliations: PiServerHistoryReconciliation[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const method = init?.method ?? "GET";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
-				capturedRequests.push({ url, body, method });
-
-				if (url.endsWith("/api/session/init")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "server-new-test",
-							staticContextHash: "hash-server-new",
-							messageCount: serverMessages.length,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.includes("/api/session/server-new-test/history")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "server-new-test",
-							staticContextHash: "hash-server-new",
-							messageCount: serverMessages.length,
-							messages: serverMessages,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const stream = await streamPiServer(
-				testModel,
-				{
-					systemPrompt: "You are helpful.",
-					messages: [],
-				},
-				{
-					sessionId: "server-new-test",
-					onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
-				},
-			);
-			for await (const _event of stream) {
-			}
-
-			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
-			const streamBody = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
-			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toEqual([]);
-			expect(reconciliations).toEqual([
-				{
-					reason: "server_newer",
-					messages: serverMessages,
-				},
-			]);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("sends session init on first request", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
 				capturedBodies.push({ url, body });
 
-				if (url.endsWith("/api/session/init")) {
+				if (url.endsWith("/api/session/compact")) {
 					return new Response(
 						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-init",
-							messageCount: 0,
+							success: true,
+							compaction: { summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
 						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
 						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const context: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [{ role: "user", content: "Hello", timestamp: 1000 }],
-			};
-
-			const stream = await streamPiServer(testModel, context, { sessionId: "init-test" });
-			const events: any[] = [];
-			for await (const event of stream) {
-				events.push(event);
-			}
-
-			const initBody = capturedBodies.find((b) => b.url.endsWith("/api/session/init"));
-			expect(initBody).toBeDefined();
-			expect(initBody!.body.sessionId).toBe("init-test");
-			expect(initBody!.body.staticContext).toBeDefined();
-			expect(initBody!.body.staticContext.systemPrompt).toBe("You are helpful.");
-
-			vi.unstubAllGlobals();
-		});
-
-		it("sends session update when static context changes", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/init") || url.endsWith("/api/session/update")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: `hash-${body.staticContext?.systemPrompt?.length ?? 0}`,
-							messageCount: 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const context1: Context = {
-				systemPrompt: "v1",
-				messages: [{ role: "user", content: "Hello", timestamp: 1000 }],
-			};
-
-			const stream1 = await streamPiServer(testModel, context1, { sessionId: "update-test" });
-			for await (const _event of stream1) {
-			}
-
-			capturedBodies.length = 0;
-
-			const context2: Context = {
-				systemPrompt: "v2",
-				messages: [{ role: "user", content: "Hello", timestamp: 1000 }],
-			};
-
-			const stream2 = await streamPiServer(testModel, context2, { sessionId: "update-test" });
-			for await (const _event of stream2) {
-			}
-
-			const updateBody = capturedBodies.find((b) => b.url.endsWith("/api/session/update"));
-			expect(updateBody).toBeDefined();
-			expect(updateBody!.body.staticContext.systemPrompt).toBe("v2");
-
-			vi.unstubAllGlobals();
-		});
-
-		it("uses server history when local history is no longer append-only", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-			const serverHistory: Message[] = [
-				{ role: "user", content: "first branch", timestamp: 1000 },
-				{
-					role: "assistant",
-					content: [{ type: "text", text: "server answer" }],
-					api: "openai-completions",
-					provider: "test-provider",
-					model: "test-model",
-					usage: {
-						input: 1,
-						output: 1,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 2,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "stop",
-					timestamp: 2000,
-				},
-			];
-			const reconciliations: PiServerHistoryReconciliation[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/init") || url.endsWith("/api/session/sync")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-sync",
-							messageCount: body.messages?.length ?? 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/sync-test/history")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "sync-test",
-							staticContextHash: "hash-sync",
-							messageCount: serverHistory.length,
-							messages: serverHistory,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const context1: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [{ role: "user", content: "first branch", timestamp: 1000 }],
-			};
-			const stream1 = await streamPiServer(testModel, context1, { sessionId: "sync-test" });
-			for await (const _event of stream1) {
-			}
-
-			capturedBodies.length = 0;
-
-			const context2: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [
-					{ role: "user", content: "other branch", timestamp: 2000 },
-					{
-						role: "assistant",
-						content: [{ type: "text", text: "other answer" }],
-						api: "openai-completions",
-						provider: "test-provider",
-						model: "test-model",
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "stop",
-						timestamp: 3000,
-					},
-					{ role: "user", content: "continue here", timestamp: 4000 },
-				],
-			};
-
-			const stream2 = await streamPiServer(testModel, context2, {
-				sessionId: "sync-test",
-				onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
-			});
-			for await (const _event of stream2) {
-			}
-
-			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeUndefined();
-			expect(reconciliations).toEqual([{ reason: "server_authoritative", messages: serverHistory }]);
-
-			const streamBody = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
-			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toEqual([]);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("chunks oversized incremental stream requests under the configured request size", async () => {
-			process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
-			const maxBytes = 2 * 1024;
-			const capturedRequests: { url: string; bodyBytes: number; body: JsonObject }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const rawBody = (init?.body as string | undefined) ?? "";
-				const body = parseJsonObject(rawBody);
-				capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
-
-				if (url.endsWith("/api/session/init")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-large-sync",
-							messageCount: 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/request/chunk")) {
-					const index = getNumberProperty(body, "index");
-					const total = getNumberProperty(body, "total");
-					if (index !== total - 1) {
-						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
-						});
-					}
-
-					if (body.target === "/api/stream") {
-						return new Response(
-							[
-								'data: {"type":"start"}\n\n',
-								'data: {"type":"done","reason":"stop","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}\n\n',
-							].join(""),
-							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
-						);
-					}
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
 						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const stream = await streamPiServer(
-				testModel,
-				{
-					systemPrompt: "You are helpful.",
-					messages: [{ role: "user", content: "x".repeat(1024 * 1024), timestamp: 2000 }],
-				},
-				{ sessionId: "large-sync-test" },
-			);
-			for await (const _event of stream) {
-			}
-
-			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
-			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/sync"))).toBe(false);
-			expect(capturedRequests.some((request) => request.body.target === "/api/stream")).toBe(true);
-
-			vi.unstubAllGlobals();
-		});
-
-		it("marks local history synced after server-side compact", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/compact")) {
-					return new Response(JSON.stringify({ success: true }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				if (url.endsWith("/api/session/append")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-compact",
-							messageCount: 3,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
 				}
 
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
 
-				return new Response(
-					JSON.stringify({
-						sessionId: body.sessionId,
-						staticContextHash: "hash-compact",
-						messageCount: body.messages?.length ?? 0,
-					}),
-					{ status: 200, headers: { "Content-Type": "application/json" } },
-				);
-			});
+		await compactPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [] },
+			{ sessionId: "compact-tree", apiKey: "sk-client", sessionTree: { entries, leafId: "u2" } },
+		);
 
-			vi.stubGlobal("fetch", mockFetch);
-
-			const compactedContext: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [
-					{ role: "user", content: "old question", timestamp: 1000 },
-					{
-						role: "assistant",
-						content: [{ type: "text", text: "old answer" }],
-						api: "openai-completions",
-						provider: "test-provider",
-						model: "test-model",
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "stop",
-						timestamp: 2000,
-					},
-				],
-			};
-
-			await compactPiServer(testModel, compactedContext, { sessionId: "compact-test", apiKey: "sk-client" });
-			capturedBodies.length = 0;
-
-			const nextContext: Context = {
-				...compactedContext,
-				messages: [...compactedContext.messages, { role: "user", content: "new question", timestamp: 3000 }],
-			};
-			const stream = await streamPiServer(testModel, nextContext, {
-				sessionId: "compact-test",
-				apiKey: "sk-client",
-			});
-			for await (const _event of stream) {
-			}
-
-			const streamBody = capturedBodies.find((b) => b.url.endsWith("/api/stream"));
-			expect(streamBody).toBeDefined();
-			expect(streamBody!.body.delta).toEqual([]);
-			const appendBody = capturedBodies.find((b) => b.url.endsWith("/api/session/append"));
-			expect(appendBody).toBeDefined();
-			expect(appendBody!.body.messages).toHaveLength(1);
-			expect(appendBody!.body.messages[0].content).toBe("new question");
-
-			const compactBody = capturedBodies.find((b) => b.url.endsWith("/api/session/compact"));
-			expect(compactBody).toBeUndefined();
-
-			vi.unstubAllGlobals();
-		});
-
-		it("syncs diverged history before server-side compact", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-			const serverHistory: Message[] = [{ role: "user", content: "original branch", timestamp: 1000 }];
-			const reconciliations: PiServerHistoryReconciliation[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/init") || url.endsWith("/api/session/sync")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							staticContextHash: "hash-compact-sync",
-							messageCount: body.messages?.length ?? 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/compact-sync-test/history")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "compact-sync-test",
-							staticContextHash: "hash-compact-sync",
-							messageCount: serverHistory.length,
-							messages: serverHistory,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				if (url.endsWith("/api/session/compact")) {
-					return new Response(JSON.stringify({ success: true }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				if (url.endsWith("/api/stream")) {
-					return makeMockResponse([
-						{ type: "start" },
-						{
-							type: "done",
-							reason: "stop",
-							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-						},
-					]);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			const context1: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [{ role: "user", content: "original branch", timestamp: 1000 }],
-			};
-			const stream = await streamPiServer(testModel, context1, { sessionId: "compact-sync-test" });
-			for await (const _event of stream) {
-			}
-
-			capturedBodies.length = 0;
-
-			const divergedContext: Context = {
-				systemPrompt: "You are helpful.",
-				messages: [
-					{ role: "user", content: "other branch", timestamp: 2000 },
-					{ role: "user", content: "compact this branch", timestamp: 3000 },
-				],
-			};
-			await compactPiServer(testModel, divergedContext, {
-				sessionId: "compact-sync-test",
-				apiKey: "sk-client",
-				onHistoryReconciled: (reconciliation) => reconciliations.push(reconciliation),
-			});
-
-			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeUndefined();
-			expect(reconciliations).toEqual([{ reason: "server_authoritative", messages: serverHistory }]);
-			const compactBody = capturedBodies.at(-1);
-			expect(compactBody?.url.endsWith("/api/session/compact")).toBe(true);
-			expect(compactBody?.body.dropLastAssistantError).toBeUndefined();
-
-			vi.unstubAllGlobals();
-		});
-
-		it("syncs local retry history when server has no assistant error to drop", async () => {
-			const capturedBodies: { url: string; body: any }[] = [];
-
-			const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-				const body = init?.body ? JSON.parse(init.body as string) : {};
-				capturedBodies.push({ url, body });
-
-				if (url.endsWith("/api/session/drop-last-assistant-error")) {
-					return new Response(JSON.stringify({ success: true, dropped: false, messageCount: 1 }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				if (url.endsWith("/api/session/drop-sync-test/history")) {
-					return new Response(
-						JSON.stringify({
-							sessionId: "drop-sync-test",
-							staticContextHash: "hash-drop-sync",
-							messageCount: 1,
-							messages: [{ role: "user", content: "retry without error", timestamp: 1000 }],
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-
-				return new Response("Not found", { status: 404 });
-			});
-
-			vi.stubGlobal("fetch", mockFetch);
-
-			await dropLastPiServerAssistantError("drop-sync-test", {
-				systemPrompt: "You are helpful.",
-				messages: [{ role: "user", content: "retry without error", timestamp: 1000 }],
-			});
-
-			const syncBody = capturedBodies.find((b) => b.url.endsWith("/api/session/sync"));
-			expect(syncBody).toBeUndefined();
-
-			vi.unstubAllGlobals();
-		});
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/tree/sync",
+			"/api/session/compact",
+		]);
+		expect(capturedBodies[1].body.entries).toEqual(entries);
 	});
 });

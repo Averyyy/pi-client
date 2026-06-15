@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { buildSessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
 
 export interface SessionStaticContext {
@@ -9,7 +11,10 @@ export interface SessionState {
 	sessionId: string;
 	staticContext: SessionStaticContext | undefined;
 	staticContextHash: string;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
 	messages: Message[];
+	revision: number;
 }
 
 const sessions = new Map<string, SessionState>();
@@ -33,7 +38,10 @@ export function getOrCreateSession(sessionId: string): SessionState {
 			sessionId,
 			staticContext: undefined,
 			staticContextHash: "",
+			entries: [],
+			leafId: null,
 			messages: [],
+			revision: 0,
 		};
 		sessions.set(sessionId, session);
 	}
@@ -52,9 +60,100 @@ export function setStaticContext(sessionId: string, context: SessionStaticContex
 	return session;
 }
 
+function entryToMessageEntry(message: Message, parentId: string | null): SessionTreeEntry {
+	return {
+		type: "message",
+		id: randomUUID(),
+		parentId,
+		timestamp: new Date(message.timestamp).toISOString(),
+		message,
+	};
+}
+
+function deriveActiveMessages(session: SessionState): Message[] {
+	const byId = new Map(session.entries.map((entry) => [entry.id, entry]));
+	const branch: SessionTreeEntry[] = [];
+	let current = session.leafId ? byId.get(session.leafId) : undefined;
+	while (current) {
+		branch.unshift(current);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return convertToLlm(buildSessionContext(branch).messages);
+}
+
+function refreshActiveMessages(session: SessionState): void {
+	session.messages = deriveActiveMessages(session);
+}
+
+function assertValidLeaf(entries: SessionTreeEntry[], leafId: string | null): void {
+	if (leafId === null) return;
+	if (!entries.some((entry) => entry.id === leafId)) {
+		throw new Error(`leafId ${leafId} does not exist in session tree`);
+	}
+}
+
+export function replaceSessionTree(
+	sessionId: string,
+	entries: SessionTreeEntry[],
+	leafId: string | null,
+): SessionState {
+	assertValidLeaf(entries, leafId);
+	const session = getOrCreateSession(sessionId);
+	session.entries = entries.map((entry) => ({ ...entry }));
+	session.leafId = leafId;
+	session.revision++;
+	refreshActiveMessages(session);
+	return session;
+}
+
+export function appendSessionEntries(
+	sessionId: string,
+	entries: SessionTreeEntry[],
+	leafId: string | null,
+): SessionState {
+	const session = getOrCreateSession(sessionId);
+	const knownIds = new Set(session.entries.map((entry) => entry.id));
+	for (const entry of entries) {
+		if (knownIds.has(entry.id)) {
+			throw new Error(`entry ${entry.id} already exists`);
+		}
+		if (entry.parentId !== null && !knownIds.has(entry.parentId)) {
+			throw new Error(`parent entry ${entry.parentId} does not exist`);
+		}
+		knownIds.add(entry.id);
+	}
+	session.entries.push(...entries.map((entry) => ({ ...entry })));
+	assertValidLeaf(session.entries, leafId);
+	session.leafId = leafId;
+	session.revision++;
+	refreshActiveMessages(session);
+	return session;
+}
+
+export function switchSessionLeaf(sessionId: string, leafId: string | null): SessionState {
+	const session = getOrCreateSession(sessionId);
+	assertValidLeaf(session.entries, leafId);
+	session.leafId = leafId;
+	session.revision++;
+	refreshActiveMessages(session);
+	return session;
+}
+
+export function getActiveMessages(sessionId: string): Message[] {
+	const session = getSession(sessionId);
+	return session ? [...session.messages] : [];
+}
+
 export function appendMessages(sessionId: string, delta: Message[]): SessionState {
 	const session = getOrCreateSession(sessionId);
-	session.messages.push(...delta);
+	const entries = delta.map((message) => {
+		const entry = entryToMessageEntry(message, session.leafId);
+		session.leafId = entry.id;
+		return entry;
+	});
+	session.entries.push(...entries);
+	session.revision++;
+	refreshActiveMessages(session);
 	return session;
 }
 
@@ -66,16 +165,29 @@ export function appendAssistantResponse(sessionId: string, message: Message): Se
 
 export function replaceMessages(sessionId: string, messages: Message[]): SessionState {
 	const session = getOrCreateSession(sessionId);
-	session.messages = [...messages];
+	let parentId: string | null = null;
+	session.entries = messages.map((message) => {
+		const entry = entryToMessageEntry(message, parentId);
+		parentId = entry.id;
+		return entry;
+	});
+	session.leafId = parentId;
+	session.revision++;
+	refreshActiveMessages(session);
 	return session;
 }
 
 export function dropLastAssistantError(sessionId: string): boolean {
 	const session = getSession(sessionId);
 	if (!session) return false;
-	const last = session.messages[session.messages.length - 1];
-	if (last?.role !== "assistant" || last.stopReason !== "error") return false;
-	session.messages.pop();
+	const leaf = session.leafId ? session.entries.find((entry) => entry.id === session.leafId) : undefined;
+	if (leaf?.type !== "message" || leaf.message.role !== "assistant" || leaf.message.stopReason !== "error") {
+		return false;
+	}
+	session.entries = session.entries.filter((entry) => entry.id !== leaf.id);
+	session.leafId = leaf.parentId;
+	session.revision++;
+	refreshActiveMessages(session);
 	return true;
 }
 

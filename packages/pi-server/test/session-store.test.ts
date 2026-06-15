@@ -5,11 +5,14 @@ import {
 	clearAllSessions,
 	deleteSession,
 	dropLastAssistantError,
+	getActiveMessages,
 	getOrCreateSession,
 	getSession,
 	replaceMessages,
+	replaceSessionTree,
 	type SessionStaticContext,
 	setStaticContext,
+	switchSessionLeaf,
 } from "../src/session-store.ts";
 
 describe("session-store", () => {
@@ -93,6 +96,64 @@ describe("session-store", () => {
 		const session = getSession("test-replace")!;
 		expect(session.messages).toEqual([{ role: "user", content: "branch", timestamp: 1000 }]);
 		expect(session.staticContext?.systemPrompt).toBe("Keep me");
+	});
+
+	it("stores a session tree and derives active messages from the selected leaf", () => {
+		replaceSessionTree(
+			"tree-session",
+			[
+				{
+					type: "message",
+					id: "u1",
+					parentId: null,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					message: { role: "user", content: "one", timestamp: 1000 },
+				},
+				{
+					type: "message",
+					id: "a1",
+					parentId: "u1",
+					timestamp: "2026-01-01T00:00:01.000Z",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "first answer" }],
+						api: "openai-completions",
+						provider: "opencode-go",
+						model: "glm-5.1",
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: 2000,
+					},
+				},
+				{
+					type: "message",
+					id: "u2",
+					parentId: "a1",
+					timestamp: "2026-01-01T00:00:02.000Z",
+					message: { role: "user", content: "two", timestamp: 3000 },
+				},
+			],
+			"u2",
+		);
+
+		expect(getActiveMessages("tree-session").map((message) => message.content)).toEqual([
+			"one",
+			[{ type: "text", text: "first answer" }],
+			"two",
+		]);
+
+		switchSessionLeaf("tree-session", "a1");
+		expect(getActiveMessages("tree-session").map((message) => message.content)).toEqual([
+			"one",
+			[{ type: "text", text: "first answer" }],
+		]);
 	});
 
 	it("appends assistant response", () => {

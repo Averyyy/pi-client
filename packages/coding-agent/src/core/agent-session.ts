@@ -88,8 +88,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
-import type { PiServerHistoryReconciliation } from "./pi-server-client.ts";
-import { compactPiServer, dropLastPiServerAssistantError } from "./pi-server-client.ts";
+import { compactPiServer, dropLastPiServerAssistantError, syncPiServerTree } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
@@ -145,7 +144,6 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
-	| { type: "history_reconciled"; reason: PiServerHistoryReconciliation["reason"]; messages: Message[] }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -561,6 +559,18 @@ export class AgentSession {
 					});
 					this._retryAttempt = 0;
 				}
+
+				if (isPiServerMode()) {
+					await syncPiServerTree(
+						this.sessionId,
+						{
+							systemPrompt: this.systemPrompt,
+							messages: this.agent.state.messages as Message[],
+							tools: this.agent.state.tools,
+						},
+						{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+					);
+				}
 			}
 		}
 	};
@@ -578,16 +588,6 @@ export class AgentSession {
 			}
 		}
 		return false;
-	}
-
-	reconcilePiServerHistory(reconciliation: PiServerHistoryReconciliation): void {
-		this.agent.state.messages = reconciliation.messages as AgentMessage[];
-		this.sessionManager.replaceMessages(reconciliation.messages);
-		this._emit({
-			type: "history_reconciled",
-			reason: reconciliation.reason,
-			messages: reconciliation.messages,
-		});
 	}
 
 	/** Extract text content from a message */
@@ -1473,6 +1473,10 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
+		if (this.isStreaming) {
+			await this.abort();
+		}
+
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
@@ -1662,6 +1666,41 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _applyPiServerCompactionResult(result: CompactionResult): Promise<void> {
+		this.sessionManager.appendCompaction(
+			result.summary,
+			result.firstKeptEntryId,
+			result.tokensBefore,
+			result.details,
+			false,
+		);
+		const newEntries = this.sessionManager.getEntries();
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
+
+		const savedCompactionEntry = newEntries.find(
+			(entry) => entry.type === "compaction" && entry.summary === result.summary,
+		) as CompactionEntry | undefined;
+
+		if (this._extensionRunner && savedCompactionEntry) {
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: savedCompactionEntry,
+				fromExtension: false,
+			});
+		}
+
+		await syncPiServerTree(
+			this.sessionId,
+			{
+				systemPrompt: this.systemPrompt,
+				messages: this.agent.state.messages as Message[],
+				tools: this.agent.state.tools,
+			},
+			{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+		);
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -1681,7 +1720,7 @@ export class AgentSession {
 			const { apiKey, headers } = await this._getCompactionRequestAuth(this.model);
 
 			if (isPiServerMode()) {
-				await compactPiServer(
+				const result = await compactPiServer(
 					this.model,
 					{
 						systemPrompt: this.systemPrompt,
@@ -1694,19 +1733,21 @@ export class AgentSession {
 						headers,
 						customInstructions,
 						settings: this.settingsManager.getCompactionSettings(),
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 						signal: this._compactionAbortController.signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
 					},
 				);
+				await this._applyPiServerCompactionResult(result);
 				this._lastServerCompactionTimestamp = Date.now();
 				this._emit({
 					type: "compaction_end",
 					reason: "manual",
-					result: undefined,
+					result,
 					aborted: false,
 					willRetry: false,
 				});
-				return undefined;
+				return result;
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
@@ -1977,7 +2018,7 @@ export class AgentSession {
 			}
 
 			if (isPiServerMode()) {
-				await compactPiServer(
+				const result = await compactPiServer(
 					this.model,
 					{
 						systemPrompt: this.systemPrompt,
@@ -1989,12 +2030,14 @@ export class AgentSession {
 						apiKey,
 						headers,
 						settings,
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 						signal: this._autoCompactionAbortController.signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
 					},
 				);
+				await this._applyPiServerCompactionResult(result);
 				this._lastServerCompactionTimestamp = Date.now();
-				this._emit({ type: "compaction_end", reason, result: undefined, aborted: false, willRetry });
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 				return willRetry ? true : this.agent.hasQueuedMessages();
 			}
 
@@ -2600,11 +2643,7 @@ export class AgentSession {
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 			this.agent.state.messages = messages.slice(0, -1);
 			if (isPiServerMode()) {
-				await dropLastPiServerAssistantError(this.sessionId, {
-					systemPrompt: this.systemPrompt,
-					messages: this.agent.state.messages as Message[],
-					tools: this.agent.state.tools,
-				});
+				await dropLastPiServerAssistantError(this.sessionId);
 			}
 		}
 
@@ -2957,6 +2996,17 @@ export class AgentSession {
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			if (isPiServerMode()) {
+				await syncPiServerTree(
+					this.sessionId,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+				);
+			}
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

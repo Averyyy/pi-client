@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ProxyAssistantMessageEvent } from "@earendil-works/pi-agent-core";
+import type { CompactResult, ProxyAssistantMessageEvent, SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -41,9 +41,11 @@ function createPiServerRequest(signal?: AbortSignal): ChunkRequest {
 	});
 }
 
-const sessionSentCounts = new Map<string, number>();
 const sessionStaticContextHashes = new Map<string, string>();
-const sessionLocalContextHashes = new Map<string, string>();
+const sessionSyncedEntryIds = new Map<string, Set<string>>();
+const sessionTreeHashes = new Map<string, string>();
+const sessionTreeLeafIds = new Map<string, string | null>();
+const sessionHasTemporaryTree = new Set<string>();
 
 export function hashStaticContext(ctx: Context): string {
 	const parts: string[] = [];
@@ -56,55 +58,60 @@ export function hashStaticContext(ctx: Context): string {
 	return parts.join("|");
 }
 
-function getDelta(context: Context, sessionId: string): Message[] {
-	const sentCount = sessionSentCounts.get(sessionId) ?? 0;
-	const allMessages = context.messages;
-	const delta = allMessages.slice(sentCount);
-	return delta as Message[];
+function hashEntries(entries: SessionTreeEntry[]): string {
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
-function hashMessages(messages: Message[]): string {
-	return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
-}
-
-function markLocalSynced(sessionId: string, messages: Message[]): void {
-	sessionSentCounts.set(sessionId, messages.length);
-	sessionLocalContextHashes.set(sessionId, hashMessages(messages));
+function getLinearTreeFromMessages(messages: Message[]): { entries: SessionTreeEntry[]; leafId: string | null } {
+	let parentId: string | null = null;
+	const entries = messages.map((message, index): SessionTreeEntry => {
+		const id = `message-${index}`;
+		const entry: SessionTreeEntry = {
+			type: "message",
+			id,
+			parentId,
+			timestamp: new Date(message.timestamp).toISOString(),
+			message,
+		};
+		parentId = id;
+		return entry;
+	});
+	return { entries, leafId: parentId };
 }
 
 export function resetSessionTracking(sessionId: string): void {
-	sessionSentCounts.delete(sessionId);
 	sessionStaticContextHashes.delete(sessionId);
-	sessionLocalContextHashes.delete(sessionId);
+	sessionSyncedEntryIds.delete(sessionId);
+	sessionTreeHashes.delete(sessionId);
+	sessionTreeLeafIds.delete(sessionId);
+	sessionHasTemporaryTree.delete(sessionId);
 }
 
 export function resetAllSessionTracking(): void {
-	sessionSentCounts.clear();
 	sessionStaticContextHashes.clear();
-	sessionLocalContextHashes.clear();
+	sessionSyncedEntryIds.clear();
+	sessionTreeHashes.clear();
+	sessionTreeLeafIds.clear();
+	sessionHasTemporaryTree.clear();
 }
 
 interface SessionInitResponse {
 	sessionId: string;
 	staticContextHash: string;
 	messageCount: number;
+	entryCount?: number;
+	leafId?: string | null;
+	fromCache?: boolean;
 }
 
-interface SessionHistoryResponse {
-	sessionId: string;
-	staticContextHash: string;
-	messageCount: number;
-	baseMessageCount?: number;
-	messages: Message[];
-}
-
-export interface PiServerHistoryReconciliation {
-	reason: "server_newer" | "server_authoritative";
-	messages: Message[];
+export interface PiServerTreeSnapshot {
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	replace?: boolean;
 }
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
-	onHistoryReconciled?: (reconciliation: PiServerHistoryReconciliation) => void;
+	sessionTree?: PiServerTreeSnapshot;
 }
 
 async function ensureSessionInit(
@@ -119,7 +126,8 @@ async function ensureSessionInit(
 		return {
 			sessionId,
 			staticContextHash: previousHash,
-			messageCount: sessionSentCounts.get(sessionId) ?? 0,
+			messageCount: 0,
+			fromCache: true,
 		};
 	}
 
@@ -149,6 +157,98 @@ function getStaticContext(context: Context) {
 	};
 }
 
+function markTreeSynced(sessionId: string, tree: PiServerTreeSnapshot): void {
+	sessionSyncedEntryIds.set(sessionId, new Set(tree.entries.map((entry) => entry.id)));
+	sessionTreeHashes.set(sessionId, hashEntries(tree.entries));
+	sessionTreeLeafIds.set(sessionId, tree.leafId);
+	if (tree.replace) {
+		sessionHasTemporaryTree.add(sessionId);
+	} else {
+		sessionHasTemporaryTree.delete(sessionId);
+	}
+}
+
+async function postTreeJson(
+	request: ChunkRequest,
+	endpoint: string,
+	body: unknown,
+	errorPrefix: string,
+): Promise<void> {
+	const response = await request.postJson(endpoint, body);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`${errorPrefix} (${response.status}): ${errorBody}`);
+	}
+}
+
+export async function syncPiServerTree(
+	sessionId: string,
+	context: Context,
+	tree: PiServerTreeSnapshot,
+	options?: { signal?: AbortSignal },
+): Promise<void> {
+	const request = createPiServerRequest(options?.signal);
+	await ensureSessionInit(sessionId, context, request);
+	await syncPiServerTreeWithRequest(sessionId, context, tree, request);
+}
+
+async function syncPiServerTreeWithRequest(
+	sessionId: string,
+	context: Context,
+	tree: PiServerTreeSnapshot,
+	request: ChunkRequest,
+): Promise<void> {
+	const currentHash = hashEntries(tree.entries);
+	const previousHash = sessionTreeHashes.get(sessionId);
+	const previousLeafId = sessionTreeLeafIds.get(sessionId);
+
+	if (!tree.replace && previousHash === currentHash) {
+		if (previousLeafId !== tree.leafId) {
+			await postTreeJson(
+				request,
+				"/api/session/tree/switch",
+				{ sessionId, leafId: tree.leafId },
+				"Session tree switch failed",
+			);
+			sessionTreeLeafIds.set(sessionId, tree.leafId);
+		}
+		return;
+	}
+
+	const syncedIds = sessionSyncedEntryIds.get(sessionId);
+	if (syncedIds && !tree.replace && !sessionHasTemporaryTree.has(sessionId)) {
+		const deltaEntries = tree.entries.filter((entry) => !syncedIds.has(entry.id));
+		if (deltaEntries.length > 0) {
+			await postTreeJson(
+				request,
+				"/api/session/tree/append",
+				{
+					sessionId,
+					entries: deltaEntries,
+					leafId: tree.leafId,
+					staticContext: getStaticContext(context),
+				},
+				"Session tree append failed",
+			);
+			markTreeSynced(sessionId, tree);
+			return;
+		}
+	}
+
+	await postTreeJson(
+		request,
+		"/api/session/tree/sync",
+		{
+			sessionId,
+			entries: tree.entries,
+			leafId: tree.leafId,
+			staticContext: getStaticContext(context),
+		},
+		"Session tree sync failed",
+	);
+	markTreeSynced(sessionId, tree);
+}
+
 function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStreamOptions {
 	return {
 		temperature: options?.temperature,
@@ -168,123 +268,23 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 	};
 }
 
-async function fetchServerHistory(
-	sessionId: string,
-	request: ChunkRequest,
-	from?: number,
-): Promise<SessionHistoryResponse> {
-	const query = from === undefined ? "" : `?from=${from}`;
-	const response = await request.getJson(`/api/session/${encodeURIComponent(sessionId)}/history${query}`);
-	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`Session history failed (${response.status}): ${errorBody}`);
-	}
-	return (await response.json()) as SessionHistoryResponse;
-}
-
-function isPrefix(prefix: Message[], messages: Message[]): boolean {
-	if (prefix.length > messages.length) return false;
-	return hashMessages(messages.slice(0, prefix.length) as Message[]) === hashMessages(prefix);
-}
-
-async function syncPiServerSessionIfNeeded(
-	sessionId: string,
-	context: Context,
-	request: ChunkRequest,
-	serverMessageCount: number,
-	options: {
-		syncWhenUnsent?: boolean;
-		onHistoryReconciled?: (reconciliation: PiServerHistoryReconciliation) => void;
-	} = {},
-): Promise<{ synced: boolean; messages: Message[] }> {
-	const localMessages = context.messages as Message[];
-	const syncedHash = sessionLocalContextHashes.get(sessionId);
-	if (serverMessageCount === 0 && syncedHash === undefined && !options.syncWhenUnsent) {
-		return { synced: false, messages: localMessages };
-	}
-
-	if (serverMessageCount > localMessages.length) {
-		const history = await fetchServerHistory(sessionId, request, localMessages.length);
-		const messages = [...localMessages, ...history.messages];
-		markLocalSynced(sessionId, messages);
-		options.onHistoryReconciled?.({ reason: "server_newer", messages });
-		return { synced: true, messages };
-	}
-
-	if (serverMessageCount === localMessages.length) {
-		if (syncedHash === hashMessages(localMessages)) {
-			return { synced: false, messages: localMessages };
-		}
-		const history = await fetchServerHistory(sessionId, request);
-		if (hashMessages(history.messages) === hashMessages(localMessages)) {
-			markLocalSynced(sessionId, localMessages);
-			return { synced: false, messages: localMessages };
-		}
-		markLocalSynced(sessionId, history.messages);
-		options.onHistoryReconciled?.({ reason: "server_authoritative", messages: history.messages });
-		return { synced: true, messages: history.messages };
-	}
-
-	const localServerPrefix = localMessages.slice(0, serverMessageCount) as Message[];
-	if (serverMessageCount === 0 || syncedHash === hashMessages(localServerPrefix)) {
-		const delta = localMessages.slice(serverMessageCount) as Message[];
-		const response = await request.postJson("/api/session/append", {
-			sessionId,
-			messages: delta,
-			staticContext: getStaticContext(context),
-		});
-		if (!response.ok) {
-			const errorBody = await response.text();
-			throw new Error(`Session append failed (${response.status}): ${errorBody}`);
-		}
-		markLocalSynced(sessionId, localMessages);
-		return { synced: true, messages: localMessages };
-	}
-
-	const history = await fetchServerHistory(sessionId, request);
-	if (!isPrefix(history.messages, localMessages)) {
-		markLocalSynced(sessionId, history.messages);
-		options.onHistoryReconciled?.({ reason: "server_authoritative", messages: history.messages });
-		return { synced: true, messages: history.messages };
-	}
-
-	const delta = localMessages.slice(history.messages.length) as Message[];
-	if (delta.length === 0 && !options.syncWhenUnsent) {
-		return { synced: false, messages: localMessages };
-	}
-
-	const response = await request.postJson("/api/session/append", {
-		sessionId,
-		messages: delta,
-		staticContext: getStaticContext(context),
-	});
-	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`Session append failed (${response.status}): ${errorBody}`);
-	}
-	markLocalSynced(sessionId, localMessages);
-	return { synced: true, messages: localMessages };
-}
-
 export interface PiServerCompactOptions extends SimpleStreamOptions {
 	customInstructions?: string;
 	settings?: unknown;
-	onHistoryReconciled?: (reconciliation: PiServerHistoryReconciliation) => void;
+	sessionTree?: PiServerTreeSnapshot;
 }
 
 export async function compactPiServer(
 	model: Model<any>,
 	context: Context,
 	options?: PiServerCompactOptions,
-): Promise<void> {
+): Promise<CompactResult> {
 	const sessionId = options?.sessionId ?? "default";
 	const request = createPiServerRequest(options?.signal);
 
-	const init = await ensureSessionInit(sessionId, context, request);
-	const sync = await syncPiServerSessionIfNeeded(sessionId, context, request, init.messageCount, {
-		syncWhenUnsent: true,
-		onHistoryReconciled: options?.onHistoryReconciled,
-	});
+	await ensureSessionInit(sessionId, context, request);
+	const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
+	await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 
 	const response = await request.postJson("/api/session/compact", {
 		sessionId,
@@ -297,33 +297,19 @@ export async function compactPiServer(
 		const errorBody = await response.text();
 		throw new Error(`Server compaction failed (${response.status}): ${errorBody}`);
 	}
-	markLocalSynced(sessionId, sync.messages);
+	const result = (await response.json()) as { compaction?: CompactResult };
+	if (!result.compaction) {
+		throw new Error("Server compaction response did not include a compaction result");
+	}
+	return result.compaction;
 }
 
-interface DropLastAssistantErrorResponse {
-	dropped?: boolean;
-	messageCount?: number;
-}
-
-export async function dropLastPiServerAssistantError(sessionId: string, context: Context): Promise<void> {
+export async function dropLastPiServerAssistantError(sessionId: string): Promise<void> {
 	const request = createPiServerRequest();
 	const response = await request.postJson("/api/session/drop-last-assistant-error", { sessionId });
 	if (!response.ok) {
 		const errorBody = await response.text();
 		throw new Error(`Dropping server assistant error failed (${response.status}): ${errorBody}`);
-	}
-
-	const result = (await response.json()) as DropLastAssistantErrorResponse;
-	if (result.dropped) {
-		markLocalSynced(sessionId, context.messages as Message[]);
-		return;
-	}
-
-	const didSync = await syncPiServerSessionIfNeeded(sessionId, context, request, result.messageCount ?? 0, {
-		syncWhenUnsent: true,
-	});
-	if (!didSync.synced) {
-		markLocalSynced(sessionId, context.messages as Message[]);
 	}
 }
 
@@ -357,17 +343,16 @@ export async function streamPiServer(
 	(async () => {
 		try {
 			const request = createPiServerRequest(options?.signal);
-			const init = await ensureSessionInit(sessionId, context, request);
-
-			const sync = await syncPiServerSessionIfNeeded(sessionId, context, request, init.messageCount, {
-				onHistoryReconciled: options?.onHistoryReconciled,
-			});
-			const delta = sync.synced ? [] : getDelta(context, sessionId);
+			await ensureSessionInit(sessionId, context, request);
+			const tree = options?.sessionTree ?? {
+				...getLinearTreeFromMessages(context.messages as Message[]),
+				replace: true,
+			};
+			await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 
 			const response = await request.postJson("/api/stream", {
 				sessionId,
 				model,
-				delta,
 				options: serializeOptions(options),
 			});
 
@@ -417,7 +402,6 @@ export async function streamPiServer(
 				throw new Error("Request aborted by user");
 			}
 
-			markLocalSynced(sessionId, [...sync.messages, partial]);
 			if (isEphemeralSession) {
 				resetSessionTracking(sessionId);
 			}

@@ -9,11 +9,14 @@ interface ServerResponse {
 	sessionId?: string;
 	staticContextHash?: string;
 	messageCount?: number;
+	entryCount?: number;
+	leafId?: string | null;
 	error?: string;
 	deleted?: string;
 	dropped?: boolean;
 	staticContext?: { systemPrompt?: string };
 	messages?: Message[];
+	entries?: unknown[];
 	baseMessageCount?: number;
 }
 
@@ -284,6 +287,82 @@ describe("pi-server HTTP", () => {
 		expect(getSession("append-history")?.messages).toEqual([first, second]);
 	});
 
+	it("switches active history by tree leaf without replacing the stored tree", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "one", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "a1",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "first answer" }],
+					api: "openai-completions",
+					provider: "opencode-go",
+					model: "glm-5.1",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2000,
+				},
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "a1",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				message: { role: "user", content: "two", timestamp: 3000 },
+			},
+		];
+
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "tree-http", entries, leafId: "u2" }),
+		});
+
+		const res = await fetch(`${baseUrl}/api/session/tree/switch`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "tree-http", leafId: "a1" }),
+		});
+
+		expect(res.status).toBe(200);
+		const switchBody = (await res.json()) as ServerResponse;
+		expect(switchBody.leafId).toBe("a1");
+		expect(switchBody.entryCount).toBe(3);
+		expect(switchBody.messageCount).toBe(2);
+
+		const history = await fetch(`${baseUrl}/api/session/tree-http/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		const historyBody = (await history.json()) as ServerResponse;
+		expect(historyBody.entries).toEqual(entries);
+		expect(historyBody.messages?.map((message) => message.content)).toEqual([
+			"one",
+			[{ type: "text", text: "first answer" }],
+		]);
+	});
+
 	it("returns 404 when full session history is missing", async () => {
 		const res = await fetch(`${baseUrl}/api/session/missing-history/history`, {
 			headers: { Authorization: "Bearer test-token" },
@@ -448,7 +527,6 @@ describe("resolveStreamOptions", () => {
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
 			model: baseModel,
-			delta: [],
 		});
 		expect(model.baseUrl).toBe("https://original.example.com");
 		expect(options.apiKey).toBeUndefined();
@@ -466,7 +544,6 @@ describe("resolveStreamOptions", () => {
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
 			model: baseModel,
-			delta: [],
 			options: { headers: { "X-Client": "yes" } },
 		});
 		expect(model.baseUrl).toBe("https://original.example.com");

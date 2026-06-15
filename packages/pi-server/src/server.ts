@@ -1,8 +1,7 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
-	COMPACTION_SUMMARY_PREFIX,
-	COMPACTION_SUMMARY_SUFFIX,
 	type CompactionSettings,
+	type CompactResult,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	type ProxyAssistantMessageEvent,
@@ -15,15 +14,17 @@ import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import {
-	appendAssistantResponse,
 	appendMessages,
+	appendSessionEntries,
 	deleteSession as deleteSessionFromStore,
 	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
 	replaceMessages,
+	replaceSessionTree,
 	type SessionStaticContext,
 	setStaticContext,
+	switchSessionLeaf,
 } from "./session-store.ts";
 
 export { loadConfig, type ServerConfig } from "./config.ts";
@@ -36,7 +37,6 @@ interface SessionInitBody {
 interface StreamRequestBody {
 	sessionId: string;
 	model: Model<any>;
-	delta: Message[];
 	options?: SimpleStreamOptions;
 	staticContext?: SessionStaticContext;
 }
@@ -51,6 +51,18 @@ interface SessionAppendBody {
 	sessionId: string;
 	messages: Message[];
 	staticContext?: SessionStaticContext;
+}
+
+interface SessionTreeSyncBody {
+	sessionId: string;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	staticContext?: SessionStaticContext;
+}
+
+interface SessionTreeSwitchBody {
+	sessionId: string;
+	leafId: string | null;
 }
 
 interface SessionCompactBody {
@@ -116,6 +128,8 @@ function handleSessionInit(body: SessionInitBody, res: ServerResponse): void {
 		sessionId: session.sessionId,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
 	});
 }
 
@@ -137,6 +151,8 @@ function handleSessionUpdate(
 		sessionId: session.sessionId,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
 	});
 }
 
@@ -157,6 +173,8 @@ function handleSessionSync(body: SessionSyncBody, res: ServerResponse): void {
 		sessionId: session.sessionId,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
 	});
 }
 
@@ -177,31 +195,71 @@ function handleSessionAppend(body: SessionAppendBody, res: ServerResponse): void
 		sessionId: session.sessionId,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
 	});
 }
 
-function messagesToEntries(messages: Message[]): SessionTreeEntry[] {
-	let parentId: string | null = null;
-	return messages.map((message, index) => {
-		const id = `message-${index}`;
-		const entry: SessionTreeEntry = {
-			type: "message",
-			id,
-			parentId,
-			timestamp: new Date(message.timestamp).toISOString(),
-			message,
-		};
-		parentId = id;
-		return entry;
+function handleSessionTreeSync(body: SessionTreeSyncBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	if (!Array.isArray(body.entries)) {
+		sendJson(res, 400, { error: "entries is required" });
+		return;
+	}
+	if (body.staticContext) {
+		setStaticContext(body.sessionId, body.staticContext);
+	}
+	const session = replaceSessionTree(body.sessionId, body.entries, body.leafId ?? null);
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
 	});
 }
 
-function createCompactionSummaryMessage(summary: string): Message {
-	return {
-		role: "user",
-		content: [{ type: "text", text: `${COMPACTION_SUMMARY_PREFIX}${summary}${COMPACTION_SUMMARY_SUFFIX}` }],
-		timestamp: Date.now(),
-	};
+function handleSessionTreeAppend(body: SessionTreeSyncBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	if (!Array.isArray(body.entries)) {
+		sendJson(res, 400, { error: "entries is required" });
+		return;
+	}
+	if (body.staticContext) {
+		setStaticContext(body.sessionId, body.staticContext);
+	}
+	const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
+	});
+}
+
+function handleSessionTreeSwitch(body: SessionTreeSwitchBody, res: ServerResponse): void {
+	if (!body.sessionId) {
+		sendJson(res, 400, { error: "sessionId is required" });
+		return;
+	}
+	const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
+	sendJson(res, 200, {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
+	});
 }
 
 async function handleSessionCompact(body: SessionCompactBody, res: ServerResponse): Promise<void> {
@@ -220,7 +278,7 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 		return;
 	}
 
-	const entries = messagesToEntries(session.messages);
+	const entries = session.entries;
 	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS);
 	if (!preparationResult.ok) {
 		sendJson(res, 400, { error: preparationResult.error.message });
@@ -246,17 +304,7 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 		return;
 	}
 
-	const firstKeptIndex = entries.findIndex((entry) => entry.id === result.value.firstKeptEntryId);
-	if (firstKeptIndex === -1) {
-		sendJson(res, 500, { error: "Compaction result referenced an unknown kept message" });
-		return;
-	}
-
-	const nextSession = replaceMessages(body.sessionId, [
-		createCompactionSummaryMessage(result.value.summary),
-		...session.messages.slice(firstKeptIndex),
-	]);
-	sendJson(res, 200, { success: true, messageCount: nextSession.messages.length });
+	sendJson(res, 200, { success: true, compaction: result.value satisfies CompactResult });
 }
 
 function handleDropLastAssistantError(body: SessionIdBody, res: ServerResponse): void {
@@ -281,6 +329,9 @@ function handleSessionHistory(sessionId: string, from: number | undefined, res: 
 		staticContext: session.staticContext,
 		staticContextHash: session.staticContextHash,
 		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		entries: session.entries,
 		baseMessageCount,
 		messages: session.messages.slice(baseMessageCount),
 	});
@@ -307,10 +358,6 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		return;
 	}
 
-	if (body.delta && body.delta.length > 0) {
-		appendMessages(body.sessionId, body.delta);
-	}
-
 	const context: Context = {
 		systemPrompt: session.staticContext?.systemPrompt,
 		messages: session.messages,
@@ -327,24 +374,12 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 
 	const stream = streamSimple(resolvedModel, context, streamOptions);
 
-	let assistantMessage: Message | undefined;
-
 	(async () => {
 		for await (const event of stream) {
-			if (event.type === "done") {
-				assistantMessage = event.message;
-			} else if (event.type === "error") {
-				assistantMessage = event.error;
-			}
-
 			const proxyEvent = toProxyEvent(event);
 			if (proxyEvent) {
 				res.write(encodeProxyEvent(proxyEvent));
 			}
-		}
-
-		if (assistantMessage) {
-			appendAssistantResponse(body.sessionId, assistantMessage);
 		}
 
 		res.end();
@@ -377,6 +412,21 @@ async function handlePostRequest(
 
 	if (pathname === "/api/session/append") {
 		handleSessionAppend(body as SessionAppendBody, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/tree/sync") {
+		handleSessionTreeSync(body as SessionTreeSyncBody, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/tree/append") {
+		handleSessionTreeAppend(body as SessionTreeSyncBody, res);
+		return true;
+	}
+
+	if (pathname === "/api/session/tree/switch") {
+		handleSessionTreeSwitch(body as SessionTreeSwitchBody, res);
 		return true;
 	}
 

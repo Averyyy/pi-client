@@ -56,15 +56,24 @@ describe("ChunkRequest", () => {
 		vi.stubGlobal("fetch", mockFetch);
 
 		const request = new ChunkRequest({ serverUrl: "http://pi-server.test", authToken: "token" });
-		const response = await request.postJson("/api/session/sync", {
+		const response = await request.postJson("/api/session/tree/sync", {
 			sessionId: "chunk-class-test",
-			messages: [{ role: "user", content: "x".repeat(1024 * 1024), timestamp: 1000 }],
+			entries: [
+				{
+					type: "message",
+					id: "u1",
+					parentId: null,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					message: { role: "user", content: "x".repeat(1024 * 1024), timestamp: 1000 },
+				},
+			],
+			leafId: "u1",
 		});
 
 		expect(response.ok).toBe(true);
 		expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
 		expect(capturedRequests.every((request) => request.url.endsWith("/api/request/chunk"))).toBe(true);
-		expect(capturedRequests.some((request) => request.body.target === "/api/session/sync")).toBe(true);
+		expect(capturedRequests.some((request) => request.body.target === "/api/session/tree/sync")).toBe(true);
 	});
 
 	it("uses the same pi-server request object for bodyless gets", async () => {

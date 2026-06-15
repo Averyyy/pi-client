@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage, type SessionTreeEntry, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -11,7 +12,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import { findInitialModel } from "./model-resolver.ts";
-import { streamPiServer } from "./pi-server-client.ts";
+import { type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -127,6 +128,42 @@ export {
 
 function getDefaultAgentDir(): string {
 	return getAgentDir();
+}
+
+function hashJson(value: unknown): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
+}
+
+function messagesEqual(left: Message[], right: Message[]): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function buildPiServerTreeSnapshot(sessionManager: SessionManager, contextMessages: Message[]): PiServerTreeSnapshot {
+	const entries = sessionManager.getEntries();
+	const localContextMessages = convertToLlm(sessionManager.buildSessionContext().messages);
+	if (messagesEqual(localContextMessages, contextMessages)) {
+		return { entries, leafId: sessionManager.getLeafId() };
+	}
+
+	const hasLocalPrefix =
+		localContextMessages.length <= contextMessages.length &&
+		messagesEqual(localContextMessages, contextMessages.slice(0, localContextMessages.length));
+	const baseEntries = hasLocalPrefix ? entries : [];
+	const tailMessages = hasLocalPrefix ? contextMessages.slice(localContextMessages.length) : contextMessages;
+	let parentId = hasLocalPrefix ? sessionManager.getLeafId() : null;
+	const pendingEntries: SessionTreeEntry[] = tailMessages.map((message, index) => {
+		const id = `pending-${index}-${hashJson(message)}`;
+		const entry: SessionTreeEntry = {
+			type: "message",
+			id,
+			parentId,
+			timestamp: new Date(message.timestamp).toISOString(),
+			message: message as AgentMessage,
+		};
+		parentId = id;
+		return entry;
+	});
+	return { entries: [...baseEntries, ...pendingEntries], leafId: parentId, replace: true };
 }
 
 /**
@@ -315,6 +352,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 						return streamPiServer(model, context, {
 							...options,
+							sessionTree: agentSession
+								? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
+								: undefined,
 							apiKey: auth.apiKey,
 							timeoutMs,
 							websocketConnectTimeoutMs,
@@ -327,13 +367,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								auth.headers,
 								options?.headers,
 							),
-							onHistoryReconciled: (reconciliation) => {
-								if (agentSession) {
-									agentSession.reconcilePiServerHistory(reconciliation);
-								} else {
-									agent.state.messages = reconciliation.messages as AgentMessage[];
-								}
-							},
 						});
 					}
 				: async (model, context, options) => {
