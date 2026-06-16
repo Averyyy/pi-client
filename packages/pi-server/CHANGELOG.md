@@ -13,3 +13,4 @@
 - `DELETE /api/session/:id` endpoint for removing one server-side session.
 - `/health` endpoint for health checks.
 - Configurable via `PI_SERVER_CONFIG` or environment variables: `PI_SERVER_HOST`, `PI_SERVER_PORT`, `PI_SERVER_AUTH_TOKEN`.
+- Persistent session tree storage under `PI_SERVER_SESSION_STORE_DIR`, including exact tree hashes in session responses.

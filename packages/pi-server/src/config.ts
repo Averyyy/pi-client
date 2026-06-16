@@ -5,12 +5,14 @@ export interface ServerConfig {
 	host: string;
 	port: number;
 	authToken: string | undefined;
+	sessionStoreDir: string;
 }
 
 const DEFAULT_CONFIG: ServerConfig = {
 	host: "127.0.0.1",
 	port: 4217,
 	authToken: undefined,
+	sessionStoreDir: resolve(".pi", "pi-server", "sessions"),
 };
 
 function loadConfigFile(): Partial<ServerConfig> {
@@ -40,5 +42,11 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
 			DEFAULT_CONFIG.port,
 		authToken:
 			overrides?.authToken ?? process.env.PI_SERVER_AUTH_TOKEN ?? fileConfig.authToken ?? DEFAULT_CONFIG.authToken,
+		sessionStoreDir: resolve(
+			overrides?.sessionStoreDir ??
+				process.env.PI_SERVER_SESSION_STORE_DIR ??
+				fileConfig.sessionStoreDir ??
+				DEFAULT_CONFIG.sessionStoreDir,
+		),
 	};
 }

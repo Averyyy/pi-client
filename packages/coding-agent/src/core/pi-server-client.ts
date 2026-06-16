@@ -98,9 +98,11 @@ export function resetAllSessionTracking(): void {
 interface SessionInitResponse {
 	sessionId: string;
 	staticContextHash: string;
+	treeHash?: string;
 	messageCount: number;
 	entryCount?: number;
 	leafId?: string | null;
+	revision?: number;
 	fromCache?: boolean;
 }
 
@@ -147,6 +149,10 @@ async function ensureSessionInit(
 
 	const result = (await response.json()) as SessionInitResponse;
 	sessionStaticContextHashes.set(sessionId, currentHash);
+	if (result.treeHash !== undefined) {
+		sessionTreeHashes.set(sessionId, result.treeHash);
+		sessionTreeLeafIds.set(sessionId, result.leafId ?? null);
+	}
 	return result;
 }
 
@@ -273,6 +279,7 @@ async function syncPiServerTreeWithRequest(
 			}
 			sessionTreeLeafIds.set(sessionId, tree.leafId);
 		}
+		markTreeSynced(sessionId, tree);
 		return;
 	}
 

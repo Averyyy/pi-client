@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPiServer, type ServerConfig } from "../src/server.ts";
 import {
@@ -21,10 +24,12 @@ interface ServerResponse {
 describe("pi-server integration", () => {
 	let server: Server;
 	let baseUrl: string;
+	let sessionStoreDir: string;
 
 	beforeEach(() => {
 		clearAllSessions();
-		server = createPiServer({ authToken: "test-token" } as Partial<ServerConfig>);
+		sessionStoreDir = mkdtempSync(join(tmpdir(), "pi-server-integration-sessions-"));
+		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
 		server.listen(0);
 		const addr = server.address();
 		if (typeof addr === "object" && addr !== null) {
@@ -36,7 +41,10 @@ describe("pi-server integration", () => {
 
 	afterEach(() => {
 		return new Promise<void>((resolve) => {
-			server.close(() => resolve());
+			server.close(() => {
+				rmSync(sessionStoreDir, { recursive: true, force: true });
+				resolve();
+			});
 		});
 	});
 

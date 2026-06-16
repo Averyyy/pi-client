@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
 
@@ -16,6 +16,7 @@ describe("config", () => {
 			"PI_SERVER_PROVIDER_BASE_URL",
 			"PI_SERVER_PROVIDER_HEADERS",
 			"PI_SERVER_CONFIG",
+			"PI_SERVER_SESSION_STORE_DIR",
 		]) {
 			savedEnv[key] = process.env[key];
 			delete process.env[key];
@@ -34,6 +35,7 @@ describe("config", () => {
 		expect(config.host).toBe("127.0.0.1");
 		expect(config.port).toBe(4217);
 		expect(config.authToken).toBeUndefined();
+		expect(config.sessionStoreDir).toBe(resolve(".pi", "pi-server", "sessions"));
 	});
 
 	it("does not load upstream provider request config", () => {
@@ -51,18 +53,26 @@ describe("config", () => {
 		process.env.PI_SERVER_HOST = "0.0.0.0";
 		process.env.PI_SERVER_PORT = "9999";
 		process.env.PI_SERVER_AUTH_TOKEN = "test-token";
+		process.env.PI_SERVER_SESSION_STORE_DIR = "env-sessions";
 
 		const config = loadConfig();
 		expect(config.host).toBe("0.0.0.0");
 		expect(config.port).toBe(9999);
 		expect(config.authToken).toBe("test-token");
+		expect(config.sessionStoreDir).toBe(resolve("env-sessions"));
 	});
 
 	it("overrides from explicit config object", () => {
-		const config = loadConfig({ host: "192.168.1.1", port: 8080, authToken: "my-token" });
+		const config = loadConfig({
+			host: "192.168.1.1",
+			port: 8080,
+			authToken: "my-token",
+			sessionStoreDir: "override-sessions",
+		});
 		expect(config.host).toBe("192.168.1.1");
 		expect(config.port).toBe(8080);
 		expect(config.authToken).toBe("my-token");
+		expect(config.sessionStoreDir).toBe(resolve("override-sessions"));
 	});
 
 	it("loads config from JSON file via PI_SERVER_CONFIG", () => {
@@ -75,6 +85,7 @@ describe("config", () => {
 				host: "10.0.0.1",
 				port: 5555,
 				authToken: "file-token",
+				sessionStoreDir: "file-sessions",
 			}),
 		);
 
@@ -83,6 +94,7 @@ describe("config", () => {
 		expect(config.host).toBe("10.0.0.1");
 		expect(config.port).toBe(5555);
 		expect(config.authToken).toBe("file-token");
+		expect(config.sessionStoreDir).toBe(resolve("file-sessions"));
 
 		rmSync(tmpDir, { recursive: true, force: true });
 	});

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { buildSessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
 
@@ -15,6 +15,30 @@ export interface SessionState {
 	leafId: string | null;
 	messages: Message[];
 	revision: number;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface SessionSummary {
+	sessionId: string;
+	staticContextHash: string;
+	treeHash: string;
+	messageCount: number;
+	entryCount: number;
+	leafId: string | null;
+	revision: number;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface PersistedSessionState {
+	sessionId: string;
+	staticContext: SessionStaticContext | undefined;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	revision: number;
+	createdAt: number;
+	updatedAt: number;
 }
 
 const sessions = new Map<string, SessionState>();
@@ -34,6 +58,7 @@ function hashStaticContext(ctx: SessionStaticContext | undefined): string {
 export function getOrCreateSession(sessionId: string): SessionState {
 	let session = sessions.get(sessionId);
 	if (!session) {
+		const now = Date.now();
 		session = {
 			sessionId,
 			staticContext: undefined,
@@ -42,6 +67,8 @@ export function getOrCreateSession(sessionId: string): SessionState {
 			leafId: null,
 			messages: [],
 			revision: 0,
+			createdAt: now,
+			updatedAt: now,
 		};
 		sessions.set(sessionId, session);
 	}
@@ -52,11 +79,62 @@ export function getSession(sessionId: string): SessionState | undefined {
 	return sessions.get(sessionId);
 }
 
+export function hashSessionEntries(entries: SessionTreeEntry[]): string {
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
+export function listSessions(): SessionSummary[] {
+	return Array.from(sessions.values())
+		.map((session) => ({
+			sessionId: session.sessionId,
+			staticContextHash: session.staticContextHash,
+			treeHash: hashSessionEntries(session.entries),
+			messageCount: session.messages.length,
+			entryCount: session.entries.length,
+			leafId: session.leafId,
+			revision: session.revision,
+			createdAt: session.createdAt,
+			updatedAt: session.updatedAt,
+		}))
+		.sort((a, b) => b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId));
+}
+
+export function exportSessionState(session: SessionState): PersistedSessionState {
+	return {
+		sessionId: session.sessionId,
+		staticContext: session.staticContext,
+		entries: session.entries.map((entry) => ({ ...entry })),
+		leafId: session.leafId,
+		revision: session.revision,
+		createdAt: session.createdAt,
+		updatedAt: session.updatedAt,
+	};
+}
+
+export function restoreSessionState(persisted: PersistedSessionState): SessionState {
+	assertValidLeaf(persisted.entries, persisted.leafId);
+	const session: SessionState = {
+		sessionId: persisted.sessionId,
+		staticContext: persisted.staticContext,
+		staticContextHash: hashStaticContext(persisted.staticContext),
+		entries: persisted.entries.map((entry) => ({ ...entry })),
+		leafId: persisted.leafId,
+		messages: [],
+		revision: persisted.revision,
+		createdAt: persisted.createdAt,
+		updatedAt: persisted.updatedAt,
+	};
+	refreshActiveMessages(session);
+	sessions.set(session.sessionId, session);
+	return session;
+}
+
 export function setStaticContext(sessionId: string, context: SessionStaticContext): SessionState {
 	const session = getOrCreateSession(sessionId);
 	const newHash = hashStaticContext(context);
 	session.staticContext = context;
 	session.staticContextHash = newHash;
+	session.updatedAt = Date.now();
 	return session;
 }
 
@@ -102,6 +180,7 @@ export function replaceSessionTree(
 	session.entries = entries.map((entry) => ({ ...entry }));
 	session.leafId = leafId;
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
 }
@@ -126,6 +205,7 @@ export function appendSessionEntries(
 	assertValidLeaf(session.entries, leafId);
 	session.leafId = leafId;
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
 }
@@ -135,6 +215,7 @@ export function switchSessionLeaf(sessionId: string, leafId: string | null): Ses
 	assertValidLeaf(session.entries, leafId);
 	session.leafId = leafId;
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
 }
@@ -153,6 +234,7 @@ export function appendMessages(sessionId: string, delta: Message[]): SessionStat
 	});
 	session.entries.push(...entries);
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
 }
@@ -160,6 +242,7 @@ export function appendMessages(sessionId: string, delta: Message[]): SessionStat
 export function appendAssistantResponse(sessionId: string, message: Message): SessionState {
 	const session = getOrCreateSession(sessionId);
 	session.messages.push(message);
+	session.updatedAt = Date.now();
 	return session;
 }
 
@@ -173,6 +256,7 @@ export function replaceMessages(sessionId: string, messages: Message[]): Session
 	});
 	session.leafId = parentId;
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
 }
@@ -187,6 +271,7 @@ export function dropLastAssistantError(sessionId: string): boolean {
 	session.entries = session.entries.filter((entry) => entry.id !== leaf.id);
 	session.leafId = leaf.parentId;
 	session.revision++;
+	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return true;
 }

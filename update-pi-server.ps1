@@ -131,6 +131,7 @@ if ($health.StatusCode -ne 200 -or $health.Content -notmatch '"ok"') {
 }
 
 $body = '{"sessionId":"update-script-auth-check","staticContext":{"systemPrompt":"health check","tools":[]}}'
+$authCheckSessionId = "update-script-auth-check"
 $authCheck = Invoke-WebRequest `
 	-Uri "http://${HostName}:$Port/api/session/init" `
 	-Method Post `
@@ -142,6 +143,12 @@ $authCheck = Invoke-WebRequest `
 if ($authCheck.StatusCode -ne 200) {
 	throw "pi-server auth check failed: HTTP $($authCheck.StatusCode) $($authCheck.Content)"
 }
+Invoke-WebRequest `
+	-Uri "http://${HostName}:$Port/api/session/$authCheckSessionId" `
+	-Method Delete `
+	-Headers @{ Authorization = "Bearer $AuthToken" } `
+	-UseBasicParsing `
+	-TimeoutSec 10 | Out-Null
 
 if (-not $SkipPublicCheck) {
 	$publicHealthUrl = "$($PublicUrl.TrimEnd('/'))/health"

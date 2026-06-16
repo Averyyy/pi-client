@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPiServer, resolveStreamOptions, type ServerConfig } from "../src/server.ts";
@@ -8,9 +11,20 @@ interface ServerResponse {
 	status?: string;
 	sessionId?: string;
 	staticContextHash?: string;
+	treeHash?: string;
 	messageCount?: number;
 	entryCount?: number;
 	leafId?: string | null;
+	sessions?: {
+		sessionId: string;
+		treeHash?: string;
+		messageCount: number;
+		entryCount: number;
+		leafId: string | null;
+		revision: number;
+		createdAt: number;
+		updatedAt: number;
+	}[];
 	error?: string;
 	deleted?: string;
 	dropped?: boolean;
@@ -23,10 +37,12 @@ interface ServerResponse {
 describe("pi-server HTTP", () => {
 	let server: Server;
 	let baseUrl: string;
+	let sessionStoreDir: string;
 
 	beforeEach(() => {
 		clearAllSessions();
-		server = createPiServer({ authToken: "test-token" } as Partial<ServerConfig>);
+		sessionStoreDir = mkdtempSync(join(tmpdir(), "pi-server-http-sessions-"));
+		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
 		server.listen(0);
 		const addr = server.address();
 		if (typeof addr === "object" && addr !== null) {
@@ -38,7 +54,10 @@ describe("pi-server HTTP", () => {
 
 	afterEach(() => {
 		return new Promise<void>((resolve) => {
-			server.close(() => resolve());
+			server.close(() => {
+				rmSync(sessionStoreDir, { recursive: true, force: true });
+				resolve();
+			});
 		});
 	});
 
@@ -259,6 +278,42 @@ describe("pi-server HTTP", () => {
 		expect(body.messages).toEqual(messages.slice(1));
 	});
 
+	it("lists active sessions with summary counts", async () => {
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "listed-a",
+				messages: [{ role: "user", content: "one", timestamp: 1000 }],
+			}),
+		});
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "listed-b", staticContext: { systemPrompt: "B" } }),
+		});
+
+		const res = await fetch(`${baseUrl}/api/sessions`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.sessions?.map((session) => session.sessionId).sort()).toEqual(["listed-a", "listed-b"]);
+		expect(body.sessions?.find((session) => session.sessionId === "listed-a")).toMatchObject({
+			messageCount: 1,
+			entryCount: 1,
+			revision: 1,
+		});
+		expect(body.sessions?.every((session) => typeof session.updatedAt === "number")).toBe(true);
+	});
+
 	it("appends client-only messages without replacing server history", async () => {
 		const first: Message = { role: "user", content: "server base", timestamp: 1000 };
 		const second: Message = { role: "user", content: "client delta", timestamp: 2000 };
@@ -361,6 +416,57 @@ describe("pi-server HTTP", () => {
 			"one",
 			[{ type: "text", text: "first answer" }],
 		]);
+	});
+
+	it("persists a synced session tree by session id across server restarts", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "persist me", timestamp: 1000 },
+			},
+		];
+
+		const sync = await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "persisted-tree",
+				entries,
+				leafId: "u1",
+				staticContext: { systemPrompt: "Persisted" },
+			}),
+		});
+		expect(sync.status).toBe(200);
+		const syncBody = (await sync.json()) as ServerResponse;
+		expect(syncBody.treeHash).toBeTruthy();
+
+		await new Promise<void>((resolve) => {
+			server.close(() => resolve());
+		});
+		clearAllSessions();
+		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
+		server.listen(0);
+		const addr = server.address();
+		if (typeof addr !== "object" || addr === null) {
+			throw new Error("Failed to get restarted server address");
+		}
+		baseUrl = `http://127.0.0.1:${addr.port}`;
+
+		const history = await fetch(`${baseUrl}/api/session/persisted-tree/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(history.status).toBe(200);
+		const historyBody = (await history.json()) as ServerResponse;
+		expect(historyBody.staticContext?.systemPrompt).toBe("Persisted");
+		expect(historyBody.treeHash).toBe(syncBody.treeHash);
+		expect(historyBody.entries).toEqual(entries);
+		expect(historyBody.messages?.map((message) => message.content)).toEqual(["persist me"]);
 	});
 
 	it("returns 404 when full session history is missing", async () => {
@@ -564,6 +670,7 @@ describe("resolveStreamOptions", () => {
 			host: "127.0.0.1",
 			port: 4217,
 			authToken: undefined,
+			sessionStoreDir: "unused",
 		};
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
@@ -578,6 +685,7 @@ describe("resolveStreamOptions", () => {
 			host: "127.0.0.1",
 			port: 4217,
 			authToken: undefined,
+			sessionStoreDir: "unused",
 			providerApiKey: "sk-server",
 			providerBaseUrl: "https://server-proxy.example.com/v1",
 			providerHeaders: { "X-Server": "yes" },

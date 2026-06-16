@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -78,6 +79,10 @@ function baseTree(): SessionTreeEntry[] {
 	];
 }
 
+function hashEntries(entries: SessionTreeEntry[]): string {
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
 const testModel: Model<"openai-completions"> = {
 	id: "test-model",
 	name: "Test Model",
@@ -153,6 +158,46 @@ describe("pi-server-client", () => {
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/append"]);
 		expect(capturedBodies[0].body.entries).toEqual([nextEntry]);
 		expect(capturedBodies[0].body.leafId).toBe("u2");
+	});
+
+	it("skips initial tree sync when pi-server reports a matching persisted tree hash", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		const nextEntry = messageEntry("u2", "a1", textMessage("two", 3000));
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/session/tree/append")) {
+					return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response(
+					JSON.stringify({
+						sessionId: body.sessionId,
+						staticContextHash: "hash-persisted",
+						treeHash: hashEntries(entries),
+						leafId: "a1",
+						entryCount: entries.length,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}),
+		);
+
+		await syncPiServerTree("persisted-tree", context, { entries, leafId: "a1" });
+		await syncPiServerTree("persisted-tree", context, { entries: [...entries, nextEntry], leafId: "u2" });
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/tree/append",
+		]);
+		expect(capturedBodies[1].body.entries).toEqual([nextEntry]);
 	});
 
 	it("rebuilds the server tree when incremental append finds missing server state", async () => {

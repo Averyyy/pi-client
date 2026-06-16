@@ -20,6 +20,7 @@ import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
+import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
 import {
 	appendMessages,
 	appendSessionEntries,
@@ -27,8 +28,11 @@ import {
 	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
+	hashSessionEntries,
+	listSessions,
 	replaceMessages,
 	replaceSessionTree,
+	type SessionState,
 	type SessionStaticContext,
 	setStaticContext,
 	switchSessionLeaf,
@@ -115,6 +119,22 @@ interface ResolvedStream {
 	options: SimpleStreamOptions;
 }
 
+function sessionResponseBody(session: SessionState) {
+	return {
+		sessionId: session.sessionId,
+		staticContextHash: session.staticContextHash,
+		treeHash: hashSessionEntries(session.entries),
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
+	};
+}
+
+function persistSession(config: ServerConfig, session: SessionState): void {
+	savePersistedSession(config.sessionStoreDir, session);
+}
+
 export function resolveStreamOptions(
 	_config: ServerConfig,
 	model: Model<any>,
@@ -123,7 +143,7 @@ export function resolveStreamOptions(
 	return { model, options: { ...(body.options ?? {}) } };
 }
 
-function handleSessionInit(body: SessionInitBody, res: ServerResponse): void {
+function handleSessionInit(config: ServerConfig, body: SessionInitBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -134,16 +154,12 @@ function handleSessionInit(body: SessionInitBody, res: ServerResponse): void {
 		getOrCreateSession(body.sessionId);
 	}
 	const session = getSession(body.sessionId)!;
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
 function handleSessionUpdate(
+	config: ServerConfig,
 	body: SessionInitBody & { staticContext: SessionStaticContext },
 	res: ServerResponse,
 ): void {
@@ -157,16 +173,11 @@ function handleSessionUpdate(
 	}
 	setStaticContext(body.sessionId, body.staticContext);
 	const session = getSession(body.sessionId)!;
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionSync(body: SessionSyncBody, res: ServerResponse): void {
+function handleSessionSync(config: ServerConfig, body: SessionSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -179,16 +190,11 @@ function handleSessionSync(body: SessionSyncBody, res: ServerResponse): void {
 		setStaticContext(body.sessionId, body.staticContext);
 	}
 	const session = replaceMessages(body.sessionId, body.messages);
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionAppend(body: SessionAppendBody, res: ServerResponse): void {
+function handleSessionAppend(config: ServerConfig, body: SessionAppendBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -201,16 +207,11 @@ function handleSessionAppend(body: SessionAppendBody, res: ServerResponse): void
 		setStaticContext(body.sessionId, body.staticContext);
 	}
 	const session = appendMessages(body.sessionId, body.messages);
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionTreeSync(body: SessionTreeSyncBody, res: ServerResponse): void {
+function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -223,17 +224,11 @@ function handleSessionTreeSync(body: SessionTreeSyncBody, res: ServerResponse): 
 		setStaticContext(body.sessionId, body.staticContext);
 	}
 	const session = replaceSessionTree(body.sessionId, body.entries, body.leafId ?? null);
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-		revision: session.revision,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionTreeAppend(body: SessionTreeSyncBody, res: ServerResponse): void {
+function handleSessionTreeAppend(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -246,30 +241,18 @@ function handleSessionTreeAppend(body: SessionTreeSyncBody, res: ServerResponse)
 		setStaticContext(body.sessionId, body.staticContext);
 	}
 	const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-		revision: session.revision,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionTreeSwitch(body: SessionTreeSwitchBody, res: ServerResponse): void {
+function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
 	}
 	const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContextHash: session.staticContextHash,
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-		revision: session.revision,
-	});
+	persistSession(config, session);
+	sendJson(res, 200, sessionResponseBody(session));
 }
 
 async function handleSessionCompact(body: SessionCompactBody, res: ServerResponse): Promise<void> {
@@ -317,13 +300,17 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 	sendJson(res, 200, { success: true, compaction: result.value satisfies CompactResult });
 }
 
-function handleDropLastAssistantError(body: SessionIdBody, res: ServerResponse): void {
+function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
 	}
 	const dropped = dropLastAssistantError(body.sessionId);
-	const messageCount = getSession(body.sessionId)?.messages.length ?? 0;
+	const session = getSession(body.sessionId);
+	if (session) {
+		persistSession(config, session);
+	}
+	const messageCount = session?.messages.length ?? 0;
 	sendJson(res, 200, { success: true, dropped, messageCount });
 }
 
@@ -338,6 +325,7 @@ function handleSessionHistory(sessionId: string, from: number | undefined, res: 
 		sessionId: session.sessionId,
 		staticContext: session.staticContext,
 		staticContextHash: session.staticContextHash,
+		treeHash: hashSessionEntries(session.entries),
 		messageCount: session.messages.length,
 		entryCount: session.entries.length,
 		leafId: session.leafId,
@@ -361,6 +349,7 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 
 	if (body.staticContext) {
 		setStaticContext(body.sessionId, body.staticContext);
+		persistSession(config, session);
 	}
 
 	if (!session.staticContext && !body.staticContext) {
@@ -428,42 +417,42 @@ async function handlePostRequest(
 	res: ServerResponse,
 ): Promise<boolean> {
 	if (pathname === "/api/session/init") {
-		handleSessionInit(body as SessionInitBody, res);
+		handleSessionInit(config, body as SessionInitBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/update") {
-		handleSessionUpdate(body as SessionInitBody & { staticContext: SessionStaticContext }, res);
+		handleSessionUpdate(config, body as SessionInitBody & { staticContext: SessionStaticContext }, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/sync") {
-		handleSessionSync(body as SessionSyncBody, res);
+		handleSessionSync(config, body as SessionSyncBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/append") {
-		handleSessionAppend(body as SessionAppendBody, res);
+		handleSessionAppend(config, body as SessionAppendBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/tree/sync") {
-		handleSessionTreeSync(body as SessionTreeSyncBody, res);
+		handleSessionTreeSync(config, body as SessionTreeSyncBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/tree/append") {
-		handleSessionTreeAppend(body as SessionTreeSyncBody, res);
+		handleSessionTreeAppend(config, body as SessionTreeSyncBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/tree/switch") {
-		handleSessionTreeSwitch(body as SessionTreeSwitchBody, res);
+		handleSessionTreeSwitch(config, body as SessionTreeSwitchBody, res);
 		return true;
 	}
 
 	if (pathname === "/api/session/drop-last-assistant-error") {
-		handleDropLastAssistantError(body as SessionIdBody, res);
+		handleDropLastAssistantError(config, body as SessionIdBody, res);
 		return true;
 	}
 
@@ -482,6 +471,7 @@ async function handlePostRequest(
 
 export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServer {
 	const config = loadConfig(configOverride);
+	loadPersistedSessions(config.sessionStoreDir);
 
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", `http://${config.host}:${config.port}`);
@@ -493,6 +483,11 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 
 		if (!authenticate(config, req)) {
 			sendJson(res, 401, { error: "Unauthorized" });
+			return;
+		}
+
+		if (req.method === "GET" && url.pathname === "/api/sessions") {
+			sendJson(res, 200, { sessions: listSessions() });
 			return;
 		}
 
@@ -546,6 +541,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		if (req.method === "DELETE" && url.pathname.startsWith("/api/session/")) {
 			const sessionId = decodeURIComponent(url.pathname.slice("/api/session/".length));
 			deleteSessionFromStore(sessionId);
+			deletePersistedSession(config.sessionStoreDir, sessionId);
 			sendJson(res, 200, { deleted: sessionId });
 			return;
 		}
