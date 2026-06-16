@@ -8,7 +8,14 @@ import {
 	prepareCompaction,
 	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
-import { type Context, type Message, type Model, type SimpleStreamOptions, streamSimple } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessageEvent,
+	type Context,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	streamSimple,
+} from "@earendil-works/pi-ai";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
@@ -76,6 +83,9 @@ interface SessionCompactBody {
 interface SessionIdBody {
 	sessionId: string;
 }
+
+const STREAM_HEARTBEAT = ": keep-alive\n\n";
+const STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
 
 function readBody(req: IncomingMessage): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -371,19 +381,41 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		"Cache-Control": "no-cache",
 		Connection: "keep-alive",
 	});
+	res.flushHeaders();
+	res.write(STREAM_HEARTBEAT);
 
-	const stream = streamSimple(resolvedModel, context, streamOptions);
+	const heartbeat = setInterval(() => {
+		if (!res.writableEnded) {
+			res.write(STREAM_HEARTBEAT);
+		}
+	}, STREAM_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+
+	let stream: AsyncIterable<AssistantMessageEvent>;
+	try {
+		stream = streamSimple(resolvedModel, context, streamOptions);
+	} catch (err) {
+		clearInterval(heartbeat);
+		res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
+		res.end();
+		return;
+	}
 
 	(async () => {
-		for await (const event of stream) {
-			const proxyEvent = toProxyEvent(event);
-			if (proxyEvent) {
-				res.write(encodeProxyEvent(proxyEvent));
+		try {
+			for await (const event of stream) {
+				const proxyEvent = toProxyEvent(event);
+				if (proxyEvent) {
+					res.write(encodeProxyEvent(proxyEvent));
+				}
 			}
+		} finally {
+			clearInterval(heartbeat);
 		}
 
 		res.end();
 	})().catch((err) => {
+		clearInterval(heartbeat);
 		res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
 		res.end();
 	});
@@ -524,9 +556,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 	return server;
 }
 
-function toProxyEvent(
-	event: import("@earendil-works/pi-ai").AssistantMessageEvent,
-): ProxyAssistantMessageEvent | undefined {
+function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent | undefined {
 	switch (event.type) {
 		case "start":
 			return { type: "start" };

@@ -215,6 +215,7 @@ describe("AgentSession pi-server sync", () => {
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(model!.provider, "test-key");
 		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 
 		try {
@@ -251,7 +252,7 @@ describe("AgentSession pi-server sync", () => {
 				thinkingLevel: "off",
 				authStorage,
 				modelRegistry,
-				sessionManager: SessionManager.inMemory(cwd),
+				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
 			try {
@@ -263,6 +264,218 @@ describe("AgentSession pi-server sync", () => {
 
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
 			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
+			const leaf = sessionManager.getLeafEntry();
+			expect(leaf?.type).toBe("message");
+			expect(leaf?.type === "message" ? leaf.message.role : undefined).toBe("user");
+			expect(session.state.messages.map((message) => message.role)).toEqual(["user"]);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("continues from the last valid pi-server leaf after an HTTP 524 stream failure", async () => {
+		const tempDir = join(tmpdir(), `pi-stream-524-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+		let streamCount = 0;
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						if (streamCount === 1) {
+							return new Response("Cloudflare timeout", { status: 524, statusText: "A timeout occurred" });
+						}
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-524",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("will 524");
+				await session.agent.waitForIdle();
+				expect(session.state.messages.map((message) => message.role)).toEqual(["user"]);
+
+				await session.prompt("continue after 524");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(streamCount).toBe(2);
+			const activeMessages = sessionManager.buildSessionContext().messages;
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+			expect(
+				activeMessages.some(
+					(message) =>
+						message.role === "assistant" &&
+						message.stopReason === "error" &&
+						message.errorMessage?.includes("524"),
+				),
+			).toBe(false);
+			const errorEntries = sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error" &&
+						entry.message.errorMessage?.includes("524"),
+				);
+			expect(errorEntries).toHaveLength(1);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("continues from the last valid leaf when an existing session ends on an assistant failure", async () => {
+		const tempDir = join(
+			tmpdir(),
+			`pi-existing-failure-session-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		sessionManager.appendMessage({ role: "user", content: "old question", timestamp: 1000 });
+		const oldErrorId = sessionManager.appendMessage({
+			role: "assistant",
+			content: [],
+			api: model!.api,
+			provider: model!.provider,
+			model: model!.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "previous 524",
+			timestamp: 2000,
+		});
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.endsWith("/api/stream")) {
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-existing-failure",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("continue from old failure");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			const treeSync = capturedRequests.find((request) => request.url.endsWith("/api/session/tree/sync"));
+			expect(treeSync).toBeDefined();
+			const syncedEntries = treeSync!.body.entries as Array<{ id: string }>;
+			expect(syncedEntries.some((entry) => entry.id === oldErrorId)).toBe(true);
+			const activeMessages = sessionManager.buildSessionContext().messages;
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+			expect(
+				activeMessages.some(
+					(message) =>
+						message.role === "assistant" &&
+						message.stopReason === "error" &&
+						message.errorMessage === "previous 524",
+				),
+			).toBe(false);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
@@ -417,6 +630,7 @@ describe("AgentSession pi-server sync", () => {
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(model!.provider, "test-key");
 		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 		let streamRequestStarted = () => {};
 		const streamRequestPromise = new Promise<void>((resolve) => {
@@ -464,7 +678,7 @@ describe("AgentSession pi-server sync", () => {
 				thinkingLevel: "off",
 				authStorage,
 				modelRegistry,
-				sessionManager: SessionManager.inMemory(cwd),
+				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
 			const events: Array<{ type: string; willRetry?: boolean }> = [];
@@ -487,6 +701,9 @@ describe("AgentSession pi-server sync", () => {
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
 			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
 			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
+			const leaf = sessionManager.getLeafEntry();
+			expect(leaf?.type).toBe("message");
+			expect(leaf?.type === "message" ? leaf.message.role : undefined).toBe("user");
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

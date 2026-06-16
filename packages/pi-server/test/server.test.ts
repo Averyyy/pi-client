@@ -457,6 +457,47 @@ describe("pi-server HTTP", () => {
 		expect(body.error).toContain("static context");
 	});
 
+	it("sends a stream heartbeat before upstream provider events", async () => {
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-heartbeat",
+				staticContext: { systemPrompt: "Heartbeat test" },
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-heartbeat",
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "http://127.0.0.1:1" },
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		expect(res.body).toBeTruthy();
+
+		const reader = res.body!.getReader();
+		const firstChunk = await Promise.race([
+			reader.read(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("Timed out waiting for heartbeat")), 1000),
+			),
+		]);
+		await reader.cancel();
+
+		expect(firstChunk.done).toBe(false);
+		expect(new TextDecoder().decode(firstChunk.value)).toContain(": keep-alive");
+	});
+
 	it("returns 404 for unknown routes with auth", async () => {
 		const res = await fetch(`${baseUrl}/unknown`, {
 			headers: { Authorization: "Bearer test-token" },

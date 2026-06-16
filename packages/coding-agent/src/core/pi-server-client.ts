@@ -181,6 +181,59 @@ async function postTreeJson(
 	}
 }
 
+function isRecoverableTreeDivergenceError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(message);
+}
+
+async function readErrorBody(response: Response): Promise<string> {
+	const text = await response.text();
+	if (!text) return "";
+
+	try {
+		const parsed = JSON.parse(text) as { error?: unknown };
+		if (typeof parsed.error === "string" && parsed.error.length > 0) {
+			return parsed.error;
+		}
+	} catch {
+		// Non-JSON proxy errors should still be surfaced verbatim.
+	}
+
+	return text;
+}
+
+function formatResponseError(response: Response, errorBody: string): string {
+	const status = response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+	return errorBody ? `${status}: ${errorBody}` : status;
+}
+
+function isRecoverableMissingServerState(response: Response, errorBody: string): boolean {
+	if (response.status !== 400 && response.status !== 404) return false;
+	return /Session has no static context|session not found|parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(
+		errorBody,
+	);
+}
+
+async function syncFullPiServerTree(
+	sessionId: string,
+	context: Context,
+	tree: PiServerTreeSnapshot,
+	request: ChunkRequest,
+): Promise<void> {
+	await postTreeJson(
+		request,
+		"/api/session/tree/sync",
+		{
+			sessionId,
+			entries: tree.entries,
+			leafId: tree.leafId,
+			staticContext: getStaticContext(context),
+		},
+		"Session tree sync failed",
+	);
+	markTreeSynced(sessionId, tree);
+}
+
 export async function syncPiServerTree(
 	sessionId: string,
 	context: Context,
@@ -204,12 +257,20 @@ async function syncPiServerTreeWithRequest(
 
 	if (!tree.replace && previousHash === currentHash) {
 		if (previousLeafId !== tree.leafId) {
-			await postTreeJson(
-				request,
-				"/api/session/tree/switch",
-				{ sessionId, leafId: tree.leafId },
-				"Session tree switch failed",
-			);
+			try {
+				await postTreeJson(
+					request,
+					"/api/session/tree/switch",
+					{ sessionId, leafId: tree.leafId },
+					"Session tree switch failed",
+				);
+			} catch (error) {
+				if (!isRecoverableTreeDivergenceError(error)) {
+					throw error;
+				}
+				await syncFullPiServerTree(sessionId, context, tree, request);
+				return;
+			}
 			sessionTreeLeafIds.set(sessionId, tree.leafId);
 		}
 		return;
@@ -219,34 +280,31 @@ async function syncPiServerTreeWithRequest(
 	if (syncedIds && !tree.replace && !sessionHasTemporaryTree.has(sessionId)) {
 		const deltaEntries = tree.entries.filter((entry) => !syncedIds.has(entry.id));
 		if (deltaEntries.length > 0) {
-			await postTreeJson(
-				request,
-				"/api/session/tree/append",
-				{
-					sessionId,
-					entries: deltaEntries,
-					leafId: tree.leafId,
-					staticContext: getStaticContext(context),
-				},
-				"Session tree append failed",
-			);
+			try {
+				await postTreeJson(
+					request,
+					"/api/session/tree/append",
+					{
+						sessionId,
+						entries: deltaEntries,
+						leafId: tree.leafId,
+						staticContext: getStaticContext(context),
+					},
+					"Session tree append failed",
+				);
+			} catch (error) {
+				if (!isRecoverableTreeDivergenceError(error)) {
+					throw error;
+				}
+				await syncFullPiServerTree(sessionId, context, tree, request);
+				return;
+			}
 			markTreeSynced(sessionId, tree);
 			return;
 		}
 	}
 
-	await postTreeJson(
-		request,
-		"/api/session/tree/sync",
-		{
-			sessionId,
-			entries: tree.entries,
-			leafId: tree.leafId,
-			staticContext: getStaticContext(context),
-		},
-		"Session tree sync failed",
-	);
-	markTreeSynced(sessionId, tree);
+	await syncFullPiServerTree(sessionId, context, tree, request);
 }
 
 function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStreamOptions {
@@ -286,16 +344,30 @@ export async function compactPiServer(
 	const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
 	await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 
-	const response = await request.postJson("/api/session/compact", {
+	const makeBody = () => ({
 		sessionId,
 		model,
 		options: serializeOptions(options),
 		settings: options?.settings,
 		customInstructions: options?.customInstructions,
 	});
+	let response = await request.postJson("/api/session/compact", makeBody());
 	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`Server compaction failed (${response.status}): ${errorBody}`);
+		let errorBody = await readErrorBody(response);
+		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, errorBody)) {
+			resetSessionTracking(sessionId);
+			await ensureSessionInit(sessionId, context, request);
+			await syncFullPiServerTree(sessionId, context, tree, request);
+			response = await request.postJson("/api/session/compact", makeBody());
+			if (response.ok) {
+				errorBody = "";
+			} else {
+				errorBody = await readErrorBody(response);
+			}
+		}
+		if (!response.ok) {
+			throw new Error(`Server compaction failed (${formatResponseError(response, errorBody)})`);
+		}
 	}
 	const result = (await response.json()) as { compaction?: CompactResult };
 	if (!result.compaction) {
@@ -350,23 +422,29 @@ export async function streamPiServer(
 			};
 			await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 
-			const response = await request.postJson("/api/stream", {
+			const makeBody = () => ({
 				sessionId,
 				model,
 				options: serializeOptions(options),
 			});
+			let response = await request.postJson("/api/stream", makeBody());
 
 			if (!response.ok) {
-				let errorMessage = `pi-server error: ${response.status} ${response.statusText}`;
-				try {
-					const errorData = (await response.json()) as { error?: string };
-					if (errorData.error) {
-						errorMessage = `pi-server error: ${errorData.error}`;
+				let errorBody = await readErrorBody(response);
+				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, errorBody)) {
+					resetSessionTracking(sessionId);
+					await ensureSessionInit(sessionId, context, request);
+					await syncFullPiServerTree(sessionId, context, tree, request);
+					response = await request.postJson("/api/stream", makeBody());
+					if (response.ok) {
+						errorBody = "";
+					} else {
+						errorBody = await readErrorBody(response);
 					}
-				} catch {
-					// Couldn't parse error response
 				}
-				throw new Error(errorMessage);
+				if (!response.ok) {
+					throw new Error(`pi-server error: ${formatResponseError(response, errorBody)}`);
+				}
 			}
 
 			const reader = response.body!.getReader();

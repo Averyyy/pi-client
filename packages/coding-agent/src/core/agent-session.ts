@@ -91,7 +91,7 @@ import type { ModelRegistry } from "./model-registry.ts";
 import { compactPiServer, dropLastPiServerAssistantError, syncPiServerTree } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
+import type { BranchSummaryEntry, CompactionEntry, SessionManager, SessionMessageEntry } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -355,6 +355,10 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
+		if (isPiServerMode()) {
+			this._detachPiServerTerminalAssistantFailure();
+		}
+
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
@@ -613,6 +617,35 @@ export class AgentSession {
 			}
 		}
 		return undefined;
+	}
+
+	private _detachPiServerTerminalAssistantFailure(): void {
+		const branch = this.sessionManager.getBranch();
+		let terminalMessageEntry: SessionMessageEntry | undefined;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "message") {
+				terminalMessageEntry = entry;
+				break;
+			}
+		}
+		if (!terminalMessageEntry || terminalMessageEntry.message.role !== "assistant") {
+			return;
+		}
+
+		const assistant = terminalMessageEntry.message as AssistantMessage;
+		if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+			return;
+		}
+
+		if (terminalMessageEntry.parentId) {
+			this.sessionManager.branch(terminalMessageEntry.parentId);
+		} else {
+			this.sessionManager.resetLeaf();
+		}
+
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1002,6 +1035,10 @@ export class AgentSession {
 			return true;
 		}
 
+		if (isPiServerMode() && (msg.stopReason === "error" || msg.stopReason === "aborted")) {
+			this._detachPiServerTerminalAssistantFailure();
+		}
+
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		return this.agent.hasQueuedMessages();
@@ -1107,6 +1144,10 @@ export class AgentSession {
 				} finally {
 					this._flushPendingBashMessages();
 				}
+			}
+
+			if (isPiServerMode()) {
+				this._detachPiServerTerminalAssistantFailure();
 			}
 
 			// Build messages array (custom message if any, then user message)
