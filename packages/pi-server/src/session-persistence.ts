@@ -11,6 +11,7 @@ import {
 } from "./session-store.ts";
 
 const PERSISTED_SESSION_VERSION = 1;
+const REPLACE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
 
 interface PersistedSessionFile {
 	version: 1;
@@ -23,6 +24,43 @@ function sessionFileName(sessionId: string): string {
 
 function sessionPath(sessionStoreDir: string, sessionId: string): string {
 	return join(sessionStoreDir, sessionFileName(sessionId));
+}
+
+function isRetryableReplaceError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function replaceFileSync(sourcePath: string, targetPath: string): void {
+	let lastError: unknown;
+	for (let attempt = 0; attempt <= REPLACE_RETRY_DELAYS_MS.length; attempt++) {
+		try {
+			renameSync(sourcePath, targetPath);
+			return;
+		} catch (error) {
+			lastError = error;
+			if (!isRetryableReplaceError(error)) {
+				throw error;
+			}
+			try {
+				rmSync(targetPath, { force: true });
+				renameSync(sourcePath, targetPath);
+				return;
+			} catch (replaceError) {
+				lastError = replaceError;
+				if (!isRetryableReplaceError(replaceError) || attempt === REPLACE_RETRY_DELAYS_MS.length) {
+					throw replaceError;
+				}
+				sleepSync(REPLACE_RETRY_DELAYS_MS[attempt]);
+			}
+		}
+	}
+	throw lastError;
 }
 
 function assertRecord(value: unknown, path: string): asserts value is Record<string, unknown> {
@@ -142,7 +180,7 @@ export function savePersistedSession(sessionStoreDir: string, session: SessionSt
 	};
 	try {
 		writeFileSync(tempPath, JSON.stringify(body), "utf-8");
-		renameSync(tempPath, filePath);
+		replaceFileSync(tempPath, filePath);
 	} catch (error) {
 		rmSync(tempPath, { force: true });
 		throw error;

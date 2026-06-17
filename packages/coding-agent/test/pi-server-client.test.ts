@@ -71,6 +71,23 @@ function messageEntry(id: string, parentId: string | null, message: Message): Se
 	};
 }
 
+function compactionEntry(
+	id: string,
+	parentId: string | null,
+	summary: string,
+	firstKeptEntryId: string,
+): SessionTreeEntry {
+	return {
+		type: "compaction",
+		id,
+		parentId,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		summary,
+		firstKeptEntryId,
+		tokensBefore: 100,
+	};
+}
+
 function baseTree(): SessionTreeEntry[] {
 	return [
 		messageEntry("u1", null, textMessage("one", 1000)),
@@ -158,6 +175,40 @@ describe("pi-server-client", () => {
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/append"]);
 		expect(capturedBodies[0].body.entries).toEqual([nextEntry]);
 		expect(capturedBodies[0].body.leafId).toBe("u2");
+	});
+
+	it("prunes compacted tree history before full tree sync", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = [
+			messageEntry("u1", null, textMessage("one", 1000)),
+			messageEntry("a1", "u1", assistantMessage("first answer", 2000)),
+			messageEntry("u2", "a1", textMessage("two", 3000)),
+			messageEntry("a2", "u2", assistantMessage("second answer", 4000)),
+			compactionEntry("c1", "a2", "summary of one", "u2"),
+			messageEntry("u3", "c1", textMessage("three", 5000)),
+		];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 4 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("compacted-tree-sync", context, { entries, leafId: "u3" });
+
+		const treeSync = capturedBodies.find((request) => request.url.endsWith("/api/session/tree/sync"));
+		expect(treeSync).toBeDefined();
+		const syncedEntries = treeSync!.body.entries as Array<{ id: string; parentId: string | null }>;
+		expect(syncedEntries.map((entry) => entry.id)).toEqual(["u2", "a2", "c1", "u3"]);
+		expect(syncedEntries.map((entry) => entry.parentId)).toEqual([null, "u2", "a2", "c1"]);
+		expect(treeSync!.body.leafId).toBe("u3");
 	});
 
 	it("skips initial tree sync when pi-server reports a matching persisted tree hash", async () => {
@@ -465,6 +516,53 @@ describe("pi-server-client", () => {
 			"/api/session/compact",
 		]);
 		expect(capturedBodies[1].body.entries).toEqual(entries);
+	});
+
+	it("prunes already compacted history before server-side compact", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = [
+			messageEntry("u1", null, textMessage("one", 1000)),
+			messageEntry("a1", "u1", assistantMessage("first answer", 2000)),
+			messageEntry("u2", "a1", textMessage("two", 3000)),
+			messageEntry("a2", "u2", assistantMessage("second answer", 4000)),
+			compactionEntry("c1", "a2", "summary of one", "u2"),
+			messageEntry("u3", "c1", textMessage("three", 5000)),
+		];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/compact")) {
+					return new Response(
+						JSON.stringify({
+							success: true,
+							compaction: { summary: "next summary", firstKeptEntryId: "u3", tokensBefore: 10 },
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 4 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await compactPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [] },
+			{ sessionId: "compact-pruned-tree", apiKey: "sk-client", sessionTree: { entries, leafId: "u3" } },
+		);
+
+		const treeSync = capturedBodies.find((request) => request.url.endsWith("/api/session/tree/sync"));
+		expect(treeSync).toBeDefined();
+		const syncedEntries = treeSync!.body.entries as Array<{ id: string; parentId: string | null }>;
+		expect(syncedEntries.map((entry) => entry.id)).toEqual(["u2", "a2", "c1", "u3"]);
+		expect(syncedEntries.map((entry) => entry.parentId)).toEqual([null, "u2", "a2", "c1"]);
 	});
 
 	it("rebuilds missing server state once when compacting after a pi-server restart", async () => {

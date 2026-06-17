@@ -106,6 +106,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(data);
 }
 
+function logRequestError(req: IncomingMessage, error: unknown): void {
+	const message = error instanceof Error ? error.stack || error.message : String(error);
+	console.error(`${req.method ?? "UNKNOWN"} ${req.url ?? "/"} failed: ${message}`);
+}
+
 function authenticate(config: ServerConfig, req: IncomingMessage): boolean {
 	if (!config.authToken) return true;
 	const header = req.headers.authorization;
@@ -513,6 +518,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 				}
 				await handlePostRequest(config, chunkResult.target, JSON.parse(chunkResult.bodyJson) as unknown, res);
 			} catch (err) {
+				logRequestError(req, err);
 				if (!res.headersSent) {
 					sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
 				} else {
@@ -528,6 +534,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 				const body = JSON.parse(await readBody(req)) as unknown;
 				if (await handlePostRequest(config, url.pathname, body, res)) return;
 			} catch (err) {
+				logRequestError(req, err);
 				if (!res.headersSent) {
 					sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
 				} else {
