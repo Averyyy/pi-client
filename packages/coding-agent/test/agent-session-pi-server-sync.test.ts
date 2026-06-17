@@ -7,6 +7,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createHarness } from "./test-harness.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
@@ -204,7 +205,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("does not run a second tree sync after a pi-server stream error", async () => {
+	it("retries a retryable pi-server stream error after resyncing the active tree", async () => {
 		const tempDir = join(tmpdir(), `pi-stream-error-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -216,7 +217,10 @@ describe("AgentSession pi-server sync", () => {
 		authStorage.setRuntimeApiKey(model!.provider, "test-key");
 		const modelRegistry = ModelRegistry.inMemory(authStorage);
 		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+		let streamCount = 0;
 
 		try {
 			process.env.PI_SERVER_MODE = "true";
@@ -227,6 +231,19 @@ describe("AgentSession pi-server sync", () => {
 					capturedRequests.push({ url, body });
 
 					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						if (streamCount === 2) {
+							return new Response(
+								[
+									'data: {"type":"start"}\n\n',
+									'data: {"type":"text_start","contentIndex":0}\n\n',
+									'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
+									'data: {"type":"text_end","contentIndex":0}\n\n',
+									'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+								].join(""),
+								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+							);
+						}
 						return new Response(
 							'data: {"type":"error","reason":"error","errorMessage":"connection lost","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0}}\n\n',
 							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
@@ -253,7 +270,13 @@ describe("AgentSession pi-server sync", () => {
 				authStorage,
 				modelRegistry,
 				sessionManager,
+				settingsManager,
 				resourceLoader: createTestResourceLoader(),
+			});
+			const events: string[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+				if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
 			});
 			try {
 				await session.prompt("will fail");
@@ -263,10 +286,88 @@ describe("AgentSession pi-server sync", () => {
 			}
 
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
-			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
-			const leaf = sessionManager.getLeafEntry();
-			expect(leaf?.type).toBe("message");
-			expect(leaf?.type === "message" ? leaf.message.role : undefined).toBe("user");
+			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual([
+				"/api/session/tree/sync",
+				"/api/session/tree/sync",
+				"/api/session/tree/append",
+			]);
+			expect(streamCount).toBe(2);
+			expect(events).toEqual(["start:1", "end:success=true"]);
+			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("does not retry a pi-server provider balance error", async () => {
+		const tempDir = join(tmpdir(), `pi-stream-balance-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
+		let streamCount = 0;
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						return new Response(
+							'data: {"type":"error","reason":"error","errorMessage":"401 Insufficient balance","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0}}\n\n',
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-balance",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				settingsManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			const events: string[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+			});
+			try {
+				await session.prompt("will fail for balance");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(streamCount).toBe(1);
+			expect(events).toEqual([]);
 			expect(session.state.messages.map((message) => message.role)).toEqual(["user"]);
 		} finally {
 			if (existsSync(tempDir)) {
@@ -275,7 +376,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("continues from the last valid pi-server leaf after an HTTP 524 stream failure", async () => {
+	it("retries from the last valid pi-server leaf after an HTTP 524 stream failure", async () => {
 		const tempDir = join(tmpdir(), `pi-stream-524-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -287,6 +388,8 @@ describe("AgentSession pi-server sync", () => {
 		authStorage.setRuntimeApiKey(model!.provider, "test-key");
 		const modelRegistry = ModelRegistry.inMemory(authStorage);
 		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 		let streamCount = 0;
 
@@ -335,22 +438,25 @@ describe("AgentSession pi-server sync", () => {
 				authStorage,
 				modelRegistry,
 				sessionManager,
+				settingsManager,
 				resourceLoader: createTestResourceLoader(),
+			});
+			const events: string[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+				if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
 			});
 			try {
 				await session.prompt("will 524");
-				await session.agent.waitForIdle();
-				expect(session.state.messages.map((message) => message.role)).toEqual(["user"]);
-
-				await session.prompt("continue after 524");
 				await session.agent.waitForIdle();
 			} finally {
 				session.dispose();
 			}
 
 			expect(streamCount).toBe(2);
+			expect(events).toEqual(["start:1", "end:success=true"]);
 			const activeMessages = sessionManager.buildSessionContext().messages;
-			expect(activeMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
 			expect(
 				activeMessages.some(
 					(message) =>

@@ -88,7 +88,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
-import { compactPiServer, dropLastPiServerAssistantError, syncPiServerTree } from "./pi-server-client.ts";
+import { compactPiServer, resetSessionTracking, syncPiServerTree } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionManager, SessionMessageEntry } from "./session-manager.ts";
@@ -580,10 +580,6 @@ export class AgentSession {
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
-		if (isPiServerMode()) {
-			return false;
-		}
-
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
@@ -1017,7 +1013,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (!isPiServerMode() && this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
 			return true;
 		}
 
@@ -2631,7 +2627,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private _isNonRetryableProviderLimitError(errorMessage: string): boolean {
-		return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/i.test(
+		return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient.?balance|balance.?insufficient|insufficient_quota|out of budget|quota exceeded|billing|payment required|402/i.test(
 			errorMessage,
 		);
 	}
@@ -2683,12 +2679,14 @@ export class AgentSession {
 			errorMessage: message.errorMessage || "Unknown error",
 		});
 
-		// Remove error message from agent state (keep in session for history)
-		const messages = this.agent.state.messages;
-		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-			this.agent.state.messages = messages.slice(0, -1);
-			if (isPiServerMode()) {
-				await dropLastPiServerAssistantError(this.sessionId);
+		if (isPiServerMode()) {
+			this._detachPiServerTerminalAssistantFailure();
+			resetSessionTracking(this.sessionId);
+		} else {
+			// Remove error message from agent state (keep in session for history)
+			const messages = this.agent.state.messages;
+			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+				this.agent.state.messages = messages.slice(0, -1);
 			}
 		}
 
