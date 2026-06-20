@@ -5,26 +5,20 @@
 </p>
 <p align="center">
   <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-</p>
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
+  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
 </p>
 
 > New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+# Pi Agent Harness
 
-# Pi Agent Harness Mono Repo
-
-This is the home of the pi agent harness project including our self extensible coding agent.
+This is the home of the Pi agent harness project including our self extensible coding agent.
 
 * **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
 
-To learn more about pi:
+To learn more about Pi:
 
 * [Visit pi.dev](https://pi.dev), the project website with demos
 * [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
@@ -59,7 +53,7 @@ This installs:
 - `pi-client`: the forked client CLI. It does not overwrite an existing `pi` install.
 - `pi-server`: the local HTTP proxy that stores session state and forwards upstream LLM requests using request metadata supplied by `pi-client`.
 
-This fork is based on upstream Pi `0.79.3` at commit `6f29450`.
+This fork is based on upstream Pi `0.79.9` at commit `d93b92ba`.
 
 ### 3. Configure and start pi-server
 
@@ -98,14 +92,26 @@ In another terminal:
 ```bash
 export PI_SERVER_URL="http://127.0.0.1:4217"
 export PI_SERVER_AUTH_TOKEN="change-me"
-export PI_CLIENT_MAX_REQUEST_KB=512
+export PI_CLIENT_MAX_REQUEST_KB=64
 
 pi-client --provider opencode-go --model glm-5.1
 ```
 
 Configure provider models, base URLs, API keys, and headers on the client side through the normal Pi `~/.pi/agent/models.json` and auth settings. For OpenCode Go, use the OpenAI-compatible base URL there, for example `https://opencode.ai/zen/go/v1`.
 
-`PI_CLIENT_MAX_REQUEST_KB` caps every client-to-server JSON POST body. When a request is larger than this limit, `pi-client` splits it into multiple `/api/request/chunk` uploads and `pi-server` reassembles the original request before dispatching it. The default is `512` KB.
+`PI_CLIENT_MAX_REQUEST_KB` caps every client-to-server JSON POST body. When a request is larger than this limit, `pi-client` splits it into multiple `/api/request/chunk` uploads and `pi-server` reassembles the original request before dispatching it. The default is `64` KB.
+
+You can also persist the same limit in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "piServer": {
+    "maxRequestKB": 64
+  }
+}
+```
+
+`PI_CLIENT_MAX_REQUEST_KB` takes precedence over `settings.json`.
 
 ### Existing pi users
 
@@ -149,7 +155,7 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 - `pi-client`：基于原始 Pi coding agent 的客户端。它仍然读取和复用 `~/.pi/agent`，所以已有的配置、extension、skill、prompt、theme、session 和项目发现逻辑保持不变。它不会安装或覆盖 `pi` 命令。
 - `pi-server`：本地或远程 HTTP 服务。它按 `sessionId` 保存完整历史，把 `pi-client` 发来的增量消息拼回完整请求，再转发到真正的 LLM API。
 
-当前 `pi-client` 基于 upstream Pi `0.79.3`，对应 commit `6f29450`。
+当前 `pi-client` 基于 upstream Pi `0.79.9`，对应 commit `d93b92ba`。
 
 ### 1. 克隆仓库并安装依赖
 
@@ -212,14 +218,26 @@ PI_SERVER_CONFIG=/absolute/path/to/pi-server.json pi-server
 ```bash
 export PI_SERVER_URL="http://127.0.0.1:4217"
 export PI_SERVER_AUTH_TOKEN="change-me"
-export PI_CLIENT_MAX_REQUEST_KB=512
+export PI_CLIENT_MAX_REQUEST_KB=64
 
 pi-client --provider opencode-go --model glm-5.1
 ```
 
 provider 的 model、base URL、API key 和 headers 仍在 client 侧按原始 Pi 的方式配置，也就是 `~/.pi/agent/models.json` 和 auth 相关配置。比如 OpenCode Go 的 OpenAI-compatible base URL 应该配置在 client 侧：`https://opencode.ai/zen/go/v1`。
 
-`PI_CLIENT_MAX_REQUEST_KB` 用来限制 `pi-client` 到 `pi-server` 的单次 JSON POST 大小，单位是 KB。超过限制时，`pi-client` 会把请求拆成多次 `/api/request/chunk` 上传，`pi-server` 收齐后再还原原始请求。默认值是 `512`。
+`PI_CLIENT_MAX_REQUEST_KB` 用来限制 `pi-client` 到 `pi-server` 的单次 JSON POST 大小，单位是 KB。超过限制时，`pi-client` 会把请求拆成多次 `/api/request/chunk` 上传，`pi-server` 收齐后再还原原始请求。默认值是 `64`。
+
+也可以把同一个限制持久化到 `~/.pi/agent/settings.json`：
+
+```json
+{
+  "piServer": {
+    "maxRequestKB": 64
+  }
+}
+```
+
+`PI_CLIENT_MAX_REQUEST_KB` 的优先级高于 `settings.json`。
 
 ### 已经安装过原始 Pi 的用户
 
@@ -276,22 +294,6 @@ pi-client update
 - 如果跨机器访问 `pi-server`，建议放在你自己的 TLS 或反向代理后面。
 - `pi-client` 不会覆盖本机已有的 `pi` 命令，两者可以同时存在。
 
-## Share your OSS coding agent sessions
-
-If you use pi or other coding agents for open source work, please share your sessions.
-
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
-
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
 ## All Packages
 
 | Package | Description |
@@ -309,13 +311,13 @@ Pi does not include a built-in permission system for restricting filesystem, pro
 
 If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
 
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
 - **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
 - **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
+- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
 
 ## Development
 
@@ -341,6 +343,28 @@ We treat npm dependency changes as reviewed code changes.
 - CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
 - Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
 
+## Share your OSS coding agent sessions
+
+If you use Pi or other coding agents for open source work, please share your sessions.
+
+Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
+
+For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
+
+To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
+
+You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
+
+I regularly publish my own `pi-mono` work sessions here:
+
+- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
+
 ## License
 
 MIT
+
+<p align="center">
+  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
+  <br /><br />
+  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
+</p>

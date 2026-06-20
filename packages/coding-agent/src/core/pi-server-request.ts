@@ -1,13 +1,14 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 
-const DEFAULT_MAX_REQUEST_KB = 512;
+const DEFAULT_MAX_REQUEST_KB = 64;
 const CHUNK_ENDPOINT = "/api/request/chunk";
 
 export interface PiServerRequestOptions {
 	serverUrl: string;
 	authToken: string;
 	signal?: AbortSignal;
+	maxRequestKB?: number;
 }
 
 interface ChunkBody {
@@ -22,9 +23,17 @@ function jsonByteLength(value: unknown): number {
 	return Buffer.byteLength(JSON.stringify(value), "utf-8");
 }
 
-export function getMaxRequestBytes(): number {
+export function getMaxRequestBytes(configuredMaxRequestKB?: number): number {
 	const raw = process.env.PI_CLIENT_MAX_REQUEST_KB;
-	if (raw === undefined || raw === "") return DEFAULT_MAX_REQUEST_KB * 1024;
+	if (raw === undefined || raw === "") {
+		if (configuredMaxRequestKB !== undefined) {
+			if (!Number.isFinite(configuredMaxRequestKB) || configuredMaxRequestKB <= 0) {
+				throw new Error("piServer.maxRequestKB must be a positive number");
+			}
+			return Math.floor(configuredMaxRequestKB * 1024);
+		}
+		return DEFAULT_MAX_REQUEST_KB * 1024;
+	}
 
 	const value = Number(raw);
 	if (!Number.isFinite(value) || value <= 0) {
@@ -100,7 +109,7 @@ export class ChunkRequest {
 
 	async postJson(endpoint: string, body: unknown): Promise<Response> {
 		const rawJson = JSON.stringify(body);
-		const maxBytes = getMaxRequestBytes();
+		const maxBytes = getMaxRequestBytes(this.options.maxRequestKB);
 		if (Buffer.byteLength(rawJson, "utf-8") <= maxBytes) {
 			return this.#postRawJson(endpoint, rawJson);
 		}

@@ -337,67 +337,51 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: [],
 		},
 		convertToLlm: convertToLlmWithBlockImages,
-		streamFn:
-			process.env.PI_SERVER_MODE === "true"
-				? async (model, context, options) => {
-						const auth = await modelRegistry.getApiKeyAndHeaders(model);
-						if (!auth.ok) {
-							throw new Error(auth.error);
-						}
-						const providerRetrySettings = settingsManager.getProviderRetrySettings();
-						const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-						const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-						const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
-						const websocketConnectTimeoutMs =
-							options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
-						return streamPiServer(model, context, {
-							...options,
-							sessionTree: agentSession
-								? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
-								: undefined,
-							apiKey: auth.apiKey,
-							timeoutMs,
-							websocketConnectTimeoutMs,
-							maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-							maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-							headers: mergeProviderAttributionHeaders(
-								model,
-								settingsManager,
-								options?.sessionId,
-								auth.headers,
-								options?.headers,
-							),
-						});
-					}
-				: async (model, context, options) => {
-						const auth = await modelRegistry.getApiKeyAndHeaders(model);
-						if (!auth.ok) {
-							throw new Error(auth.error);
-						}
-						const providerRetrySettings = settingsManager.getProviderRetrySettings();
-						const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-						// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
-						// Use max int32 to effectively disable the timeout.
-						const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-						const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
-						const websocketConnectTimeoutMs =
-							options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
-						return streamSimple(model, context, {
-							...options,
-							apiKey: auth.apiKey,
-							timeoutMs,
-							websocketConnectTimeoutMs,
-							maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-							maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-							headers: mergeProviderAttributionHeaders(
-								model,
-								settingsManager,
-								options?.sessionId,
-								auth.headers,
-								options?.headers,
-							),
-						});
-					},
+		streamFn: async (model, context, options) => {
+			const auth = await modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) {
+				throw new Error(auth.error);
+			}
+			const env = auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined;
+			const providerRetrySettings = settingsManager.getProviderRetrySettings();
+			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
+			// Use max int32 to effectively disable the timeout.
+			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
+			const websocketConnectTimeoutMs =
+				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+			const streamOptions = {
+				...options,
+				apiKey: auth.apiKey,
+				env,
+				timeoutMs,
+				websocketConnectTimeoutMs,
+				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				headers: mergeProviderAttributionHeaders(
+					model,
+					settingsManager,
+					options?.sessionId,
+					auth.headers,
+					options?.headers,
+				),
+			};
+
+			if (process.env.PI_SERVER_MODE === "true") {
+				return streamPiServer(model, context, {
+					...streamOptions,
+					sessionTree: agentSession
+						? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
+						: undefined,
+					maxRequestKB: settingsManager.getPiServerMaxRequestKB(),
+				});
+			}
+
+			return streamSimple(model, context, {
+				...streamOptions,
+			});
+		},
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {

@@ -8,6 +8,13 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
+import {
+	isOsc11BackgroundColorResponse,
+	parseOsc11BackgroundColor,
+	parseTerminalColorSchemeReport,
+	type RgbColor,
+	type TerminalColorScheme,
+} from "./terminal-colors.ts";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
@@ -82,6 +89,11 @@ export interface Component {
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
+type PendingOsc11BackgroundQuery = {
+	settled: boolean;
+	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
+	timer: NodeJS.Timeout | undefined;
+};
 
 /**
  * Interface for components that can receive focus and display a hardware cursor.
@@ -303,6 +315,10 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private pendingOsc11BackgroundReplies = 0;
+	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
+	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
+	private terminalColorSchemeNotificationsEnabled = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -623,6 +639,9 @@ export class TUI extends Container {
 			() => this.requestRender(),
 		);
 		this.terminal.hideCursor();
+		if (this.terminalColorSchemeNotificationsEnabled) {
+			this.terminal.write("\x1b[?2031h");
+		}
 		this.queryCellSize();
 		this.requestRender();
 	}
@@ -636,6 +655,23 @@ export class TUI extends Container {
 
 	removeInputListener(listener: InputListener): void {
 		this.inputListeners.delete(listener);
+	}
+
+	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void {
+		this.terminalColorSchemeListeners.add(listener);
+		return () => {
+			this.terminalColorSchemeListeners.delete(listener);
+		};
+	}
+
+	setTerminalColorSchemeNotifications(enabled: boolean): void {
+		if (this.terminalColorSchemeNotificationsEnabled === enabled) {
+			return;
+		}
+		this.terminalColorSchemeNotificationsEnabled = enabled;
+		if (!this.stopped) {
+			this.terminal.write(enabled ? "\x1b[?2031h" : "\x1b[?2031l");
+		}
 	}
 
 	private queryCellSize(): void {
@@ -653,6 +689,9 @@ export class TUI extends Container {
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
+		}
+		if (this.terminalColorSchemeNotificationsEnabled) {
+			this.terminal.write("\x1b[?2031l");
 		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
@@ -720,6 +759,13 @@ export class TUI extends Container {
 	}
 
 	private handleInput(data: string): void {
+		if (this.consumeOsc11BackgroundResponse(data)) {
+			return;
+		}
+		if (this.consumeTerminalColorSchemeReport(data)) {
+			return;
+		}
+
 		if (this.inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.inputListeners) {
@@ -786,6 +832,42 @@ export class TUI extends Container {
 			this.focusedComponent.handleInput(data);
 			this.requestRender();
 		}
+	}
+
+	private consumeOsc11BackgroundResponse(data: string): boolean {
+		if (this.pendingOsc11BackgroundReplies <= 0) {
+			return false;
+		}
+
+		if (!isOsc11BackgroundColorResponse(data)) {
+			return false;
+		}
+
+		const rgb = parseOsc11BackgroundColor(data);
+		this.pendingOsc11BackgroundReplies -= 1;
+		const query = this.pendingOsc11BackgroundQueries.shift();
+		if (query && !query.settled) {
+			query.settled = true;
+			if (query.timer) {
+				clearTimeout(query.timer);
+				query.timer = undefined;
+			}
+			query.resolve?.(rgb);
+			query.resolve = undefined;
+		}
+		return true;
+	}
+
+	private consumeTerminalColorSchemeReport(data: string): boolean {
+		const scheme = parseTerminalColorSchemeReport(data);
+		if (!scheme) {
+			return false;
+		}
+
+		for (const listener of this.terminalColorSchemeListeners) {
+			listener(scheme);
+		}
+		return true;
 	}
 
 	private consumeCellSizeResponse(data: string): boolean {
@@ -1208,7 +1290,20 @@ export class TUI extends Container {
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
-				buffer += newLines[i];
+				const line = newLines[i];
+				const isImage = isImageLine(line);
+				const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i) : 1;
+				if (imageReservedRows > 1 && imageReservedRows <= height) {
+					for (let row = 1; row < imageReservedRows; row++) {
+						buffer += "\r\n";
+					}
+					buffer += `\x1b[${imageReservedRows - 1}A`;
+					buffer += line;
+					buffer += `\x1b[${imageReservedRows - 1}B`;
+					i += imageReservedRows - 1;
+					continue;
+				}
+				buffer += line;
 			}
 			buffer += "\x1b[?2026l"; // End synchronized output
 			this.terminal.write(buffer);
@@ -1560,5 +1655,60 @@ export class TUI extends Container {
 		} else {
 			this.terminal.hideCursor();
 		}
+	}
+
+	/**
+	 * Query the terminal's default background color with OSC 11 (`ESC ] 11 ; ? BEL`).
+	 * @param timeoutMs Query timeout in milliseconds.
+	 * @returns Promise containing the parsed RGB color, or undefined if it times out or fails to parse.
+	 */
+	queryTerminalBackgroundColor({ timeoutMs }: { timeoutMs: number }): Promise<RgbColor | undefined> {
+		return new Promise((resolve) => {
+			const query: PendingOsc11BackgroundQuery = {
+				settled: false,
+				resolve,
+				timer: undefined,
+			};
+
+			query.timer = setTimeout(() => {
+				if (query.settled) {
+					return;
+				}
+				query.settled = true;
+				query.timer = undefined;
+				query.resolve?.(undefined);
+				query.resolve = undefined;
+			}, timeoutMs);
+			this.pendingOsc11BackgroundQueries.push(query);
+			this.pendingOsc11BackgroundReplies += 1;
+			this.terminal.write("\x1b]11;?\x07");
+		});
+	}
+
+	/**
+	 * Query the terminal's color-scheme preference with DSR (`CSI ? 996 n`).
+	 * Terminals that support the color palette notification protocol reply with
+	 * `CSI ? 997 ; 1 n` for dark or `CSI ? 997 ; 2 n` for light.
+	 */
+	queryTerminalColorScheme({ timeoutMs }: { timeoutMs: number }): Promise<TerminalColorScheme | undefined> {
+		return new Promise((resolve) => {
+			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
+			let unsubscribe: () => void = () => {};
+			const settle = (scheme: TerminalColorScheme | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (timer) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unsubscribe();
+				resolve(scheme);
+			};
+
+			unsubscribe = this.onTerminalColorSchemeChange(settle);
+			timer = setTimeout(() => settle(undefined), timeoutMs);
+			this.terminal.write("\x1b[?996n");
+		});
 	}
 }

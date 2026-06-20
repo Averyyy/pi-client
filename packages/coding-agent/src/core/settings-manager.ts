@@ -24,6 +24,10 @@ export interface ProviderRetrySettings {
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
 }
 
+export interface PiServerSettings {
+	maxRequestKB?: number; // Client-to-pi-server JSON POST limit before chunking
+}
+
 export interface RetrySettings {
 	enabled?: boolean; // default: true
 	maxRetries?: number; // default: 3
@@ -89,6 +93,7 @@ export interface Settings {
 	compaction?: CompactionSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
+	piServer?: PiServerSettings;
 	hideThinkingBlock?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -117,6 +122,7 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
 }
@@ -713,8 +719,15 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getThemeSetting(): string | undefined {
+		const value = this.settings.theme;
+		if (typeof value === "string") return value;
+		return undefined;
+	}
+
 	getTheme(): string | undefined {
-		return this.settings.theme;
+		const theme = this.getThemeSetting();
+		return theme?.includes("/") ? undefined : theme;
 	}
 
 	setTheme(theme: string): void {
@@ -823,6 +836,17 @@ export class SettingsManager {
 			maxRetries: this.settings.retry?.provider?.maxRetries,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
+	}
+
+	getPiServerMaxRequestKB(): number | undefined {
+		const value = this.settings.piServer?.maxRequestKB;
+		if (value === undefined) {
+			return undefined;
+		}
+		if (!Number.isFinite(value) || value <= 0) {
+			throw new Error("Invalid piServer.maxRequestKB setting: must be a positive number");
+		}
+		return value;
 	}
 
 	getWebSocketConnectTimeoutMs(): number | undefined {

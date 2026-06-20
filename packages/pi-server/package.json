@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-server",
-	"version": "0.79.3",
+	"version": "0.79.9",
 	"description": "Proxy server for pi-client that stores session state and forwards incremental requests to upstream LLM providers",
 	"type": "module",
 	"bin": {

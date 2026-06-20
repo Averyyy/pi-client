@@ -1,6 +1,6 @@
 {
 	"name": "pi-webui",
-	"version": "0.79.3",
+	"version": "0.79.9",
 	"private": true,
 	"description": "Local web UI for inspecting and continuing pi-server sessions",
 	"type": "module",
