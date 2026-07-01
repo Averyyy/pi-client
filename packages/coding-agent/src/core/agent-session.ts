@@ -94,7 +94,7 @@ import type { ModelRegistry } from "./model-registry.ts";
 import {
 	compactPiServer,
 	type PiServerCompactionResult,
-	resetSessionTracking,
+	type PiServerHistorySnapshot,
 	syncPiServerTree,
 } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -158,6 +158,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "history_reconciled"; entryCount: number; messageCount: number }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -399,6 +400,17 @@ export class AgentSession {
 		return this._modelRegistry;
 	}
 
+	reconcilePiServerHistory(snapshot: PiServerHistorySnapshot): void {
+		this.sessionManager.replaceTree(snapshot.entries as unknown as SessionEntry[], snapshot.leafId);
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
+		this._emit({
+			type: "history_reconciled",
+			entryCount: snapshot.entries.length,
+			messageCount: snapshot.messages.length,
+		});
+	}
+
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
@@ -622,7 +634,7 @@ export class AgentSession {
 							tools: this.agent.state.tools,
 						},
 						{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						{ signal },
+						{ signal, onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot) },
 					);
 				}
 			}
@@ -1828,6 +1840,7 @@ export class AgentSession {
 						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 						signal: this._compactionAbortController.signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
+						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
 					},
 				);
 				const result = await this._applyPiServerCompactionResult(piServerResult, "manual", false);
@@ -2137,6 +2150,7 @@ export class AgentSession {
 						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 						signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
+						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
 					},
 				);
 				const result = await this._applyPiServerCompactionResult(piServerResult, reason, willRetry);
@@ -2743,7 +2757,6 @@ export class AgentSession {
 
 		if (isPiServerMode()) {
 			this._detachPiServerTerminalAssistantFailure();
-			resetSessionTracking(this.sessionId);
 		} else {
 			// Remove error message from agent state (keep in session for history)
 			const messages = this.agent.state.messages;
@@ -3113,6 +3126,7 @@ export class AgentSession {
 						tools: this.agent.state.tools,
 					},
 					{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+					{ onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot) },
 				);
 			}
 

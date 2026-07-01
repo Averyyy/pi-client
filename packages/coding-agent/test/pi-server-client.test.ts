@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -267,6 +268,106 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[1].body.entries).toEqual([nextEntry]);
 	});
 
+	it("appends after pi-server init reports a known persisted tree prefix", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		const nextEntry = messageEntry("u2", "a1", textMessage("two", 3000));
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-persisted-prefix",
+							treeHash: hashEntries(entries),
+							leafId: "a1",
+							entryCount: entries.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("persisted-tree-prefix", context, { entries: [...entries, nextEntry], leafId: "u2" });
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/tree/append",
+		]);
+		expect(capturedBodies[1].body.entries).toEqual([nextEntry]);
+	});
+
+	it("reconciles server history instead of full-syncing over a different non-empty server tree", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const serverEntries = baseTree().slice(0, 2);
+		const localEntries = [messageEntry("local-u1", null, textMessage("local one", 1000))];
+		let reconciled: { entries: SessionTreeEntry[]; leafId: string | null } | undefined;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-server",
+							treeHash: hashEntries(serverEntries),
+							leafId: "a1",
+							entryCount: serverEntries.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url.endsWith("/api/session/server-authoritative/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "server-authoritative",
+							treeHash: hashEntries(serverEntries),
+							entryCount: serverEntries.length,
+							leafId: "a1",
+							entries: serverEntries,
+							messages: [textMessage("one", 1000), assistantMessage("first answer", 2000)],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("unexpected request", { status: 500 });
+			}),
+		);
+
+		await expect(
+			syncPiServerTree(
+				"server-authoritative",
+				context,
+				{ entries: localEntries, leafId: "local-u1" },
+				{
+					onHistoryReconciled: (snapshot) => {
+						reconciled = { entries: snapshot.entries, leafId: snapshot.leafId };
+					},
+				},
+			),
+		).rejects.toThrow("pi-server history differed");
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/server-authoritative/history",
+		]);
+		expect(reconciled).toEqual({ entries: serverEntries, leafId: "a1" });
+	});
+
 	it("rebuilds the server tree when incremental append finds missing server state", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
@@ -279,6 +380,13 @@ describe("pi-server-client", () => {
 			vi.fn(async (url: string, init?: RequestInit) => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/tree-rebuild/history")) {
+					return new Response(JSON.stringify({ error: "session not found" }), {
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
 
 				if (url.endsWith("/api/session/tree/append") && rejectNextAppend) {
 					return new Response(JSON.stringify({ error: "parent entry a1 does not exist" }), {
@@ -301,10 +409,113 @@ describe("pi-server-client", () => {
 
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
 			"/api/session/tree/append",
+			"/api/session/tree-rebuild/history",
 			"/api/session/tree/sync",
 		]);
-		expect(capturedBodies[1].body.entries).toEqual([...entries, nextEntry]);
-		expect(capturedBodies[1].body.leafId).toBe("u2");
+		expect(capturedBodies[2].body.entries).toEqual([...entries, nextEntry]);
+		expect(capturedBodies[2].body.leafId).toBe("u2");
+	});
+
+	it("reconciles server history instead of full-syncing after tree switch divergence", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree();
+		const serverEntries = baseTree().slice(0, 2);
+		let rejectSwitch = false;
+		let reconciled: { entries: SessionTreeEntry[]; leafId: string | null } | undefined;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/tree-switch-divergence/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "tree-switch-divergence",
+							treeHash: hashEntries(serverEntries),
+							entryCount: serverEntries.length,
+							leafId: "a1",
+							entries: serverEntries,
+							messages: [textMessage("one", 1000), assistantMessage("first answer", 2000)],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/session/tree/switch") && rejectSwitch) {
+					return new Response(JSON.stringify({ error: "leafId a1 does not exist in session tree" }), {
+						status: 400,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("tree-switch-divergence", context, { entries, leafId: "u2" });
+		capturedBodies.length = 0;
+		rejectSwitch = true;
+
+		await expect(
+			syncPiServerTree(
+				"tree-switch-divergence",
+				context,
+				{ entries, leafId: "a1" },
+				{
+					onHistoryReconciled: (snapshot) => {
+						reconciled = { entries: snapshot.entries, leafId: snapshot.leafId };
+					},
+				},
+			),
+		).rejects.toThrow("pi-server history differed");
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/tree/switch",
+			"/api/session/tree-switch-divergence/history",
+		]);
+		expect(reconciled).toEqual({ entries: serverEntries, leafId: "a1" });
+	});
+
+	it("replaces a temporary full-sync tree with the real session tree", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const temporaryEntry = messageEntry("pending-0", null, textMessage("pending", 1000));
+		const entries = baseTree().slice(0, 2);
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				return new Response(
+					JSON.stringify({
+						sessionId: body.sessionId,
+						leafId: body.leafId,
+						treeHash: hashEntries((body.entries as SessionTreeEntry[] | undefined) ?? []),
+						entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}),
+		);
+
+		await syncPiServerTree("temporary-tree", context, {
+			entries: [temporaryEntry],
+			leafId: temporaryEntry.id,
+			replace: true,
+		});
+		capturedBodies.length = 0;
+
+		await syncPiServerTree("temporary-tree", context, { entries, leafId: "a1" });
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
+		expect(capturedBodies[0].body.entries).toEqual(entries);
 	});
 
 	it("does not mark tree sync successful after an HTML proxy failure", async () => {
@@ -357,6 +568,50 @@ describe("pi-server-client", () => {
 
 		expect(treeSyncAttempts).toBe(2);
 		expect(capturedPaths).toEqual(["/api/session/init", "/api/session/tree/sync", "/api/session/tree/sync"]);
+	});
+
+	it("does not mark tree append successful after a proxy failure", async () => {
+		const capturedRequests: { path: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		const nextEntry = messageEntry("u2", "a1", textMessage("two", 3000));
+		let appendAttempts = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				const path = new URL(url).pathname;
+				capturedRequests.push({ path, body });
+
+				if (path === "/api/session/tree/append") {
+					appendAttempts++;
+					if (appendAttempts === 1) {
+						return new Response("<html>Cloudflare 520</html>", {
+							status: 520,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("append-proxy-failure", context, { entries, leafId: "a1" });
+		await expect(
+			syncPiServerTree("append-proxy-failure", context, { entries: [...entries, nextEntry], leafId: "u2" }),
+		).rejects.toThrow("Session tree append failed");
+		await syncPiServerTree("append-proxy-failure", context, { entries: [...entries, nextEntry], leafId: "u2" });
+
+		const appendRequests = capturedRequests.filter((request) => request.path === "/api/session/tree/append");
+		expect(appendRequests).toHaveLength(2);
+		expect(
+			appendRequests.every((request) => JSON.stringify(request.body.entries) === JSON.stringify([nextEntry])),
+		).toBe(true);
 	});
 
 	it("rejects non-JSON successful tree sync responses before marking sync state", async () => {
@@ -471,6 +726,76 @@ describe("pi-server-client", () => {
 		expect(streamBody).not.toHaveProperty("messages");
 		expect(streamBody).not.toHaveProperty("delta");
 		expect(streamBody).not.toHaveProperty("entries");
+		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
+	});
+
+	it("does not count request chunk upload time against the LLM timeout", async () => {
+		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = [messageEntry("u1", null, textMessage("x".repeat(1024 * 1024), 1000))];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/request/chunk")) {
+					await sleep(5);
+					const index = body.index;
+					const total = body.total;
+					if (typeof index !== "number" || typeof total !== "number") {
+						throw new Error("Expected numeric chunk index and total");
+					}
+					if (index !== total - 1) {
+						return new Response(JSON.stringify({ received: true }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response(JSON.stringify({ sessionId: "chunk-timeout", leafId: "u1", entryCount: 1 }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{ type: "text_start", contentIndex: 0 },
+						{ type: "text_delta", contentIndex: 0, delta: "ok" },
+						{ type: "text_end", contentIndex: 0 },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+						},
+					]);
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 0 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("x".repeat(1024 * 1024), 1000)] },
+			{ sessionId: "chunk-timeout", sessionTree: { entries, leafId: "u1" }, timeoutMs: 1 },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const chunkTargets = capturedBodies
+			.filter((request) => request.url.endsWith("/api/request/chunk"))
+			.map((request) => request.body.target);
+		expect(chunkTargets).toContain("/api/session/tree/sync");
+		const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"))?.body;
+		expect((streamBody?.options as { timeoutMs?: number } | undefined)?.timeoutMs).toBe(1);
 		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
 	});
 
@@ -668,6 +993,68 @@ describe("pi-server-client", () => {
 			"/api/session/compact",
 		]);
 		expect(capturedBodies[1].body.entries).toEqual(entries);
+	});
+
+	it("reconciles server history before compact instead of full-syncing over a different tree", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const serverEntries = baseTree().slice(0, 2);
+		const localEntries = [messageEntry("local-u1", null, textMessage("local one", 1000))];
+		let reconciled: { entries: SessionTreeEntry[]; leafId: string | null } | undefined;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-compact-diverged",
+							treeHash: hashEntries(serverEntries),
+							leafId: "a1",
+							entryCount: serverEntries.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/session/compact-diverged/history")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: "compact-diverged",
+							treeHash: hashEntries(serverEntries),
+							entryCount: serverEntries.length,
+							leafId: "a1",
+							entries: serverEntries,
+							messages: [textMessage("one", 1000), assistantMessage("first answer", 2000)],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				return new Response("unexpected request", { status: 500 });
+			}),
+		);
+
+		await expect(
+			compactPiServer(testModel, context, {
+				sessionId: "compact-diverged",
+				apiKey: "sk-client",
+				sessionTree: { entries: localEntries, leafId: "local-u1" },
+				onHistoryReconciled: (snapshot) => {
+					reconciled = { entries: snapshot.entries, leafId: snapshot.leafId };
+				},
+			}),
+		).rejects.toThrow("pi-server history differed");
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/compact-diverged/history",
+		]);
+		expect(reconciled).toEqual({ entries: serverEntries, leafId: "a1" });
 	});
 
 	it("preserves already compacted branches before server-side compact", async () => {

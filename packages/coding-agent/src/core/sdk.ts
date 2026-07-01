@@ -12,7 +12,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import { findInitialModel } from "./model-resolver.ts";
-import { type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
+import { type PiServerHistorySnapshot, type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -351,10 +351,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+			const activeAgentSession = agentSession;
 			const streamOptions = {
 				...options,
-				sessionTree: agentSession
-					? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
+				sessionTree: activeAgentSession
+					? buildPiServerTreeSnapshot(activeAgentSession.sessionManager, context.messages as Message[])
+					: undefined,
+				onHistoryReconciled: activeAgentSession
+					? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 					: undefined,
 				apiKey: auth.apiKey,
 				env,

@@ -288,7 +288,7 @@ describe("AgentSession pi-server sync", () => {
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
 			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual([
 				"/api/session/tree/sync",
-				"/api/session/tree/sync",
+				"/api/session/tree/append",
 				"/api/session/tree/append",
 			]);
 			expect(streamCount).toBe(2);
