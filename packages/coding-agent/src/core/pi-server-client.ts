@@ -33,12 +33,11 @@ function getAuthToken(): string {
 	return process.env.PI_SERVER_AUTH_TOKEN ?? "";
 }
 
-function createPiServerRequest(options?: { signal?: AbortSignal; maxRequestKB?: number }): ChunkRequest {
+function createPiServerRequest(signal?: AbortSignal): ChunkRequest {
 	return new ChunkRequest({
 		serverUrl: getServerUrl(),
 		authToken: getAuthToken(),
-		signal: options?.signal,
-		maxRequestKB: options?.maxRequestKB,
+		signal,
 	});
 }
 
@@ -194,7 +193,6 @@ export interface PiServerTreeSnapshot {
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
 	sessionTree?: PiServerTreeSnapshot;
-	maxRequestKB?: number;
 }
 
 async function ensureSessionInit(
@@ -325,9 +323,9 @@ export async function syncPiServerTree(
 	sessionId: string,
 	context: Context,
 	tree: PiServerTreeSnapshot,
-	options?: { signal?: AbortSignal; maxRequestKB?: number },
+	options?: { signal?: AbortSignal },
 ): Promise<void> {
-	const request = createPiServerRequest(options);
+	const request = createPiServerRequest(options?.signal);
 	await ensureSessionInit(sessionId, context, request);
 	await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 }
@@ -405,7 +403,6 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 		sessionId: options?.sessionId,
 		apiKey: options?.apiKey,
 		headers: options?.headers,
-		env: options?.env,
 		metadata: options?.metadata,
 		transport: options?.transport,
 		thinkingBudgets: options?.thinkingBudgets,
@@ -420,7 +417,6 @@ export interface PiServerCompactOptions extends SimpleStreamOptions {
 	customInstructions?: string;
 	settings?: unknown;
 	sessionTree?: PiServerTreeSnapshot;
-	maxRequestKB?: number;
 }
 
 export async function compactPiServer(
@@ -429,7 +425,7 @@ export async function compactPiServer(
 	options?: PiServerCompactOptions,
 ): Promise<CompactResult> {
 	const sessionId = options?.sessionId ?? "default";
-	const request = createPiServerRequest({ signal: options?.signal, maxRequestKB: options?.maxRequestKB });
+	const request = createPiServerRequest(options?.signal);
 
 	await ensureSessionInit(sessionId, context, request);
 	const tree = compactTreeForPiServerSync(
@@ -507,7 +503,7 @@ export async function streamPiServer(
 
 	(async () => {
 		try {
-			const request = createPiServerRequest({ signal: options?.signal, maxRequestKB: options?.maxRequestKB });
+			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
 			const tree = options?.sessionTree ?? {
 				...getLinearTreeFromMessages(context.messages as Message[]),

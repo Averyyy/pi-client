@@ -15,7 +15,7 @@ PI_SERVER_AUTH_TOKEN="你的 token" ./docs/pi-client-one-click.sh
 - 安装目录：`~/pi-client`
 - Node：`22.19.0`
 - pi-server：`https://pi.yreva.asia`
-- 单次 client 到 server 请求上限：`PI_CLIENT_MAX_REQUEST_KB=64`
+- 单次 client 到 server 请求上限：`PI_CLIENT_MAX_REQUEST_KB=512`
 
 脚本不会保存 auth token。每次运行时通过环境变量传入：
 
@@ -31,20 +31,8 @@ PI_CLIENT_REPO_DIR="$HOME/pi-client"
 PI_CLIENT_NODE_VERSION="22.19.0"
 PI_SERVER_URL="https://pi.yreva.asia"
 PI_SERVER_AUTH_TOKEN="你的 token"
-PI_CLIENT_MAX_REQUEST_KB=64
+PI_CLIENT_MAX_REQUEST_KB=512
 ```
-
-也可以写入 `~/.pi/agent/settings.json`，这样普通启动 `pi-client` 时不需要每次带环境变量：
-
-```json
-{
-  "piServer": {
-    "maxRequestKB": 64
-  }
-}
-```
-
-如果同时设置了环境变量和 `settings.json`，`PI_CLIENT_MAX_REQUEST_KB` 优先。
 
 ## 脚本实际执行的步骤
 
@@ -77,7 +65,7 @@ cd pi-client-smoke
 npm install --ignore-scripts
 npm run build
 npm run install:pi-client
-PI_SERVER_URL="https://pi.yreva.asia" PI_SERVER_AUTH_TOKEN="***" PI_CLIENT_MAX_REQUEST_KB=64 pi-client -p "Reply exactly: pi-client-smoke-ok"
+PI_SERVER_URL="https://pi.yreva.asia" PI_SERVER_AUTH_TOKEN="***" PI_CLIENT_MAX_REQUEST_KB=512 pi-client -p "Reply exactly: pi-client-smoke-ok"
 ```
 
 结果：

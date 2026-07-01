@@ -11,11 +11,13 @@ import {
 import {
 	type AssistantMessageEvent,
 	type Context,
+	createModels,
+	createProvider,
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
-	streamSimple,
 } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
@@ -82,6 +84,28 @@ interface SessionCompactBody {
 	options?: SimpleStreamOptions;
 	settings?: CompactionSettings;
 	customInstructions?: string;
+}
+
+function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
+	const models = createModels();
+	models.setProvider(
+		createProvider({
+			id: model.provider,
+			name: model.provider,
+			models: [model],
+			auth: {
+				apiKey: {
+					name: "pi-server request auth",
+					resolve: async () => ({ auth: { apiKey: options.apiKey, headers: options.headers } }),
+				},
+			},
+			api: {
+				stream: (requestModel, context, streamOptions) => streamSimple(requestModel, context, streamOptions),
+				streamSimple: (requestModel, context, streamOptions) => streamSimple(requestModel, context, streamOptions),
+			},
+		}),
+	);
+	return models;
 }
 
 interface SessionIdBody {
@@ -290,9 +314,8 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 	const options = body.options ?? {};
 	const result = await compact(
 		preparationResult.value,
+		createRequestModels(body.model, options),
 		body.model,
-		options.apiKey ?? "",
-		options.headers,
 		body.customInstructions,
 		undefined,
 		options.reasoning,

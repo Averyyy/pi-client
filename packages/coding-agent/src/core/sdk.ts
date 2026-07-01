@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type SessionTreeEntry, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
@@ -353,6 +353,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const streamOptions = {
 				...options,
+				sessionTree: agentSession
+					? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
+					: undefined,
 				apiKey: auth.apiKey,
 				env,
 				timeoutMs,
@@ -367,20 +370,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					options?.headers,
 				),
 			};
-
 			if (process.env.PI_SERVER_MODE === "true") {
-				return streamPiServer(model, context, {
-					...streamOptions,
-					sessionTree: agentSession
-						? buildPiServerTreeSnapshot(agentSession.sessionManager, context.messages as Message[])
-						: undefined,
-					maxRequestKB: settingsManager.getPiServerMaxRequestKB(),
-				});
+				return streamPiServer(model, context, streamOptions);
 			}
-
-			return streamSimple(model, context, {
-				...streamOptions,
-			});
+			return streamSimple(model, context, streamOptions);
 		},
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;

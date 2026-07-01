@@ -1,11 +1,11 @@
 {
 	"name": "pi-client",
-	"version": "0.79.9",
+	"version": "0.80.3",
 	"description": "Lightweight CLI wrapper that connects to a pi-server instance",
 	"type": "module",
 	"piClient": {
-		"basePiVersion": "0.79.9",
-		"basePiCommit": "d93b92ba"
+		"basePiVersion": "0.80.3",
+		"basePiCommit": "85b7c247"
 	},
 	"bin": {
 		"pi-client": "./bin/pi-client.js"
@@ -25,7 +25,7 @@
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
-		"vitest": "3.2.4"
+		"vitest": "4.1.9"
 	},
 	"keywords": [
 		"pi-client",

@@ -38,6 +38,6 @@ npm run build
 npm run install:pi-client
 
 export PI_SERVER_URL="$server_url"
-export PI_CLIENT_MAX_REQUEST_KB="${PI_CLIENT_MAX_REQUEST_KB:-64}"
+export PI_CLIENT_MAX_REQUEST_KB="${PI_CLIENT_MAX_REQUEST_KB:-512}"
 
 exec pi-client "$@"

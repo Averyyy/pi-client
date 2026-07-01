@@ -11,8 +11,8 @@ describe("pi-client update", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 
 		expect(pkg.piClient).toEqual({
-			basePiVersion: "0.79.9",
-			basePiCommit: "d93b92ba",
+			basePiVersion: "0.80.3",
+			basePiCommit: "85b7c247",
 		});
 	});
 
@@ -41,8 +41,8 @@ describe("pi-client update", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(output.join("")).toContain("based on pi 0.79.9");
-		expect(output.join("")).toContain("upstream d93b92ba");
+		expect(output.join("")).toContain("based on pi 0.80.3");
+		expect(output.join("")).toContain("upstream 85b7c247");
 		expect(calls).toEqual([
 			{ command: "git", args: ["status", "--porcelain"], cwd: "/repo/pi-client", stdio: "pipe" },
 			{ command: "git", args: ["pull", "--ff-only"], cwd: "/repo/pi-client", stdio: "inherit" },

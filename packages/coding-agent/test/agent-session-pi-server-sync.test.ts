@@ -1,13 +1,13 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@earendil-works/pi-ai";
+import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createHarness } from "./test-harness.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
@@ -725,236 +725,6 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("uses settings piServer.maxRequestKB for every pi-server request when env is unset", async () => {
-		const tempDir = join(tmpdir(), `pi-settings-request-limit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		const cwd = join(tempDir, "project");
-		const agentDir = join(tempDir, "agent");
-		mkdirSync(cwd, { recursive: true });
-		mkdirSync(agentDir, { recursive: true });
-		const model = getModel("anthropic", "claude-sonnet-4-5");
-		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
-		const sessionManager = SessionManager.inMemory(cwd);
-		sessionManager.appendMessage({
-			role: "user",
-			content: "legacy question",
-			timestamp: 1000,
-		});
-
-		const requestLimitSettings = JSON.parse('{"piServer":{"maxRequestKB":2}}') as Partial<Settings>;
-		const settingsManager = SettingsManager.inMemory(requestLimitSettings);
-		const maxBytes = 2 * 1024;
-		const capturedRequests: { url: string; bodyBytes: number; body: Record<string, unknown> }[] = [];
-
-		try {
-			process.env.PI_SERVER_MODE = "true";
-			vi.stubGlobal(
-				"fetch",
-				vi.fn(async (url: string, init?: RequestInit) => {
-					const rawBody = (init?.body as string | undefined) ?? "";
-					const body = parseJsonObject(rawBody);
-					capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
-
-					if (url.endsWith("/api/request/chunk")) {
-						const index = body.index;
-						const total = body.total;
-						if (typeof index !== "number" || typeof total !== "number") {
-							throw new Error("Expected numeric chunk index and total");
-						}
-						if (index !== total - 1) {
-							return new Response(JSON.stringify({ received: true }), {
-								status: 200,
-								headers: { "Content-Type": "application/json" },
-							});
-						}
-					}
-
-					if (url.endsWith("/api/stream")) {
-						return new Response(
-							[
-								'data: {"type":"start"}\n\n',
-								'data: {"type":"text_start","contentIndex":0}\n\n',
-								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
-								'data: {"type":"text_end","contentIndex":0}\n\n',
-								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
-							].join(""),
-							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
-						);
-					}
-
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							leafId: body.leafId,
-							staticContextHash: "hash-settings-limit",
-							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}),
-			);
-
-			const { session } = await createAgentSession({
-				cwd,
-				agentDir,
-				model: model!,
-				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
-				sessionManager,
-				settingsManager,
-				resourceLoader: createTestResourceLoader(),
-			});
-			try {
-				await session.prompt("fresh question");
-				await session.agent.waitForIdle();
-			} finally {
-				session.dispose();
-			}
-
-			expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
-			const chunkTargets = capturedRequests
-				.filter((request) => request.url.endsWith("/api/request/chunk"))
-				.map((request) => request.body.target);
-			expect(chunkTargets).toContain("/api/session/tree/sync");
-			expect(capturedRequests.some((request) => request.url.endsWith("/api/session/tree/sync"))).toBe(false);
-		} finally {
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
-		}
-	});
-
-	it("chunks large read tool-result appends with the default pi-server request limit", async () => {
-		const tempDir = join(tmpdir(), `pi-read-append-limit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		const cwd = join(tempDir, "project");
-		const agentDir = join(tempDir, "agent");
-		mkdirSync(cwd, { recursive: true });
-		mkdirSync(agentDir, { recursive: true });
-		writeFileSync(
-			join(cwd, "large.txt"),
-			Array.from({ length: 4000 }, (_, index) => `line ${index} ${"x".repeat(80)}`).join("\n"),
-		);
-
-		const model = getModel("anthropic", "claude-sonnet-4-5");
-		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
-		const proxyLimitBytes = 64 * 1024;
-		const capturedRequests: { url: string; bodyBytes: number; body: Record<string, unknown> }[] = [];
-		let streamCount = 0;
-
-		try {
-			process.env.PI_SERVER_MODE = "true";
-			vi.stubGlobal(
-				"fetch",
-				vi.fn(async (url: string, init?: RequestInit) => {
-					const rawBody = (init?.body as string | undefined) ?? "";
-					const bodyBytes = Buffer.byteLength(rawBody, "utf-8");
-					const body = parseJsonObject(rawBody);
-					capturedRequests.push({ url, bodyBytes, body });
-
-					if (bodyBytes > proxyLimitBytes) {
-						return new Response(
-							JSON.stringify({ error: `upload limit ${proxyLimitBytes} exceeded by ${bodyBytes}` }),
-							{
-								status: 413,
-								headers: { "Content-Type": "application/json" },
-							},
-						);
-					}
-
-					if (url.endsWith("/api/request/chunk")) {
-						const index = body.index;
-						const total = body.total;
-						if (typeof index !== "number" || typeof total !== "number") {
-							throw new Error("Expected numeric chunk index and total");
-						}
-						if (index !== total - 1) {
-							return new Response(JSON.stringify({ received: true }), {
-								status: 200,
-								headers: { "Content-Type": "application/json" },
-							});
-						}
-					}
-
-					if (url.endsWith("/api/stream")) {
-						streamCount++;
-						if (streamCount === 1) {
-							return new Response(
-								[
-									'data: {"type":"start"}\n\n',
-									'data: {"type":"toolcall_start","contentIndex":0,"id":"tool-read-large","toolName":"read"}\n\n',
-									'data: {"type":"toolcall_delta","contentIndex":0,"delta":"{\\"path\\":\\"large.txt\\"}"}\n\n',
-									'data: {"type":"toolcall_end","contentIndex":0}\n\n',
-									'data: {"type":"done","reason":"toolUse","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
-								].join(""),
-								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
-							);
-						}
-
-						return new Response(
-							[
-								'data: {"type":"start"}\n\n',
-								'data: {"type":"text_start","contentIndex":0}\n\n',
-								'data: {"type":"text_delta","contentIndex":0,"delta":"done"}\n\n',
-								'data: {"type":"text_end","contentIndex":0}\n\n',
-								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
-							].join(""),
-							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
-						);
-					}
-
-					return new Response(
-						JSON.stringify({
-							sessionId: body.sessionId,
-							leafId: body.leafId,
-							staticContextHash: "hash-read-append",
-							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}),
-			);
-
-			const { session } = await createAgentSession({
-				cwd,
-				agentDir,
-				model: model!,
-				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
-				sessionManager: SessionManager.inMemory(cwd),
-				resourceLoader: createTestResourceLoader(),
-			});
-			try {
-				await session.prompt("read the large file");
-				await session.agent.waitForIdle();
-			} finally {
-				session.dispose();
-			}
-
-			expect(capturedRequests.every((request) => request.bodyBytes <= proxyLimitBytes)).toBe(true);
-			const chunkTargets = capturedRequests
-				.filter((request) => request.url.endsWith("/api/request/chunk"))
-				.map((request) => request.body.target);
-			expect(chunkTargets).toContain("/api/session/tree/append");
-			expect(
-				capturedRequests.some(
-					(request) => request.url.endsWith("/api/session/tree/append") && request.bodyBytes > proxyLimitBytes,
-				),
-			).toBe(false);
-			expect(streamCount).toBe(2);
-		} finally {
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
-		}
-	});
-
 	it("does not retry or resync after aborting a pi-server stream", async () => {
 		const tempDir = join(tmpdir(), `pi-stream-abort-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
@@ -1040,6 +810,81 @@ describe("AgentSession pi-server sync", () => {
 			const leaf = sessionManager.getLeafEntry();
 			expect(leaf?.type).toBe("message");
 			expect(leaf?.type === "message" ? leaf.message.role : undefined).toBe("user");
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("passes the active abort signal to post-stream pi-server tree sync", async () => {
+		const tempDir = join(tmpdir(), `pi-post-stream-sync-signal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const treeSignals: Array<AbortSignal | null> = [];
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					if (url.includes("/api/session/tree/")) {
+						treeSignals.push(init?.signal ?? null);
+					}
+
+					if (url.endsWith("/api/stream")) {
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-post-stream",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("hello");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(treeSignals.length).toBeGreaterThanOrEqual(2);
+			expect(treeSignals.every((signal) => signal instanceof AbortSignal)).toBe(true);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
