@@ -1,13 +1,17 @@
+import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	appendAssistantResponse,
+	appendCompactionEntry,
 	appendMessages,
+	appendSessionEntries,
 	clearAllSessions,
 	deleteSession,
 	dropLastAssistantError,
 	getActiveMessages,
 	getOrCreateSession,
 	getSession,
+	getSessionBranch,
 	replaceMessages,
 	replaceSessionTree,
 	type SessionStaticContext,
@@ -154,6 +158,109 @@ describe("session-store", () => {
 			"one",
 			[{ type: "text", text: "first answer" }],
 		]);
+	});
+
+	it("treats matching duplicate tree append entries as idempotent", () => {
+		const entries: SessionTreeEntry[] = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "one", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "two", timestamp: 2000 },
+			},
+		];
+
+		appendSessionEntries("tree-append-idempotent", [entries[0]], "u1");
+		const appended = appendSessionEntries("tree-append-idempotent", entries, "u2");
+		expect(appended.entries.map((entry) => entry.id)).toEqual(["u1", "u2"]);
+		expect(appended.messages.map((message) => message.content)).toEqual(["one", "two"]);
+		const revision = appended.revision;
+
+		const retried = appendSessionEntries("tree-append-idempotent", entries, "u2");
+		expect(retried.entries.map((entry) => entry.id)).toEqual(["u1", "u2"]);
+		expect(retried.revision).toBe(revision);
+	});
+
+	it("rejects duplicate tree append entries when the entry body diverges", () => {
+		const entry: SessionTreeEntry = {
+			type: "message",
+			id: "u1",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: { role: "user", content: "one", timestamp: 1000 },
+		};
+		appendSessionEntries("tree-append-divergent", [entry], "u1");
+
+		expect(() =>
+			appendSessionEntries(
+				"tree-append-divergent",
+				[{ ...entry, message: { role: "user", content: "changed", timestamp: 1000 } }],
+				"u1",
+			),
+		).toThrow("entry u1 already exists");
+		expect(getSession("tree-append-divergent")?.messages.map((message) => message.content)).toEqual(["one"]);
+	});
+
+	it("appends compaction on the active branch without deleting sibling history", () => {
+		const entries: SessionTreeEntry[] = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "one", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "a1",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "old answer" }],
+					api: "openai-completions",
+					provider: "opencode-go",
+					model: "glm-5.1",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "length",
+					timestamp: 2000,
+				},
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				message: { role: "user", content: "two", timestamp: 3000 },
+			},
+		];
+		replaceSessionTree("tree-compact-branch", entries, "u2");
+
+		const { session, entry } = appendCompactionEntry("tree-compact-branch", {
+			summary: "summary",
+			firstKeptEntryId: "u2",
+			tokensBefore: 100,
+		});
+
+		expect(session.entries.map((storedEntry) => storedEntry.id)).toEqual(["u1", "a1", "u2", entry.id]);
+		expect(session.leafId).toBe(entry.id);
+		expect(getSessionBranch(session).map((branchEntry) => branchEntry.id)).toEqual(["u1", "u2", entry.id]);
+		expect(getActiveMessages("tree-compact-branch").some((message) => message.role === "assistant")).toBe(false);
 	});
 
 	it("appends assistant response", () => {

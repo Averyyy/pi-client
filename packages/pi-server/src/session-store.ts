@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { buildSessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
 
@@ -148,14 +149,24 @@ function entryToMessageEntry(message: Message, parentId: string | null): Session
 	};
 }
 
-function deriveActiveMessages(session: SessionState): Message[] {
+export function getSessionBranch(session: SessionState): SessionTreeEntry[] {
 	const byId = new Map(session.entries.map((entry) => [entry.id, entry]));
 	const branch: SessionTreeEntry[] = [];
 	let current = session.leafId ? byId.get(session.leafId) : undefined;
+	const seen = new Set<string>();
 	while (current) {
+		if (seen.has(current.id)) {
+			throw new Error(`session tree contains a parent cycle at entry ${current.id}`);
+		}
+		seen.add(current.id);
 		branch.unshift(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	return branch;
+}
+
+function deriveActiveMessages(session: SessionState): Message[] {
+	const branch = getSessionBranch(session);
 	return convertToLlm(buildSessionContext(branch).messages);
 }
 
@@ -191,17 +202,30 @@ export function appendSessionEntries(
 	leafId: string | null,
 ): SessionState {
 	const session = getOrCreateSession(sessionId);
-	const knownIds = new Set(session.entries.map((entry) => entry.id));
+	const knownEntries = new Map(session.entries.map((entry) => [entry.id, entry]));
+	const entriesToAppend: SessionTreeEntry[] = [];
 	for (const entry of entries) {
-		if (knownIds.has(entry.id)) {
-			throw new Error(`entry ${entry.id} already exists`);
+		const knownEntry = knownEntries.get(entry.id);
+		if (knownEntry) {
+			if (!isDeepStrictEqual(knownEntry, entry)) {
+				throw new Error(`entry ${entry.id} already exists`);
+			}
+			continue;
 		}
-		if (entry.parentId !== null && !knownIds.has(entry.parentId)) {
+		if (entry.parentId !== null && !knownEntries.has(entry.parentId)) {
 			throw new Error(`parent entry ${entry.parentId} does not exist`);
 		}
-		knownIds.add(entry.id);
+		const entryToAppend = { ...entry };
+		entriesToAppend.push(entryToAppend);
+		knownEntries.set(entryToAppend.id, entryToAppend);
 	}
-	session.entries.push(...entries.map((entry) => ({ ...entry })));
+	if (leafId !== null && !knownEntries.has(leafId)) {
+		throw new Error(`leafId ${leafId} does not exist in session tree`);
+	}
+	if (entriesToAppend.length === 0 && session.leafId === leafId) {
+		return session;
+	}
+	session.entries.push(...entriesToAppend);
 	assertValidLeaf(session.entries, leafId);
 	session.leafId = leafId;
 	session.revision++;
@@ -218,6 +242,29 @@ export function switchSessionLeaf(sessionId: string, leafId: string | null): Ses
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	return session;
+}
+
+export function appendCompactionEntry(
+	sessionId: string,
+	compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown },
+): { session: SessionState; entry: SessionTreeEntry } {
+	const session = getOrCreateSession(sessionId);
+	const entry: SessionTreeEntry = {
+		type: "compaction",
+		id: randomUUID(),
+		parentId: session.leafId,
+		timestamp: new Date().toISOString(),
+		summary: compaction.summary,
+		firstKeptEntryId: compaction.firstKeptEntryId,
+		tokensBefore: compaction.tokensBefore,
+		details: compaction.details,
+	};
+	session.entries.push(entry);
+	session.leafId = entry.id;
+	session.revision++;
+	session.updatedAt = Date.now();
+	refreshActiveMessages(session);
+	return { session, entry };
 }
 
 export function getActiveMessages(sessionId: string): Message[] {

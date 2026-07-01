@@ -26,10 +26,10 @@ function sessionPath(sessionStoreDir: string, sessionId: string): string {
 	return join(sessionStoreDir, sessionFileName(sessionId));
 }
 
-function isRetryableReplaceError(error: unknown): boolean {
+function isRetryableRenameError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const code = (error as NodeJS.ErrnoException).code;
-	return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+	return process.platform === "win32" && code === "EPERM";
 }
 
 function sleepSync(ms: number): void {
@@ -37,30 +37,17 @@ function sleepSync(ms: number): void {
 }
 
 function replaceFileSync(sourcePath: string, targetPath: string): void {
-	let lastError: unknown;
 	for (let attempt = 0; attempt <= REPLACE_RETRY_DELAYS_MS.length; attempt++) {
 		try {
 			renameSync(sourcePath, targetPath);
 			return;
 		} catch (error) {
-			lastError = error;
-			if (!isRetryableReplaceError(error)) {
+			if (!isRetryableRenameError(error) || attempt === REPLACE_RETRY_DELAYS_MS.length) {
 				throw error;
 			}
-			try {
-				rmSync(targetPath, { force: true });
-				renameSync(sourcePath, targetPath);
-				return;
-			} catch (replaceError) {
-				lastError = replaceError;
-				if (!isRetryableReplaceError(replaceError) || attempt === REPLACE_RETRY_DELAYS_MS.length) {
-					throw replaceError;
-				}
-				sleepSync(REPLACE_RETRY_DELAYS_MS[attempt]);
-			}
+			sleepSync(REPLACE_RETRY_DELAYS_MS[attempt]);
 		}
 	}
-	throw lastError;
 }
 
 function assertRecord(value: unknown, path: string): asserts value is Record<string, unknown> {

@@ -91,10 +91,21 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
-import { compactPiServer, resetSessionTracking, syncPiServerTree } from "./pi-server-client.ts";
+import {
+	compactPiServer,
+	type PiServerCompactionResult,
+	resetSessionTracking,
+	syncPiServerTree,
+} from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager, SessionMessageEntry } from "./session-manager.ts";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionEntry,
+	SessionManager,
+	SessionMessageEntry,
+} from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -587,13 +598,13 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
+				if (!this._isTerminalAssistantFailure(assistantMsg)) {
 					this._overflowRecoveryAttempted = false;
 				}
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				if (!this._isTerminalAssistantFailure(assistantMsg) && this._retryAttempt > 0) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
@@ -602,7 +613,7 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 
-				if (isPiServerMode() && assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+				if (isPiServerMode() && !this._isTerminalAssistantFailure(assistantMsg)) {
 					await syncPiServerTree(
 						this.sessionId,
 						{
@@ -654,7 +665,11 @@ export class AgentSession {
 		return undefined;
 	}
 
-	private _detachPiServerTerminalAssistantFailure(): void {
+	private _isTerminalAssistantFailure(message: AssistantMessage): boolean {
+		return message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length";
+	}
+
+	private _detachTerminalAssistantFailure(): void {
 		const branch = this.sessionManager.getBranch();
 		let terminalMessageEntry: SessionMessageEntry | undefined;
 		for (let index = branch.length - 1; index >= 0; index--) {
@@ -669,7 +684,7 @@ export class AgentSession {
 		}
 
 		const assistant = terminalMessageEntry.message as AssistantMessage;
-		if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+		if (!this._isTerminalAssistantFailure(assistant)) {
 			return;
 		}
 
@@ -681,6 +696,10 @@ export class AgentSession {
 
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
+	}
+
+	private _detachPiServerTerminalAssistantFailure(): void {
+		this._detachTerminalAssistantFailure();
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1071,7 +1090,7 @@ export class AgentSession {
 			return true;
 		}
 
-		if (isPiServerMode() && (msg.stopReason === "error" || msg.stopReason === "aborted")) {
+		if (isPiServerMode() && this._isTerminalAssistantFailure(msg)) {
 			this._detachPiServerTerminalAssistantFailure();
 		}
 
@@ -1744,24 +1763,21 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _applyPiServerCompactionResult(
-		result: CompactionResult,
+		result: PiServerCompactionResult,
 		reason: "manual" | "threshold" | "overflow",
 		willRetry: boolean,
-	): Promise<void> {
-		this.sessionManager.appendCompaction(
-			result.summary,
-			result.firstKeptEntryId,
-			result.tokensBefore,
-			result.details,
-			false,
-		);
-		const newEntries = this.sessionManager.getEntries();
+	): Promise<CompactionResult> {
+		this.sessionManager.replaceTree(result.entries as unknown as SessionEntry[], result.leafId);
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
+		const compactionResult: CompactionResult = {
+			...result.compaction,
+			estimatedTokensAfter: estimateMessagesTokens(sessionContext.messages),
+		};
 
-		const savedCompactionEntry = newEntries.find(
-			(entry) => entry.type === "compaction" && entry.summary === result.summary,
-		) as CompactionEntry | undefined;
+		const savedCompactionEntry = this.sessionManager.getEntry(result.compactionEntry.id) as
+			| CompactionEntry
+			| undefined;
 
 		if (this._extensionRunner && savedCompactionEntry) {
 			await this._extensionRunner.emit({
@@ -1773,15 +1789,7 @@ export class AgentSession {
 			});
 		}
 
-		await syncPiServerTree(
-			this.sessionId,
-			{
-				systemPrompt: this.systemPrompt,
-				messages: this.agent.state.messages as Message[],
-				tools: this.agent.state.tools,
-			},
-			{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-		);
+		return compactionResult;
 	}
 
 	/**
@@ -1803,7 +1811,8 @@ export class AgentSession {
 			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
 
 			if (isPiServerMode()) {
-				const result = await compactPiServer(
+				this._detachPiServerTerminalAssistantFailure();
+				const piServerResult = await compactPiServer(
 					this.model,
 					{
 						systemPrompt: this.systemPrompt,
@@ -1821,7 +1830,7 @@ export class AgentSession {
 						reasoning: toProviderReasoning(this.thinkingLevel),
 					},
 				);
-				await this._applyPiServerCompactionResult(result, "manual", false);
+				const result = await this._applyPiServerCompactionResult(piServerResult, "manual", false);
 				this._lastServerCompactionTimestamp = Date.now();
 				this._emit({
 					type: "compaction_end",
@@ -2039,9 +2048,13 @@ export class AgentSession {
 			this._overflowRecoveryAttempted = true;
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
-			const messages = this.agent.state.messages;
-			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.state.messages = messages.slice(0, -1);
+			if (this._isTerminalAssistantFailure(assistantMessage)) {
+				this._detachTerminalAssistantFailure();
+			} else {
+				const messages = this.agent.state.messages;
+				if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+					this.agent.state.messages = messages.slice(0, -1);
+				}
 			}
 			return await this._runAutoCompaction("overflow", willRetry);
 		}
@@ -2109,7 +2122,7 @@ export class AgentSession {
 				this._autoCompactionAbortController = new AbortController();
 				started = true;
 				const signal = this._autoCompactionAbortController.signal;
-				const result = await compactPiServer(
+				const piServerResult = await compactPiServer(
 					this.model,
 					{
 						systemPrompt: this.systemPrompt,
@@ -2126,7 +2139,7 @@ export class AgentSession {
 						reasoning: toProviderReasoning(this.thinkingLevel),
 					},
 				);
-				await this._applyPiServerCompactionResult(result, reason, willRetry);
+				const result = await this._applyPiServerCompactionResult(piServerResult, reason, willRetry);
 				this._lastServerCompactionTimestamp = Date.now();
 				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 				return willRetry ? true : this.agent.hasQueuedMessages();

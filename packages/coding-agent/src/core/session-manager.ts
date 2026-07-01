@@ -991,6 +991,34 @@ export class SessionManager {
 		this.flushed = this.persist;
 	}
 
+	replaceTree(entries: SessionEntry[], leafId: string | null): void {
+		const header = this.fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) {
+			throw new Error("Session header is missing");
+		}
+		const ids = new Set<string>();
+		for (const entry of entries) {
+			if (ids.has(entry.id)) {
+				throw new Error(`Duplicate session entry id ${entry.id}`);
+			}
+			ids.add(entry.id);
+		}
+		for (const entry of entries) {
+			if (entry.parentId !== null && !ids.has(entry.parentId)) {
+				throw new Error(`Parent entry ${entry.parentId} does not exist`);
+			}
+		}
+		if (leafId !== null && !ids.has(leafId)) {
+			throw new Error(`Leaf entry ${leafId} does not exist`);
+		}
+
+		this.fileEntries = [header, ...entries.map((entry) => ({ ...entry }))];
+		this._buildIndex();
+		this.leafId = leafId;
+		this._rewriteFile();
+		this.flushed = this.persist;
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {

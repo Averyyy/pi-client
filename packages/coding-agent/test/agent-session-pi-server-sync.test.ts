@@ -891,4 +891,173 @@ describe("AgentSession pi-server sync", () => {
 			}
 		}
 	});
+
+	it("compacts pi-server length overflow without keeping the length assistant on the active branch", async () => {
+		const tempDir = join(tmpdir(), `pi-length-overflow-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const baseModel = getModel("anthropic", "claude-sonnet-4-5");
+		expect(baseModel).toBeDefined();
+		const model = { ...baseModel!, contextWindow: 100, maxTokens: 20 };
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ compaction: { enabled: true, reserveTokens: 20, keepRecentTokens: 1 } });
+		let streamCount = 0;
+		let serverEntries: Array<Record<string, unknown>> = [];
+		let serverLeafId: string | null = null;
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						if (streamCount === 1) {
+							return new Response(
+								[
+									'data: {"type":"start"}\n\n',
+									'data: {"type":"text_start","contentIndex":0}\n\n',
+									'data: {"type":"text_delta","contentIndex":0,"delta":"first ok"}\n\n',
+									'data: {"type":"text_end","contentIndex":0}\n\n',
+									'data: {"type":"done","reason":"stop","usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":11}}\n\n',
+								].join(""),
+								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+							);
+						}
+						if (streamCount === 2) {
+							return new Response(
+								'data: {"type":"done","reason":"length","usage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100}}\n\n',
+								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+							);
+						}
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":20,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":21}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					if (url.endsWith("/api/session/tree/sync")) {
+						serverEntries = [...((body.entries as Array<Record<string, unknown>> | undefined) ?? [])];
+						serverLeafId = (body.leafId as string | null | undefined) ?? null;
+					} else if (url.endsWith("/api/session/tree/append")) {
+						const existingIds = new Set(serverEntries.map((entry) => entry.id));
+						for (const entry of (body.entries as Array<Record<string, unknown>> | undefined) ?? []) {
+							if (!existingIds.has(entry.id)) {
+								serverEntries.push(entry);
+								existingIds.add(entry.id);
+							}
+						}
+						serverLeafId = (body.leafId as string | null | undefined) ?? null;
+					} else if (url.endsWith("/api/session/tree/switch")) {
+						serverLeafId = (body.leafId as string | null | undefined) ?? null;
+					} else if (url.endsWith("/api/session/compact")) {
+						const compactionEntry = {
+							type: "compaction",
+							id: "server-compact-1",
+							parentId: serverLeafId,
+							timestamp: "2026-01-01T00:00:00.000Z",
+							summary: "server summary",
+							firstKeptEntryId: serverLeafId,
+							tokensBefore: 100,
+						};
+						serverEntries = [...serverEntries, compactionEntry];
+						serverLeafId = compactionEntry.id;
+						return new Response(
+							JSON.stringify({
+								success: true,
+								compaction: {
+									summary: compactionEntry.summary,
+									firstKeptEntryId: compactionEntry.firstKeptEntryId,
+									tokensBefore: compactionEntry.tokensBefore,
+								},
+								compactionEntry,
+								entries: serverEntries,
+								leafId: serverLeafId,
+								messages: [],
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-length",
+							entryCount: serverEntries.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				settingsManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			try {
+				await session.prompt("first");
+				await session.agent.waitForIdle();
+				await session.prompt("overflow");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(streamCount).toBe(3);
+			const allLengthEntries = sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "length",
+				);
+			expect(allLengthEntries).toHaveLength(1);
+			const activeLengthEntries = sessionManager
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "length",
+				);
+			expect(activeLengthEntries).toHaveLength(0);
+			expect(
+				sessionManager
+					.buildSessionContext()
+					.messages.some((message) => message.role === "assistant" && message.stopReason === "length"),
+			).toBe(false);
+			const lastMessage = session.messages.at(-1);
+			expect(lastMessage?.role).toBe("assistant");
+			expect(lastMessage?.role === "assistant" ? lastMessage.content : undefined).toEqual([
+				{ type: "text", text: "recovered" },
+			]);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
 });

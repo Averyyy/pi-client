@@ -31,6 +31,16 @@
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 
+## pi-client / pi-server Compact and Resilience
+
+- Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
+- Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
+- Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
+- Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.
+- Do not mark pi-server sync as successful until the response is valid JSON. For proxy/network failures, report status, content-type, and a short body excerpt; stream responses must be `text/event-stream`.
+- Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
+- To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
+
 ## Commands
 
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.

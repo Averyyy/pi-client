@@ -46,6 +46,7 @@ const sessionSyncedEntryIds = new Map<string, Set<string>>();
 const sessionTreeHashes = new Map<string, string>();
 const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
+const RESPONSE_BODY_EXCERPT_CHARS = 500;
 
 export function hashStaticContext(ctx: Context): string {
 	const parts: string[] = [];
@@ -60,85 +61,6 @@ export function hashStaticContext(ctx: Context): string {
 
 function hashEntries(entries: SessionTreeEntry[]): string {
 	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
-}
-
-function getBranchEntries(entries: SessionTreeEntry[], leafId: string | null): SessionTreeEntry[] {
-	if (leafId === null) return [];
-
-	const byId = new Map<string, SessionTreeEntry>();
-	for (const entry of entries) {
-		if (byId.has(entry.id)) {
-			throw new Error(`Session tree contains duplicate entry id ${entry.id}`);
-		}
-		byId.set(entry.id, entry);
-	}
-
-	const leaf = byId.get(leafId);
-	if (!leaf) {
-		throw new Error(`Session tree leafId ${leafId} does not exist`);
-	}
-
-	const path: SessionTreeEntry[] = [];
-	const seen = new Set<string>();
-	let current: SessionTreeEntry | undefined = leaf;
-	while (current) {
-		if (seen.has(current.id)) {
-			throw new Error(`Session tree contains a parent cycle at entry ${current.id}`);
-		}
-		seen.add(current.id);
-		path.unshift(current);
-
-		if (current.parentId === null) break;
-		const parent = byId.get(current.parentId);
-		if (!parent) {
-			throw new Error(`Session tree parent entry ${current.parentId} does not exist`);
-		}
-		current = parent;
-	}
-
-	return path;
-}
-
-function getLatestCompactionIndex(entries: SessionTreeEntry[]): number {
-	for (let index = entries.length - 1; index >= 0; index--) {
-		if (entries[index].type === "compaction") {
-			return index;
-		}
-	}
-	return -1;
-}
-
-function compactTreeForPiServerSync(tree: PiServerTreeSnapshot): PiServerTreeSnapshot {
-	if (tree.leafId === null) return tree;
-
-	const branch = getBranchEntries(tree.entries, tree.leafId);
-	const compactionIndex = getLatestCompactionIndex(branch);
-	if (compactionIndex === -1) return tree;
-
-	const compaction = branch[compactionIndex];
-	if (compaction.type !== "compaction") {
-		throw new Error("Latest compaction index did not resolve to a compaction entry");
-	}
-
-	const firstKeptIndex = branch.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
-	if (firstKeptIndex === -1) {
-		throw new Error(`Compaction ${compaction.id} firstKeptEntryId ${compaction.firstKeptEntryId} does not exist`);
-	}
-	if (firstKeptIndex >= compactionIndex) {
-		throw new Error(`Compaction ${compaction.id} firstKeptEntryId must precede the compaction entry`);
-	}
-
-	const retainedBranch = branch.slice(firstKeptIndex);
-	const entries = retainedBranch.map((entry, index) => ({
-		...entry,
-		parentId: index === 0 ? null : retainedBranch[index - 1].id,
-	}));
-
-	return {
-		...tree,
-		entries,
-		leafId: entries[entries.length - 1]?.id ?? null,
-	};
 }
 
 function getLinearTreeFromMessages(messages: Message[]): { entries: SessionTreeEntry[]; leafId: string | null } {
@@ -191,8 +113,87 @@ export interface PiServerTreeSnapshot {
 	replace?: boolean;
 }
 
+export interface PiServerCompactionResult {
+	compaction: CompactResult;
+	compactionEntry: SessionTreeEntry;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	messages: Message[];
+}
+
 export interface PiServerStreamOptions extends SimpleStreamOptions {
 	sessionTree?: PiServerTreeSnapshot;
+}
+
+interface PiServerResponseFailure {
+	details: string;
+	matchText: string;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getResponseStatus(response: Response): string {
+	const status = response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+	return response.status >= 500 ? `${status} (server error)` : status;
+}
+
+function getResponseContentType(response: Response): string {
+	return response.headers.get("content-type") ?? "unknown";
+}
+
+function getBodyExcerpt(text: string): string {
+	const trimmed = text.trim();
+	if (!trimmed) return "<empty>";
+	const excerpt = trimmed.slice(0, RESPONSE_BODY_EXCERPT_CHARS);
+	return excerpt.length < trimmed.length ? `${excerpt}...` : excerpt;
+}
+
+function getJsonErrorText(text: string): string | undefined {
+	if (!text) return undefined;
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		if (!isObject(parsed)) return undefined;
+		const error = parsed.error;
+		return typeof error === "string" && error.length > 0 ? error : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function formatResponseDetails(response: Response, bodyText: string): string {
+	const body = getJsonErrorText(bodyText) ?? getBodyExcerpt(bodyText);
+	return `${getResponseStatus(response)}; content-type: ${getResponseContentType(response)}; body excerpt: ${body}`;
+}
+
+async function readPiServerFailure(response: Response): Promise<PiServerResponseFailure> {
+	const bodyText = await response.text();
+	return {
+		details: formatResponseDetails(response, bodyText),
+		matchText: getJsonErrorText(bodyText) ?? bodyText,
+	};
+}
+
+async function readPiServerJson<T>(response: Response, errorPrefix: string): Promise<T> {
+	const bodyText = await response.text();
+	if (!response.ok) {
+		throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
+	}
+	try {
+		return JSON.parse(bodyText) as T;
+	} catch {
+		throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)}; expected JSON)`);
+	}
+}
+
+async function ensurePiServerEventStream(response: Response): Promise<void> {
+	const contentType = getResponseContentType(response);
+	if (contentType.toLowerCase().split(";")[0]?.trim() === "text/event-stream") {
+		return;
+	}
+	const bodyText = await response.text();
+	throw new Error(`pi-server error: ${formatResponseDetails(response, bodyText)}; expected text/event-stream`);
 }
 
 async function ensureSessionInit(
@@ -221,12 +222,7 @@ async function ensureSessionInit(
 
 	const response = await request.postJson(endpoint, { sessionId, staticContext });
 
-	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`Session init failed (${response.status}): ${errorBody}`);
-	}
-
-	const result = (await response.json()) as SessionInitResponse;
+	const result = await readPiServerJson<SessionInitResponse>(response, "Session init failed");
 	sessionStaticContextHashes.set(sessionId, currentHash);
 	if (result.treeHash !== undefined) {
 		sessionTreeHashes.set(sessionId, result.treeHash);
@@ -260,36 +256,12 @@ async function postTreeJson(
 	errorPrefix: string,
 ): Promise<void> {
 	const response = await request.postJson(endpoint, body);
-	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`${errorPrefix} (${response.status}): ${errorBody}`);
-	}
+	await readPiServerJson<unknown>(response, errorPrefix);
 }
 
 function isRecoverableTreeDivergenceError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
 	return /parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(message);
-}
-
-async function readErrorBody(response: Response): Promise<string> {
-	const text = await response.text();
-	if (!text) return "";
-
-	try {
-		const parsed = JSON.parse(text) as { error?: unknown };
-		if (typeof parsed.error === "string" && parsed.error.length > 0) {
-			return parsed.error;
-		}
-	} catch {
-		// Non-JSON proxy errors should still be surfaced verbatim.
-	}
-
-	return text;
-}
-
-function formatResponseError(response: Response, errorBody: string): string {
-	const status = response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
-	return errorBody ? `${status}: ${errorBody}` : status;
 }
 
 function isRecoverableMissingServerState(response: Response, errorBody: string): boolean {
@@ -336,7 +308,7 @@ async function syncPiServerTreeWithRequest(
 	tree: PiServerTreeSnapshot,
 	request: ChunkRequest,
 ): Promise<void> {
-	const syncTree = compactTreeForPiServerSync(tree);
+	const syncTree = tree;
 	const currentHash = hashEntries(syncTree.entries);
 	const previousHash = sessionTreeHashes.get(sessionId);
 	const previousLeafId = sessionTreeLeafIds.get(sessionId);
@@ -423,14 +395,12 @@ export async function compactPiServer(
 	model: Model<any>,
 	context: Context,
 	options?: PiServerCompactOptions,
-): Promise<CompactResult> {
+): Promise<PiServerCompactionResult> {
 	const sessionId = options?.sessionId ?? "default";
 	const request = createPiServerRequest(options?.signal);
 
 	await ensureSessionInit(sessionId, context, request);
-	const tree = compactTreeForPiServerSync(
-		options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]),
-	);
+	const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
 	await syncPiServerTreeWithRequest(sessionId, context, tree, request);
 
 	const makeBody = () => ({
@@ -442,36 +412,43 @@ export async function compactPiServer(
 	});
 	let response = await request.postJson("/api/session/compact", makeBody());
 	if (!response.ok) {
-		let errorBody = await readErrorBody(response);
-		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, errorBody)) {
+		let failure = await readPiServerFailure(response);
+		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.matchText)) {
 			resetSessionTracking(sessionId);
 			await ensureSessionInit(sessionId, context, request);
 			await syncFullPiServerTree(sessionId, context, tree, request);
 			response = await request.postJson("/api/session/compact", makeBody());
 			if (response.ok) {
-				errorBody = "";
+				failure = { details: "", matchText: "" };
 			} else {
-				errorBody = await readErrorBody(response);
+				failure = await readPiServerFailure(response);
 			}
 		}
 		if (!response.ok) {
-			throw new Error(`Server compaction failed (${formatResponseError(response, errorBody)})`);
+			throw new Error(`Server compaction failed (${failure.details})`);
 		}
 	}
-	const result = (await response.json()) as { compaction?: CompactResult };
+	const result = await readPiServerJson<Partial<PiServerCompactionResult>>(response, "Server compaction failed");
 	if (!result.compaction) {
 		throw new Error("Server compaction response did not include a compaction result");
 	}
-	return result.compaction;
+	if (!result.compactionEntry || !result.entries || result.leafId === undefined || !result.messages) {
+		throw new Error("Server compaction response did not include the updated session tree");
+	}
+	markTreeSynced(sessionId, { entries: result.entries, leafId: result.leafId });
+	return {
+		compaction: result.compaction,
+		compactionEntry: result.compactionEntry,
+		entries: result.entries,
+		leafId: result.leafId,
+		messages: result.messages,
+	};
 }
 
 export async function dropLastPiServerAssistantError(sessionId: string): Promise<void> {
 	const request = createPiServerRequest();
 	const response = await request.postJson("/api/session/drop-last-assistant-error", { sessionId });
-	if (!response.ok) {
-		const errorBody = await response.text();
-		throw new Error(`Dropping server assistant error failed (${response.status}): ${errorBody}`);
-	}
+	await readPiServerJson<unknown>(response, "Dropping server assistant error failed");
 }
 
 export async function streamPiServer(
@@ -509,7 +486,7 @@ export async function streamPiServer(
 				...getLinearTreeFromMessages(context.messages as Message[]),
 				replace: true,
 			};
-			const syncTree = compactTreeForPiServerSync(tree);
+			const syncTree = tree;
 			await syncPiServerTreeWithRequest(sessionId, context, syncTree, request);
 
 			const makeBody = () => ({
@@ -520,23 +497,24 @@ export async function streamPiServer(
 			let response = await request.postJson("/api/stream", makeBody());
 
 			if (!response.ok) {
-				let errorBody = await readErrorBody(response);
-				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, errorBody)) {
+				let failure = await readPiServerFailure(response);
+				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.matchText)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);
 					await syncFullPiServerTree(sessionId, context, syncTree, request);
 					response = await request.postJson("/api/stream", makeBody());
 					if (response.ok) {
-						errorBody = "";
+						failure = { details: "", matchText: "" };
 					} else {
-						errorBody = await readErrorBody(response);
+						failure = await readPiServerFailure(response);
 					}
 				}
 				if (!response.ok) {
-					throw new Error(`pi-server error: ${formatResponseError(response, errorBody)}`);
+					throw new Error(`pi-server error: ${failure.details}`);
 				}
 			}
 
+			await ensurePiServerEventStream(response);
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";

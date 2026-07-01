@@ -24,12 +24,14 @@ import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
 import {
+	appendCompactionEntry,
 	appendMessages,
 	appendSessionEntries,
 	deleteSession as deleteSessionFromStore,
 	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
+	getSessionBranch,
 	hashSessionEntries,
 	listSessions,
 	replaceMessages,
@@ -284,7 +286,11 @@ function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBo
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-async function handleSessionCompact(body: SessionCompactBody, res: ServerResponse): Promise<void> {
+async function handleSessionCompact(
+	config: ServerConfig,
+	body: SessionCompactBody,
+	res: ServerResponse,
+): Promise<void> {
 	if (!body.sessionId) {
 		sendJson(res, 400, { error: "sessionId is required" });
 		return;
@@ -300,7 +306,7 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 		return;
 	}
 
-	const entries = session.entries;
+	const entries = getSessionBranch(session);
 	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS);
 	if (!preparationResult.ok) {
 		sendJson(res, 400, { error: preparationResult.error.message });
@@ -325,7 +331,17 @@ async function handleSessionCompact(body: SessionCompactBody, res: ServerRespons
 		return;
 	}
 
-	sendJson(res, 200, { success: true, compaction: result.value satisfies CompactResult });
+	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, result.value);
+	persistSession(config, updatedSession);
+	sendJson(res, 200, {
+		success: true,
+		compaction: result.value satisfies CompactResult,
+		compactionEntry,
+		...sessionResponseBody(updatedSession),
+		staticContext: updatedSession.staticContext,
+		entries: updatedSession.entries,
+		messages: updatedSession.messages,
+	});
 }
 
 function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody, res: ServerResponse): void {
@@ -485,7 +501,7 @@ async function handlePostRequest(
 	}
 
 	if (pathname === "/api/session/compact") {
-		await handleSessionCompact(body as SessionCompactBody, res);
+		await handleSessionCompact(config, body as SessionCompactBody, res);
 		return true;
 	}
 

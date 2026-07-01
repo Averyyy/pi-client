@@ -100,6 +100,22 @@ function hashEntries(entries: SessionTreeEntry[]): string {
 	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
+function compactResponse(
+	compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number },
+	entries: SessionTreeEntry[],
+	leafId: string | null,
+): string {
+	const compactionEntry = entries.find((entry) => entry.type === "compaction" && entry.id === leafId);
+	return JSON.stringify({
+		success: true,
+		compaction,
+		compactionEntry,
+		entries,
+		leafId,
+		messages: [],
+	});
+}
+
 const testModel: Model<"openai-completions"> = {
 	id: "test-model",
 	name: "Test Model",
@@ -177,7 +193,7 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[0].body.leafId).toBe("u2");
 	});
 
-	it("prunes compacted tree history before full tree sync", async () => {
+	it("preserves full compacted tree history before full tree sync", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
 		const entries = [
@@ -194,7 +210,7 @@ describe("pi-server-client", () => {
 			vi.fn(async (url: string, init?: RequestInit) => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				capturedBodies.push({ url, body });
-				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 4 }), {
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 6 }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
@@ -206,8 +222,8 @@ describe("pi-server-client", () => {
 		const treeSync = capturedBodies.find((request) => request.url.endsWith("/api/session/tree/sync"));
 		expect(treeSync).toBeDefined();
 		const syncedEntries = treeSync!.body.entries as Array<{ id: string; parentId: string | null }>;
-		expect(syncedEntries.map((entry) => entry.id)).toEqual(["u2", "a2", "c1", "u3"]);
-		expect(syncedEntries.map((entry) => entry.parentId)).toEqual([null, "u2", "a2", "c1"]);
+		expect(syncedEntries.map((entry) => entry.id)).toEqual(entries.map((entry) => entry.id));
+		expect(syncedEntries.map((entry) => entry.parentId)).toEqual(entries.map((entry) => entry.parentId));
 		expect(treeSync!.body.leafId).toBe("u3");
 	});
 
@@ -291,6 +307,98 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[1].body.leafId).toBe("u2");
 	});
 
+	it("does not mark tree sync successful after an HTML proxy failure", async () => {
+		const capturedPaths: string[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		let treeSyncAttempts = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+
+				if (path === "/api/session/tree/sync") {
+					treeSyncAttempts++;
+					if (treeSyncAttempts === 1) {
+						return new Response("<html>Cloudflare 520</html>", {
+							status: 520,
+							headers: { "Content-Type": "text/html; charset=utf-8" },
+						});
+					}
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 2 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		let error: unknown;
+		try {
+			await syncPiServerTree("html-tree-failure", context, { entries, leafId: "a1" });
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("Session tree sync failed");
+		expect(message).toContain("520");
+		expect(message).toContain("server error");
+		expect(message).toContain("content-type: text/html; charset=utf-8");
+		expect(message).toContain("body excerpt: <html>Cloudflare 520</html>");
+		expect(message).not.toContain("Unexpected token");
+
+		await syncPiServerTree("html-tree-failure", context, { entries, leafId: "a1" });
+
+		expect(treeSyncAttempts).toBe(2);
+		expect(capturedPaths).toEqual(["/api/session/init", "/api/session/tree/sync", "/api/session/tree/sync"]);
+	});
+
+	it("rejects non-JSON successful tree sync responses before marking sync state", async () => {
+		const capturedPaths: string[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		let treeSyncAttempts = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+
+				if (path === "/api/session/tree/sync") {
+					treeSyncAttempts++;
+					if (treeSyncAttempts === 1) {
+						return new Response("<html>not json</html>", {
+							status: 200,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 2 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await expect(syncPiServerTree("non-json-tree-success", context, { entries, leafId: "a1" })).rejects.toThrow(
+			"expected JSON",
+		);
+
+		await syncPiServerTree("non-json-tree-success", context, { entries, leafId: "a1" });
+
+		expect(treeSyncAttempts).toBe(2);
+		expect(capturedPaths).toEqual(["/api/session/init", "/api/session/tree/sync", "/api/session/tree/sync"]);
+	});
+
 	it("switches pi-server tree leaf without uploading entries after the tree is already synced", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const entries = baseTree();
@@ -364,6 +472,48 @@ describe("pi-server-client", () => {
 		expect(streamBody).not.toHaveProperty("delta");
 		expect(streamBody).not.toHaveProperty("entries");
 		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
+	});
+
+	it("reports HTML stream proxy failures with response details", async () => {
+		const entries = baseTree().slice(0, 1);
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+				if (url.endsWith("/api/stream")) {
+					return new Response("<html>Bad gateway</html>", {
+						status: 502,
+						statusText: "Bad Gateway",
+						headers: { "Content-Type": "text/html" },
+					});
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "html-stream-failure", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
+			| { error?: { errorMessage?: string } }
+			| undefined;
+		expect(errorEvent?.error?.errorMessage).toContain("502 Bad Gateway");
+		expect(errorEvent?.error?.errorMessage).toContain("content-type: text/html");
+		expect(errorEvent?.error?.errorMessage).toContain("body excerpt: <html>Bad gateway</html>");
+		expect(errorEvent?.error?.errorMessage).not.toContain("Unexpected token");
 	});
 
 	it("rebuilds missing server state once when streaming after a pi-server restart", async () => {
@@ -485,11 +635,13 @@ describe("pi-server-client", () => {
 				capturedBodies.push({ url, body });
 
 				if (url.endsWith("/api/session/compact")) {
+					const serverEntry = compactionEntry("c1", "u2", "summary", "u2");
 					return new Response(
-						JSON.stringify({
-							success: true,
-							compaction: { summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
-						}),
+						compactResponse(
+							{ summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
+							[...entries, serverEntry],
+							"c1",
+						),
 						{
 							status: 200,
 							headers: { "Content-Type": "application/json" },
@@ -518,7 +670,7 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[1].body.entries).toEqual(entries);
 	});
 
-	it("prunes already compacted history before server-side compact", async () => {
+	it("preserves already compacted branches before server-side compact", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const entries = [
 			messageEntry("u1", null, textMessage("one", 1000)),
@@ -536,16 +688,18 @@ describe("pi-server-client", () => {
 				capturedBodies.push({ url, body });
 
 				if (url.endsWith("/api/session/compact")) {
+					const serverEntry = compactionEntry("c2", "u3", "next summary", "u3");
 					return new Response(
-						JSON.stringify({
-							success: true,
-							compaction: { summary: "next summary", firstKeptEntryId: "u3", tokensBefore: 10 },
-						}),
+						compactResponse(
+							{ summary: "next summary", firstKeptEntryId: "u3", tokensBefore: 10 },
+							[...entries, serverEntry],
+							"c2",
+						),
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
 				}
 
-				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 4 }), {
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 6 }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
@@ -561,8 +715,8 @@ describe("pi-server-client", () => {
 		const treeSync = capturedBodies.find((request) => request.url.endsWith("/api/session/tree/sync"));
 		expect(treeSync).toBeDefined();
 		const syncedEntries = treeSync!.body.entries as Array<{ id: string; parentId: string | null }>;
-		expect(syncedEntries.map((entry) => entry.id)).toEqual(["u2", "a2", "c1", "u3"]);
-		expect(syncedEntries.map((entry) => entry.parentId)).toEqual([null, "u2", "a2", "c1"]);
+		expect(syncedEntries.map((entry) => entry.id)).toEqual(entries.map((entry) => entry.id));
+		expect(syncedEntries.map((entry) => entry.parentId)).toEqual(entries.map((entry) => entry.parentId));
 	});
 
 	it("rebuilds missing server state once when compacting after a pi-server restart", async () => {
@@ -584,11 +738,13 @@ describe("pi-server-client", () => {
 							headers: { "Content-Type": "application/json" },
 						});
 					}
+					const serverEntry = compactionEntry("c1", "u2", "summary", "u2");
 					return new Response(
-						JSON.stringify({
-							success: true,
-							compaction: { summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
-						}),
+						compactResponse(
+							{ summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
+							[...entries, serverEntry],
+							"c1",
+						),
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
 				}
@@ -610,7 +766,7 @@ describe("pi-server-client", () => {
 			sessionTree: { entries, leafId: "u2" },
 		});
 
-		expect(result.summary).toBe("summary");
+		expect(result.compaction.summary).toBe("summary");
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
 			"/api/session/compact",
 			"/api/session/init",
