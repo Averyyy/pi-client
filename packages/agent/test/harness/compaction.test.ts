@@ -126,20 +126,31 @@ function createModelChangeEntry(provider: string, modelId: string, parentId: str
 const models = createModels();
 let fauxCount = 0;
 
-function createFauxModel(reasoning: boolean, maxTokens = 8192): { faux: FauxProviderHandle; model: Model<string> } {
+function createFauxModel(
+	reasoning: boolean,
+	maxTokens = 8192,
+	contextWindow = 200000,
+): { faux: FauxProviderHandle; model: Model<string> } {
 	const faux = fauxProvider({
 		provider: `faux-${++fauxCount}`,
 		models: [
 			{
 				id: reasoning ? "reasoning-model" : "non-reasoning-model",
 				reasoning,
-				contextWindow: 200000,
+				contextWindow,
 				maxTokens,
 			},
 		],
 	});
 	models.setProvider(faux.provider);
 	return { faux, model: faux.getModel() };
+}
+
+function getPromptText(context: { messages: Message[] }): string {
+	const message = context.messages[0];
+	if (message?.role !== "user" || !Array.isArray(message.content)) return "";
+	const block = message.content[0];
+	return block?.type === "text" ? block.text : "";
 }
 
 describe("harness compaction", () => {
@@ -549,6 +560,79 @@ describe("harness compaction", () => {
 		getOrThrow(await compact(preparation, models, model));
 
 		expect(seenOptions.map((options) => options?.maxTokens)).toEqual([128000, 128000]);
+	});
+
+	it("chunks summary input to fit the active model context window", async () => {
+		const prompts: string[] = [];
+		const { faux, model } = createFauxModel(false, 2048, 2800);
+		faux.setResponses([
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+		]);
+		const chunkedMessages: AgentMessage[] = [
+			createUserMessage(`chunk-a ${"a".repeat(4000)}`),
+			createUserMessage(`chunk-b ${"b".repeat(4000)}`),
+			createUserMessage(`chunk-c ${"c".repeat(4000)}`),
+			createUserMessage(`chunk-d ${"d".repeat(4000)}`),
+		];
+
+		const summary = getOrThrow(await generateSummary(chunkedMessages, models, model, 1000));
+
+		expect(summary).toBe("summary 4");
+		expect(prompts).toHaveLength(4);
+		expect(prompts[0]).toContain("chunk-a");
+		expect(prompts[0]).not.toContain("chunk-b");
+		expect(prompts[1]).toContain("<previous-summary>\nsummary 1\n</previous-summary>");
+		expect(prompts[3]).toContain("chunk-d");
+	});
+
+	it("recursively splits a summary chunk when the provider reports context overflow", async () => {
+		const prompts: string[] = [];
+		const { faux, model } = createFauxModel(false, 2048, 200000);
+		faux.setResponses([
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "maximum context length is 100 tokens",
+				});
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+		]);
+
+		const summary = getOrThrow(
+			await generateSummary([createUserMessage("left side"), createUserMessage("right side")], models, model, 1000),
+		);
+
+		expect(summary).toBe("summary 3");
+		expect(prompts).toHaveLength(3);
+		expect(prompts[0]).toContain("left side");
+		expect(prompts[0]).toContain("right side");
+		expect(prompts[1]).toContain("left side");
+		expect(prompts[1]).not.toContain("right side");
+		expect(prompts[2]).toContain("<previous-summary>\nsummary 2\n</previous-summary>");
+		expect(prompts[2]).toContain("right side");
 	});
 
 	it("returns compaction error results without throwing", async () => {

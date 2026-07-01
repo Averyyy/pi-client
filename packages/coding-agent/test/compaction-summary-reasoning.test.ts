@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type CompactionPreparation, compact, generateSummary } from "../src/core/compaction/index.ts";
 
@@ -15,7 +15,7 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 	};
 });
 
-function createModel(reasoning: boolean, maxTokens = 8192): Model<"anthropic-messages"> {
+function createModel(reasoning: boolean, maxTokens = 8192, contextWindow = 200000): Model<"anthropic-messages"> {
 	return {
 		id: reasoning ? "reasoning-model" : "non-reasoning-model",
 		name: reasoning ? "Reasoning Model" : "Non-reasoning Model",
@@ -25,7 +25,7 @@ function createModel(reasoning: boolean, maxTokens = 8192): Model<"anthropic-mes
 		reasoning,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 200000,
+		contextWindow,
 		maxTokens,
 	};
 }
@@ -49,6 +49,13 @@ const mockSummaryResponse: AssistantMessage = {
 };
 
 const messages: AgentMessage[] = [{ role: "user", content: "Summarize this.", timestamp: Date.now() }];
+
+function getPromptText(context: { messages: Message[] }): string {
+	const message = context.messages[0];
+	if (message?.role !== "user" || !Array.isArray(message.content)) return "";
+	const block = message.content[0];
+	return block?.type === "text" ? block.text : "";
+}
 
 describe("generateSummary reasoning options", () => {
 	beforeEach(() => {
@@ -130,5 +137,65 @@ describe("generateSummary reasoning options", () => {
 		await compact(preparation, createModel(false, 128000), "test-key");
 
 		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
+	});
+
+	it("chunks summary input to fit the active model context window", async () => {
+		const prompts: string[] = [];
+		completeSimpleMock.mockImplementation(async (_model: Model<any>, context: { messages: Message[] }) => {
+			prompts.push(getPromptText(context));
+			return {
+				...mockSummaryResponse,
+				content: [{ type: "text", text: `summary ${prompts.length}` }],
+			};
+		});
+		const chunkedMessages: AgentMessage[] = [
+			{ role: "user", content: `chunk-a ${"a".repeat(4000)}`, timestamp: Date.now() },
+			{ role: "user", content: `chunk-b ${"b".repeat(4000)}`, timestamp: Date.now() },
+			{ role: "user", content: `chunk-c ${"c".repeat(4000)}`, timestamp: Date.now() },
+			{ role: "user", content: `chunk-d ${"d".repeat(4000)}`, timestamp: Date.now() },
+		];
+
+		const summary = await generateSummary(chunkedMessages, createModel(false, 2048, 2800), 1000, "test-key");
+
+		expect(summary).toBe("summary 4");
+		expect(prompts).toHaveLength(4);
+		expect(prompts[0]).toContain("chunk-a");
+		expect(prompts[0]).not.toContain("chunk-b");
+		expect(prompts[1]).toContain("<previous-summary>\nsummary 1\n</previous-summary>");
+		expect(prompts[3]).toContain("chunk-d");
+	});
+
+	it("recursively splits a summary chunk when the provider reports context overflow", async () => {
+		const prompts: string[] = [];
+		completeSimpleMock.mockImplementation(async (_model: Model<any>, context: { messages: Message[] }) => {
+			prompts.push(getPromptText(context));
+			if (prompts.length === 1) {
+				return {
+					...mockSummaryResponse,
+					content: [],
+					stopReason: "error",
+					errorMessage: "maximum context length is 100 tokens",
+				};
+			}
+			return {
+				...mockSummaryResponse,
+				content: [{ type: "text", text: `summary ${prompts.length}` }],
+			};
+		});
+		const oversizedMessages: AgentMessage[] = [
+			{ role: "user", content: "left side", timestamp: Date.now() },
+			{ role: "user", content: "right side", timestamp: Date.now() },
+		];
+
+		const summary = await generateSummary(oversizedMessages, createModel(false, 2048, 200000), 1000, "test-key");
+
+		expect(summary).toBe("summary 3");
+		expect(prompts).toHaveLength(3);
+		expect(prompts[0]).toContain("left side");
+		expect(prompts[0]).toContain("right side");
+		expect(prompts[1]).toContain("left side");
+		expect(prompts[1]).not.toContain("right side");
+		expect(prompts[2]).toContain("<previous-summary>\nsummary 2\n</previous-summary>");
+		expect(prompts[2]).toContain("right side");
 	});
 });

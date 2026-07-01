@@ -7,7 +7,7 @@
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { completeSimple, isContextOverflow } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -545,6 +545,55 @@ function createSummarizationOptions(
 	return options;
 }
 
+function getSummaryMaxTokens(model: Model<any>, reserveTokens: number): number {
+	return Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+}
+
+function estimateTextTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+function buildSummaryPrompt(conversationText: string, basePrompt: string, previousSummary: string | undefined): string {
+	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	if (previousSummary) {
+		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	}
+	return promptText + basePrompt;
+}
+
+function getSummaryInputBudget(
+	model: Model<any>,
+	maxTokens: number,
+	basePrompt: string,
+	previousSummary: string | undefined,
+): number {
+	if (model.contextWindow <= 0) return Number.POSITIVE_INFINITY;
+	const overheadTokens = estimateTextTokens(buildSummaryPrompt("", basePrompt, previousSummary));
+	return Math.max(1, Math.floor(model.contextWindow - maxTokens - overheadTokens));
+}
+
+function takeSummaryChunk(
+	messages: AgentMessage[],
+	tokenBudget: number,
+): { chunk: AgentMessage[]; remaining: AgentMessage[] } {
+	if (!Number.isFinite(tokenBudget)) return { chunk: messages, remaining: [] };
+
+	const chunk: AgentMessage[] = [];
+	let chunkTokens = 0;
+
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i];
+		const messageTokens = Math.max(1, estimateTokens(message));
+		if (chunk.length > 0 && chunkTokens + messageTokens > tokenBudget) {
+			return { chunk, remaining: messages.slice(i) };
+		}
+		chunk.push(message);
+		chunkTokens += messageTokens;
+	}
+
+	return { chunk, remaining: [] };
+}
+
 async function completeSummarization(
 	model: Model<any>,
 	context: Context,
@@ -556,6 +605,135 @@ async function completeSummarization(
 	}
 	const stream = await streamFn(model, context, options);
 	return stream.result();
+}
+
+async function summarizeChunk(
+	messages: AgentMessage[],
+	model: Model<any>,
+	maxTokens: number,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	env: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn | undefined,
+	initialPrompt: string,
+	updatePrompt: string,
+	previousSummary: string | undefined,
+): Promise<string> {
+	const basePrompt = previousSummary ? updatePrompt : initialPrompt;
+	const llmMessages = convertToLlm(messages);
+	const conversationText = serializeConversation(llmMessages);
+	const promptText = buildSummaryPrompt(conversationText, basePrompt, previousSummary);
+	const summarizationMessages = [
+		{
+			role: "user" as const,
+			content: [{ type: "text" as const, text: promptText }],
+			timestamp: Date.now(),
+		},
+	];
+
+	const response = await completeSummarization(
+		model,
+		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),
+		streamFn,
+	);
+
+	if (isContextOverflow(response, model.contextWindow) && messages.length > 1) {
+		const middle = Math.ceil(messages.length / 2);
+		const leftSummary = await summarizeMessages(
+			messages.slice(0, middle),
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			initialPrompt,
+			updatePrompt,
+			previousSummary,
+		);
+		return summarizeMessages(
+			messages.slice(middle),
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			initialPrompt,
+			updatePrompt,
+			leftSummary,
+		);
+	}
+
+	if (response.stopReason === "error") {
+		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+	}
+
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+}
+
+async function summarizeMessages(
+	messages: AgentMessage[],
+	model: Model<any>,
+	maxTokens: number,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	env: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn | undefined,
+	initialPrompt: string,
+	updatePrompt: string,
+	previousSummary: string | undefined,
+): Promise<string> {
+	if (messages.length === 0) {
+		return summarizeChunk(
+			messages,
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			initialPrompt,
+			updatePrompt,
+			previousSummary,
+		);
+	}
+	let summary = previousSummary;
+	let remaining = messages;
+	while (remaining.length > 0) {
+		const basePrompt = summary ? updatePrompt : initialPrompt;
+		const next = takeSummaryChunk(remaining, getSummaryInputBudget(model, maxTokens, basePrompt, summary));
+		summary = await summarizeChunk(
+			next.chunk,
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			initialPrompt,
+			updatePrompt,
+			summary,
+		);
+		remaining = next.remaining;
+	}
+	return summary ?? "";
 }
 
 /**
@@ -575,56 +753,29 @@ export async function generateSummary(
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
 ): Promise<string> {
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
+	const maxTokens = getSummaryMaxTokens(model, reserveTokens);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	let initialPrompt = SUMMARIZATION_PROMPT;
+	let updatePrompt = UPDATE_SUMMARIZATION_PROMPT;
 	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+		initialPrompt = `${initialPrompt}\n\nAdditional focus: ${customInstructions}`;
+		updatePrompt = `${updatePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
 
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions = createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel);
-
-	const response = await completeSummarization(
+	return summarizeMessages(
+		currentMessages,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
+		maxTokens,
+		apiKey,
+		headers,
+		env,
+		signal,
+		thinkingLevel,
 		streamFn,
+		initialPrompt,
+		updatePrompt,
+		previousSummary,
 	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return textContent;
 }
 
 // ============================================================================

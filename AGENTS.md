@@ -39,6 +39,7 @@
 
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
+- Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks; if one chunk still overflows, surface the provider error instead of hiding it.
 - Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
 - Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.

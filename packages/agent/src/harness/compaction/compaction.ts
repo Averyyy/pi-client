@@ -1,4 +1,5 @@
 import type { AssistantMessage, ImageContent, Model, Models, TextContent, Usage } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,
@@ -456,33 +457,77 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-/** Generate or update a conversation summary for compaction. */
-export async function generateSummary(
-	currentMessages: AgentMessage[],
-	models: Models,
-	model: Model<any>,
-	reserveTokens: number,
-	signal?: AbortSignal,
-	customInstructions?: string,
-	previousSummary?: string,
-	thinkingLevel?: ThinkingLevel,
-): Promise<Result<string, CompactionError>> {
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
+function getSummaryMaxTokens(model: Model<any>, reserveTokens: number): number {
+	return Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+}
+
+function estimateTextTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+function buildSummaryPrompt(conversationText: string, basePrompt: string, previousSummary: string | undefined): string {
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
-	promptText += basePrompt;
+	return promptText + basePrompt;
+}
 
+function getSummaryInputBudget(
+	model: Model<any>,
+	maxTokens: number,
+	basePrompt: string,
+	previousSummary: string | undefined,
+): number {
+	if (model.contextWindow <= 0) return Number.POSITIVE_INFINITY;
+	const overheadTokens = estimateTextTokens(buildSummaryPrompt("", basePrompt, previousSummary));
+	return Math.max(1, Math.floor(model.contextWindow - maxTokens - overheadTokens));
+}
+
+function takeSummaryChunk(
+	messages: AgentMessage[],
+	tokenBudget: number,
+): { chunk: AgentMessage[]; remaining: AgentMessage[] } {
+	if (!Number.isFinite(tokenBudget)) return { chunk: messages, remaining: [] };
+
+	const chunk: AgentMessage[] = [];
+	let chunkTokens = 0;
+
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i];
+		const messageTokens = Math.max(1, estimateTokens(message));
+		if (chunk.length > 0 && chunkTokens + messageTokens > tokenBudget) {
+			return { chunk, remaining: messages.slice(i) };
+		}
+		chunk.push(message);
+		chunkTokens += messageTokens;
+	}
+
+	return { chunk, remaining: [] };
+}
+
+function getResponseText(response: AssistantMessage): string {
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+}
+
+async function summarizeChunk(
+	messages: AgentMessage[],
+	models: Models,
+	model: Model<any>,
+	maxTokens: number,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	initialPrompt: string,
+	updatePrompt: string,
+	previousSummary: string | undefined,
+): Promise<Result<string, CompactionError>> {
+	const basePrompt = previousSummary ? updatePrompt : initialPrompt;
+	const llmMessages = convertToLlm(messages);
+	const conversationText = serializeConversation(llmMessages);
+	const promptText = buildSummaryPrompt(conversationText, basePrompt, previousSummary);
 	const summarizationMessages = [
 		{
 			role: "user" as const,
@@ -491,16 +536,40 @@ export async function generateSummary(
 		},
 	];
 
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, reasoning: thinkingLevel }
-			: { maxTokens, signal };
-
 	const response = await models.completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
+		model.reasoning && thinkingLevel && thinkingLevel !== "off"
+			? { maxTokens, signal, reasoning: thinkingLevel }
+			: { maxTokens, signal },
 	);
+
+	if (isContextOverflow(response, model.contextWindow) && messages.length > 1) {
+		const middle = Math.ceil(messages.length / 2);
+		const leftSummary = await summarizeMessages(
+			messages.slice(0, middle),
+			models,
+			model,
+			maxTokens,
+			signal,
+			thinkingLevel,
+			initialPrompt,
+			updatePrompt,
+			previousSummary,
+		);
+		if (!leftSummary.ok) return leftSummary;
+		return summarizeMessages(
+			messages.slice(middle),
+			models,
+			model,
+			maxTokens,
+			signal,
+			thinkingLevel,
+			initialPrompt,
+			updatePrompt,
+			leftSummary.value,
+		);
+	}
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Summarization aborted"));
 	}
@@ -513,12 +582,85 @@ export async function generateSummary(
 		);
 	}
 
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+	return ok(getResponseText(response));
+}
 
-	return ok(textContent);
+async function summarizeMessages(
+	messages: AgentMessage[],
+	models: Models,
+	model: Model<any>,
+	maxTokens: number,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	initialPrompt: string,
+	updatePrompt: string,
+	previousSummary: string | undefined,
+): Promise<Result<string, CompactionError>> {
+	if (messages.length === 0) {
+		return summarizeChunk(
+			messages,
+			models,
+			model,
+			maxTokens,
+			signal,
+			thinkingLevel,
+			initialPrompt,
+			updatePrompt,
+			previousSummary,
+		);
+	}
+	let summary = previousSummary;
+	let remaining = messages;
+	while (remaining.length > 0) {
+		const basePrompt = summary ? updatePrompt : initialPrompt;
+		const next = takeSummaryChunk(remaining, getSummaryInputBudget(model, maxTokens, basePrompt, summary));
+		const chunkSummary = await summarizeChunk(
+			next.chunk,
+			models,
+			model,
+			maxTokens,
+			signal,
+			thinkingLevel,
+			initialPrompt,
+			updatePrompt,
+			summary,
+		);
+		if (!chunkSummary.ok) return chunkSummary;
+		summary = chunkSummary.value;
+		remaining = next.remaining;
+	}
+	return ok(summary ?? "");
+}
+
+/** Generate or update a conversation summary for compaction. */
+export async function generateSummary(
+	currentMessages: AgentMessage[],
+	models: Models,
+	model: Model<any>,
+	reserveTokens: number,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	thinkingLevel?: ThinkingLevel,
+): Promise<Result<string, CompactionError>> {
+	const maxTokens = getSummaryMaxTokens(model, reserveTokens);
+	let initialPrompt = SUMMARIZATION_PROMPT;
+	let updatePrompt = UPDATE_SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		initialPrompt = `${initialPrompt}\n\nAdditional focus: ${customInstructions}`;
+		updatePrompt = `${updatePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+	return summarizeMessages(
+		currentMessages,
+		models,
+		model,
+		maxTokens,
+		signal,
+		thinkingLevel,
+		initialPrompt,
+		updatePrompt,
+		previousSummary,
+	);
 }
 
 /** Prepared inputs for a compaction run. */
