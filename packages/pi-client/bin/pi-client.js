@@ -5,6 +5,10 @@ const modulePromise =
 		? import("./update.js").then(({ runPiClientUpdate }) => {
 				process.exitCode = runPiClientUpdate(args.slice(1));
 			})
+		: args[0] === "web"
+			? import("./web.js").then(async ({ runPiClientWeb }) => {
+					process.exitCode = await runPiClientWeb(args.slice(1));
+				})
 		: import("@earendil-works/pi-coding-agent/pi-client-cli");
 
 modulePromise.catch((e) => {

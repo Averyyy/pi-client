@@ -1,0 +1,13 @@
+{
+	"name": "pi-client-pi-web-plugin",
+	"version": "0.0.0",
+	"type": "module",
+	"piWeb": {
+		"plugins": [
+			{
+				"id": "pi-client",
+				"module": "pi-web-plugin.js"
+			}
+		]
+	}
+}

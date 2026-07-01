@@ -49,6 +49,14 @@
 - Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
 - To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
 
+## pi-client Web UI
+
+- `pi-client web` is the client GUI entrypoint and should build on `@jmfederico/pi-web`. Do not use `packages/pi-webui` for this command; that package is a pi-server session inspector/proxy.
+- Keep `PI_SERVER_MODE=true` when launching the web runtime so browser sessions use the same pi-client-to-pi-server transport as the CLI.
+- Keep pi-client-specific web UI additions in the `pi-client web` wrapper routes and bundled PI WEB plugin; do not fork or patch `@jmfederico/pi-web` unless the user explicitly asks.
+- Global `AGENTS.md` web editing should use the coding-agent `getAgentDir()` path (`~/.pi/agent/AGENTS.md` by default) so the web UI and CLI share the same instructions file.
+- Hidden project support in `pi-client web` should stay as a wrapper-layer visibility filter over PI WEB projects; do not fork PI WEB's project store format for client-only visibility.
+
 ## Commands
 
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
