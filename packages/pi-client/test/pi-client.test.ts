@@ -18,7 +18,8 @@ describe("pi-client package", () => {
 
 	it("bin entry point file exists", () => {
 		const binContent = readFileSync(join(pkgRoot, "bin", "pi-client.js"), "utf-8");
-		expect(binContent).toContain("@earendil-works/pi-coding-agent/pi-client-cli");
+		expect(binContent).toContain('import.meta.resolve("@earendil-works/pi-coding-agent")');
+		expect(binContent).toContain('PI_SERVER_MODE: "true"');
 	});
 
 	it("routes the web subcommand through the pi-web wrapper", () => {
@@ -55,9 +56,15 @@ describe("pi-client package", () => {
 		expect(pluginContent).toContain("pi-client.server");
 	});
 
-	it("depends on pi-coding-agent via local file reference", () => {
+	it("publishes under the averyyy pi-client scope", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toBe("file:../coding-agent");
+		expect(pkg.name).toBe("@averyyy/pi-client");
+		expect(pkg.publishConfig.access).toBe("public");
+	});
+
+	it("depends on the published pi-coding-agent package", () => {
+		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
+		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toBe("0.80.3");
 	});
 
 	it("depends on pinned pi-web for the web UI", () => {
@@ -65,11 +72,10 @@ describe("pi-client package", () => {
 		expect(pkg.dependencies["@jmfederico/pi-web"]).toBe("1.202606.7");
 	});
 
-	it("keeps the root lockfile aligned to the local pi-coding-agent fork", () => {
+	it("keeps the root lockfile aligned to published runtime dependencies", () => {
 		const lock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf-8"));
-		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe(
-			"file:../coding-agent",
-		);
+		expect(lock.packages["packages/pi-client"].name).toBe("@averyyy/pi-client");
+		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe("0.80.3");
 		expect(lock.packages["packages/pi-client"].dependencies["@jmfederico/pi-web"]).toBe("1.202606.7");
 		expect(lock.packages["node_modules/@jmfederico/pi-web"].version).toBe("1.202606.7");
 	});

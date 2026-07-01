@@ -57,6 +57,7 @@
 - Keep pi-client-specific web UI additions in the `pi-client web` wrapper routes and bundled PI WEB plugin; do not fork or patch `@jmfederico/pi-web` unless the user explicitly asks.
 - Global `AGENTS.md` web editing should use the coding-agent `getAgentDir()` path (`~/.pi/agent/AGENTS.md` by default) so the web UI and CLI share the same instructions file.
 - Hidden project support in `pi-client web` should stay as a wrapper-layer visibility filter over PI WEB projects; do not fork PI WEB's project store format for client-only visibility.
+- When publishing the standalone client package, publish `packages/pi-client` as `@averyyy/pi-client` and keep its runtime dependencies as registry versions, not workspace `file:` links.
 
 ## Commands
 
