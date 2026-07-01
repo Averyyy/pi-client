@@ -307,6 +307,44 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[1].body.entries).toEqual([nextEntry]);
 	});
 
+	it("switches persisted server tree leaf without reuploading entries after tracking resets", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree();
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/session/init")) {
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							staticContextHash: "hash-persisted-switch",
+							treeHash: hashEntries(entries),
+							leafId: "u2",
+							entryCount: entries.length,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("persisted-tree-switch", context, { entries, leafId: "a1" });
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/session/tree/switch",
+		]);
+		expect(capturedBodies[1].body).toEqual({ sessionId: "persisted-tree-switch", leafId: "a1" });
+	});
+
 	it("reconciles server history instead of full-syncing over a different non-empty server tree", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
