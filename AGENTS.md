@@ -12,6 +12,7 @@
 ## Code Quality
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
+- After completing implementation work, add any reusable lessons from the task to this `AGENTS.md` so future agents do not rediscover the same rule.
 - No `any` unless absolutely necessary.
 - Inline single-line helpers that have only one call site.
 - Check node_modules for external API types; don't guess.
