@@ -572,26 +572,35 @@ function getSummaryInputBudget(
 	return Math.max(1, Math.floor(model.contextWindow - maxTokens - overheadTokens));
 }
 
-function takeSummaryChunk(
-	messages: AgentMessage[],
-	tokenBudget: number,
-): { chunk: AgentMessage[]; remaining: AgentMessage[] } {
-	if (!Number.isFinite(tokenBudget)) return { chunk: messages, remaining: [] };
+function toSummarySegments(messages: AgentMessage[]): string[] {
+	return messages
+		.map((message) => serializeConversation(convertToLlm([message])))
+		.filter((segment) => segment.length > 0);
+}
 
-	const chunk: AgentMessage[] = [];
+function takeSummaryChunk(segments: string[], tokenBudget: number): { chunk: string; remaining: string[] } {
+	if (!Number.isFinite(tokenBudget)) return { chunk: segments.join("\n\n"), remaining: [] };
+
+	const chunk: string[] = [];
 	let chunkTokens = 0;
 
-	for (let i = 0; i < messages.length; i++) {
-		const message = messages[i];
-		const messageTokens = Math.max(1, estimateTokens(message));
-		if (chunk.length > 0 && chunkTokens + messageTokens > tokenBudget) {
-			return { chunk, remaining: messages.slice(i) };
+	for (let i = 0; i < segments.length; i++) {
+		const segment = segments[i];
+		const messageTokens = Math.max(1, estimateTextTokens(segment));
+		if (chunk.length === 0 && messageTokens > tokenBudget) {
+			const chunkChars = Math.max(1, Math.floor(tokenBudget * 4));
+			const remainingSegment = segment.slice(chunkChars);
+			const remaining = remainingSegment ? [remainingSegment, ...segments.slice(i + 1)] : segments.slice(i + 1);
+			return { chunk: segment.slice(0, chunkChars), remaining };
 		}
-		chunk.push(message);
+		if (chunk.length > 0 && chunkTokens + messageTokens > tokenBudget) {
+			return { chunk: chunk.join("\n\n"), remaining: segments.slice(i) };
+		}
+		chunk.push(segment);
 		chunkTokens += messageTokens;
 	}
 
-	return { chunk, remaining: [] };
+	return { chunk: chunk.join("\n\n"), remaining: [] };
 }
 
 async function completeSummarization(
@@ -608,7 +617,7 @@ async function completeSummarization(
 }
 
 async function summarizeChunk(
-	messages: AgentMessage[],
+	conversationText: string,
 	model: Model<any>,
 	maxTokens: number,
 	apiKey: string | undefined,
@@ -622,8 +631,6 @@ async function summarizeChunk(
 	previousSummary: string | undefined,
 ): Promise<string> {
 	const basePrompt = previousSummary ? updatePrompt : initialPrompt;
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
 	const promptText = buildSummaryPrompt(conversationText, basePrompt, previousSummary);
 	const summarizationMessages = [
 		{
@@ -640,10 +647,10 @@ async function summarizeChunk(
 		streamFn,
 	);
 
-	if (isContextOverflow(response, model.contextWindow) && messages.length > 1) {
-		const middle = Math.ceil(messages.length / 2);
-		const leftSummary = await summarizeMessages(
-			messages.slice(0, middle),
+	if (isContextOverflow(response, model.contextWindow) && conversationText.length > 1) {
+		const middle = Math.ceil(conversationText.length / 2);
+		const leftSummary = await summarizeChunk(
+			conversationText.slice(0, middle),
 			model,
 			maxTokens,
 			apiKey,
@@ -656,8 +663,8 @@ async function summarizeChunk(
 			updatePrompt,
 			previousSummary,
 		);
-		return summarizeMessages(
-			messages.slice(middle),
+		return summarizeChunk(
+			conversationText.slice(middle),
 			model,
 			maxTokens,
 			apiKey,
@@ -696,9 +703,10 @@ async function summarizeMessages(
 	updatePrompt: string,
 	previousSummary: string | undefined,
 ): Promise<string> {
-	if (messages.length === 0) {
+	let remaining = toSummarySegments(messages);
+	if (remaining.length === 0) {
 		return summarizeChunk(
-			messages,
+			"",
 			model,
 			maxTokens,
 			apiKey,
@@ -713,7 +721,6 @@ async function summarizeMessages(
 		);
 	}
 	let summary = previousSummary;
-	let remaining = messages;
 	while (remaining.length > 0) {
 		const basePrompt = summary ? updatePrompt : initialPrompt;
 		const next = takeSummaryChunk(remaining, getSummaryInputBudget(model, maxTokens, basePrompt, summary));
@@ -900,6 +907,16 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
+const UPDATE_TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are the next part of the same oversized turn prefix.
+
+Update the existing turn-prefix summary in <previous-summary> tags. Keep the same sections:
+
+## Original Request
+## Early Progress
+## Context for Suffix
+
+Be concise. Preserve exact file paths, function names, and error messages.`;
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
@@ -1015,30 +1032,24 @@ async function generateTurnPrefixSummary(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
 
-	const response = await completeSummarization(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),
-		streamFn,
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
+	try {
+		return await summarizeMessages(
+			messages,
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			TURN_PREFIX_SUMMARIZATION_PROMPT,
+			UPDATE_TURN_PREFIX_SUMMARIZATION_PROMPT,
+			undefined,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`Turn prefix summarization failed: ${message.replace(/^Summarization failed: /, "")}`);
 	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
 }

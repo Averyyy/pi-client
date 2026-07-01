@@ -165,6 +165,29 @@ describe("generateSummary reasoning options", () => {
 		expect(prompts[3]).toContain("chunk-d");
 	});
 
+	it("splits one oversized serialized message to fit the active model context window", async () => {
+		const prompts: string[] = [];
+		completeSimpleMock.mockImplementation(async (_model: Model<any>, context: { messages: Message[] }) => {
+			prompts.push(getPromptText(context));
+			return {
+				...mockSummaryResponse,
+				content: [{ type: "text", text: `summary ${prompts.length}` }],
+			};
+		});
+		const oversizedMessages: AgentMessage[] = [
+			{ role: "user", content: `single-start ${"x".repeat(9000)} single-end`, timestamp: Date.now() },
+		];
+
+		const summary = await generateSummary(oversizedMessages, createModel(false, 2048, 2800), 1000, "test-key");
+
+		expect(summary).toBe(`summary ${prompts.length}`);
+		expect(prompts.length).toBeGreaterThan(1);
+		expect(prompts[0]).toContain("single-start");
+		expect(prompts[0]).not.toContain("single-end");
+		expect(prompts[1]).toContain("<previous-summary>\nsummary 1\n</previous-summary>");
+		expect(prompts[prompts.length - 1]).toContain("single-end");
+	});
+
 	it("recursively splits a summary chunk when the provider reports context overflow", async () => {
 		const prompts: string[] = [];
 		completeSimpleMock.mockImplementation(async (_model: Model<any>, context: { messages: Message[] }) => {

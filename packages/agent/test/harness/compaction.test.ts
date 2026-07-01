@@ -600,6 +600,36 @@ describe("harness compaction", () => {
 		expect(prompts[3]).toContain("chunk-d");
 	});
 
+	it("splits one oversized serialized message to fit the active model context window", async () => {
+		const prompts: string[] = [];
+		const { faux, model } = createFauxModel(false, 2048, 2800);
+		faux.setResponses([
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+			(context) => {
+				prompts.push(getPromptText(context));
+				return fauxAssistantMessage(`summary ${prompts.length}`);
+			},
+		]);
+
+		const summary = getOrThrow(
+			await generateSummary([createUserMessage(`single-start ${"x".repeat(9000)} single-end`)], models, model, 1000),
+		);
+
+		expect(summary).toBe(`summary ${prompts.length}`);
+		expect(prompts.length).toBeGreaterThan(1);
+		expect(prompts[0]).toContain("single-start");
+		expect(prompts[0]).not.toContain("single-end");
+		expect(prompts[1]).toContain("<previous-summary>\nsummary 1\n</previous-summary>");
+		expect(prompts[prompts.length - 1]).toContain("single-end");
+	});
+
 	it("recursively splits a summary chunk when the provider reports context overflow", async () => {
 		const prompts: string[] = [];
 		const { faux, model } = createFauxModel(false, 2048, 200000);
