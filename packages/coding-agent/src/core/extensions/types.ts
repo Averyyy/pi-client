@@ -288,7 +288,7 @@ export interface ContextUsage {
 
 export interface CompactOptions {
 	customInstructions?: string;
-	onComplete?: (result: CompactionResult) => void;
+	onComplete?: (result: CompactionResult | undefined) => void;
 	onError?: (error: Error) => void;
 }
 

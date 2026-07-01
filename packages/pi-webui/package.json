@@ -1,0 +1,15 @@
+{
+	"name": "pi-webui",
+	"version": "0.80.3",
+	"private": true,
+	"description": "Local web UI for inspecting and continuing pi-server sessions",
+	"type": "module",
+	"scripts": {
+		"dev": "tsx src/server.ts",
+		"start": "tsx src/server.ts",
+		"check": "tsgo --noEmit -p tsconfig.json"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

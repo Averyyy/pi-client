@@ -24,7 +24,14 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Message,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+} from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -84,9 +91,10 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
+import { compactPiServer, resetSessionTracking, syncPiServerTree } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
+import type { BranchSummaryEntry, CompactionEntry, SessionManager, SessionMessageEntry } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -260,6 +268,14 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
+function isPiServerMode(): boolean {
+	return process.env.PI_SERVER_MODE === "true";
+}
+
+function toProviderReasoning(thinkingLevel: ThinkingLevel): SimpleStreamOptions["reasoning"] {
+	return thinkingLevel === "off" ? undefined : thinkingLevel;
+}
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -286,6 +302,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _lastServerCompactionTimestamp: number | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -349,6 +366,10 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+
+		if (isPiServerMode()) {
+			this._detachPiServerTerminalAssistantFailure();
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -511,7 +532,7 @@ export class AgentSession {
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -580,6 +601,19 @@ export class AgentSession {
 					});
 					this._retryAttempt = 0;
 				}
+
+				if (isPiServerMode() && assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					await syncPiServerTree(
+						this.sessionId,
+						{
+							systemPrompt: this.systemPrompt,
+							messages: this.agent.state.messages as Message[],
+							tools: this.agent.state.tools,
+						},
+						{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+						{ signal },
+					);
+				}
 			}
 		}
 	};
@@ -618,6 +652,35 @@ export class AgentSession {
 			}
 		}
 		return undefined;
+	}
+
+	private _detachPiServerTerminalAssistantFailure(): void {
+		const branch = this.sessionManager.getBranch();
+		let terminalMessageEntry: SessionMessageEntry | undefined;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "message") {
+				terminalMessageEntry = entry;
+				break;
+			}
+		}
+		if (!terminalMessageEntry || terminalMessageEntry.message.role !== "assistant") {
+			return;
+		}
+
+		const assistant = terminalMessageEntry.message as AssistantMessage;
+		if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+			return;
+		}
+
+		if (terminalMessageEntry.parentId) {
+			this.sessionManager.branch(terminalMessageEntry.parentId);
+		} else {
+			this.sessionManager.resetLeaf();
+		}
+
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1008,6 +1071,10 @@ export class AgentSession {
 			return true;
 		}
 
+		if (isPiServerMode() && (msg.stopReason === "error" || msg.stopReason === "aborted")) {
+			this._detachPiServerTerminalAssistantFailure();
+		}
+
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		return this.agent.hasQueuedMessages();
@@ -1107,6 +1174,10 @@ export class AgentSession {
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				await this._checkCompaction(lastAssistant, false);
+			}
+
+			if (isPiServerMode()) {
+				this._detachPiServerTerminalAssistantFailure();
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1479,6 +1550,10 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
+		if (this.isStreaming) {
+			await this.abort();
+		}
+
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
@@ -1668,12 +1743,53 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _applyPiServerCompactionResult(
+		result: CompactionResult,
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
+	): Promise<void> {
+		this.sessionManager.appendCompaction(
+			result.summary,
+			result.firstKeptEntryId,
+			result.tokensBefore,
+			result.details,
+			false,
+		);
+		const newEntries = this.sessionManager.getEntries();
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
+
+		const savedCompactionEntry = newEntries.find(
+			(entry) => entry.type === "compaction" && entry.summary === result.summary,
+		) as CompactionEntry | undefined;
+
+		if (this._extensionRunner && savedCompactionEntry) {
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: savedCompactionEntry,
+				fromExtension: false,
+				reason,
+				willRetry,
+			});
+		}
+
+		await syncPiServerTree(
+			this.sessionId,
+			{
+				systemPrompt: this.systemPrompt,
+				messages: this.agent.state.messages as Message[],
+				tools: this.agent.state.tools,
+			},
+			{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+		);
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1685,6 +1801,37 @@ export class AgentSession {
 			}
 
 			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
+
+			if (isPiServerMode()) {
+				const result = await compactPiServer(
+					this.model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						customInstructions,
+						settings: this.settingsManager.getCompactionSettings(),
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+						signal: this._compactionAbortController.signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+					},
+				);
+				await this._applyPiServerCompactionResult(result, "manual", false);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result,
+					aborted: false,
+					willRetry: false,
+				});
+				return result;
+			}
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
@@ -1857,8 +2004,10 @@ export class AgentSession {
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const localCompactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : 0;
+		const compactionTimestamp = Math.max(localCompactionTimestamp, this._lastServerCompactionTimestamp ?? 0);
 		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
+			compactionTimestamp > 0 && assistantMessage.timestamp <= compactionTimestamp;
 		if (assistantIsFromBeforeCompaction) {
 			return false;
 		}
@@ -1912,9 +2061,9 @@ export class AgentSession {
 			// trigger compaction right after one just finished.
 			const usageMsg = messages[estimate.lastUsageIndex];
 			if (
-				compactionEntry &&
+				compactionTimestamp > 0 &&
 				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()
+				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
 			) {
 				return false;
 			}
@@ -1953,6 +2102,34 @@ export class AgentSession {
 				env = authResult.env;
 			} else {
 				({ apiKey, headers, env } = await this._getCompactionRequestAuth(this.model));
+			}
+
+			if (isPiServerMode()) {
+				this._emit({ type: "compaction_start", reason });
+				this._autoCompactionAbortController = new AbortController();
+				started = true;
+				const signal = this._autoCompactionAbortController.signal;
+				const result = await compactPiServer(
+					this.model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						settings,
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+						signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+					},
+				);
+				await this._applyPiServerCompactionResult(result, reason, willRetry);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				return willRetry ? true : this.agent.hasQueuedMessages();
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
@@ -2506,6 +2683,12 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
+	private _isNonRetryableProviderLimitError(errorMessage: string): boolean {
+		return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient.?balance|balance.?insufficient|insufficient_quota|out of budget|quota exceeded|billing|payment required|402/i.test(
+			errorMessage,
+		);
+	}
+
 	/**
 	 * Check if an error is retryable (overloaded, rate limit, server errors).
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
@@ -2513,6 +2696,7 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
+		if (message.errorMessage && this._isNonRetryableProviderLimitError(message.errorMessage)) return false;
 		return isRetryableAssistantError(message);
 	}
 
@@ -2544,10 +2728,15 @@ export class AgentSession {
 			errorMessage: message.errorMessage || "Unknown error",
 		});
 
-		// Remove error message from agent state (keep in session for history)
-		const messages = this.agent.state.messages;
-		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-			this.agent.state.messages = messages.slice(0, -1);
+		if (isPiServerMode()) {
+			this._detachPiServerTerminalAssistantFailure();
+			resetSessionTracking(this.sessionId);
+		} else {
+			// Remove error message from agent state (keep in session for history)
+			const messages = this.agent.state.messages;
+			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+				this.agent.state.messages = messages.slice(0, -1);
+			}
 		}
 
 		// Wait with exponential backoff (abortable)
@@ -2902,6 +3091,17 @@ export class AgentSession {
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			if (isPiServerMode()) {
+				await syncPiServerTree(
+					this.sessionId,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+				);
+			}
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

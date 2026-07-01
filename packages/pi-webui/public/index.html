@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>pi-webui</title>
+		<link rel="stylesheet" href="/styles.css" />
+	</head>
+	<body>
+		<div class="app-shell">
+			<aside class="sidebar">
+				<header class="brand-row">
+					<div>
+						<h1>pi-webui</h1>
+						<p id="serverLabel">127.0.0.1:4217</p>
+					</div>
+					<span id="healthDot" class="health-dot pending" title="Health"></span>
+				</header>
+
+				<section class="control-group">
+					<label for="serverToken">Server token</label>
+					<input id="serverToken" type="password" autocomplete="off" />
+					<button id="saveTokenButton" type="button">Save</button>
+				</section>
+
+				<section class="control-group">
+					<label for="manualSessionId">Session ID</label>
+					<div class="inline-controls">
+						<input id="manualSessionId" type="text" spellcheck="false" />
+						<button id="loadSessionButton" type="button">Load</button>
+					</div>
+				</section>
+
+				<div class="sidebar-actions">
+					<button id="refreshSessionsButton" type="button">Refresh</button>
+				</div>
+				<div id="sessionList" class="session-list"></div>
+			</aside>
+
+			<main class="main-pane">
+				<header class="session-header">
+					<div>
+						<h2 id="sessionTitle">No session selected</h2>
+						<p id="sessionMeta"></p>
+					</div>
+					<button id="refreshHistoryButton" type="button" disabled>Reload</button>
+				</header>
+
+				<section id="statusBar" class="status-bar">Starting</section>
+				<section id="messages" class="messages"></section>
+
+				<section class="composer">
+					<div class="model-grid">
+						<label>
+							Model JSON
+							<textarea id="modelJson" spellcheck="false" rows="7"></textarea>
+						</label>
+						<div class="option-grid">
+							<label>
+								Provider API key
+								<input id="providerApiKey" type="password" autocomplete="off" />
+							</label>
+							<label>
+								Reasoning
+								<select id="reasoning">
+									<option value="">Default</option>
+									<option value="minimal">minimal</option>
+									<option value="low">low</option>
+									<option value="medium">medium</option>
+									<option value="high">high</option>
+									<option value="xhigh">xhigh</option>
+								</select>
+							</label>
+							<label>
+								Max tokens
+								<input id="maxTokens" type="number" min="1" step="1" />
+							</label>
+							<label>
+								Temperature
+								<input id="temperature" type="number" min="0" max="2" step="0.1" />
+							</label>
+							<label class="headers-field">
+								Provider headers JSON
+								<textarea id="providerHeaders" spellcheck="false" rows="3"></textarea>
+							</label>
+						</div>
+					</div>
+					<label>
+						Message
+						<textarea id="prompt" rows="4"></textarea>
+					</label>
+					<div class="composer-actions">
+						<button id="sendButton" type="button" disabled>Send</button>
+					</div>
+				</section>
+			</main>
+		</div>
+		<script type="module" src="/app.js"></script>
+	</body>
+</html>

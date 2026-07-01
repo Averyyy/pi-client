@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pi-client` server mode transport for sending incremental session/model/message deltas to `pi-server`.
+- Added chunked `pi-server` request upload support controlled by `PI_CLIENT_MAX_REQUEST_KB`.
+- Added a `pi-client` CLI entrypoint that preserves the original Pi config, extension, skill, prompt, and theme loading path.
+- Reused matching `pi-server` tree hashes to avoid repeating full tree sync when the server already has the same persisted session tree.
+
 ### Fixed
 
 - Fixed oversized bash tool timeouts to fail with a clear validation error instead of being clamped to an immediate timeout ([#6181](https://github.com/earendil-works/pi/issues/6181)).

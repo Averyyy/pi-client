@@ -18,6 +18,9 @@
 		},
 		"./rpc-entry": {
 			"import": "./dist/rpc-entry.js"
+		},
+		"./pi-client-cli": {
+			"import": "./dist/pi-client-cli.js"
 		}
 	},
 	"files": [

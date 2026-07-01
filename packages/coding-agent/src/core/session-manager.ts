@@ -963,6 +963,34 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	replaceMessages(messages: Message[]): void {
+		const header = this.fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) {
+			throw new Error("Session header is missing");
+		}
+		const retainedEntries = this.fileEntries.filter(
+			(entry) => entry.type === "session" || entry.type === "model_change" || entry.type === "thinking_level_change",
+		);
+		const ids = new Set(retainedEntries.map((entry) => entry.id).filter((id): id is string => id !== undefined));
+		let parentId = retainedEntries.at(-1)?.type === "session" ? null : (retainedEntries.at(-1)?.id ?? null);
+		const messageEntries: SessionMessageEntry[] = messages.map((message) => {
+			const entry: SessionMessageEntry = {
+				type: "message",
+				id: generateId(ids),
+				parentId,
+				timestamp: new Date(message.timestamp).toISOString(),
+				message,
+			};
+			ids.add(entry.id);
+			parentId = entry.id;
+			return entry;
+		});
+		this.fileEntries = [...retainedEntries, ...messageEntries];
+		this._buildIndex();
+		this._rewriteFile();
+		this.flushed = this.persist;
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
