@@ -191,23 +191,26 @@ describe("FooterDataProvider reftable branch detection", () => {
 	});
 
 	it("debounces rapid reftable updates into a single async refresh", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
 		const provider = new FooterDataProvider(worktreeDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
 			vi.mocked(execFile).mockClear();
+			vi.useFakeTimers();
+			const providerWithInternals = provider as unknown as { scheduleRefresh: () => void };
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			writeFileSync(join(reftableDir, "tables.list"), "2\n");
-			writeFileSync(join(reftableDir, "tables.list"), "3\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await new Promise((resolve) => setTimeout(resolve, 650));
+			providerWithInternals.scheduleRefresh();
+			providerWithInternals.scheduleRefresh();
+			providerWithInternals.scheduleRefresh();
+			await vi.advanceTimersByTimeAsync(500);
+			await vi.runOnlyPendingTimersAsync();
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 

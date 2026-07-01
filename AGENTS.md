@@ -42,6 +42,7 @@
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
+- Tree/branch summaries are part of the same compaction family: use the shared chunked summarizer instead of pre-dropping old branch messages or sending a single oversized summary request.
 - Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
 - Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.
@@ -65,6 +66,8 @@
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
+- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files.
+- Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 - After finishing workspace changes, commit and push only your own changes unless the user explicitly says not to.
 

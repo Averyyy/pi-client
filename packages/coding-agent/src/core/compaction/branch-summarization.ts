@@ -6,24 +6,16 @@
  */
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
-import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "../messages.ts";
+import type { Model } from "@earendil-works/pi-ai/compat";
+import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
-import { estimateTokens } from "./compaction.ts";
+import { estimateTokens, summarizeMessages } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
-	serializeConversation,
 } from "./utils.ts";
 
 // ============================================================================
@@ -278,6 +270,18 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+const UPDATE_BRANCH_SUMMARY_PROMPT = `The messages above are NEW messages from the same abandoned branch.
+
+Update the existing branch summary in <previous-summary> tags with the new information. Keep the same sections:
+
+## Goal
+## Constraints & Preferences
+## Progress
+## Key Decisions
+## Next Steps
+
+Be concise. Preserve exact file paths, function names, and error messages.`;
+
 /**
  * Generate a summary of abandoned branch entries.
  *
@@ -300,61 +304,56 @@ export async function generateBranchSummary(
 		streamFn,
 	} = options;
 
-	// Token budget = context window minus reserved space for prompt + response
-	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
-
-	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
+	const { messages, fileOps } = prepareBranchEntries(entries);
 
 	if (messages.length === 0) {
 		return { summary: "No content to summarize" };
 	}
 
-	// Transform to LLM-compatible messages, then serialize to text
-	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build prompt
 	let instructions: string;
+	let updateInstructions = UPDATE_BRANCH_SUMMARY_PROMPT;
 	if (replaceInstructions && customInstructions) {
 		instructions = customInstructions;
+		updateInstructions = `${UPDATE_BRANCH_SUMMARY_PROMPT}\n\nUse these replacement instructions while updating:\n\n${customInstructions}`;
 	} else if (customInstructions) {
 		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+		updateInstructions = `${UPDATE_BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+	const maxTokens = Math.min(
+		2048,
+		Math.floor(0.8 * reserveTokens),
+		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+	);
 
-	// Call LLM for summarization. Prefer the session stream function so SDK
-	// request behavior (timeouts, retries, attribution headers) stays consistent
-	// without running through agent state/events.
-	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
-	const response = streamFn
-		? await (await streamFn(model, context, requestOptions)).result()
-		: await completeSimple(model, context, requestOptions);
+	let summary: string;
+	try {
+		summary = await summarizeMessages(
+			messages,
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			undefined,
+			streamFn,
+			instructions,
+			updateInstructions,
+			undefined,
+		);
+	} catch (error) {
+		if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+			return { aborted: true };
+		}
+		return { error: error instanceof Error ? error.message.replace(/^Summarization failed: /, "") : String(error) };
+	}
 
-	// Check if aborted or errored
-	if (response.stopReason === "aborted") {
+	if (signal.aborted) {
 		return { aborted: true };
 	}
-	if (response.stopReason === "error") {
-		return { error: response.errorMessage || "Summarization failed" };
-	}
-
-	let summary = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
 
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;

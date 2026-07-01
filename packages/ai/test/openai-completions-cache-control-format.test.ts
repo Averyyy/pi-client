@@ -92,7 +92,7 @@ async function capturePayload(
 				},
 			],
 		},
-		{ apiKey: "test-key", ...options },
+		{ apiKey: "test-key", cacheRetention: "short", ...options },
 	).result();
 
 	if (!mockState.lastParams) {

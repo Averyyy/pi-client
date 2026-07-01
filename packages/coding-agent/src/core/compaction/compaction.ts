@@ -689,7 +689,7 @@ async function summarizeChunk(
 		.join("\n");
 }
 
-async function summarizeMessages(
+export async function summarizeMessages(
 	messages: AgentMessage[],
 	model: Model<any>,
 	maxTokens: number,

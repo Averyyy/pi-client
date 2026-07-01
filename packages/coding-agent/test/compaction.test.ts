@@ -11,6 +11,7 @@ import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
+	generateBranchSummary,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
@@ -25,6 +26,7 @@ import {
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
 } from "../src/core/session-manager.ts";
+import { createFauxStreamFn } from "./test-harness.ts";
 
 // ============================================================================
 // Test fixtures
@@ -499,6 +501,31 @@ describe("Large session fixture", () => {
 
 		expect(loaded.messages.length).toBeGreaterThan(100);
 		expect(loaded.model).not.toBeNull();
+	});
+});
+
+describe("generateBranchSummary", () => {
+	it("chunks a single oversized branch message instead of dropping it", async () => {
+		const model = {
+			...getModel("anthropic", "claude-sonnet-4-5")!,
+			contextWindow: 2000,
+			maxTokens: 256,
+		};
+		const { streamFn, state } = createFauxStreamFn(["branch chunk summary"]);
+		const entries = [createMessageEntry(createUserMessage("oversized branch detail ".repeat(700)))];
+
+		const result = await generateBranchSummary(entries, {
+			model,
+			apiKey: "test-key",
+			signal: new AbortController().signal,
+			reserveTokens: 200,
+			streamFn,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.summary).toContain("Summary of that exploration");
+		expect(result.summary).toContain("branch chunk summary");
+		expect(state.callCount).toBeGreaterThan(1);
 	});
 });
 
