@@ -75,4 +75,9 @@ unset AWS_WEB_IDENTITY_TOKEN_FILE
 unset BEDROCK_EXTENSIVE_MODEL_TEST
 
 echo "Running tests without API keys..."
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [[ "$NODE_MAJOR" != "26" ]]; then
+    echo "test.sh requires Node 26; current node is $(node -v)"
+    exit 1
+fi
 npm test

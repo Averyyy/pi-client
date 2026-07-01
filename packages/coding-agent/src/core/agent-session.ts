@@ -49,6 +49,7 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -2059,6 +2060,9 @@ export class AgentSession {
 			}
 
 			this._overflowRecoveryAttempted = true;
+			const terminalFailurePreparation = this._isTerminalAssistantFailure(assistantMessage)
+				? prepareCompaction(this.sessionManager.getBranch(), settings)
+				: undefined;
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			if (this._isTerminalAssistantFailure(assistantMessage)) {
@@ -2069,7 +2073,7 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			return await this._runAutoCompaction("overflow", willRetry, terminalFailurePreparation);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2106,7 +2110,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		preparationOverride?: CompactionPreparation,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2160,8 +2168,7 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = preparationOverride ?? prepareCompaction(pathEntries, settings);
 			if (!preparation) {
 				return false;
 			}

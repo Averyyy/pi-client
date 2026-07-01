@@ -76,6 +76,40 @@ describe("ChunkRequest", () => {
 		expect(capturedRequests.some((request) => request.body.target === "/api/session/tree/sync")).toBe(true);
 	});
 
+	it("does not add provider timeout signals to chunk uploads", async () => {
+		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+		const controller = new AbortController();
+		const seenSignals: (AbortSignal | null | undefined)[] = [];
+
+		const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+			seenSignals.push(init?.signal);
+			const rawBody = (init?.body as string | undefined) ?? "";
+			const body = rawBody ? (JSON.parse(rawBody) as CapturedRequestBody) : {};
+			const index = getNumberProperty(body, "index");
+			const total = getNumberProperty(body, "total");
+			return new Response(JSON.stringify({ ok: index === total - 1 }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		vi.stubGlobal("fetch", mockFetch);
+
+		const request = new ChunkRequest({
+			serverUrl: "http://pi-server.test",
+			authToken: "token",
+			signal: controller.signal,
+		});
+		const response = await request.postJson("/api/stream", {
+			sessionId: "chunk-timeout-test",
+			content: "x".repeat(1024 * 1024),
+		});
+
+		expect(response.ok).toBe(true);
+		expect(seenSignals.length).toBeGreaterThan(1);
+		expect(seenSignals.every((signal) => signal === controller.signal)).toBe(true);
+	});
+
 	it("uses the same pi-server request object for bodyless gets", async () => {
 		const capturedRequests: { url: string; method?: string; body?: RequestInit["body"] }[] = [];
 		const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {

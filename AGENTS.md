@@ -34,6 +34,7 @@
 - If `/api/session/tree/append` or `/api/session/tree/switch` returns a recoverable divergence for a non-empty server tree, reconcile from `/api/session/:id/history`; do not treat it as permission to replace the server tree.
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
+- Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
 
 ## pi-client / pi-server Compact and Resilience
 
