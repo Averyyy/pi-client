@@ -67,7 +67,9 @@
 - Dry-run locally with `npm run publish:averyyy:dry -- --version 0.80.3-piclient.N`. Use `--skip-build` only when existing `dist` output was already built for the same source.
 - The script publishes `@averyyy/pi-ai`, `@averyyy/pi-tui`, `@averyyy/pi-agent-core`, `@averyyy/pi-coding-agent`, `@averyyy/pi-client`, and `@averyyy/pi-server` from temporary package directories. It rewrites internal runtime dependencies to exact `npm:@averyyy/...@version` aliases and does not mutate workspace package versions.
 - Remote publishing is handled by `.github/workflows/publish-averyyy-npm.yml`. Creating or editing a draft release does not trigger GitHub Actions; publish the draft release, or run the workflow manually with `workflow_dispatch`.
-- The remote workflow uses npm trusted publishing through environment `npm-publish` with `--provenance`. Configure each `@averyyy/*` npm package for that trusted publisher.
+- The remote workflow uses npm trusted publishing through environment `npm-publish` with `--provenance`. Configure each package, not just `@averyyy/pi-client`, for that trusted publisher:
+  `npx --yes npm@11 trust github @averyyy/<package> --file publish-averyyy-npm.yml --repo Averyyy/pi-client --env npm-publish --allow-publish`.
+- Before relying on remote publishing, verify every package in the script already exists on npm and has trusted publishing configured. A release-triggered publish can fail with `404 Not Found ... or you do not have permission` when the package exists but lacks the trusted publisher, and a new package such as `@averyyy/pi-tui` must be created once before it can be configured.
 
 ## Commands
 
