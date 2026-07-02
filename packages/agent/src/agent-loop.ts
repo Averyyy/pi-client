@@ -378,10 +378,7 @@ async function executeToolCalls(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
-	const hasSequentialToolCall = toolCalls.some(
-		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
-	);
-	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+	if (config.toolExecution === "sequential") {
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
 	}
 	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
@@ -456,7 +453,7 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	const scheduledCalls: ScheduledToolCallEntry[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -474,33 +471,26 @@ async function executeToolCallsParallel(
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
-			finalizedCalls.push(finalized);
+			scheduledCalls.push(finalized);
 			if (signal?.aborted) {
 				break;
 			}
 			continue;
 		}
 
-		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
-			const finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
-			await emitToolExecutionEnd(finalized, emit);
-			return finalized;
-		});
+		scheduledCalls.push({ preparation });
 		if (signal?.aborted) {
 			break;
 		}
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	const orderedFinalizedCalls = await executeScheduledToolCalls(
+		currentContext,
+		assistantMessage,
+		scheduledCalls,
+		config,
+		signal,
+		emit,
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
@@ -539,7 +529,59 @@ type FinalizedToolCallOutcome = {
 	isError: boolean;
 };
 
-type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
+type ScheduledToolCallEntry = FinalizedToolCallOutcome | { preparation: PreparedToolCall };
+
+async function executeScheduledToolCalls(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	scheduledCalls: ScheduledToolCallEntry[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<FinalizedToolCallOutcome[]> {
+	const orderedFinalizedCalls: FinalizedToolCallOutcome[] = [];
+	let parallelBatch: Array<{ index: number; preparation: PreparedToolCall }> = [];
+
+	const runPrepared = async (preparation: PreparedToolCall) => {
+		const executed = await executePreparedToolCall(preparation, signal, emit);
+		const finalized = await finalizeExecutedToolCall(
+			currentContext,
+			assistantMessage,
+			preparation,
+			executed,
+			config,
+			signal,
+		);
+		await emitToolExecutionEnd(finalized, emit);
+		return finalized;
+	};
+
+	const flushParallelBatch = async () => {
+		if (parallelBatch.length === 0) return;
+		const batch = parallelBatch;
+		parallelBatch = [];
+		const finalizedBatch = await Promise.all(batch.map(({ preparation }) => runPrepared(preparation)));
+		for (let i = 0; i < batch.length; i++) {
+			orderedFinalizedCalls[batch[i].index] = finalizedBatch[i];
+		}
+	};
+
+	for (const [index, entry] of scheduledCalls.entries()) {
+		if (!("preparation" in entry)) {
+			orderedFinalizedCalls[index] = entry;
+			continue;
+		}
+		if (entry.preparation.tool.executionMode === "sequential") {
+			await flushParallelBatch();
+			orderedFinalizedCalls[index] = await runPrepared(entry.preparation);
+			continue;
+		}
+		parallelBatch.push({ index, preparation: entry.preparation });
+	}
+	await flushParallelBatch();
+
+	return orderedFinalizedCalls;
+}
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);

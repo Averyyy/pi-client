@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed parallel tool scheduling so sequential tools act as source-order barriers instead of forcing the whole tool batch to run serially.
+
 ## [0.80.3] - 2026-06-30
 
 ### Added

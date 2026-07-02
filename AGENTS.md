@@ -24,6 +24,10 @@
 - Never hardcode key checks (e.g. `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
 - Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes.
 
+## Agent Core Tool Scheduling
+
+- In parallel tool mode, do not downgrade an entire tool batch to sequential just because one tool has `executionMode: "sequential"`. Treat sequential tools as source-order barriers: run the parallel segment before them concurrently, run the sequential tool alone, then continue with the next parallel segment. Same-file edit/write ordering belongs in `withFileMutationQueue()`, and bash stays sequential so validation commands do not overlap sibling tool calls.
+
 ## pi-client / pi-server Request Sync
 
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
@@ -35,6 +39,7 @@
 - If `/api/session/tree/append` or `/api/session/tree/switch` returns a recoverable divergence for a non-empty server tree, reconcile from `/api/session/:id/history`; do not treat it as permission to replace the server tree.
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
+- Chunk envelopes must include `requestId`, `chunkIndex`, `totalChunks`, and a `sha256` of the encoded chunk string. Identical duplicate chunks are acknowledgement-only no-ops; checksum mismatches or divergent duplicate indexes fail in `request-chunks`.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
 - Keep update-command install-shape handling in the package updater wrappers: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 

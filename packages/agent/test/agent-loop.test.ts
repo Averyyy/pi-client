@@ -820,6 +820,94 @@ describe("agentLoop with AgentMessage", () => {
 		expect(executionOrder).toContain("fast:b");
 	});
 
+	it("should keep parallel tool groups around sequential tool calls", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		let firstResolved = false;
+		let parallelObserved = false;
+		let validationStartedAfterFirst = false;
+		let releaseFirst: (() => void) | undefined;
+		const firstDone = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+
+		const parallelTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "parallel",
+			label: "Parallel",
+			description: "Parallel tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				if (params.value === "first") {
+					await firstDone;
+					firstResolved = true;
+				}
+				if (params.value === "second" && !firstResolved) {
+					parallelObserved = true;
+				}
+				return {
+					content: [{ type: "text", text: `parallel: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const validationTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "validate",
+			label: "Validate",
+			description: "Validation tool",
+			parameters: toolSchema,
+			executionMode: "sequential",
+			async execute(_toolCallId, params) {
+				validationStartedAfterFirst = firstResolved;
+				return {
+					content: [{ type: "text", text: `validate: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [parallelTool, validationTool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		let callIndex = 0;
+		const stream = agentLoop([createUserMessage("run tools")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "parallel", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "parallel", arguments: { value: "second" } },
+							{ type: "toolCall", id: "tool-3", name: "validate", arguments: { value: "after" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+					setTimeout(() => releaseFirst?.(), 20);
+				} else {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					mockStream.push({ type: "done", reason: "stop", message });
+				}
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(parallelObserved).toBe(true);
+		expect(validationStartedAfterFirst).toBe(true);
+	});
+
 	it("should allow parallel execution when all tools have executionMode=parallel", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		let firstResolved = false;

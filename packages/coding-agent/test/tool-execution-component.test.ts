@@ -154,6 +154,10 @@ describe("ToolExecutionComponent parity", () => {
 		await promise;
 	});
 
+	test("bash executes as a sequential scheduler barrier", () => {
+		expect(createBashToolDefinition(process.cwd()).executionMode).toBe("sequential");
+	});
+
 	test("bash renderer does not duplicate final full output truncation details", async () => {
 		const operations: BashOperations = {
 			exec: async (_command, _cwd, { onData }) => {
