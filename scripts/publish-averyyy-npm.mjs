@@ -105,7 +105,7 @@ try {
 			continue;
 		}
 
-		const publishArgs = ["publish", "--access", "public", "--ignore-scripts"];
+		const publishArgs = ["publish", "--access", "public", "--tag", "latest", "--ignore-scripts"];
 		if (args.provenance) {
 			publishArgs.push("--provenance");
 		}
