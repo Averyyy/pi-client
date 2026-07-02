@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,24 @@ const binDir = dirname(fileURLToPath(import.meta.url));
 const defaultPort = "1838";
 const defaultPiServerUrl = "http://127.0.0.1:4217";
 
+export async function piClientWebSessiondEnv(env = process.env, platform = process.platform) {
+	if (platform !== "win32") return {};
+	if (env.PI_WEB_SESSIOND_URL !== undefined && env.PI_WEB_SESSIOND_URL !== "") return {};
+	if (env.PI_WEB_SESSIOND_SOCKET !== undefined && env.PI_WEB_SESSIOND_SOCKET !== "") return {};
+
+	const host = env.PI_WEB_SESSIOND_HOST !== undefined && env.PI_WEB_SESSIOND_HOST !== "" ? env.PI_WEB_SESSIOND_HOST : "127.0.0.1";
+	const port =
+		env.PI_WEB_SESSIOND_PORT !== undefined && env.PI_WEB_SESSIOND_PORT !== ""
+			? env.PI_WEB_SESSIOND_PORT
+			: String(await findOpenTcpPort(host));
+	const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+	return {
+		PI_WEB_SESSIOND_HOST: host,
+		PI_WEB_SESSIOND_PORT: port,
+		PI_WEB_SESSIOND_URL: `http://${urlHost}:${port}`,
+	};
+}
+
 export async function runPiClientWeb(args = process.argv.slice(2)) {
 	const parsed = parseArgs(args);
 	if (parsed.help) {
@@ -28,8 +47,11 @@ export async function runPiClientWeb(args = process.argv.slice(2)) {
 
 	process.title = "pi-client web";
 	const piServer = await effectivePiServerSettings(process.env);
+	const sessiondEnv = await piClientWebSessiondEnv(process.env);
+	Object.assign(process.env, sessiondEnv);
 	const childEnv = {
 		...process.env,
+		...sessiondEnv,
 		PI_CODING_AGENT: "true",
 		PI_SERVER_MODE: "true",
 		PI_SERVER_URL: piServer.serverUrl,
@@ -74,6 +96,21 @@ export async function runPiClientWeb(args = process.argv.slice(2)) {
 		});
 		process.once("SIGINT", () => shutdown(130));
 		process.once("SIGTERM", () => shutdown(143));
+	});
+}
+
+async function findOpenTcpPort(host) {
+	return await new Promise((resolve, reject) => {
+		const server = createServer();
+		server.once("error", reject);
+		server.listen(0, host, () => {
+			const address = server.address();
+			if (address === null || typeof address === "string") {
+				server.close(() => reject(new Error("Could not reserve a session daemon TCP port")));
+				return;
+			}
+			server.close(() => resolve(address.port));
+		});
 	});
 }
 
