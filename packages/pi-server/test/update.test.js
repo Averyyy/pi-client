@@ -20,7 +20,6 @@ describe("pi-server update", () => {
 			packageRoot: pkgRoot,
 			repoRoot: "/repo/pi-client",
 			runner,
-			fetch: async () => new Response("", { status: 200 }),
 			stdout: { write: (value) => output.push(value) },
 			stderr: { write: (value) => output.push(value) },
 		});
@@ -30,8 +29,6 @@ describe("pi-server update", () => {
 		expect(output.join("")).toContain(`pi-server ${pkg.version}`);
 		expect(calls).toEqual([
 			{ command: "git", args: ["status", "--porcelain"], cwd: "/repo/pi-client", stdio: "pipe" },
-			{ command: "git", args: ["config", "--get", "remote.origin.url"], cwd: "/repo/pi-client", stdio: "pipe" },
-			{ command: "npm", args: ["config", "get", "registry"], cwd: "/repo/pi-client", stdio: "pipe" },
 			{ command: "git", args: ["pull", "--ff-only"], cwd: "/repo/pi-client", stdio: "inherit" },
 			{ command: "npm", args: ["install", "--ignore-scripts"], cwd: "/repo/pi-client", stdio: "inherit" },
 			{ command: "npm", args: ["run", "install:pi-client"], cwd: "/repo/pi-client", stdio: "inherit" },
@@ -48,9 +45,6 @@ describe("pi-server update", () => {
 			if (command === "git" && args.join(" ") === "status --porcelain") {
 				return { status: 128, stderr: "fatal: not a git repository\n" };
 			}
-			if (command === "npm" && args.join(" ") === "config get registry") {
-				return { status: 0, stdout: "https://registry.npmjs.org/\n" };
-			}
 			return { status: 0, stdout: "" };
 		};
 
@@ -58,7 +52,6 @@ describe("pi-server update", () => {
 			packageRoot: pkgRoot,
 			repoRoot: "/usr/local/lib/node_modules",
 			runner,
-			fetch: async () => new Response("", { status: 200 }),
 			stdout: { write: (value) => output.push(value) },
 			stderr: { write: (value) => output.push(value) },
 		});
@@ -67,7 +60,6 @@ describe("pi-server update", () => {
 		expect(output.join("")).toContain("Updating npm packages");
 		expect(calls).toEqual([
 			{ command: "git", args: ["status", "--porcelain"], cwd: "/usr/local/lib/node_modules", stdio: "pipe" },
-			{ command: "npm", args: ["config", "get", "registry"], cwd: "/usr/local/lib/node_modules", stdio: "pipe" },
 			{
 				command: "npm",
 				args: [

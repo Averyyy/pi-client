@@ -36,8 +36,7 @@
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
-- Keep proxy acknowledgement in `ChunkRequest`: if a pi-server request receives a `proxycontrolwarn` warning, approve it there and retry the same request once instead of adding feature-level retries.
-- Keep update-command proxy acknowledgement in the package updater wrappers: git checkouts approve the git remote and npm registry before `git pull` / `npm install`; npm global installs approve the npm registry before `npm install -g @averyyy/pi-client@latest @averyyy/pi-server@latest`.
+- Keep update-command install-shape handling in the package updater wrappers: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 
 ## pi-client / pi-server Compact and Resilience
 
@@ -49,6 +48,7 @@
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
 - Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.
 - Do not mark pi-server sync as successful until the response is valid JSON. For proxy/network failures, report status, content-type, and a short body excerpt; stream responses must be `text/event-stream`.
+- If post-stream pi-server tree sync fails after a successful assistant response, do not auto-retry the LLM or call `agent.continue()` from that assistant leaf; detach the sync-error assistant from the active branch and let the next pi-server sync recover.
 - Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
 - To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
 
