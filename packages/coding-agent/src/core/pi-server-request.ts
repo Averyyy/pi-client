@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const DEFAULT_MAX_REQUEST_KB = 512;
 const CHUNK_ENDPOINT = "/api/request/chunk";
@@ -13,8 +13,9 @@ export interface PiServerRequestOptions {
 interface ChunkBody {
 	requestId: string;
 	target: string;
-	index: number;
-	total: number;
+	chunkIndex: number;
+	totalChunks: number;
+	sha256: string;
 	chunk: string;
 }
 
@@ -40,6 +41,10 @@ function makeHeaders(authToken: string): Record<string, string> {
 	};
 }
 
+function sha256(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
 function chunkBodyFits(
 	target: string,
 	requestId: string,
@@ -51,8 +56,9 @@ function chunkBodyFits(
 	const body: ChunkBody = {
 		requestId,
 		target,
-		index: Math.max(0, total - 1),
-		total,
+		chunkIndex: Math.max(0, total - 1),
+		totalChunks: total,
+		sha256: "0".repeat(64),
 		chunk: "x".repeat(Math.min(chunkLength, encodedLength)),
 	};
 	return jsonByteLength(body) <= maxBytes;
@@ -111,12 +117,14 @@ export class ChunkRequest {
 		let response: Response | undefined;
 
 		for (let index = 0; index < chunks.length; index++) {
+			const chunk = chunks[index];
 			const chunkBody: ChunkBody = {
 				requestId,
 				target: endpoint,
-				index,
-				total: chunks.length,
-				chunk: chunks[index],
+				chunkIndex: index,
+				totalChunks: chunks.length,
+				sha256: sha256(chunk),
+				chunk,
 			};
 			response = await this.#postRawJson(CHUNK_ENDPOINT, JSON.stringify(chunkBody));
 			if (!response.ok || index === chunks.length - 1) {

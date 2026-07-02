@@ -3,11 +3,12 @@ import { ChunkRequest } from "../src/core/pi-server-request.ts";
 
 interface CapturedRequestBody {
 	target?: string;
-	index?: number;
-	total?: number;
+	chunkIndex?: number;
+	totalChunks?: number;
+	sha256?: string;
 }
 
-function getNumberProperty(body: CapturedRequestBody, key: "index" | "total"): number {
+function getNumberProperty(body: CapturedRequestBody, key: "chunkIndex" | "totalChunks"): number {
 	const value = body[key];
 	if (typeof value !== "number") {
 		throw new Error(`Expected numeric ${key}`);
@@ -36,9 +37,9 @@ describe("ChunkRequest", () => {
 			capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
 
 			if (url.endsWith("/api/request/chunk")) {
-				const index = getNumberProperty(body, "index");
-				const total = getNumberProperty(body, "total");
-				if (index !== total - 1) {
+				const chunkIndex = getNumberProperty(body, "chunkIndex");
+				const totalChunks = getNumberProperty(body, "totalChunks");
+				if (chunkIndex !== totalChunks - 1) {
 					return new Response(JSON.stringify({ received: true }), {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
@@ -74,6 +75,7 @@ describe("ChunkRequest", () => {
 		expect(capturedRequests.every((request) => request.bodyBytes <= maxBytes)).toBe(true);
 		expect(capturedRequests.every((request) => request.url.endsWith("/api/request/chunk"))).toBe(true);
 		expect(capturedRequests.some((request) => request.body.target === "/api/session/tree/sync")).toBe(true);
+		expect(capturedRequests.every((request) => typeof request.body.sha256 === "string")).toBe(true);
 	});
 
 	it("does not add provider timeout signals to chunk uploads", async () => {
@@ -85,9 +87,9 @@ describe("ChunkRequest", () => {
 			seenSignals.push(init?.signal);
 			const rawBody = (init?.body as string | undefined) ?? "";
 			const body = rawBody ? (JSON.parse(rawBody) as CapturedRequestBody) : {};
-			const index = getNumberProperty(body, "index");
-			const total = getNumberProperty(body, "total");
-			return new Response(JSON.stringify({ ok: index === total - 1 }), {
+			const chunkIndex = getNumberProperty(body, "chunkIndex");
+			const totalChunks = getNumberProperty(body, "totalChunks");
+			return new Response(JSON.stringify({ ok: chunkIndex === totalChunks - 1 }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});

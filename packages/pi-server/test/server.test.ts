@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -34,6 +35,10 @@ interface ServerResponse {
 	baseMessageCount?: number;
 }
 
+function sha256(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
 describe("pi-server HTTP", () => {
 	let server: Server;
 	let baseUrl: string;
@@ -60,6 +65,20 @@ describe("pi-server HTTP", () => {
 			});
 		});
 	});
+
+	async function restartServer(): Promise<void> {
+		await new Promise<void>((resolve) => {
+			server.close(() => resolve());
+		});
+		clearAllSessions();
+		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
+		server.listen(0);
+		const addr = server.address();
+		if (typeof addr !== "object" || addr === null) {
+			throw new Error("Failed to get restarted server address");
+		}
+		baseUrl = `http://127.0.0.1:${addr.port}`;
+	}
 
 	it("responds to health check", async () => {
 		const res = await fetch(`${baseUrl}/health`);
@@ -122,6 +141,8 @@ describe("pi-server HTTP", () => {
 		const encoded = Buffer.from(JSON.stringify(originalBody), "utf-8").toString("base64");
 		const midpoint = Math.ceil(encoded.length / 2);
 		const requestId = "request-1";
+		const firstChunk = encoded.slice(0, midpoint);
+		const secondChunk = encoded.slice(midpoint);
 
 		const first = await fetch(`${baseUrl}/api/request/chunk`, {
 			method: "POST",
@@ -132,13 +153,14 @@ describe("pi-server HTTP", () => {
 			body: JSON.stringify({
 				requestId,
 				target: "/api/session/init",
-				index: 0,
-				total: 2,
-				chunk: encoded.slice(0, midpoint),
+				chunkIndex: 0,
+				totalChunks: 2,
+				sha256: sha256(firstChunk),
+				chunk: firstChunk,
 			}),
 		});
 		expect(first.status).toBe(200);
-		expect(await first.json()).toEqual({ received: true, requestId, index: 0, total: 2 });
+		expect(await first.json()).toEqual({ received: true, requestId, chunkIndex: 0, totalChunks: 2 });
 
 		const second = await fetch(`${baseUrl}/api/request/chunk`, {
 			method: "POST",
@@ -149,9 +171,10 @@ describe("pi-server HTTP", () => {
 			body: JSON.stringify({
 				requestId,
 				target: "/api/session/init",
-				index: 1,
-				total: 2,
-				chunk: encoded.slice(midpoint),
+				chunkIndex: 1,
+				totalChunks: 2,
+				sha256: sha256(secondChunk),
+				chunk: secondChunk,
 			}),
 		});
 		expect(second.status).toBe(200);
@@ -342,6 +365,37 @@ describe("pi-server HTTP", () => {
 		expect(getSession("append-history")?.messages).toEqual([first, second]);
 	});
 
+	it("persists appended session history across server restarts", async () => {
+		const first: Message = { role: "user", content: "before restart", timestamp: 1000 };
+		const second: Message = { role: "user", content: "after append", timestamp: 2000 };
+
+		await fetch(`${baseUrl}/api/session/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "append-restart", messages: [first] }),
+		});
+		await fetch(`${baseUrl}/api/session/append`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "append-restart", messages: [second] }),
+		});
+
+		await restartServer();
+
+		const history = await fetch(`${baseUrl}/api/session/append-restart/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(history.status).toBe(200);
+		const historyBody = (await history.json()) as ServerResponse;
+		expect(historyBody.messages).toEqual([first, second]);
+	});
+
 	it("switches active history by tree leaf without replacing the stored tree", async () => {
 		const entries = [
 			{
@@ -446,17 +500,7 @@ describe("pi-server HTTP", () => {
 		const syncBody = (await sync.json()) as ServerResponse;
 		expect(syncBody.treeHash).toBeTruthy();
 
-		await new Promise<void>((resolve) => {
-			server.close(() => resolve());
-		});
-		clearAllSessions();
-		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
-		server.listen(0);
-		const addr = server.address();
-		if (typeof addr !== "object" || addr === null) {
-			throw new Error("Failed to get restarted server address");
-		}
-		baseUrl = `http://127.0.0.1:${addr.port}`;
+		await restartServer();
 
 		const history = await fetch(`${baseUrl}/api/session/persisted-tree/history`, {
 			headers: { Authorization: "Bearer test-token" },
