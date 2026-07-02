@@ -36,6 +36,7 @@
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
+- Keep proxy acknowledgement in `ChunkRequest`: if a pi-server request receives a `proxycontrolwarn` warning, approve it there and retry the same request once instead of adding feature-level retries.
 
 ## pi-client / pi-server Compact and Resilience
 
