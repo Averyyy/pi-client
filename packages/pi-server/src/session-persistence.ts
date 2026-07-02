@@ -1,9 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import {
 	exportSessionState,
+	markSessionPersisted,
 	type PersistedSessionState,
 	restoreSessionState,
 	type SessionState,
@@ -11,6 +21,7 @@ import {
 } from "./session-store.ts";
 
 const PERSISTED_SESSION_VERSION = 1;
+const WAL_SNAPSHOT_INTERVAL = 32;
 const REPLACE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
 
 interface PersistedSessionFile {
@@ -18,12 +29,38 @@ interface PersistedSessionFile {
 	session: PersistedSessionState;
 }
 
+interface PersistedSessionWalRecord {
+	version: 1;
+	sessionId: string;
+	baseEntryCount: number;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	revision: number;
+	updatedAt: number;
+	staticContext: SessionStaticContext | undefined;
+}
+
+interface PersistedSessionMeta {
+	entryCount: number;
+	walRecords: number;
+}
+
+const persistedSessions = new Map<string, PersistedSessionMeta>();
+
 function sessionFileName(sessionId: string): string {
 	return `${createHash("sha256").update(sessionId).digest("hex")}.json`;
 }
 
 function sessionPath(sessionStoreDir: string, sessionId: string): string {
 	return join(sessionStoreDir, sessionFileName(sessionId));
+}
+
+function walPath(sessionStoreDir: string, sessionId: string): string {
+	return `${sessionPath(sessionStoreDir, sessionId)}.wal`;
+}
+
+function persistedSessionKey(sessionStoreDir: string, sessionId: string): string {
+	return `${sessionStoreDir}\0${sessionId}`;
 }
 
 function isRetryableRenameError(error: unknown): boolean {
@@ -124,6 +161,25 @@ function assertPersistedSessionState(value: unknown): asserts value is Persisted
 	assertNumber(value.updatedAt, "session.updatedAt");
 }
 
+function assertPersistedWalRecord(
+	value: unknown,
+	sourcePath: string,
+	lineNumber: number,
+): asserts value is PersistedSessionWalRecord {
+	const path = `${sourcePath}:${lineNumber}`;
+	assertRecord(value, path);
+	if (value.version !== PERSISTED_SESSION_VERSION) {
+		throw new Error(`Unsupported persisted session WAL version in ${path}`);
+	}
+	assertString(value.sessionId, `${path}.sessionId`);
+	assertNumber(value.baseEntryCount, `${path}.baseEntryCount`);
+	assertSessionTreeEntries(value.entries);
+	assertNullableString(value.leafId, `${path}.leafId`);
+	assertNumber(value.revision, `${path}.revision`);
+	assertNumber(value.updatedAt, `${path}.updatedAt`);
+	assertStaticContext(value.staticContext);
+}
+
 function parsePersistedSessionFile(raw: string, sourcePath: string): PersistedSessionFile {
 	let parsed: unknown;
 	try {
@@ -142,6 +198,48 @@ function parsePersistedSessionFile(raw: string, sourcePath: string): PersistedSe
 	};
 }
 
+function parseWalLine(raw: string, sourcePath: string, lineNumber: number): PersistedSessionWalRecord {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(`Persisted session WAL contains invalid JSON: ${sourcePath}:${lineNumber}`, { cause: error });
+	}
+	assertPersistedWalRecord(parsed, sourcePath, lineNumber);
+	return parsed;
+}
+
+function applyWalRecord(session: PersistedSessionState, record: PersistedSessionWalRecord): void {
+	if (record.sessionId !== session.sessionId) {
+		throw new Error(`Persisted session WAL sessionId does not match snapshot: ${record.sessionId}`);
+	}
+	if (record.baseEntryCount < session.entries.length) {
+		if (record.baseEntryCount + record.entries.length <= session.entries.length) return;
+		throw new Error(`Persisted session WAL overlaps snapshot for ${record.sessionId}`);
+	}
+	if (record.baseEntryCount !== session.entries.length) {
+		throw new Error(`Persisted session WAL has a gap for ${record.sessionId}`);
+	}
+	session.entries.push(...record.entries.map((entry) => ({ ...entry })));
+	session.leafId = record.leafId;
+	session.revision = record.revision;
+	session.updatedAt = record.updatedAt;
+	session.staticContext = record.staticContext;
+}
+
+function applyPersistedWal(sessionStoreDir: string, session: PersistedSessionState): number {
+	const filePath = walPath(sessionStoreDir, session.sessionId);
+	if (!existsSync(filePath)) return 0;
+	const lines = readFileSync(filePath, "utf-8").split("\n");
+	let applied = 0;
+	for (const [index, line] of lines.entries()) {
+		if (!line) continue;
+		applyWalRecord(session, parseWalLine(line, filePath, index + 1));
+		applied++;
+	}
+	return applied;
+}
+
 export function loadPersistedSessions(sessionStoreDir: string): void {
 	if (!existsSync(sessionStoreDir)) return;
 	const entries = readdirSync(sessionStoreDir, { withFileTypes: true });
@@ -153,11 +251,16 @@ export function loadPersistedSessions(sessionStoreDir: string): void {
 		if (entry.name !== expectedFileName) {
 			throw new Error(`Persisted session file name does not match sessionId: ${filePath}`);
 		}
+		const walRecords = applyPersistedWal(sessionStoreDir, persisted.session);
 		restoreSessionState(persisted.session);
+		persistedSessions.set(persistedSessionKey(sessionStoreDir, persisted.session.sessionId), {
+			entryCount: persisted.session.entries.length,
+			walRecords,
+		});
 	}
 }
 
-export function savePersistedSession(sessionStoreDir: string, session: SessionState): void {
+function writeSnapshot(sessionStoreDir: string, session: SessionState): void {
 	mkdirSync(sessionStoreDir, { recursive: true });
 	const filePath = sessionPath(sessionStoreDir, session.sessionId);
 	const tempPath = `${filePath}.${randomUUID()}.tmp`;
@@ -168,12 +271,44 @@ export function savePersistedSession(sessionStoreDir: string, session: SessionSt
 	try {
 		writeFileSync(tempPath, JSON.stringify(body), "utf-8");
 		replaceFileSync(tempPath, filePath);
+		rmSync(walPath(sessionStoreDir, session.sessionId), { force: true });
 	} catch (error) {
 		rmSync(tempPath, { force: true });
 		throw error;
 	}
 }
 
+function appendWalRecord(sessionStoreDir: string, session: SessionState, baseEntryCount: number): void {
+	const record: PersistedSessionWalRecord = {
+		version: PERSISTED_SESSION_VERSION,
+		sessionId: session.sessionId,
+		baseEntryCount,
+		entries: session.persistenceChange?.kind === "wal" ? session.persistenceChange.entries : [],
+		leafId: session.leafId,
+		revision: session.revision,
+		updatedAt: session.updatedAt,
+		staticContext: session.staticContext,
+	};
+	appendFileSync(walPath(sessionStoreDir, session.sessionId), `${JSON.stringify(record)}\n`, "utf-8");
+}
+
+export function savePersistedSession(sessionStoreDir: string, session: SessionState): void {
+	const key = persistedSessionKey(sessionStoreDir, session.sessionId);
+	const meta = persistedSessions.get(key);
+	if (meta && !session.persistenceChange) return;
+	if (!meta || session.persistenceChange?.kind === "snapshot" || meta.walRecords >= WAL_SNAPSHOT_INTERVAL) {
+		writeSnapshot(sessionStoreDir, session);
+		persistedSessions.set(key, { entryCount: session.entries.length, walRecords: 0 });
+		markSessionPersisted(session);
+		return;
+	}
+	appendWalRecord(sessionStoreDir, session, meta.entryCount);
+	persistedSessions.set(key, { entryCount: session.entries.length, walRecords: meta.walRecords + 1 });
+	markSessionPersisted(session);
+}
+
 export function deletePersistedSession(sessionStoreDir: string, sessionId: string): void {
 	rmSync(sessionPath(sessionStoreDir, sessionId), { force: true });
+	rmSync(walPath(sessionStoreDir, sessionId), { force: true });
+	persistedSessions.delete(persistedSessionKey(sessionStoreDir, sessionId));
 }

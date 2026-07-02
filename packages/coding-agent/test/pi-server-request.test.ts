@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChunkRequest } from "../src/core/pi-server-request.ts";
 
 interface CapturedRequestBody {
+	requestId?: string;
 	target?: string;
 	chunkIndex?: number;
 	totalChunks?: number;
@@ -40,10 +41,13 @@ describe("ChunkRequest", () => {
 				const chunkIndex = getNumberProperty(body, "chunkIndex");
 				const totalChunks = getNumberProperty(body, "totalChunks");
 				if (chunkIndex !== totalChunks - 1) {
-					return new Response(JSON.stringify({ received: true }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
+					return new Response(
+						JSON.stringify({ received: true, requestId: body.requestId, chunkIndex, totalChunks }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
 				}
 				return new Response(JSON.stringify({ ok: true }), {
 					status: 200,
@@ -89,7 +93,16 @@ describe("ChunkRequest", () => {
 			const body = rawBody ? (JSON.parse(rawBody) as CapturedRequestBody) : {};
 			const chunkIndex = getNumberProperty(body, "chunkIndex");
 			const totalChunks = getNumberProperty(body, "totalChunks");
-			return new Response(JSON.stringify({ ok: chunkIndex === totalChunks - 1 }), {
+			if (chunkIndex !== totalChunks - 1) {
+				return new Response(
+					JSON.stringify({ received: true, requestId: body.requestId, chunkIndex, totalChunks }),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
@@ -110,6 +123,49 @@ describe("ChunkRequest", () => {
 		expect(response.ok).toBe(true);
 		expect(seenSignals.length).toBeGreaterThan(1);
 		expect(seenSignals.every((signal) => signal === controller.signal)).toBe(true);
+	});
+
+	it("uploads chunks with at most four concurrent requests", async () => {
+		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
+		let activeRequests = 0;
+		let maxActiveRequests = 0;
+		const receivedChunks = new Set<number>();
+
+		const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+			const rawBody = (init?.body as string | undefined) ?? "";
+			const body = JSON.parse(rawBody) as CapturedRequestBody;
+			const chunkIndex = getNumberProperty(body, "chunkIndex");
+			const totalChunks = getNumberProperty(body, "totalChunks");
+			activeRequests++;
+			maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 5);
+			});
+			activeRequests--;
+			receivedChunks.add(chunkIndex);
+			if (receivedChunks.size === totalChunks) {
+				return new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response(JSON.stringify({ received: true, requestId: body.requestId, chunkIndex, totalChunks }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		vi.stubGlobal("fetch", mockFetch);
+
+		const request = new ChunkRequest({ serverUrl: "http://pi-server.test", authToken: "token" });
+		const response = await request.postJson("/api/session/tree/sync", {
+			sessionId: "chunk-parallel-test",
+			content: "x".repeat(1024 * 1024),
+		});
+
+		expect(response.ok).toBe(true);
+		expect(mockFetch.mock.calls.length).toBeGreaterThan(4);
+		expect(maxActiveRequests).toBe(4);
 	});
 
 	it("uses the same pi-server request object for bodyless gets", async () => {

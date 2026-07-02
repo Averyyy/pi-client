@@ -3,10 +3,27 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Message, Model } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type * as AgentCore from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import { registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPiServer, resolveStreamOptions, type ServerConfig } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
+
+vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
+	const actual = await importOriginal<typeof AgentCore>();
+	return {
+		...actual,
+		compact: vi.fn(async () => ({
+			ok: true,
+			value: {
+				summary: "summary",
+				firstKeptEntryId: "u2",
+				tokensBefore: 10,
+			},
+		})),
+	};
+});
 
 interface ServerResponse {
 	status?: string;
@@ -16,6 +33,7 @@ interface ServerResponse {
 	messageCount?: number;
 	entryCount?: number;
 	leafId?: string | null;
+	revision?: number;
 	sessions?: {
 		sessionId: string;
 		treeHash?: string;
@@ -33,6 +51,21 @@ interface ServerResponse {
 	messages?: Message[];
 	entries?: unknown[];
 	baseMessageCount?: number;
+	compactionEntry?: unknown;
+	treePatch?: {
+		baseTreeHash?: string;
+		entriesFrom: number;
+		baseRevision?: number;
+		entries: unknown[];
+		leafId: string | null;
+		revision: number;
+	};
+}
+
+interface RunResponse {
+	status?: "running" | "completed" | "failed";
+	message?: Message;
+	error?: string;
 }
 
 function sha256(value: string): string {
@@ -61,6 +94,7 @@ describe("pi-server HTTP", () => {
 		return new Promise<void>((resolve) => {
 			server.close(() => {
 				rmSync(sessionStoreDir, { recursive: true, force: true });
+				resetApiProviders();
 				resolve();
 			});
 		});
@@ -299,6 +333,100 @@ describe("pi-server HTTP", () => {
 		expect(body.messageCount).toBe(3);
 		expect(body.baseMessageCount).toBe(1);
 		expect(body.messages).toEqual(messages.slice(1));
+	});
+
+	it("returns session history tree patch after the requested entry offset and revision", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "one", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "two", timestamp: 2000 },
+			},
+		];
+		const sync = await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "entry-delta-history", entries, leafId: "u2" }),
+		});
+		const syncBody = (await sync.json()) as ServerResponse;
+
+		const res = await fetch(
+			`${baseUrl}/api/session/entry-delta-history/history?entriesFrom=1&revision=${syncBody.revision}`,
+			{ headers: { Authorization: "Bearer test-token" } },
+		);
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.entries).toBeUndefined();
+		expect(body.treePatch?.entriesFrom).toBe(1);
+		expect(body.treePatch?.baseRevision).toBe(1);
+		expect(body.treePatch?.entries).toEqual([entries[1]]);
+		expect(body.treePatch?.revision).toBe(body.revision);
+	});
+
+	it("returns compact tree patch when the client base tree hash matches", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "old", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "keep", timestamp: 2000 },
+			},
+		];
+		const sync = await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "compact-delta", entries, leafId: "u2" }),
+		});
+		const syncBody = (await sync.json()) as ServerResponse;
+
+		const res = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "compact-delta",
+				baseTreeHash: syncBody.treeHash,
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.entries).toBeUndefined();
+		expect(body.messages).toBeUndefined();
+		expect(body.treePatch?.baseTreeHash).toBe(syncBody.treeHash);
+		expect(body.treePatch?.entriesFrom).toBe(2);
+		expect(body.treePatch?.entries).toHaveLength(1);
+		expect(body.treePatch?.leafId).toBe(body.leafId);
+		expect(body.entryCount).toBe(3);
 	});
 
 	it("lists active sessions with summary counts", async () => {
@@ -646,6 +774,66 @@ describe("pi-server HTTP", () => {
 
 		expect(firstChunk.done).toBe(false);
 		expect(new TextDecoder().decode(firstChunk.value)).toContain(": keep-alive");
+	});
+
+	it("journals a completed stream run for recovery by run id", async () => {
+		const faux = registerFauxProvider();
+		const journaledMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "journaled" }],
+			api: faux.models[0].api,
+			provider: faux.models[0].provider,
+			model: faux.models[0].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1000,
+		};
+		faux.setResponses([journaledMessage]);
+		const runId = "run-journal-1";
+
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-run-journal",
+				staticContext: { systemPrompt: "Journal test" },
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-run-journal",
+				runId,
+				model: faux.models[0],
+			}),
+		});
+		expect(res.status).toBe(200);
+		await res.text();
+
+		const runRes = await fetch(`${baseUrl}/api/session/stream-run-journal/runs/${runId}`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+
+		expect(runRes.status).toBe(200);
+		const runBody = (await runRes.json()) as RunResponse;
+		expect(runBody.status).toBe("completed");
+		expect(runBody.message?.role).toBe("assistant");
+		expect(runBody.message?.content).toEqual([{ type: "text", text: "journaled" }]);
 	});
 
 	it("returns 404 for unknown routes with auth", async () => {

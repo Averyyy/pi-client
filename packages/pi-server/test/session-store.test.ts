@@ -12,6 +12,7 @@ import {
 	getOrCreateSession,
 	getSession,
 	getSessionBranch,
+	hashSessionEntries,
 	replaceMessages,
 	replaceSessionTree,
 	type SessionStaticContext,
@@ -47,6 +48,8 @@ describe("session-store", () => {
 		const session = getSession("test-1")!;
 		expect(session.staticContext?.systemPrompt).toBe("You are a helpful assistant.");
 		expect(session.staticContextHash).toBeTruthy();
+		expect(session.staticContextHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(session.staticContextHash).not.toContain("helpful");
 	});
 
 	it("detects static context changes via hash", () => {
@@ -158,6 +161,33 @@ describe("session-store", () => {
 			"one",
 			[{ type: "text", text: "first answer" }],
 		]);
+	});
+
+	it("keeps a rolling tree hash across append and leaf switch", () => {
+		const first: SessionTreeEntry = {
+			type: "message",
+			id: "u1",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: { role: "user", content: "one", timestamp: 1000 },
+		};
+		const second: SessionTreeEntry = {
+			type: "message",
+			id: "u2",
+			parentId: "u1",
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "two", timestamp: 2000 },
+		};
+
+		appendSessionEntries("tree-hash", [first], "u1");
+		const firstHash = getSession("tree-hash")!.treeHash;
+		appendSessionEntries("tree-hash", [second], "u2");
+		const appendedHash = getSession("tree-hash")!.treeHash;
+		switchSessionLeaf("tree-hash", "u1");
+
+		expect(firstHash).toBe(hashSessionEntries([first]));
+		expect(appendedHash).toBe(hashSessionEntries([first, second]));
+		expect(getSession("tree-hash")!.treeHash).toBe(appendedHash);
 	});
 
 	it("treats matching duplicate tree append entries as idempotent", () => {

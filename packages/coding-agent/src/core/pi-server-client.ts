@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
 	CompactionPreparationOptions,
 	CompactResult,
@@ -15,6 +15,11 @@ import {
 	parseStreamingJson,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import {
+	buildPiServerTreePrefixHashes,
+	hashPiServerSessionEntries,
+	hashPiServerStaticContext,
+} from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
 
 class PiServerEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -55,18 +60,11 @@ const sessionHasTemporaryTree = new Set<string>();
 const RESPONSE_BODY_EXCERPT_CHARS = 500;
 
 export function hashStaticContext(ctx: Context): string {
-	const parts: string[] = [];
-	if (ctx.systemPrompt !== undefined) parts.push(`sp:${ctx.systemPrompt}`);
-	if (ctx.tools) {
-		parts.push(
-			`t:${JSON.stringify(ctx.tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })))}`,
-		);
-	}
-	return parts.join("|");
+	return hashPiServerStaticContext(ctx);
 }
 
 function hashEntries(entries: SessionTreeEntry[]): string {
-	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+	return hashPiServerSessionEntries(entries);
 }
 
 function getLinearTreeFromMessages(messages: Message[]): { entries: SessionTreeEntry[]; leafId: string | null } {
@@ -137,6 +135,8 @@ export interface PiServerHistorySnapshot {
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
 	sessionTree?: PiServerTreeSnapshot;
+	ephemeralMessages?: Message[];
+	contextOverlay?: Message[];
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 }
 
@@ -150,12 +150,34 @@ interface PiServerHistoryResponse extends Partial<PiServerHistorySnapshot> {
 	treeHash?: string;
 	entryCount?: number;
 	leafId?: string | null;
+	treePatch?: PiServerTreePatch;
+}
+
+interface PiServerTreePatch {
+	entriesFrom: number;
+	baseRevision?: number;
+	entries: SessionTreeEntry[];
+	leafId: string | null;
+	revision: number;
+}
+
+interface PiServerCompactionResponse extends Partial<PiServerCompactionResult> {
+	treePatch?: PiServerTreePatch & { baseTreeHash?: string };
+}
+
+interface PiServerRunResponse {
+	runId: string;
+	status: "running" | "completed" | "failed";
+	message?: AssistantMessage;
+	errorMessage?: string;
 }
 
 interface PiServerSyncOptions {
 	signal?: AbortSignal;
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 }
+
+type PiServerFailurePhase = "session_init" | "tree_sync" | "provider_stream" | "history_reconcile";
 
 function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -270,7 +292,8 @@ function getStaticContext(context: Context) {
 
 function markTreeSynced(sessionId: string, tree: PiServerTreeSnapshot): void {
 	sessionSyncedEntryIds.set(sessionId, new Set(tree.entries.map((entry) => entry.id)));
-	sessionTreeHashes.set(sessionId, hashEntries(tree.entries));
+	const prefixHashes = buildPiServerTreePrefixHashes(tree.entries);
+	sessionTreeHashes.set(sessionId, prefixHashes[prefixHashes.length - 1]);
 	sessionTreeEntryCounts.set(sessionId, tree.entries.length);
 	sessionTreeLeafIds.set(sessionId, tree.leafId);
 	if (tree.replace) {
@@ -293,12 +316,25 @@ async function postTreeJson(
 async function fetchPiServerHistory(
 	sessionId: string,
 	request: ChunkRequest,
+	localTree?: PiServerTreeSnapshot,
 ): Promise<PiServerHistorySnapshot | undefined> {
-	const response = await request.getJson(`/api/session/${encodeURIComponent(sessionId)}/history`);
+	const prefixHashes = localTree ? buildPiServerTreePrefixHashes(localTree.entries) : undefined;
+	const historyUrl =
+		localTree && prefixHashes
+			? `/api/session/${encodeURIComponent(sessionId)}/history?entriesFrom=${localTree.entries.length}&baseTreeHash=${encodeURIComponent(prefixHashes[prefixHashes.length - 1])}`
+			: `/api/session/${encodeURIComponent(sessionId)}/history`;
+	const response = await request.getJson(historyUrl);
 	if (response.status === 404) {
 		return undefined;
 	}
 	const history = await readPiServerJson<PiServerHistoryResponse>(response, "Session history reconciliation failed");
+	if (history.treePatch && localTree) {
+		return {
+			entries: [...localTree.entries.slice(0, history.treePatch.entriesFrom), ...history.treePatch.entries],
+			leafId: history.treePatch.leafId,
+			messages: history.messages ?? [],
+		};
+	}
 	if (!history.entries || history.leafId === undefined || !history.messages) {
 		throw new Error("Session history reconciliation failed (response did not include the session tree)");
 	}
@@ -318,17 +354,31 @@ async function applyPiServerHistory(
 	await onHistoryReconciled?.(snapshot);
 }
 
+async function fetchPiServerRun(
+	sessionId: string,
+	runId: string,
+	request: ChunkRequest,
+): Promise<PiServerRunResponse | undefined> {
+	const response = await request.getJson(
+		`/api/session/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
+	);
+	if (response.status === 404) {
+		return undefined;
+	}
+	return readPiServerJson<PiServerRunResponse>(response, "Session run recovery failed");
+}
+
 function getKnownServerPrefixIds(sessionId: string, entries: SessionTreeEntry[]): Set<string> | undefined {
 	const entryCount = sessionTreeEntryCounts.get(sessionId);
 	const treeHash = sessionTreeHashes.get(sessionId);
 	if (entryCount === undefined || treeHash === undefined || entryCount > entries.length) {
 		return undefined;
 	}
-	const prefix = entries.slice(0, entryCount);
-	if (hashEntries(prefix) !== treeHash) {
+	const prefixHashes = buildPiServerTreePrefixHashes(entries);
+	if (prefixHashes[entryCount] !== treeHash) {
 		return undefined;
 	}
-	const ids = new Set(prefix.map((entry) => entry.id));
+	const ids = new Set(entries.slice(0, entryCount).map((entry) => entry.id));
 	sessionSyncedEntryIds.set(sessionId, ids);
 	return ids;
 }
@@ -377,7 +427,7 @@ async function recoverPiServerTreeDivergence(
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>,
 ): Promise<void> {
 	if (shouldUseServerHistory(sessionId, tree)) {
-		const snapshot = await fetchPiServerHistory(sessionId, request);
+		const snapshot = await fetchPiServerHistory(sessionId, request, tree);
 		if (snapshot && snapshot.entries.length > 0) {
 			await applyPiServerHistory(sessionId, snapshot, onHistoryReconciled);
 			throw new Error(
@@ -514,6 +564,7 @@ export async function compactPiServer(
 		settings: options?.settings,
 		preparation: options?.preparation,
 		customInstructions: options?.customInstructions,
+		baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
 	});
 	let response = await request.postJson("/api/session/compact", makeBody());
 	if (!response.ok) {
@@ -533,20 +584,26 @@ export async function compactPiServer(
 			throw new Error(`Server compaction failed (${failure.details})`);
 		}
 	}
-	const result = await readPiServerJson<Partial<PiServerCompactionResult>>(response, "Server compaction failed");
+	const result = await readPiServerJson<PiServerCompactionResponse>(response, "Server compaction failed");
 	if (!result.compaction) {
 		throw new Error("Server compaction response did not include a compaction result");
 	}
-	if (!result.compactionEntry || !result.entries || result.leafId === undefined || !result.messages) {
+	const resultEntries =
+		result.entries ??
+		(result.treePatch
+			? [...tree.entries.slice(0, result.treePatch.entriesFrom), ...result.treePatch.entries]
+			: undefined);
+	const resultLeafId = result.leafId ?? result.treePatch?.leafId;
+	if (!result.compactionEntry || !resultEntries || resultLeafId === undefined) {
 		throw new Error("Server compaction response did not include the updated session tree");
 	}
-	markTreeSynced(sessionId, { entries: result.entries, leafId: result.leafId });
+	markTreeSynced(sessionId, { entries: resultEntries, leafId: resultLeafId });
 	return {
 		compaction: result.compaction,
 		compactionEntry: result.compactionEntry,
-		entries: result.entries,
-		leafId: result.leafId,
-		messages: result.messages,
+		entries: resultEntries,
+		leafId: resultLeafId,
+		messages: result.messages ?? [],
 	};
 }
 
@@ -562,6 +619,7 @@ export async function streamPiServer(
 	options?: PiServerStreamOptions,
 ): Promise<PiServerEventStream> {
 	const sessionId = options?.sessionId ?? randomUUID();
+	const runId = randomUUID();
 	const isEphemeralSession = options?.sessionId === undefined;
 	const stream = new PiServerEventStream();
 
@@ -584,6 +642,7 @@ export async function streamPiServer(
 	};
 
 	(async () => {
+		let phase: PiServerFailurePhase = "session_init";
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
@@ -592,13 +651,18 @@ export async function streamPiServer(
 				replace: true,
 			};
 			const syncTree = tree;
+			phase = "tree_sync";
 			await syncPiServerTreeWithRequest(sessionId, context, syncTree, request, options?.onHistoryReconciled);
 
 			const makeBody = () => ({
 				sessionId,
+				runId,
 				model,
 				options: serializeOptions(options),
+				ephemeralMessages: options?.ephemeralMessages,
+				contextOverlay: options?.contextOverlay,
 			});
+			phase = "provider_stream";
 			let response = await request.postJson("/api/stream", makeBody());
 
 			if (!response.ok) {
@@ -660,9 +724,46 @@ export async function streamPiServer(
 			stream.end();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
+			if (!options?.signal?.aborted && phase === "provider_stream") {
+				try {
+					const recoveredRun = await fetchPiServerRun(sessionId, runId, createPiServerRequest());
+					if (recoveredRun?.status === "completed" && recoveredRun.message) {
+						switch (recoveredRun.message.stopReason) {
+							case "stop":
+							case "length":
+							case "toolUse":
+								stream.push({
+									type: "done",
+									reason: recoveredRun.message.stopReason,
+									message: recoveredRun.message,
+								});
+								break;
+							case "aborted":
+								stream.push({ type: "error", reason: "aborted", error: recoveredRun.message });
+								break;
+							case "error":
+								stream.push({ type: "error", reason: "error", error: recoveredRun.message });
+								break;
+						}
+						stream.end();
+						return;
+					}
+				} catch {
+					// Keep the original stream error authoritative.
+				}
+			}
 			const reason = options?.signal?.aborted ? "aborted" : "error";
 			partial.stopReason = reason;
 			partial.errorMessage = errorMessage;
+			partial.diagnostics = [
+				...(partial.diagnostics ?? []),
+				{
+					type: "pi_server_failure",
+					timestamp: Date.now(),
+					error: { name: error instanceof Error ? error.name : "Error", message: errorMessage },
+					details: { phase, source: "pi-server", retryable: phase === "provider_stream" },
+				},
+			];
 			stream.push({
 				type: "error",
 				reason,

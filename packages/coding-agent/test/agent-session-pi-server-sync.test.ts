@@ -657,16 +657,21 @@ describe("AgentSession pi-server sync", () => {
 						if (typeof target !== "string") {
 							throw new Error("Expected chunk target");
 						}
-						const index = body.index;
-						const total = body.total;
+						const index = body.chunkIndex;
+						const total = body.totalChunks;
 						if (typeof index !== "number" || typeof total !== "number") {
 							throw new Error("Expected numeric chunk index and total");
 						}
 						if (index !== total - 1) {
-							return new Response(JSON.stringify({ received: true }), {
-								status: 200,
-								headers: { "Content-Type": "application/json" },
-							});
+							return new Response(
+								JSON.stringify({
+									received: true,
+									requestId: body.requestId,
+									chunkIndex: index,
+									totalChunks: total,
+								}),
+								{ status: 200, headers: { "Content-Type": "application/json" } },
+							);
 						}
 						return new Response(
 							JSON.stringify({

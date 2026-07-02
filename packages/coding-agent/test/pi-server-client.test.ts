@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Model } from "@earendil-works/pi-ai";
@@ -11,6 +10,7 @@ import {
 	streamPiServer,
 	syncPiServerTree,
 } from "../src/core/pi-server-client.ts";
+import { hashPiServerSessionEntries } from "../src/core/pi-server-protocol.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -98,7 +98,7 @@ function baseTree(): SessionTreeEntry[] {
 }
 
 function hashEntries(entries: SessionTreeEntry[]): string {
-	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+	return hashPiServerSessionEntries(entries);
 }
 
 function compactResponse(
@@ -165,6 +165,8 @@ describe("pi-server-client", () => {
 			],
 		};
 		expect(hashStaticContext(ctx1)).not.toBe(hashStaticContext(ctx2));
+		expect(hashStaticContext(ctx1)).toMatch(/^[a-f0-9]{64}$/);
+		expect(hashStaticContext(ctx1)).not.toContain("You are helpful");
 	});
 
 	it("syncs the tree once, then appends only new entries", async () => {
@@ -369,7 +371,7 @@ describe("pi-server-client", () => {
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					);
 				}
-				if (url.endsWith("/api/session/server-authoritative/history")) {
+				if (new URL(url).pathname === "/api/session/server-authoritative/history") {
 					return new Response(
 						JSON.stringify({
 							sessionId: "server-authoritative",
@@ -419,7 +421,7 @@ describe("pi-server-client", () => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				capturedBodies.push({ url, body });
 
-				if (url.endsWith("/api/session/tree-rebuild/history")) {
+				if (new URL(url).pathname === "/api/session/tree-rebuild/history") {
 					return new Response(JSON.stringify({ error: "session not found" }), {
 						status: 404,
 						headers: { "Content-Type": "application/json" },
@@ -468,7 +470,7 @@ describe("pi-server-client", () => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				capturedBodies.push({ url, body });
 
-				if (url.endsWith("/api/session/tree-switch-divergence/history")) {
+				if (new URL(url).pathname === "/api/session/tree-switch-divergence/history") {
 					return new Response(
 						JSON.stringify({
 							sessionId: "tree-switch-divergence",
@@ -767,6 +769,65 @@ describe("pi-server-client", () => {
 		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
 	});
 
+	it("recovers a completed run when the stream disconnects before final delivery", async () => {
+		const capturedPaths: string[] = [];
+		const entries = baseTree().slice(0, 1);
+		const recoveredMessage = assistantMessage("recovered", 3000);
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+				if (path.startsWith("/api/session/stream-run-recovery/runs/")) {
+					return new Response(
+						JSON.stringify({ runId: path.split("/").pop(), status: "completed", message: recoveredMessage }),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				if (url.endsWith("/api/stream")) {
+					const encoder = new TextEncoder();
+					let readCount = 0;
+					const bodyStream = new ReadableStream<Uint8Array>({
+						pull(controller) {
+							readCount++;
+							if (readCount === 1) {
+								controller.enqueue(encoder.encode('data: {"type":"start"}\n\n'));
+								return;
+							}
+							throw new Error("socket lost");
+						},
+					});
+					return new Response(bodyStream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "stream-run-recovery", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const doneEvent = events.find((event) => (event as { type?: string }).type === "done") as
+			| { message?: Message }
+			| undefined;
+		expect(doneEvent?.message).toEqual(recoveredMessage);
+		expect(capturedPaths.some((path) => path.startsWith("/api/session/stream-run-recovery/runs/"))).toBe(true);
+	});
+
 	it("does not count request chunk upload time against the LLM timeout", async () => {
 		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
@@ -780,16 +841,24 @@ describe("pi-server-client", () => {
 
 				if (url.endsWith("/api/request/chunk")) {
 					await sleep(5);
-					const index = body.index;
-					const total = body.total;
+					const index = body.chunkIndex;
+					const total = body.totalChunks;
 					if (typeof index !== "number" || typeof total !== "number") {
 						throw new Error("Expected numeric chunk index and total");
 					}
 					if (index !== total - 1) {
-						return new Response(JSON.stringify({ received: true }), {
-							status: 200,
-							headers: { "Content-Type": "application/json" },
-						});
+						return new Response(
+							JSON.stringify({
+								received: true,
+								requestId: body.requestId,
+								chunkIndex: index,
+								totalChunks: total,
+							}),
+							{
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							},
+						);
 					}
 					return new Response(JSON.stringify({ sessionId: "chunk-timeout", leafId: "u1", entryCount: 1 }), {
 						status: 200,
@@ -871,12 +940,13 @@ describe("pi-server-client", () => {
 		}
 
 		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
-			| { error?: { errorMessage?: string } }
+			| { error?: { errorMessage?: string; diagnostics?: Array<{ details?: { phase?: unknown } }> } }
 			| undefined;
 		expect(errorEvent?.error?.errorMessage).toContain("502 Bad Gateway");
 		expect(errorEvent?.error?.errorMessage).toContain("content-type: text/html");
 		expect(errorEvent?.error?.errorMessage).toContain("body excerpt: <html>Bad gateway</html>");
 		expect(errorEvent?.error?.errorMessage).not.toContain("Unexpected token");
+		expect(errorEvent?.error?.diagnostics?.[0]?.details?.phase).toBe("provider_stream");
 	});
 
 	it("rebuilds missing server state once when streaming after a pi-server restart", async () => {
@@ -957,14 +1027,22 @@ describe("pi-server-client", () => {
 				capturedRequests.push({ url, bodyBytes: Buffer.byteLength(rawBody, "utf-8"), body });
 
 				if (url.endsWith("/api/request/chunk")) {
-					if (typeof body.index !== "number" || typeof body.total !== "number") {
+					if (typeof body.chunkIndex !== "number" || typeof body.totalChunks !== "number") {
 						throw new Error("Chunk request is missing numeric index/total");
 					}
-					if (body.index !== body.total - 1) {
-						return new Response(JSON.stringify({ received: true }), {
-							status: 200,
-							headers: { "Content-Type": "application/json" },
-						});
+					if (body.chunkIndex !== body.totalChunks - 1) {
+						return new Response(
+							JSON.stringify({
+								received: true,
+								requestId: body.requestId,
+								chunkIndex: body.chunkIndex,
+								totalChunks: body.totalChunks,
+							}),
+							{
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							},
+						);
 					}
 				}
 
@@ -1033,6 +1111,54 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[1].body.entries).toEqual(entries);
 	});
 
+	it("uses compact tree patches when the server returns a delta response", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = baseTree();
+		const serverEntry = compactionEntry("c1", "u2", "summary", "u2");
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/compact")) {
+					return new Response(
+						JSON.stringify({
+							success: true,
+							compaction: { summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
+							compactionEntry: serverEntry,
+							leafId: "c1",
+							treePatch: {
+								entriesFrom: entries.length,
+								entries: [serverEntry],
+								leafId: "c1",
+								revision: 2,
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const result = await compactPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [] },
+			{ sessionId: "compact-tree-delta", apiKey: "sk-client", sessionTree: { entries, leafId: "u2" } },
+		);
+
+		const compactBody = capturedBodies.find((request) => request.url.endsWith("/api/session/compact"))?.body;
+		expect(compactBody?.baseTreeHash).toBe(hashEntries(entries));
+		expect(result.entries).toEqual([...entries, serverEntry]);
+		expect(result.leafId).toBe("c1");
+	});
+
 	it("reconciles server history before compact instead of full-syncing over a different tree", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
@@ -1059,7 +1185,7 @@ describe("pi-server-client", () => {
 					);
 				}
 
-				if (url.endsWith("/api/session/compact-diverged/history")) {
+				if (new URL(url).pathname === "/api/session/compact-diverged/history") {
 					return new Response(
 						JSON.stringify({
 							sessionId: "compact-diverged",

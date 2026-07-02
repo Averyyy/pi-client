@@ -1,9 +1,19 @@
-import type { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import type {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { savePersistedSession } from "../src/session-persistence.ts";
 import { clearAllSessions, replaceSessionTree } from "../src/session-store.ts";
 
 const fsMock = vi.hoisted(() => ({
+	appendFileSync: vi.fn<typeof appendFileSync>(),
 	existsSync: vi.fn<typeof existsSync>(),
 	mkdirSync: vi.fn<typeof mkdirSync>(),
 	readdirSync: vi.fn<typeof readdirSync>(),
@@ -14,6 +24,7 @@ const fsMock = vi.hoisted(() => ({
 }));
 
 vi.mock("node:fs", () => ({
+	appendFileSync: fsMock.appendFileSync,
 	existsSync: fsMock.existsSync,
 	mkdirSync: fsMock.mkdirSync,
 	readdirSync: fsMock.readdirSync,
@@ -74,7 +85,7 @@ describe("session-persistence rename retry", () => {
 		savePersistedSession("/sessions", persistedSession());
 
 		expect(fsMock.renameSync).toHaveBeenCalledTimes(2);
-		expect(fsMock.rmSync).not.toHaveBeenCalled();
+		expect(fsMock.rmSync.mock.calls.every(([path]) => String(path).endsWith(".wal"))).toBe(true);
 	});
 
 	it("does not retry EPERM outside Windows", () => {

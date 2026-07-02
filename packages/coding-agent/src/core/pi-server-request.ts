@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 const DEFAULT_MAX_REQUEST_KB = 512;
 const CHUNK_ENDPOINT = "/api/request/chunk";
+const CHUNK_UPLOAD_CONCURRENCY = 4;
 
 export interface PiServerRequestOptions {
 	serverUrl: string;
@@ -17,6 +18,13 @@ interface ChunkBody {
 	totalChunks: number;
 	sha256: string;
 	chunk: string;
+}
+
+interface ChunkAckBody {
+	received: unknown;
+	requestId: unknown;
+	chunkIndex: unknown;
+	totalChunks: unknown;
 }
 
 function jsonByteLength(value: unknown): number {
@@ -43,6 +51,37 @@ function makeHeaders(authToken: string): Record<string, string> {
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isChunkAckBody(value: unknown): value is ChunkAckBody {
+	return (
+		isRecord(value) && "received" in value && "requestId" in value && "chunkIndex" in value && "totalChunks" in value
+	);
+}
+
+async function isChunkAck(
+	response: Response,
+	requestId: string,
+	chunkIndex: number,
+	totalChunks: number,
+): Promise<boolean> {
+	if (!response.headers.get("Content-Type")?.includes("application/json")) return false;
+	try {
+		const body = (await response.clone().json()) as unknown;
+		return (
+			isChunkAckBody(body) &&
+			body.received === true &&
+			body.requestId === requestId &&
+			body.chunkIndex === chunkIndex &&
+			body.totalChunks === totalChunks
+		);
+	} catch {
+		return false;
+	}
 }
 
 function chunkBodyFits(
@@ -114,25 +153,44 @@ export class ChunkRequest {
 		const requestId = randomUUID();
 		const encoded = Buffer.from(rawJson, "utf-8").toString("base64");
 		const chunks = splitEncodedBody(endpoint, requestId, encoded, maxBytes);
-		let response: Response | undefined;
+		let nextIndex = 0;
+		let finalResponse: Response | undefined;
+		let failureResponse: Response | undefined;
 
-		for (let index = 0; index < chunks.length; index++) {
-			const chunk = chunks[index];
-			const chunkBody: ChunkBody = {
-				requestId,
-				target: endpoint,
-				chunkIndex: index,
-				totalChunks: chunks.length,
-				sha256: sha256(chunk),
-				chunk,
-			};
-			response = await this.#postRawJson(CHUNK_ENDPOINT, JSON.stringify(chunkBody));
-			if (!response.ok || index === chunks.length - 1) {
-				return response;
+		const uploadWorker = async (): Promise<void> => {
+			while (nextIndex < chunks.length && finalResponse === undefined && failureResponse === undefined) {
+				const index = nextIndex;
+				nextIndex++;
+				const chunk = chunks[index];
+				const chunkBody: ChunkBody = {
+					requestId,
+					target: endpoint,
+					chunkIndex: index,
+					totalChunks: chunks.length,
+					sha256: sha256(chunk),
+					chunk,
+				};
+				const response = await this.#postRawJson(CHUNK_ENDPOINT, JSON.stringify(chunkBody));
+				if (finalResponse !== undefined || failureResponse !== undefined) return;
+				if (!response.ok) {
+					failureResponse = response;
+					return;
+				}
+				if (!(await isChunkAck(response, requestId, index, chunks.length))) {
+					finalResponse = response;
+					return;
+				}
 			}
-		}
+		};
 
-		throw new Error("No chunk response received from pi-server");
+		await Promise.all(
+			Array.from({ length: Math.min(CHUNK_UPLOAD_CONCURRENCY, chunks.length) }, () => uploadWorker()),
+		);
+
+		if (failureResponse) return failureResponse;
+		if (finalResponse) return finalResponse;
+
+		throw new Error("No final chunk response received from pi-server");
 	}
 
 	async #postRawJson(endpoint: string, rawJson: string): Promise<Response> {

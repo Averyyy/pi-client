@@ -10,6 +10,7 @@ import {
 	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
+	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
 	createModels,
@@ -33,7 +34,6 @@ import {
 	getOrCreateSession,
 	getSession,
 	getSessionBranch,
-	hashSessionEntries,
 	listSessions,
 	replaceMessages,
 	replaceSessionTree,
@@ -52,9 +52,12 @@ interface SessionInitBody {
 
 interface StreamRequestBody {
 	sessionId: string;
+	runId?: string;
 	model: Model<any>;
 	options?: SimpleStreamOptions;
 	staticContext?: SessionStaticContext;
+	ephemeralMessages?: Message[];
+	contextOverlay?: Message[];
 }
 
 interface SessionSyncBody {
@@ -88,6 +91,8 @@ interface SessionCompactBody {
 	settings?: CompactionSettings;
 	preparation?: CompactionPreparationOptions;
 	customInstructions?: string;
+	baseTreeHash?: string;
+	fullResponse?: boolean;
 }
 
 function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
@@ -116,8 +121,20 @@ interface SessionIdBody {
 	sessionId: string;
 }
 
+interface StreamRunRecord {
+	sessionId: string;
+	runId: string;
+	status: "running" | "completed" | "failed";
+	events: ProxyAssistantMessageEvent[];
+	message?: AssistantMessage;
+	errorMessage?: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
 const STREAM_HEARTBEAT = ": keep-alive\n\n";
 const STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
+const streamRuns = new Map<string, StreamRunRecord>();
 
 function readBody(req: IncomingMessage): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -156,7 +173,7 @@ function sessionResponseBody(session: SessionState) {
 	return {
 		sessionId: session.sessionId,
 		staticContextHash: session.staticContextHash,
-		treeHash: hashSessionEntries(session.entries),
+		treeHash: session.treeHash,
 		messageCount: session.messages.length,
 		entryCount: session.entries.length,
 		leafId: session.leafId,
@@ -166,6 +183,96 @@ function sessionResponseBody(session: SessionState) {
 
 function persistSession(config: ServerConfig, session: SessionState): void {
 	savePersistedSession(config.sessionStoreDir, session);
+}
+
+function runKey(sessionId: string, runId: string): string {
+	return `${sessionId}\0${runId}`;
+}
+
+function getStreamRun(sessionId: string, runId: string): StreamRunRecord | undefined {
+	return streamRuns.get(runKey(sessionId, runId));
+}
+
+function startStreamRun(sessionId: string, runId: string): StreamRunRecord {
+	const existing = getStreamRun(sessionId, runId);
+	if (existing?.status === "completed" || existing?.status === "failed") return existing;
+	const now = Date.now();
+	const run: StreamRunRecord = existing ?? {
+		sessionId,
+		runId,
+		status: "running",
+		events: [],
+		createdAt: now,
+		updatedAt: now,
+	};
+	run.status = "running";
+	run.updatedAt = now;
+	streamRuns.set(runKey(sessionId, runId), run);
+	return run;
+}
+
+function recordStreamRunEvent(run: StreamRunRecord | undefined, event: ProxyAssistantMessageEvent): void {
+	if (!run) return;
+	run.events.push(event);
+	run.updatedAt = Date.now();
+}
+
+function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantMessage): void {
+	if (!run) return;
+	run.status = "completed";
+	run.message = message;
+	run.errorMessage = undefined;
+	run.updatedAt = Date.now();
+}
+
+function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): void {
+	if (!run) return;
+	run.status = "failed";
+	run.errorMessage = errorMessage;
+	run.updatedAt = Date.now();
+}
+
+function sessionHistoryFullResponseBody(session: SessionState, baseMessageCount: number) {
+	return {
+		sessionId: session.sessionId,
+		staticContext: session.staticContext,
+		staticContextHash: session.staticContextHash,
+		treeHash: session.treeHash,
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
+		entries: session.entries,
+		baseMessageCount,
+		messages: session.messages.slice(baseMessageCount),
+	};
+}
+
+function sessionTreePatchResponseBody(
+	session: SessionState,
+	baseMessageCount: number,
+	entriesFrom: number,
+	baseRevision: number | undefined,
+) {
+	return {
+		sessionId: session.sessionId,
+		staticContext: session.staticContext,
+		staticContextHash: session.staticContextHash,
+		treeHash: session.treeHash,
+		messageCount: session.messages.length,
+		entryCount: session.entries.length,
+		leafId: session.leafId,
+		revision: session.revision,
+		baseMessageCount,
+		messages: session.messages.slice(baseMessageCount),
+		treePatch: {
+			entriesFrom,
+			baseRevision,
+			entries: session.entries.slice(entriesFrom),
+			leafId: session.leafId,
+			revision: session.revision,
+		},
+	};
 }
 
 export function resolveStreamOptions(
@@ -333,8 +440,27 @@ async function handleSessionCompact(
 		return;
 	}
 
+	const baseTreeHash = session.treeHash;
+	const baseEntryCount = session.entries.length;
 	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, result.value);
 	persistSession(config, updatedSession);
+	if (!body.fullResponse && body.baseTreeHash === baseTreeHash) {
+		sendJson(res, 200, {
+			success: true,
+			compaction: result.value satisfies CompactResult,
+			compactionEntry,
+			...sessionResponseBody(updatedSession),
+			staticContext: updatedSession.staticContext,
+			treePatch: {
+				baseTreeHash,
+				entriesFrom: baseEntryCount,
+				entries: [compactionEntry],
+				leafId: updatedSession.leafId,
+				revision: updatedSession.revision,
+			},
+		});
+		return;
+	}
 	sendJson(res, 200, {
 		success: true,
 		compaction: result.value satisfies CompactResult,
@@ -360,25 +486,51 @@ function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody,
 	sendJson(res, 200, { success: true, dropped, messageCount });
 }
 
-function handleSessionHistory(sessionId: string, from: number | undefined, res: ServerResponse): void {
+function handleSessionHistory(
+	sessionId: string,
+	from: number | undefined,
+	entriesFrom: number | undefined,
+	revision: number | undefined,
+	baseTreeHash: string | undefined,
+	res: ServerResponse,
+): void {
 	const session = getSession(sessionId);
 	if (!session) {
 		sendJson(res, 404, { error: "session not found" });
 		return;
 	}
 	const baseMessageCount = from ?? 0;
-	sendJson(res, 200, {
-		sessionId: session.sessionId,
-		staticContext: session.staticContext,
-		staticContextHash: session.staticContextHash,
-		treeHash: hashSessionEntries(session.entries),
-		messageCount: session.messages.length,
-		entryCount: session.entries.length,
-		leafId: session.leafId,
-		entries: session.entries,
-		baseMessageCount,
-		messages: session.messages.slice(baseMessageCount),
-	});
+	if (
+		entriesFrom !== undefined &&
+		entriesFrom <= session.entries.length &&
+		(revision === undefined || revision <= session.revision) &&
+		(baseTreeHash === undefined || baseTreeHash === session.prefixHashes[entriesFrom])
+	) {
+		sendJson(res, 200, sessionTreePatchResponseBody(session, baseMessageCount, entriesFrom, revision));
+		return;
+	}
+	sendJson(res, 200, sessionHistoryFullResponseBody(session, baseMessageCount));
+}
+
+function handleSessionRun(sessionId: string, runId: string, res: ServerResponse): void {
+	const run = getStreamRun(sessionId, runId);
+	if (!run) {
+		sendJson(res, 404, { error: "run not found" });
+		return;
+	}
+	sendJson(res, 200, run);
+}
+
+export function buildStreamContext(
+	session: SessionState,
+	body: Pick<StreamRequestBody, "contextOverlay" | "ephemeralMessages">,
+): Context {
+	const messages = body.contextOverlay ?? [...session.messages, ...(body.ephemeralMessages ?? [])];
+	return {
+		systemPrompt: session.staticContext?.systemPrompt,
+		messages,
+		tools: session.staticContext?.tools,
+	};
 }
 
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
@@ -403,11 +555,17 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		return;
 	}
 
-	const context: Context = {
-		systemPrompt: session.staticContext?.systemPrompt,
-		messages: session.messages,
-		tools: session.staticContext?.tools,
-	};
+	if (body.ephemeralMessages !== undefined && !Array.isArray(body.ephemeralMessages)) {
+		sendJson(res, 400, { error: "ephemeralMessages must be an array" });
+		return;
+	}
+	if (body.contextOverlay !== undefined && !Array.isArray(body.contextOverlay)) {
+		sendJson(res, 400, { error: "contextOverlay must be an array" });
+		return;
+	}
+
+	const context = buildStreamContext(session, body);
+	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 
 	const { model: resolvedModel, options: streamOptions } = resolveStreamOptions(config, body.model, body);
 
@@ -418,6 +576,16 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	});
 	res.flushHeaders();
 	res.write(STREAM_HEARTBEAT);
+
+	if (existingRun?.status === "completed") {
+		for (const event of existingRun.events) {
+			res.write(encodeProxyEvent(event));
+		}
+		res.end();
+		return;
+	}
+
+	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
 
 	const heartbeat = setInterval(() => {
 		if (!res.writableEnded) {
@@ -431,7 +599,9 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		stream = streamSimple(resolvedModel, context, streamOptions);
 	} catch (err) {
 		clearInterval(heartbeat);
-		res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
+		const message = err instanceof Error ? err.message : String(err);
+		failStreamRun(run, message);
+		res.write(encodeErrorEvent(message));
 		res.end();
 		return;
 	}
@@ -441,7 +611,13 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 			for await (const event of stream) {
 				const proxyEvent = toProxyEvent(event);
 				if (proxyEvent) {
+					recordStreamRunEvent(run, proxyEvent);
 					res.write(encodeProxyEvent(proxyEvent));
+				}
+				if (event.type === "done") {
+					completeStreamRun(run, event.message);
+				} else if (event.type === "error") {
+					failStreamRun(run, event.error.errorMessage ?? event.reason);
 				}
 			}
 		} finally {
@@ -451,7 +627,9 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		res.end();
 	})().catch((err) => {
 		clearInterval(heartbeat);
-		res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
+		const message = err instanceof Error ? err.message : String(err);
+		failStreamRun(run, message);
+		res.write(encodeErrorEvent(message));
 		res.end();
 	});
 }
@@ -537,6 +715,12 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 			return;
 		}
 
+		const runMatch = /^\/api\/session\/([^/]+)\/runs\/([^/]+)$/.exec(url.pathname);
+		if (req.method === "GET" && runMatch) {
+			handleSessionRun(decodeURIComponent(runMatch[1]), decodeURIComponent(runMatch[2]), res);
+			return;
+		}
+
 		if (req.method === "GET" && url.pathname.startsWith("/api/session/") && url.pathname.endsWith("/history")) {
 			const encodedSessionId = url.pathname.slice("/api/session/".length, -"/history".length);
 			const fromParam = url.searchParams.get("from");
@@ -545,7 +729,26 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 				sendJson(res, 400, { error: "from must be a non-negative integer" });
 				return;
 			}
-			handleSessionHistory(decodeURIComponent(encodedSessionId), from, res);
+			const entriesFromParam = url.searchParams.get("entriesFrom");
+			const entriesFrom = entriesFromParam === null ? undefined : Number(entriesFromParam);
+			if (entriesFrom !== undefined && (!Number.isInteger(entriesFrom) || entriesFrom < 0)) {
+				sendJson(res, 400, { error: "entriesFrom must be a non-negative integer" });
+				return;
+			}
+			const revisionParam = url.searchParams.get("revision");
+			const revision = revisionParam === null ? undefined : Number(revisionParam);
+			if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) {
+				sendJson(res, 400, { error: "revision must be a non-negative integer" });
+				return;
+			}
+			handleSessionHistory(
+				decodeURIComponent(encodedSessionId),
+				from,
+				entriesFrom,
+				revision,
+				url.searchParams.get("baseTreeHash") ?? undefined,
+				res,
+			);
 			return;
 		}
 

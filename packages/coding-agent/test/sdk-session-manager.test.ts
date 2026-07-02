@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Message } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createAgentSession } from "../src/core/sdk.ts";
+import { buildPiServerContextSync, createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
 describe("createAgentSession session manager defaults", () => {
@@ -62,6 +63,20 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
+	});
+
+	it("keeps transient pi-server context out of the durable session tree", () => {
+		const sessionManager = SessionManager.inMemory(cwd);
+		const durableMessage: Message = { role: "user", content: "durable", timestamp: 1000 };
+		const ephemeralMessage: Message = { role: "user", content: "hint", timestamp: 2000 };
+		sessionManager.appendMessage(durableMessage);
+
+		const sync = buildPiServerContextSync(sessionManager, [durableMessage, ephemeralMessage]);
+
+		expect(sync.sessionTree.entries).toEqual(sessionManager.getEntries());
+		expect(sync.sessionTree.replace).toBeUndefined();
+		expect(sync.ephemeralMessages).toEqual([ephemeralMessage]);
+		expect(sync.contextOverlay).toBeUndefined();
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {

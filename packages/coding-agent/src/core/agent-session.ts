@@ -303,6 +303,15 @@ function getStringField(input: unknown, key: string): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
+function getPiServerFailurePhase(message: AssistantMessage): string | undefined {
+	for (const diagnostic of message.diagnostics ?? []) {
+		if (diagnostic.type !== "pi_server_failure") continue;
+		const phase = diagnostic.details?.phase;
+		if (typeof phase === "string") return phase;
+	}
+	return undefined;
+}
+
 function toolTextContent(content: Array<TextContent | ImageContent>): string {
 	return content
 		.filter((part): part is TextContent => part.type === "text")
@@ -2980,6 +2989,8 @@ export class AgentSession {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
+		const piServerPhase = getPiServerFailurePhase(message);
+		if (piServerPhase && piServerPhase !== "provider_stream") return false;
 		if (message.errorMessage && this._isNonRetryableProviderLimitError(message.errorMessage)) return false;
 		return isRetryableAssistantError(message);
 	}

@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { Agent, type AgentMessage, type SessionTreeEntry, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -130,40 +129,40 @@ function getDefaultAgentDir(): string {
 	return getAgentDir();
 }
 
-function hashJson(value: unknown): string {
-	return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
-}
-
 function messagesEqual(left: Message[], right: Message[]): boolean {
 	return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function buildPiServerTreeSnapshot(sessionManager: SessionManager, contextMessages: Message[]): PiServerTreeSnapshot {
+export interface PiServerContextSync {
+	sessionTree: PiServerTreeSnapshot;
+	ephemeralMessages?: Message[];
+	contextOverlay?: Message[];
+}
+
+export function buildPiServerContextSync(
+	sessionManager: SessionManager,
+	contextMessages: Message[],
+): PiServerContextSync {
 	const entries = sessionManager.getEntries();
 	const localContextMessages = convertToLlm(sessionManager.buildSessionContext().messages);
 	if (messagesEqual(localContextMessages, contextMessages)) {
-		return { entries, leafId: sessionManager.getLeafId() };
+		return { sessionTree: { entries, leafId: sessionManager.getLeafId() } };
 	}
 
 	const hasLocalPrefix =
 		localContextMessages.length <= contextMessages.length &&
 		messagesEqual(localContextMessages, contextMessages.slice(0, localContextMessages.length));
-	const baseEntries = hasLocalPrefix ? entries : [];
-	const tailMessages = hasLocalPrefix ? contextMessages.slice(localContextMessages.length) : contextMessages;
-	let parentId = hasLocalPrefix ? sessionManager.getLeafId() : null;
-	const pendingEntries: SessionTreeEntry[] = tailMessages.map((message, index) => {
-		const id = `pending-${index}-${hashJson(message)}`;
-		const entry: SessionTreeEntry = {
-			type: "message",
-			id,
-			parentId,
-			timestamp: new Date(message.timestamp).toISOString(),
-			message: message as AgentMessage,
+	if (hasLocalPrefix) {
+		return {
+			sessionTree: { entries, leafId: sessionManager.getLeafId() },
+			ephemeralMessages: contextMessages.slice(localContextMessages.length),
 		};
-		parentId = id;
-		return entry;
-	});
-	return { entries: [...baseEntries, ...pendingEntries], leafId: parentId, replace: true };
+	}
+
+	return {
+		sessionTree: { entries, leafId: sessionManager.getLeafId() },
+		contextOverlay: contextMessages,
+	};
 }
 
 /**
@@ -352,11 +351,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const activeAgentSession = agentSession;
+			const piServerContext = activeAgentSession
+				? buildPiServerContextSync(activeAgentSession.sessionManager, context.messages as Message[])
+				: undefined;
 			const streamOptions = {
 				...options,
-				sessionTree: activeAgentSession
-					? buildPiServerTreeSnapshot(activeAgentSession.sessionManager, context.messages as Message[])
-					: undefined,
+				sessionTree: piServerContext?.sessionTree,
+				ephemeralMessages: piServerContext?.ephemeralMessages,
+				contextOverlay: piServerContext?.contextOverlay,
 				onHistoryReconciled: activeAgentSession
 					? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 					: undefined,

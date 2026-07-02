@@ -34,6 +34,17 @@ interface PendingRequest {
 	target: string;
 	totalChunks: number;
 	chunks: Map<number, RequestChunk>;
+	receivedBytes: number;
+	updatedAtMs: number;
+}
+
+interface CompletedRequest {
+	target: string;
+	totalChunks: number;
+	bodyJson: string;
+	completedChunkIndex: number;
+	completedAtMs: number;
+	chunks: Map<number, RequestChunk>;
 }
 
 interface ChunkAck {
@@ -55,6 +66,19 @@ interface CompleteChunkResult {
 }
 
 const pendingRequests = new Map<string, PendingRequest>();
+const completedRequests = new Map<string, CompletedRequest>();
+let pendingRequestBytes = 0;
+
+export const REQUEST_CHUNK_PENDING_TTL_MS = 5 * 60 * 1000;
+export const REQUEST_CHUNK_MAX_PENDING_BYTES = 64 * 1024 * 1024;
+export const REQUEST_CHUNK_COMPLETED_TTL_MS = 60 * 1000;
+
+interface ReceiveRequestChunkOptions {
+	nowMs?: number;
+	pendingTtlMs?: number;
+	maxPendingBytes?: number;
+	completedTtlMs?: number;
+}
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
@@ -78,46 +102,114 @@ function assertValidChunk(body: RequestChunkBody): void {
 	}
 }
 
-export function receiveRequestChunk(body: RequestChunkBody): PendingChunkResult | CompleteChunkResult {
+function makeAck(body: RequestChunkBody): PendingChunkResult {
+	return {
+		complete: false,
+		ack: {
+			received: true,
+			requestId: body.requestId,
+			chunkIndex: body.chunkIndex,
+			totalChunks: body.totalChunks,
+		},
+	};
+}
+
+function deletePendingRequest(requestId: string, pending: PendingRequest): void {
+	pendingRequests.delete(requestId);
+	pendingRequestBytes -= pending.receivedBytes;
+}
+
+function cleanupExpiredRequests(nowMs: number, pendingTtlMs: number, completedTtlMs: number): void {
+	for (const [requestId, pending] of pendingRequests) {
+		if (nowMs - pending.updatedAtMs > pendingTtlMs) {
+			deletePendingRequest(requestId, pending);
+		}
+	}
+	for (const [requestId, completed] of completedRequests) {
+		if (nowMs - completed.completedAtMs > completedTtlMs) {
+			completedRequests.delete(requestId);
+		}
+	}
+}
+
+function cleanupForPendingBytes(extraBytes: number, maxPendingBytes: number, protectedRequestId: string): void {
+	for (const [requestId, pending] of pendingRequests) {
+		if (pendingRequestBytes + extraBytes <= maxPendingBytes) return;
+		if (requestId !== protectedRequestId) {
+			deletePendingRequest(requestId, pending);
+		}
+	}
+	if (pendingRequestBytes + extraBytes > maxPendingBytes) {
+		throw new Error("Request chunk pending bytes limit exceeded");
+	}
+}
+
+export function receiveRequestChunk(
+	body: RequestChunkBody,
+	options: ReceiveRequestChunkOptions = {},
+): PendingChunkResult | CompleteChunkResult {
 	assertValidChunk(body);
 
-	let pending = pendingRequests.get(body.requestId);
-	if (!pending) {
-		pending = { target: body.target, totalChunks: body.totalChunks, chunks: new Map() };
-		pendingRequests.set(body.requestId, pending);
-	}
+	const nowMs = options.nowMs ?? Date.now();
+	cleanupExpiredRequests(
+		nowMs,
+		options.pendingTtlMs ?? REQUEST_CHUNK_PENDING_TTL_MS,
+		options.completedTtlMs ?? REQUEST_CHUNK_COMPLETED_TTL_MS,
+	);
 
-	if (pending.target !== body.target || pending.totalChunks !== body.totalChunks) {
-		throw new Error("Chunk metadata does not match the pending request");
-	}
-	const existing = pending.chunks.get(body.chunkIndex);
-	if (existing) {
-		if (existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
+	const completed = completedRequests.get(body.requestId);
+	if (completed) {
+		if (completed.target !== body.target || completed.totalChunks !== body.totalChunks) {
+			throw new Error("Chunk metadata does not match the completed request");
+		}
+		const existing = completed.chunks.get(body.chunkIndex);
+		if (!existing || existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
 			throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
 		}
-		return {
-			complete: false,
-			ack: {
-				received: true,
-				requestId: body.requestId,
-				chunkIndex: body.chunkIndex,
-				totalChunks: body.totalChunks,
-			},
-		};
+		if (body.chunkIndex === completed.completedChunkIndex) {
+			return {
+				complete: true,
+				target: completed.target,
+				bodyJson: completed.bodyJson,
+			};
+		}
+		return makeAck(body);
 	}
 
+	let pending = pendingRequests.get(body.requestId);
+	if (pending) {
+		if (pending.target !== body.target || pending.totalChunks !== body.totalChunks) {
+			throw new Error("Chunk metadata does not match the pending request");
+		}
+		const existing = pending.chunks.get(body.chunkIndex);
+		if (existing) {
+			if (existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
+				throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
+			}
+			pending.updatedAtMs = nowMs;
+			return makeAck(body);
+		}
+	}
+
+	const chunkBytes = Buffer.byteLength(body.chunk, "utf-8");
+	cleanupForPendingBytes(chunkBytes, options.maxPendingBytes ?? REQUEST_CHUNK_MAX_PENDING_BYTES, body.requestId);
+	if (!pending) {
+		pending = {
+			target: body.target,
+			totalChunks: body.totalChunks,
+			chunks: new Map(),
+			receivedBytes: 0,
+			updatedAtMs: nowMs,
+		};
+		pendingRequests.set(body.requestId, pending);
+	}
 	pending.chunks.set(body.chunkIndex, { chunk: body.chunk, sha256: body.sha256 });
+	pending.receivedBytes += chunkBytes;
+	pending.updatedAtMs = nowMs;
+	pendingRequestBytes += chunkBytes;
 
 	if (pending.chunks.size !== pending.totalChunks) {
-		return {
-			complete: false,
-			ack: {
-				received: true,
-				requestId: body.requestId,
-				chunkIndex: body.chunkIndex,
-				totalChunks: body.totalChunks,
-			},
-		};
+		return makeAck(body);
 	}
 
 	const encodedChunks: string[] = [];
@@ -127,14 +219,25 @@ export function receiveRequestChunk(body: RequestChunkBody): PendingChunkResult 
 		encodedChunks.push(chunk.chunk);
 	}
 
-	pendingRequests.delete(body.requestId);
+	deletePendingRequest(body.requestId, pending);
+	const bodyJson = Buffer.from(encodedChunks.join(""), "base64").toString("utf-8");
+	completedRequests.set(body.requestId, {
+		target: pending.target,
+		totalChunks: pending.totalChunks,
+		bodyJson,
+		completedChunkIndex: body.chunkIndex,
+		completedAtMs: nowMs,
+		chunks: pending.chunks,
+	});
 	return {
 		complete: true,
 		target: pending.target,
-		bodyJson: Buffer.from(encodedChunks.join(""), "base64").toString("utf-8"),
+		bodyJson,
 	};
 }
 
 export function clearAllRequestChunks(): void {
 	pendingRequests.clear();
+	completedRequests.clear();
+	pendingRequestBytes = 0;
 }

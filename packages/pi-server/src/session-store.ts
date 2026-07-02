@@ -1,7 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { buildSessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
+import {
+	appendPiServerTreeHash,
+	buildPiServerTreePrefixHashes,
+	hashPiServerSessionEntries,
+	hashPiServerStaticContext,
+	hashPiServerTreeEntry,
+} from "./pi-server-protocol.ts";
 
 export interface SessionStaticContext {
 	systemPrompt?: string;
@@ -14,10 +21,13 @@ export interface SessionState {
 	staticContextHash: string;
 	entries: SessionTreeEntry[];
 	leafId: string | null;
+	treeHash: string;
+	prefixHashes: string[];
 	messages: Message[];
 	revision: number;
 	createdAt: number;
 	updatedAt: number;
+	persistenceChange: SessionPersistenceChange | undefined;
 }
 
 export interface SessionSummary {
@@ -42,18 +52,12 @@ export interface PersistedSessionState {
 	updatedAt: number;
 }
 
+export type SessionPersistenceChange = { kind: "snapshot" } | { kind: "wal"; entries: SessionTreeEntry[] };
+
 const sessions = new Map<string, SessionState>();
 
 function hashStaticContext(ctx: SessionStaticContext | undefined): string {
-	if (!ctx) return "";
-	const parts: string[] = [];
-	if (ctx.systemPrompt !== undefined) parts.push(`sp:${ctx.systemPrompt}`);
-	if (ctx.tools) {
-		parts.push(
-			`t:${JSON.stringify(ctx.tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })))}`,
-		);
-	}
-	return parts.join("|");
+	return hashPiServerStaticContext(ctx);
 }
 
 export function getOrCreateSession(sessionId: string): SessionState {
@@ -66,10 +70,13 @@ export function getOrCreateSession(sessionId: string): SessionState {
 			staticContextHash: "",
 			entries: [],
 			leafId: null,
+			treeHash: hashPiServerSessionEntries([]),
+			prefixHashes: buildPiServerTreePrefixHashes([]),
 			messages: [],
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
+			persistenceChange: { kind: "snapshot" },
 		};
 		sessions.set(sessionId, session);
 	}
@@ -81,7 +88,7 @@ export function getSession(sessionId: string): SessionState | undefined {
 }
 
 export function hashSessionEntries(entries: SessionTreeEntry[]): string {
-	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+	return hashPiServerSessionEntries(entries);
 }
 
 export function listSessions(): SessionSummary[] {
@@ -89,7 +96,7 @@ export function listSessions(): SessionSummary[] {
 		.map((session) => ({
 			sessionId: session.sessionId,
 			staticContextHash: session.staticContextHash,
-			treeHash: hashSessionEntries(session.entries),
+			treeHash: session.treeHash,
 			messageCount: session.messages.length,
 			entryCount: session.entries.length,
 			leafId: session.leafId,
@@ -120,10 +127,13 @@ export function restoreSessionState(persisted: PersistedSessionState): SessionSt
 		staticContextHash: hashStaticContext(persisted.staticContext),
 		entries: persisted.entries.map((entry) => ({ ...entry })),
 		leafId: persisted.leafId,
+		treeHash: hashSessionEntries(persisted.entries),
+		prefixHashes: buildPiServerTreePrefixHashes(persisted.entries),
 		messages: [],
 		revision: persisted.revision,
 		createdAt: persisted.createdAt,
 		updatedAt: persisted.updatedAt,
+		persistenceChange: undefined,
 	};
 	refreshActiveMessages(session);
 	sessions.set(session.sessionId, session);
@@ -136,6 +146,7 @@ export function setStaticContext(sessionId: string, context: SessionStaticContex
 	session.staticContext = context;
 	session.staticContextHash = newHash;
 	session.updatedAt = Date.now();
+	markWalPersistenceChange(session, []);
 	return session;
 }
 
@@ -174,6 +185,18 @@ function refreshActiveMessages(session: SessionState): void {
 	session.messages = deriveActiveMessages(session);
 }
 
+function refreshTreeHashes(session: SessionState): void {
+	session.prefixHashes = buildPiServerTreePrefixHashes(session.entries);
+	session.treeHash = session.prefixHashes[session.prefixHashes.length - 1];
+}
+
+function appendTreeHashes(session: SessionState, entries: SessionTreeEntry[]): void {
+	for (const entry of entries) {
+		session.treeHash = appendPiServerTreeHash(session.treeHash, hashPiServerTreeEntry(entry));
+		session.prefixHashes.push(session.treeHash);
+	}
+}
+
 function assertValidLeaf(entries: SessionTreeEntry[], leafId: string | null): void {
 	if (leafId === null) return;
 	if (!entries.some((entry) => entry.id === leafId)) {
@@ -190,9 +213,11 @@ export function replaceSessionTree(
 	const session = getOrCreateSession(sessionId);
 	session.entries = entries.map((entry) => ({ ...entry }));
 	session.leafId = leafId;
+	refreshTreeHashes(session);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	session.persistenceChange = { kind: "snapshot" };
 	return session;
 }
 
@@ -228,9 +253,11 @@ export function appendSessionEntries(
 	session.entries.push(...entriesToAppend);
 	assertValidLeaf(session.entries, leafId);
 	session.leafId = leafId;
+	appendTreeHashes(session, entriesToAppend);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	markWalPersistenceChange(session, entriesToAppend);
 	return session;
 }
 
@@ -241,6 +268,7 @@ export function switchSessionLeaf(sessionId: string, leafId: string | null): Ses
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	markWalPersistenceChange(session, []);
 	return session;
 }
 
@@ -261,9 +289,11 @@ export function appendCompactionEntry(
 	};
 	session.entries.push(entry);
 	session.leafId = entry.id;
+	appendTreeHashes(session, [entry]);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	markWalPersistenceChange(session, [entry]);
 	return { session, entry };
 }
 
@@ -280,9 +310,11 @@ export function appendMessages(sessionId: string, delta: Message[]): SessionStat
 		return entry;
 	});
 	session.entries.push(...entries);
+	appendTreeHashes(session, entries);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	markWalPersistenceChange(session, entries);
 	return session;
 }
 
@@ -302,9 +334,11 @@ export function replaceMessages(sessionId: string, messages: Message[]): Session
 		return entry;
 	});
 	session.leafId = parentId;
+	refreshTreeHashes(session);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	session.persistenceChange = { kind: "snapshot" };
 	return session;
 }
 
@@ -317,9 +351,11 @@ export function dropLastAssistantError(sessionId: string): boolean {
 	}
 	session.entries = session.entries.filter((entry) => entry.id !== leaf.id);
 	session.leafId = leaf.parentId;
+	refreshTreeHashes(session);
 	session.revision++;
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
+	session.persistenceChange = { kind: "snapshot" };
 	return true;
 }
 
@@ -329,4 +365,16 @@ export function deleteSession(sessionId: string): boolean {
 
 export function clearAllSessions(): void {
 	sessions.clear();
+}
+
+function markWalPersistenceChange(session: SessionState, entries: SessionTreeEntry[]): void {
+	if (session.persistenceChange?.kind === "snapshot") return;
+	session.persistenceChange = {
+		kind: "wal",
+		entries: [...(session.persistenceChange?.entries ?? []), ...entries.map((entry) => ({ ...entry }))],
+	};
+}
+
+export function markSessionPersisted(session: SessionState): void {
+	session.persistenceChange = undefined;
 }

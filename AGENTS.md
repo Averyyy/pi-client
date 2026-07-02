@@ -43,6 +43,11 @@
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Chunk envelopes must include `requestId`, `chunkIndex`, `totalChunks`, and a `sha256` of the encoded chunk string. Identical duplicate chunks are acknowledgement-only no-ops; checksum mismatches or divergent duplicate indexes fail in `request-chunks`.
+- Chunk upload may run with bounded parallelism, but chunk ack bodies must echo `requestId`, `chunkIndex`, and `totalChunks`; otherwise the client treats the response as the final target response.
+- Keep request-chunk pending state bounded with TTL/byte cleanup and keep a short completed-request tombstone so retrying the completing chunk can return the original target body.
+- Static context hashes must be real fixed-size digests over canonical `{systemPrompt, tools:[name,description,parameters]}` data, never the raw prompt/tools string.
+- Transient provider context such as validation hints or extension overlays must travel as `ephemeralMessages`/`contextOverlay` on `/api/stream`; it must not be converted into durable pending tree entries or trigger full-tree sync.
+- Do not export Node-only pi-server protocol helpers from the browser-safe `@earendil-works/pi-agent-core` root entrypoint; keep them in Node-only package modules unless a browser-safe implementation exists.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
 - Keep update-command install-shape handling in the package updater wrappers: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 
@@ -50,6 +55,11 @@
 
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
+- Prefer delta responses for server-side compact/history when the client supplies a matching base tree hash or entry offset; keep full history/tree responses as the mismatch fallback.
+- `pi-server` stream requests should include a `runId`; the server journals the final assistant message so a client can recover a completed run after a stream disconnect.
+- Structure pi-server failures with phase metadata (`session_init`, `tree_sync`, `provider_stream`, etc.) and only let provider-stream failures enter LLM retry logic.
+- Session persistence should use append-only WAL records for append/switch/static-context mutations and periodic snapshots; avoid rewriting the full JSON session on every mutation.
+- Cache rolling tree hashes/prefix hashes in server session state. Append should update the hash from new entries, and leaf switches must not recompute the tree hash.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
 - Intra-turn tool-loop compaction must run before the next provider request from `prepareNextTurn`. When compacting a huge latest tool result, insert a hidden keep marker and force compaction to that marker so the next request carries the compaction summary plus marker, not the oversized tool-result tail.
 - Compaction summaries must preserve operational state: modified files, read files, open failures, last command and exit, last failing assertion/error, and pending TODO.
