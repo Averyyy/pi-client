@@ -154,12 +154,14 @@ function maybeHttpUrl(value) {
 	return trimmed.startsWith("http://") || trimmed.startsWith("https://") ? trimmed : undefined;
 }
 
-function getProxyApprovalTargets(runner, repoRoot) {
+function getProxyApprovalTargets(runner, repoRoot, includeGitRemote = true) {
 	const targets = [];
-	const remote = runStep(runner, "git", ["config", "--get", "remote.origin.url"], repoRoot, "pipe");
-	if (remote.status === 0) {
-		const url = maybeGitHttpUrl(String(remote.stdout ?? ""));
-		if (url) targets.push(url);
+	if (includeGitRemote) {
+		const remote = runStep(runner, "git", ["config", "--get", "remote.origin.url"], repoRoot, "pipe");
+		if (remote.status === 0) {
+			const url = maybeGitHttpUrl(String(remote.stdout ?? ""));
+			if (url) targets.push(url);
+		}
 	}
 
 	const registry = runStep(runner, "npm", ["config", "get", "registry"], repoRoot, "pipe");
@@ -171,12 +173,34 @@ function getProxyApprovalTargets(runner, repoRoot) {
 	return [...new Set(targets)];
 }
 
-async function approveUpdateProxyTargets(runner, repoRoot, stdout, fetchImpl) {
-	for (const target of getProxyApprovalTargets(runner, repoRoot)) {
+async function approveUpdateProxyTargets(runner, repoRoot, stdout, fetchImpl, includeGitRemote = true) {
+	for (const target of getProxyApprovalTargets(runner, repoRoot, includeGitRemote)) {
 		if (await approveHProxyTarget(target, fetchImpl)) {
 			stdout.write(`Approved proxy warning for ${target}\n`);
 		}
 	}
+}
+
+function isMissingGitCheckout(result) {
+	const text = `${String(result.stdout ?? "")}\n${String(result.stderr ?? "")}`;
+	return result.status !== 0 && text.includes("not a git repository");
+}
+
+async function runNpmGlobalUpdate(runner, repoRoot, stdout, stderr, fetchImpl) {
+	await approveUpdateProxyTargets(runner, repoRoot, stdout, fetchImpl, false);
+	stdout.write("Updating npm packages: @averyyy/pi-client@latest @averyyy/pi-server@latest\n");
+	const result = runStep(
+		runner,
+		"npm",
+		["install", "-g", "--ignore-scripts", "@averyyy/pi-client@latest", "@averyyy/pi-server@latest"],
+		repoRoot,
+	);
+	if (result.status !== 0) {
+		stderr.write("pi-server update failed: npm install -g --ignore-scripts @averyyy/pi-client@latest @averyyy/pi-server@latest\n");
+		return result.status ?? 1;
+	}
+	stdout.write("pi-server update complete\n");
+	return 0;
 }
 
 export async function runPiServerUpdate(_args = [], options = {}) {
@@ -193,6 +217,9 @@ export async function runPiServerUpdate(_args = [], options = {}) {
 
 	const status = runStep(runner, "git", ["status", "--porcelain"], repoRoot, "pipe");
 	if (status.status !== 0) {
+		if (isMissingGitCheckout(status)) {
+			return runNpmGlobalUpdate(runner, repoRoot, stdout, stderr, fetchImpl);
+		}
 		stderr.write("pi-server update failed: unable to inspect git status\n");
 		return status.status ?? 1;
 	}

@@ -37,7 +37,7 @@
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
 - Keep proxy acknowledgement in `ChunkRequest`: if a pi-server request receives a `proxycontrolwarn` warning, approve it there and retry the same request once instead of adding feature-level retries.
-- Keep update-command proxy acknowledgement in the package updater wrappers: approve the git remote and npm registry origins before `git pull` / `npm install`, and keep the logic shared by `pi-client update` and `pi-server update` behavior.
+- Keep update-command proxy acknowledgement in the package updater wrappers: git checkouts approve the git remote and npm registry before `git pull` / `npm install`; npm global installs approve the npm registry before `npm install -g @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 
 ## pi-client / pi-server Compact and Resilience
 
