@@ -1,6 +1,6 @@
 {
-	"name": "@earendil-works/pi-server",
-	"version": "0.80.3",
+	"name": "@averyyy/pi-server",
+	"version": "0.80.3-piclient.3",
 	"description": "Proxy server for pi-client that stores session state and forwards incremental requests to upstream LLM providers",
 	"type": "module",
 	"bin": {
@@ -16,6 +16,7 @@
 	},
 	"files": [
 		"dist",
+		"README.md",
 		"CHANGELOG.md"
 	],
 	"scripts": {
@@ -25,8 +26,8 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "file:../ai",
-		"@earendil-works/pi-agent-core": "file:../agent"
+		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@0.80.3-piclient.2",
+		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@0.80.3-piclient.2"
 	},
 	"keywords": [
 		"pi-server",

@@ -64,7 +64,9 @@ describe("pi-client package", () => {
 
 	it("depends on the published pi-coding-agent package", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toBe("0.80.3");
+		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toBe(
+			"npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
+		);
 	});
 
 	it("depends on pinned pi-web for the web UI", () => {
@@ -75,7 +77,9 @@ describe("pi-client package", () => {
 	it("keeps the root lockfile aligned to published runtime dependencies", () => {
 		const lock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf-8"));
 		expect(lock.packages["packages/pi-client"].name).toBe("@averyyy/pi-client");
-		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe("0.80.3");
+		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe(
+			"npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
+		);
 		expect(lock.packages["packages/pi-client"].dependencies["@jmfederico/pi-web"]).toBe("1.202606.7");
 		expect(lock.packages["node_modules/@jmfederico/pi-web"].version).toBe("1.202606.7");
 	});

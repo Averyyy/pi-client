@@ -1,6 +1,6 @@
 {
 	"name": "@averyyy/pi-client",
-	"version": "0.80.3",
+	"version": "0.80.3-piclient.3",
 	"description": "Lightweight CLI wrapper that connects to a pi-server instance",
 	"type": "module",
 	"piClient": {
@@ -15,6 +15,7 @@
 	},
 	"files": [
 		"bin",
+		"README.md",
 		"CHANGELOG.md"
 	],
 	"scripts": {
@@ -24,7 +25,7 @@
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "0.80.3",
+		"@earendil-works/pi-coding-agent": "npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
 		"@jmfederico/pi-web": "1.202606.7"
 	},
 	"devDependencies": {

@@ -29,6 +29,24 @@ This fork adds a `pi-client` CLI and a separate `pi-server`.
 
 `pi-client` shares the same `~/.pi/agent` configuration, extensions, skills, prompts, themes, sessions, and project discovery behavior as the original `pi` CLI. It does not install a `pi` binary. The only request-path difference is that `pi-client` sends incremental requests to `pi-server`; `pi-server` reconstructs the full conversation by `sessionId` and forwards it to the client-selected LLM API.
 
+### npm install
+
+Install the client:
+
+```bash
+npm i -g @averyyy/pi-client
+PI_SERVER_URL=https://pi.yreva.asia pi-client
+```
+
+Install the server only when you want to run your own `pi-server`:
+
+```bash
+npm i -g @averyyy/pi-server
+pi-server
+```
+
+The current npm fork release is `0.80.3-piclient.3`, based on upstream Pi `0.80.3`.
+
 ### 1. Clone and install dependencies
 
 Use Node through `nvm`:
@@ -143,7 +161,23 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 - `pi-client`：基于原始 Pi coding agent 的客户端。它仍然读取和复用 `~/.pi/agent`，所以已有的配置、extension、skill、prompt、theme、session 和项目发现逻辑保持不变。它不会安装或覆盖 `pi` 命令。
 - `pi-server`：本地或远程 HTTP 服务。它按 `sessionId` 保存完整历史，把 `pi-client` 发来的增量消息拼回完整请求，再转发到真正的 LLM API。
 
-当前 `pi-client` 基于 upstream Pi `0.79.3`，对应 commit `6f29450`。
+当前 npm fork release 是 `0.80.3-piclient.3`，基于 upstream Pi `0.80.3`。
+
+### npm 安装
+
+安装客户端：
+
+```bash
+npm i -g @averyyy/pi-client
+PI_SERVER_URL=https://pi.yreva.asia pi-client
+```
+
+只有需要运行自己的 `pi-server` 时才安装服务端：
+
+```bash
+npm i -g @averyyy/pi-server
+pi-server
+```
 
 ### 1. 克隆仓库并安装依赖
 
