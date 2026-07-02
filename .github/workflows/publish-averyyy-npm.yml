@@ -3,6 +3,9 @@ name: Publish Averyyy npm packages
 on:
   release:
     types: [published]
+  schedule:
+    # GitHub cron is UTC; 21:00 UTC is 05:00 Asia/Shanghai.
+    - cron: '0 21 * * *'
   workflow_dispatch:
     inputs:
       version:
@@ -15,11 +18,11 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 concurrency:
-  group: publish-averyyy-npm-${{ github.event.release.tag_name || inputs.version }}
+  group: publish-averyyy-npm-${{ github.event.release.tag_name || inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -34,9 +37,17 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
           persist-credentials: false
 
+      - name: Resolve release version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/resolve-averyyy-daily-release.mjs
+
       - name: Setup Node.js
+        if: steps.resolve.outputs.should_publish == 'true'
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: '26'
@@ -44,20 +55,34 @@ jobs:
           cache: npm
 
       - name: Install system dependencies
+        if: steps.resolve.outputs.should_publish == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
           sudo ln -s $(which fdfind) /usr/local/bin/fd
 
       - name: Install dependencies
+        if: steps.resolve.outputs.should_publish == 'true'
         run: npm ci --ignore-scripts
 
       - name: Upgrade npm for trusted publishing
+        if: steps.resolve.outputs.should_publish == 'true'
         run: |
           npm install -g npm@11.16.0 --ignore-scripts
           npm --version
 
       - name: Publish scoped npm packages
+        if: steps.resolve.outputs.should_publish == 'true'
         run: |
-          VERSION="${RELEASE_VERSION#v}"
+          VERSION="${{ steps.resolve.outputs.release_version }}"
           npm run publish:averyyy -- --version "${VERSION}" --provenance
+
+      - name: Create GitHub release
+        if: steps.resolve.outputs.create_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.resolve.outputs.release_tag }}" \
+            --target "${GITHUB_SHA}" \
+            --title "${{ steps.resolve.outputs.release_tag }}" \
+            --generate-notes
