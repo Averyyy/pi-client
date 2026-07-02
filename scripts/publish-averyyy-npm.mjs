@@ -203,6 +203,11 @@ function preparePackage(tempRoot, def, version) {
 	const packageJson = readJson(packageJsonPath);
 	packageJson.name = def.name;
 	packageJson.version = version;
+	packageJson.repository = {
+		type: "git",
+		url: "https://github.com/Averyyy/pi-client",
+		directory: def.source,
+	};
 	packageJson.publishConfig = { ...(packageJson.publishConfig ?? {}), access: "public" };
 	def.mutate?.(packageJson, version);
 	writeJson(packageJsonPath, packageJson);
