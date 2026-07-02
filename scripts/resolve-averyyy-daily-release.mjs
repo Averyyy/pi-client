@@ -5,6 +5,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "..");
+const githubRepo = process.env.GITHUB_REPOSITORY ?? "Averyyy/pi-client";
 const versionPattern = /^\d+\.\d+\.\d+-piclient\.\d+$/;
 
 const args = parseArgs(process.argv.slice(2));
@@ -65,7 +66,7 @@ function resolveRequestedRelease(value) {
 function resolveScheduledRelease() {
 	run("git", ["fetch", "--tags", "--force", "origin"], { cwd: repoRoot });
 
-	const latestReleaseTag = run("gh", ["release", "list", "--exclude-drafts", "--limit", "1", "--json", "tagName", "--jq", ".[0].tagName // \"\""], {
+	const latestReleaseTag = run("gh", ["release", "list", "--repo", githubRepo, "--exclude-drafts", "--limit", "1", "--json", "tagName", "--jq", ".[0].tagName // \"\""], {
 		cwd: repoRoot,
 		capture: true,
 	}).stdout.trim();
