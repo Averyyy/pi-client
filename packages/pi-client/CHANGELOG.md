@@ -11,4 +11,5 @@
 
 ### Fixed
 
+- Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 - Fixed `pi-client web` startup on Windows by using PI WEB's TCP session daemon mode instead of the default Unix socket path.

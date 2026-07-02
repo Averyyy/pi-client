@@ -5,8 +5,10 @@ Client CLI for connecting Pi to a `pi-server` instance.
 ## Install
 
 ```bash
-npm i -g @averyyy/pi-client
+npm i -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client
 ```
+
+`--legacy-peer-deps` avoids npm peer override warnings when upstream Pi is already installed globally.
 
 ## Use
 
@@ -43,5 +45,5 @@ PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 Install the server separately:
 
 ```bash
-npm i -g @averyyy/pi-server
+npm i -g --ignore-scripts @averyyy/pi-server
 ```

@@ -29,11 +29,13 @@ async function runNpmGlobalUpdate(runner, repoRoot, stdout, stderr) {
 	const result = runStep(
 		runner,
 		"npm",
-		["install", "-g", "--ignore-scripts", "@averyyy/pi-client@latest", "@averyyy/pi-server@latest"],
+		["install", "-g", "--ignore-scripts", "--legacy-peer-deps", "@averyyy/pi-client@latest", "@averyyy/pi-server@latest"],
 		repoRoot,
 	);
 	if (result.status !== 0) {
-		stderr.write("pi-server update failed: npm install -g --ignore-scripts @averyyy/pi-client@latest @averyyy/pi-server@latest\n");
+		stderr.write(
+			"pi-server update failed: npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest\n",
+		);
 		return result.status ?? 1;
 	}
 	stdout.write("pi-server update complete\n");

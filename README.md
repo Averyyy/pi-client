@@ -34,18 +34,20 @@ This fork adds a `pi-client` CLI and a separate `pi-server`.
 Install the client:
 
 ```bash
-npm i -g @averyyy/pi-client
+npm i -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client
 PI_SERVER_URL=https://pi.yreva.asia pi-client
 ```
 
 Install the server only when you want to run your own `pi-server`:
 
 ```bash
-npm i -g @averyyy/pi-server
+npm i -g --ignore-scripts @averyyy/pi-server
 pi-server
 ```
 
-The current npm fork release is `0.80.3-piclient.3`, based on upstream Pi `0.80.3`.
+The npm fork releases use `0.80.3-piclient.N`, based on upstream Pi `0.80.3`.
+
+`--legacy-peer-deps` prevents npm from replacing the forked prerelease peer with upstream stable Pi when both are installed globally.
 
 ### 1. Clone and install dependencies
 
@@ -161,23 +163,25 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 - `pi-client`：基于原始 Pi coding agent 的客户端。它仍然读取和复用 `~/.pi/agent`，所以已有的配置、extension、skill、prompt、theme、session 和项目发现逻辑保持不变。它不会安装或覆盖 `pi` 命令。
 - `pi-server`：本地或远程 HTTP 服务。它按 `sessionId` 保存完整历史，把 `pi-client` 发来的增量消息拼回完整请求，再转发到真正的 LLM API。
 
-当前 npm fork release 是 `0.80.3-piclient.3`，基于 upstream Pi `0.80.3`。
+npm fork release 使用 `0.80.3-piclient.N` 版本格式，基于 upstream Pi `0.80.3`。
 
 ### npm 安装
 
 安装客户端：
 
 ```bash
-npm i -g @averyyy/pi-client
+npm i -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client
 PI_SERVER_URL=https://pi.yreva.asia pi-client
 ```
 
 只有需要运行自己的 `pi-server` 时才安装服务端：
 
 ```bash
-npm i -g @averyyy/pi-server
+npm i -g --ignore-scripts @averyyy/pi-server
 pi-server
 ```
+
+`--legacy-peer-deps` 用来避免 npm 在本机已安装 upstream Pi 时，把 forked prerelease peer 替换成 upstream stable Pi。
 
 ### 1. 克隆仓库并安装依赖
 

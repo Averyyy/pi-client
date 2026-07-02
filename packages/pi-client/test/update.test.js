@@ -104,6 +104,7 @@ describe("pi-client update", () => {
 					"install",
 					"-g",
 					"--ignore-scripts",
+					"--legacy-peer-deps",
 					"@averyyy/pi-client@latest",
 					"@averyyy/pi-server@latest",
 				],
