@@ -123,6 +123,19 @@ describe("generateSummary reasoning options", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("reasoning");
 	});
 
+	it("asks summaries to preserve operational state", async () => {
+		await generateSummary(messages, createModel(false), 2000, "test-key");
+
+		const prompt = getPromptText(completeSimpleMock.mock.calls[0][1]);
+		expect(prompt).toContain("## Operational State");
+		expect(prompt).toContain("Modified files");
+		expect(prompt).toContain("Read files");
+		expect(prompt).toContain("Open failures");
+		expect(prompt).toContain("Last command");
+		expect(prompt).toContain("Last failing assertion/error");
+		expect(prompt).toContain("Pending TODO");
+	});
+
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",

@@ -12,6 +12,7 @@ export {
 	prepareBranchEntries,
 } from "./harness/compaction/branch-summarization.ts";
 export {
+	type CompactionPreparationOptions,
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,

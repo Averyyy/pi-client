@@ -481,6 +481,14 @@ Use this EXACT format:
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
+## Operational State
+- Modified files: [Exact paths, or "(none)"]
+- Read files: [Exact paths, or "(none)"]
+- Open failures: [Current unresolved failures/errors, or "(none)"]
+- Last command: [Most recent test/build/shell command and exit code, or "(none)"]
+- Last failing assertion/error: [Exact assertion, stack frame, or failing lines if available, or "(none)"]
+- Pending TODO: [Concrete remaining work, or "(none)"]
+
 ## Next Steps
 1. [Ordered list of what should happen next]
 
@@ -520,6 +528,14 @@ Use this EXACT format:
 
 ## Key Decisions
 - **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Operational State
+- Modified files: [Preserve/update exact paths, or "(none)"]
+- Read files: [Preserve/update exact paths, or "(none)"]
+- Open failures: [Current unresolved failures/errors, or "(none)"]
+- Last command: [Most recent test/build/shell command and exit code, or "(none)"]
+- Last failing assertion/error: [Exact assertion, stack frame, or failing lines if available, or "(none)"]
+- Pending TODO: [Concrete remaining work, or "(none)"]
 
 ## Next Steps
 1. [Update based on current state]
@@ -807,9 +823,14 @@ export interface CompactionPreparation {
 	settings: CompactionSettings;
 }
 
+export interface CompactionPreparationOptions {
+	firstKeptEntryId?: string;
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	options: CompactionPreparationOptions = {},
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -835,7 +856,19 @@ export function prepareCompaction(
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const forcedFirstKeptEntryIndex = options.firstKeptEntryId
+		? pathEntries.findIndex((entry) => entry.id === options.firstKeptEntryId)
+		: -1;
+	if (
+		options.firstKeptEntryId &&
+		(forcedFirstKeptEntryIndex < boundaryStart || forcedFirstKeptEntryIndex >= boundaryEnd)
+	) {
+		return undefined;
+	}
+	const cutPoint =
+		forcedFirstKeptEntryIndex >= boundaryStart && forcedFirstKeptEntryIndex < boundaryEnd
+			? { firstKeptEntryIndex: forcedFirstKeptEntryIndex, turnStartIndex: -1, isSplitTurn: false }
+			: findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
 	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];

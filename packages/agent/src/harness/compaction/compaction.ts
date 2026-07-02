@@ -409,6 +409,14 @@ Use this EXACT format:
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
+## Operational State
+- Modified files: [Exact paths, or "(none)"]
+- Read files: [Exact paths, or "(none)"]
+- Open failures: [Current unresolved failures/errors, or "(none)"]
+- Last command: [Most recent test/build/shell command and exit code, or "(none)"]
+- Last failing assertion/error: [Exact assertion, stack frame, or failing lines if available, or "(none)"]
+- Pending TODO: [Concrete remaining work, or "(none)"]
+
 ## Next Steps
 1. [Ordered list of what should happen next]
 
@@ -448,6 +456,14 @@ Use this EXACT format:
 
 ## Key Decisions
 - **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Operational State
+- Modified files: [Preserve/update exact paths, or "(none)"]
+- Read files: [Preserve/update exact paths, or "(none)"]
+- Open failures: [Current unresolved failures/errors, or "(none)"]
+- Last command: [Most recent test/build/shell command and exit code, or "(none)"]
+- Last failing assertion/error: [Exact assertion, stack frame, or failing lines if available, or "(none)"]
+- Pending TODO: [Concrete remaining work, or "(none)"]
 
 ## Next Steps
 1. [Update based on current state]
@@ -690,10 +706,16 @@ export interface CompactionPreparation {
 	settings: CompactionSettings;
 }
 
+/** Optional preparation override for callers that inserted their own keep marker. */
+export interface CompactionPreparationOptions {
+	firstKeptEntryId?: string;
+}
+
 /** Prepare session entries for compaction, or return undefined when compaction is not applicable. */
 export function prepareCompaction(
 	pathEntries: SessionTreeEntry[],
 	settings: CompactionSettings,
+	options: CompactionPreparationOptions = {},
 ): Result<CompactionPreparation | undefined, CompactionError> {
 	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
 		return ok(undefined);
@@ -719,7 +741,19 @@ export function prepareCompaction(
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const forcedFirstKeptEntryIndex = options.firstKeptEntryId
+		? pathEntries.findIndex((entry) => entry.id === options.firstKeptEntryId)
+		: -1;
+	if (
+		options.firstKeptEntryId &&
+		(forcedFirstKeptEntryIndex < boundaryStart || forcedFirstKeptEntryIndex >= boundaryEnd)
+	) {
+		return err(new CompactionError("invalid_session", "Forced first kept entry was not found"));
+	}
+	const cutPoint =
+		forcedFirstKeptEntryIndex >= boundaryStart && forcedFirstKeptEntryIndex < boundaryEnd
+			? { firstKeptEntryIndex: forcedFirstKeptEntryIndex, turnStartIndex: -1, isSplitTurn: false }
+			: findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {
 		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));

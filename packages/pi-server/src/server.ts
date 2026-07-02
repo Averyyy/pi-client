@@ -1,5 +1,6 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
+	type CompactionPreparationOptions,
 	type CompactionSettings,
 	type CompactResult,
 	compact,
@@ -85,6 +86,7 @@ interface SessionCompactBody {
 	model: Model<any>;
 	options?: SimpleStreamOptions;
 	settings?: CompactionSettings;
+	preparation?: CompactionPreparationOptions;
 	customInstructions?: string;
 }
 
@@ -307,7 +309,7 @@ async function handleSessionCompact(
 	}
 
 	const entries = getSessionBranch(session);
-	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS);
+	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS, body.preparation);
 	if (!preparationResult.ok) {
 		sendJson(res, 400, { error: preparationResult.error.message });
 		return;

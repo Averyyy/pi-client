@@ -1,12 +1,15 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	fauxToolCall,
 	type Model,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -83,6 +86,14 @@ function seedCompactableSession(harness: Harness): void {
 	assistant.content = [{ type: "text", text: "assistant response to compact" }];
 	harness.sessionManager.appendMessage(assistant);
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+}
+
+function contextMessageText(message: unknown): string {
+	if (message && typeof message === "object" && "summary" in message) {
+		const summary = (message as { summary?: unknown }).summary;
+		if (typeof summary === "string") return summary;
+	}
+	return getMessageText(message);
 }
 
 describe("AgentSession compaction characterization", () => {
@@ -230,6 +241,56 @@ describe("AgentSession compaction characterization", () => {
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+	});
+
+	it("auto-compacts tool results before the next provider request", async () => {
+		const largeResult = `large tool result ${"x".repeat(5000)}`;
+		const largeTool: AgentTool = {
+			name: "large",
+			label: "Large",
+			description: "Returns a large tool result",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: largeResult }], details: {} }),
+		};
+		let nextProviderContext = "";
+		const harness = await createHarness({
+			tools: [largeTool],
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 1000 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 20 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "intra-turn compacted summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large", {}), { stopReason: "toolUse" }),
+			(context) => {
+				nextProviderContext = context.messages.map(contextMessageText).join("\n");
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("run large tool");
+
+		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
+		expect(compactionEnd).toMatchObject({
+			reason: "threshold",
+			aborted: false,
+			willRetry: false,
+		});
+		expect(nextProviderContext).toContain("intra-turn compacted summary");
+		expect(nextProviderContext).toContain("Continue from the compaction summary above");
+		expect(nextProviderContext).not.toContain(largeResult);
+		expect(harness.faux.state.callCount).toBe(2);
 	});
 
 	it("does not retry overflow recovery more than once", async () => {

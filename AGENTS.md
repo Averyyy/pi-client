@@ -27,6 +27,7 @@
 ## Agent Core Tool Scheduling
 
 - In parallel tool mode, do not downgrade an entire tool batch to sequential just because one tool has `executionMode: "sequential"`. Treat sequential tools as source-order barriers: run the parallel segment before them concurrently, run the sequential tool alone, then continue with the next parallel segment. Same-file edit/write ordering belongs in `withFileMutationQueue()`, and bash stays sequential so validation commands do not overlap sibling tool calls.
+- Validation-aware tool-loop hints belong in transient next-turn context, not persisted session history: record edit/write paths and failed bash output from finalized tool results, inject one hidden `pi:validation-hint` before the next provider request, and de-dupe old hints each turn.
 
 ## pi-client / pi-server Request Sync
 
@@ -41,13 +42,15 @@
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Chunk envelopes must include `requestId`, `chunkIndex`, `totalChunks`, and a `sha256` of the encoded chunk string. Identical duplicate chunks are acknowledgement-only no-ops; checksum mismatches or divergent duplicate indexes fail in `request-chunks`.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
-- Keep update-command install-shape handling in the package updater wrappers: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g @averyyy/pi-client@latest @averyyy/pi-server@latest`.
+- Keep update-command install-shape handling in the package updater wrappers: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 
 ## pi-client / pi-server Compact and Resilience
 
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
+- Intra-turn tool-loop compaction must run before the next provider request from `prepareNextTurn`. When compacting a huge latest tool result, insert a hidden keep marker and force compaction to that marker so the next request carries the compaction summary plus marker, not the oversized tool-result tail.
+- Compaction summaries must preserve operational state: modified files, read files, open failures, last command and exit, last failing assertion/error, and pending TODO.
 - Tree/branch summaries are part of the same compaction family: use the shared chunked summarizer instead of pre-dropping old branch messages or sending a single oversized summary request.
 - Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
@@ -66,6 +69,7 @@
 - Hidden project support in `pi-client web` should stay as a wrapper-layer visibility filter over PI WEB projects; do not fork PI WEB's project store format for client-only visibility.
 - On Windows, `pi-client web` should connect to the PI WEB session daemon over `PI_WEB_SESSIOND_PORT` / `PI_WEB_SESSIOND_URL`; the default `.sock` path is a Unix socket and can fail with `EACCES`.
 - When publishing the standalone client package, publish `packages/pi-client` as `@averyyy/pi-client` and keep its runtime dependencies as registry versions, not workspace `file:` links.
+- `@jmfederico/pi-web` peers use stable upstream semver ranges, so `@averyyy/*@0.80.3-piclient.N` aliases can trigger non-fatal npm peer override warnings when upstream Pi is already installed globally. For documented/manual fork installs and npm-global updater paths, use `--legacy-peer-deps`; do not install upstream stable peers to silence the warning.
 
 ## Averyyy npm Publishing
 

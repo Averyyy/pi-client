@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
 	Agent,
+	AgentContext,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
@@ -50,6 +51,7 @@ import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
 	type CompactionPreparation,
+	type CompactionPreparationOptions,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -280,6 +282,12 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const INTRA_TURN_COMPACTION_MARKER_TYPE = "pi:intra-turn-compaction";
+const INTRA_TURN_COMPACTION_MARKER_TEXT =
+	"Continue from the compaction summary above. The previous tool loop was compacted before the next provider request; use the summary's Operational State, file lists, failures, last command, and next steps.";
+const VALIDATION_HINT_MESSAGE_TYPE = "pi:validation-hint";
+const VALIDATION_HINT_FILE_LIMIT = 12;
+const VALIDATION_HINT_FAILURE_CHAR_LIMIT = 1200;
 
 function isPiServerMode(): boolean {
 	return process.env.PI_SERVER_MODE === "true";
@@ -287,6 +295,31 @@ function isPiServerMode(): boolean {
 
 function toProviderReasoning(thinkingLevel: ThinkingLevel): SimpleStreamOptions["reasoning"] {
 	return thinkingLevel === "off" ? undefined : thinkingLevel;
+}
+
+function getStringField(input: unknown, key: string): string | undefined {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+	const value = (input as Record<string, unknown>)[key];
+	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function toolTextContent(content: Array<TextContent | ImageContent>): string {
+	return content
+		.filter((part): part is TextContent => part.type === "text")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+}
+
+function compactValidationSummary(text: string): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= VALIDATION_HINT_FAILURE_CHAR_LIMIT) return trimmed;
+	return `...${trimmed.slice(trimmed.length - VALIDATION_HINT_FAILURE_CHAR_LIMIT + 3)}`;
+}
+
+interface ValidationFailureState {
+	command: string;
+	summary: string;
 }
 
 // ============================================================================
@@ -327,6 +360,8 @@ export class AgentSession {
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	private _validationModifiedFiles = new Set<string>();
+	private _validationFailure: ValidationFailureState | undefined = undefined;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -452,6 +487,96 @@ export class AgentSession {
 		return result.ok ? { apiKey: result.apiKey, headers: result.headers, env: result.env } : {};
 	}
 
+	private _resetValidationHintState(): void {
+		this._validationModifiedFiles.clear();
+		this._validationFailure = undefined;
+	}
+
+	private _recordValidationToolResult(
+		toolName: string,
+		input: unknown,
+		content: Array<TextContent | ImageContent>,
+		isError: boolean,
+	): void {
+		if ((toolName === "edit" || toolName === "write") && !isError) {
+			const path = getStringField(input, "path") ?? getStringField(input, "file_path");
+			if (path) {
+				this._validationModifiedFiles.add(path);
+			}
+			return;
+		}
+
+		if (toolName !== "bash") {
+			return;
+		}
+
+		const command = getStringField(input, "command");
+		if (!command) {
+			return;
+		}
+
+		if (isError) {
+			this._validationFailure = {
+				command,
+				summary: compactValidationSummary(toolTextContent(content)),
+			};
+		} else if (this._validationFailure?.command === command) {
+			this._resetValidationHintState();
+		} else if (!this._validationFailure) {
+			this._validationModifiedFiles.clear();
+		}
+	}
+
+	private _createValidationHintMessage():
+		| CustomMessage<{ modifiedFiles: string[]; failedCommand?: string }>
+		| undefined {
+		const modifiedFiles = Array.from(this._validationModifiedFiles).slice(-VALIDATION_HINT_FILE_LIMIT);
+		if (modifiedFiles.length === 0 && !this._validationFailure) {
+			return undefined;
+		}
+
+		const lines = ["<validation-hint>"];
+		if (modifiedFiles.length > 0) {
+			lines.push("Recent modified files:", ...modifiedFiles.map((file) => `- ${file}`));
+		}
+		if (this._validationFailure) {
+			lines.push(
+				"Recent failed command:",
+				this._validationFailure.command,
+				"Failure summary:",
+				this._validationFailure.summary || "(no output)",
+				"Suggested next validation command:",
+				this._validationFailure.command,
+			);
+		} else {
+			lines.push("Suggested next step:", "Run the smallest project validation that covers the modified files.");
+		}
+		lines.push(
+			"Inspect failures, fix the root cause, then rerun validation before finalizing.",
+			"</validation-hint>",
+		);
+
+		return {
+			role: "custom",
+			customType: VALIDATION_HINT_MESSAGE_TYPE,
+			content: [{ type: "text", text: lines.join("\n") }],
+			display: false,
+			details: { modifiedFiles, failedCommand: this._validationFailure?.command },
+			timestamp: Date.now(),
+		};
+	}
+
+	private _withValidationHint(context: AgentContext): AgentContext {
+		const messages = context.messages.filter(
+			(message) => !(message.role === "custom" && message.customType === VALIDATION_HINT_MESSAGE_TYPE),
+		);
+		const hint = this._createValidationHintMessage();
+		return {
+			...context,
+			messages: hint ? [...messages, hint] : messages,
+		};
+	}
+
 	/**
 	 * Install tool hooks once on the Agent instance.
 	 *
@@ -484,19 +609,21 @@ export class AgentSession {
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
 			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_result")) {
-				return undefined;
-			}
+			const hookResult = runner.hasHandlers("tool_result")
+				? await runner.emitToolResult({
+						type: "tool_result",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						input: args as Record<string, unknown>,
+						content: result.content,
+						details: result.details,
+						isError,
+					})
+				: undefined;
 
-			const hookResult = await runner.emitToolResult({
-				type: "tool_result",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
-			});
+			const finalContent = hookResult?.content ?? result.content;
+			const finalIsError = hookResult?.isError ?? isError;
+			this._recordValidationToolResult(toolCall.name, args, finalContent, finalIsError);
 
 			if (!hookResult) {
 				return undefined;
@@ -517,16 +644,18 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-			const previousContext = previousSnapshot?.context ?? turn.context;
+			const compactedContext = await this._compactBeforeNextProviderRequest(turn, signal);
+			const nextTurn = compactedContext ? { ...turn, context: compactedContext } : turn;
+			const previousSnapshot = await previousPrepareNextTurnWithContext?.(nextTurn, signal);
+			const previousContext = previousSnapshot?.context ?? nextTurn.context;
 
 			return {
 				...previousSnapshot,
-				context: {
+				context: this._withValidationHint({
 					...previousContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
-				},
+				}),
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
@@ -734,6 +863,16 @@ export class AgentSession {
 
 	private _detachPiServerTerminalAssistantFailure(): void {
 		this._detachTerminalAssistantFailure();
+	}
+
+	private _restoreSessionLeaf(leafId: string | null): void {
+		if (leafId) {
+			this.sessionManager.branch(leafId);
+		} else {
+			this.sessionManager.resetLeaf();
+		}
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1088,6 +1227,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		this._resetValidationHintState();
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
@@ -2149,6 +2289,7 @@ export class AgentSession {
 		reason: "overflow" | "threshold",
 		willRetry: boolean,
 		preparationOverride?: CompactionPreparation,
+		preparationOptions?: CompactionPreparationOptions,
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
@@ -2190,6 +2331,7 @@ export class AgentSession {
 						apiKey,
 						headers,
 						settings,
+						preparation: preparationOptions,
 						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 						signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
@@ -2357,6 +2499,78 @@ export class AgentSession {
 	/** Whether auto-compaction is enabled */
 	get autoCompactionEnabled(): boolean {
 		return this.settingsManager.getCompactionEnabled();
+	}
+
+	private _shouldCompactBeforeNextProviderRequest(turn: PrepareNextTurnContext): boolean {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || turn.toolResults.length === 0) return false;
+
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return false;
+
+		const projectedTokens = estimateContextTokens(turn.context.messages).tokens;
+		if (projectedTokens >= contextWindow - settings.reserveTokens) return true;
+
+		const toolResultTokens = estimateMessagesTokens(turn.toolResults);
+		return toolResultTokens >= settings.keepRecentTokens;
+	}
+
+	private _appendIntraTurnCompactionMarker(): string {
+		const marker: CustomMessage<{ reason: string }> = {
+			role: "custom",
+			customType: INTRA_TURN_COMPACTION_MARKER_TYPE,
+			content: [{ type: "text", text: INTRA_TURN_COMPACTION_MARKER_TEXT }],
+			display: false,
+			details: { reason: "intra-turn-compaction" },
+			timestamp: Date.now(),
+		};
+		const markerId = this.sessionManager.appendCustomMessageEntry(
+			marker.customType,
+			marker.content,
+			marker.display,
+			marker.details,
+		);
+		this.agent.state.messages = [...this.agent.state.messages, marker];
+		return markerId;
+	}
+
+	private _currentAgentContext(baseContext: AgentContext): AgentContext {
+		return {
+			...baseContext,
+			messages: this.agent.state.messages.slice(),
+			systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+			tools: this.agent.state.tools.slice(),
+		};
+	}
+
+	private async _compactBeforeNextProviderRequest(
+		turn: PrepareNextTurnContext,
+		signal?: AbortSignal,
+	): Promise<AgentContext | undefined> {
+		if (signal?.aborted || !this._shouldCompactBeforeNextProviderRequest(turn)) {
+			return undefined;
+		}
+
+		const settings = this.settingsManager.getCompactionSettings();
+		const markerParentId = this.sessionManager.getLeafId();
+		const markerId = this._appendIntraTurnCompactionMarker();
+		const preparationOptions: CompactionPreparationOptions = { firstKeptEntryId: markerId };
+		const branchWithMarker = this.sessionManager.getBranch();
+		const previousCompactionId = getLatestCompactionEntry(branchWithMarker)?.id;
+		const preparation = prepareCompaction(branchWithMarker, settings, preparationOptions);
+		if (!preparation) {
+			this._restoreSessionLeaf(markerParentId);
+			return undefined;
+		}
+
+		await this._runAutoCompaction("threshold", false, preparation, preparationOptions);
+
+		const currentCompactionId = getLatestCompactionEntry(this.sessionManager.getBranch())?.id;
+		if (currentCompactionId === previousCompactionId) {
+			this._restoreSessionLeaf(markerParentId);
+			return undefined;
+		}
+		return this._currentAgentContext(turn.context);
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {

@@ -403,6 +403,30 @@ describe("harness compaction", () => {
 		expect([...preparation!.fileOps.written]).toContain("written.ts");
 	});
 
+	it("prepares compaction with a forced first kept marker", () => {
+		const user = createMessageEntry(createUserMessage("user msg"));
+		const assistant = createMessageEntry(createAssistantMessage("assistant msg"), user.id);
+		const marker: CustomMessageEntry = {
+			type: "custom_message",
+			id: createId(),
+			parentId: assistant.id,
+			timestamp: new Date().toISOString(),
+			customType: "pi:intra-turn-compaction",
+			content: "continue from compaction summary",
+			display: false,
+		};
+
+		const preparation = getOrThrow(
+			prepareCompaction([user, assistant, marker], DEFAULT_COMPACTION_SETTINGS, {
+				firstKeptEntryId: marker.id,
+			}),
+		);
+
+		expect(preparation?.firstKeptEntryId).toBe(marker.id);
+		expect(preparation?.messagesToSummarize.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(preparation?.turnPrefixMessages).toEqual([]);
+	});
+
 	it("prepares custom and branch summary entries for summarization", () => {
 		const branchSummary: BranchSummaryEntry = {
 			type: "branch_summary",

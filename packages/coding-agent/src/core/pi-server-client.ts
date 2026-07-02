@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { CompactResult, ProxyAssistantMessageEvent, SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import type {
+	CompactionPreparationOptions,
+	CompactResult,
+	ProxyAssistantMessageEvent,
+	SessionTreeEntry,
+} from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -485,6 +490,7 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 export interface PiServerCompactOptions extends SimpleStreamOptions {
 	customInstructions?: string;
 	settings?: unknown;
+	preparation?: CompactionPreparationOptions;
 	sessionTree?: PiServerTreeSnapshot;
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 }
@@ -506,6 +512,7 @@ export async function compactPiServer(
 		model,
 		options: serializeOptions(options),
 		settings: options?.settings,
+		preparation: options?.preparation,
 		customInstructions: options?.customInstructions,
 	});
 	let response = await request.postJson("/api/session/compact", makeBody());
