@@ -1,5 +1,5 @@
-import { spawnSync } from "node:child_process";
 import { Buffer } from "node:buffer";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,7 +179,7 @@ async function approveUpdateProxyTargets(runner, repoRoot, stdout, fetchImpl) {
 	}
 }
 
-export async function runPiClientUpdate(_args = [], options = {}) {
+export async function runPiServerUpdate(_args = [], options = {}) {
 	const packageRoot = options.packageRoot ?? defaultPackageRoot();
 	const repoRoot = options.repoRoot ?? defaultRepoRoot();
 	const runner = options.runner ?? spawnSync;
@@ -187,19 +187,17 @@ export async function runPiClientUpdate(_args = [], options = {}) {
 	const stdout = options.stdout ?? process.stdout;
 	const stderr = options.stderr ?? process.stderr;
 	const pkg = readPackageMetadata(packageRoot);
-	const baseVersion = pkg.piClient?.basePiVersion ?? "unknown";
-	const baseCommit = pkg.piClient?.basePiCommit ?? "unknown";
 
-	stdout.write(`pi-client ${pkg.version} (based on pi ${baseVersion}, upstream ${baseCommit})\n`);
+	stdout.write(`pi-server ${pkg.version}\n`);
 	stdout.write(`Updating checkout: ${repoRoot}\n`);
 
 	const status = runStep(runner, "git", ["status", "--porcelain"], repoRoot, "pipe");
 	if (status.status !== 0) {
-		stderr.write("pi-client update failed: unable to inspect git status\n");
+		stderr.write("pi-server update failed: unable to inspect git status\n");
 		return status.status ?? 1;
 	}
 	if (String(status.stdout ?? "").trim().length > 0) {
-		stderr.write("pi-client update failed: working tree has uncommitted changes\n");
+		stderr.write("pi-server update failed: working tree has uncommitted changes\n");
 		return 1;
 	}
 
@@ -215,11 +213,11 @@ export async function runPiClientUpdate(_args = [], options = {}) {
 	for (const [command, args] of steps) {
 		const result = runStep(runner, command, args, repoRoot);
 		if (result.status !== 0) {
-			stderr.write(`pi-client update failed: ${command} ${args.join(" ")}\n`);
+			stderr.write(`pi-server update failed: ${command} ${args.join(" ")}\n`);
 			return result.status ?? 1;
 		}
 	}
 
-	stdout.write("pi-client update complete\n");
+	stdout.write("pi-server update complete\n");
 	return 0;
 }

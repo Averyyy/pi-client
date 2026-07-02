@@ -12,6 +12,16 @@ describe("pi-server package", () => {
 		expect(pkg.name).toBe("@averyyy/pi-server");
 	});
 
+	it("routes the bin through the pi-server wrapper", () => {
+		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
+		const binContent = readFileSync(join(pkgRoot, "bin", "pi-server.js"), "utf-8");
+
+		expect(pkg.bin["pi-server"]).toBe("bin/pi-server.js");
+		expect(pkg.files).toContain("bin");
+		expect(binContent).toContain('args[0] === "update"');
+		expect(binContent).toContain('join(packageRoot, "dist", "cli.js")');
+	});
+
 	it("depends on published runtime packages", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 		expect(pkg.dependencies["@earendil-works/pi-ai"]).toBe("npm:@averyyy/pi-ai@0.80.3-piclient.2");

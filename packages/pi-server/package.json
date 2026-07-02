@@ -4,7 +4,7 @@
 	"description": "Proxy server for pi-client that stores session state and forwards incremental requests to upstream LLM providers",
 	"type": "module",
 	"bin": {
-		"pi-server": "dist/cli.js"
+		"pi-server": "bin/pi-server.js"
 	},
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -15,6 +15,7 @@
 		}
 	},
 	"files": [
+		"bin",
 		"dist",
 		"README.md",
 		"CHANGELOG.md"

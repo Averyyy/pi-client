@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 const args = process.argv.slice(2);
 const modulePromise =
 	args[0] === "update"
-		? import("./update.js").then(({ runPiClientUpdate }) => {
-				process.exitCode = runPiClientUpdate(args.slice(1));
+		? import("./update.js").then(async ({ runPiClientUpdate }) => {
+				process.exitCode = await runPiClientUpdate(args.slice(1));
 			})
 		: args[0] === "web"
 			? import("./web.js").then(async ({ runPiClientWeb }) => {
