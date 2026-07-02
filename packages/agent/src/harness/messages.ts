@@ -118,47 +118,49 @@ export function createCustomMessage(
 }
 
 export function convertToLlm(messages: AgentMessage[]): Message[] {
-	return messages
-		.map((m): Message | undefined => {
-			switch (m.role) {
-				case "bashExecution":
-					if (m.excludeFromContext) {
-						return undefined;
-					}
-					return {
+	const result: Message[] = [];
+	for (const m of messages) {
+		switch (m.role) {
+			case "bashExecution":
+				if (!m.excludeFromContext) {
+					result.push({
 						role: "user",
 						content: [{ type: "text", text: bashExecutionToText(m) }],
 						timestamp: m.timestamp,
-					};
-				case "custom": {
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
-					return {
-						role: "user",
-						content,
-						timestamp: m.timestamp,
-					};
+					});
 				}
-				case "branchSummary":
-					return {
-						role: "user",
-						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
-						timestamp: m.timestamp,
-					};
-				case "compactionSummary":
-					return {
-						role: "user",
-						content: [
-							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
-						],
-						timestamp: m.timestamp,
-					};
-				case "user":
-				case "assistant":
-				case "toolResult":
-					return m;
-				default:
-					return undefined;
+				break;
+			case "custom": {
+				const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+				result.push({
+					role: "user",
+					content,
+					timestamp: m.timestamp,
+				});
+				break;
 			}
-		})
-		.filter((m): m is Message => m !== undefined);
+			case "branchSummary":
+				result.push({
+					role: "user",
+					content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+					timestamp: m.timestamp,
+				});
+				break;
+			case "compactionSummary":
+				result.push({
+					role: "user",
+					content: [
+						{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+					],
+					timestamp: m.timestamp,
+				});
+				break;
+			case "user":
+			case "assistant":
+			case "toolResult":
+				result.push(m);
+				break;
+		}
+	}
+	return result;
 }

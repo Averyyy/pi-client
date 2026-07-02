@@ -28,6 +28,7 @@
 
 - In parallel tool mode, do not downgrade an entire tool batch to sequential just because one tool has `executionMode: "sequential"`. Treat sequential tools as source-order barriers: run the parallel segment before them concurrently, run the sequential tool alone, then continue with the next parallel segment. Same-file edit/write ordering belongs in `withFileMutationQueue()`, and bash stays sequential so validation commands do not overlap sibling tool calls.
 - Coalesce tool progress updates at the shared `executePreparedToolCall()` callback path, not inside individual tools or UI renderers. `tool_execution_update` may drop intermediate same-tick partials, but must flush the latest partial before `tool_execution_end`; the final tool result remains authoritative.
+- Keep hot-path message/context transforms single-pass in shared code such as `convertToLlm()` and `buildSessionContext()`. Benchmark before keeping perf changes, and revert candidates that only move cost or improve one path while measurably regressing the common path.
 - Validation-aware tool-loop hints belong in transient next-turn context, not persisted session history: record edit/write paths and failed bash output from finalized tool results, inject one hidden `pi:validation-hint` before the next provider request, and de-dupe old hints each turn.
 
 ## pi-client / pi-server Request Sync

@@ -60,14 +60,18 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 
 	if (compaction) {
 		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
-		const compactionIdx = pathEntries.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
-		let foundFirstKept = false;
-		for (let i = 0; i < compactionIdx; i++) {
-			const entry = pathEntries[i]!;
-			if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
-			if (foundFirstKept) appendMessage(entry);
+		const compactionIndex = pathEntries.lastIndexOf(compaction);
+		let firstKeptIndex = compactionIndex;
+		for (let i = compactionIndex - 1; i >= 0; i--) {
+			if (pathEntries[i]!.id === compaction.firstKeptEntryId) {
+				firstKeptIndex = i;
+				break;
+			}
 		}
-		for (let i = compactionIdx + 1; i < pathEntries.length; i++) {
+		for (let i = firstKeptIndex; i < compactionIndex; i++) {
+			appendMessage(pathEntries[i]!);
+		}
+		for (let i = compactionIndex + 1; i < pathEntries.length; i++) {
 			appendMessage(pathEntries[i]!);
 		}
 	} else {
