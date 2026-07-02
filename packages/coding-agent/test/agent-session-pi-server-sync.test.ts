@@ -892,6 +892,110 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
+	it("does not retry the LLM after post-stream pi-server tree append fails", async () => {
+		const tempDir = join(tmpdir(), `pi-post-stream-append-fail-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(model!.provider, "test-key");
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+		let streamCount = 0;
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					if (url.endsWith("/api/session/tree/append")) {
+						return new Response(JSON.stringify({ error: "CONNECT timeout" }), {
+							status: 502,
+							statusText: "Bad Gateway",
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-post-stream-append-fail",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				settingsManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			const events: Array<{ type: string; willRetry?: boolean }> = [];
+			session.subscribe((event) => {
+				if (event.type === "agent_end") {
+					events.push({ type: event.type, willRetry: event.willRetry });
+				} else if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					events.push({ type: event.type });
+				}
+			});
+			try {
+				await session.prompt("post stream sync fails");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(streamCount).toBe(1);
+			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
+			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			const syncErrorEntries = sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.errorMessage?.includes("Session tree append failed"),
+				);
+			expect(syncErrorEntries).toHaveLength(1);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("compacts pi-server length overflow without keeping the length assistant on the active branch", async () => {
 		const tempDir = join(tmpdir(), `pi-length-overflow-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");

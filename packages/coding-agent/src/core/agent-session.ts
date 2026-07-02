@@ -682,6 +682,27 @@ export class AgentSession {
 		return message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length";
 	}
 
+	private _isPostAssistantPiServerSyncFailure(message: AssistantMessage): boolean {
+		if (!isPiServerMode() || !message.errorMessage) {
+			return false;
+		}
+		if (
+			!/^(Session init|Session tree (append|sync|switch)|Session history reconciliation) failed/.test(
+				message.errorMessage,
+			)
+		) {
+			return false;
+		}
+
+		const messages = this.agent.state.messages;
+		if (messages[messages.length - 1] !== message) {
+			return false;
+		}
+
+		const previous = messages[messages.length - 2];
+		return previous?.role === "assistant" && !this._isTerminalAssistantFailure(previous as AssistantMessage);
+	}
+
 	private _detachTerminalAssistantFailure(): void {
 		const branch = this.sessionManager.getBranch();
 		let terminalMessageEntry: SessionMessageEntry | undefined;
@@ -1070,7 +1091,21 @@ export class AgentSession {
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+				try {
+					await this.agent.continue();
+				} catch (error) {
+					if (this._retryAttempt > 0) {
+						const attempt = this._retryAttempt;
+						this._retryAttempt = 0;
+						this._emit({
+							type: "auto_retry_end",
+							success: false,
+							attempt,
+							finalError: error instanceof Error ? error.message : String(error),
+						});
+					}
+					throw error;
+				}
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -2730,6 +2765,7 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
+		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
 		if (message.errorMessage && this._isNonRetryableProviderLimitError(message.errorMessage)) return false;
 		return isRetryableAssistantError(message);
 	}
@@ -2770,6 +2806,19 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
+		}
+
+		const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
+		if (!lastMessage || lastMessage.role === "assistant") {
+			const attempt = this._retryAttempt;
+			this._retryAttempt = 0;
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt,
+				finalError: lastMessage ? "Cannot continue from message role: assistant" : "No messages to continue from",
+			});
+			return false;
 		}
 
 		// Wait with exponential backoff (abortable)
