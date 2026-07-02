@@ -84,13 +84,14 @@ function resolveScheduledRelease() {
 		}
 	}
 
-	const packageJson = readJson(join(repoRoot, "packages/pi-client/package.json"));
-	const baseVersion = basePiVersion(packageJson);
+	const clientPackageJson = readJson(join(repoRoot, "packages/pi-client/package.json"));
+	const upstreamPackageJson = readJson(join(repoRoot, "packages/ai/package.json"));
+	const baseVersion = basePiVersion(upstreamPackageJson);
 	const tags = run("git", ["tag", "--list", `v${baseVersion}-piclient.*`], { cwd: repoRoot, capture: true })
 		.stdout.trim()
 		.split("\n")
 		.filter(Boolean);
-	const version = nextForkVersion(baseVersion, tags, packageJson.version);
+	const version = nextForkVersion(baseVersion, tags, clientPackageJson.version);
 
 	return {
 		should_publish: "true",
@@ -112,7 +113,7 @@ function assertForkVersion(version) {
 }
 
 function basePiVersion(packageJson) {
-	const baseVersion = packageJson.piClient?.basePiVersion ?? packageJson.version.replace(/-piclient\.\d+$/, "");
+	const baseVersion = packageJson.version.replace(/-piclient\.\d+$/, "");
 	if (!/^\d+\.\d+\.\d+$/.test(baseVersion)) {
 		throw new Error(`Expected base Pi version like 0.80.3, got ${baseVersion}`);
 	}
