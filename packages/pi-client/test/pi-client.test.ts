@@ -22,38 +22,16 @@ describe("pi-client package", () => {
 		expect(binContent).toContain('PI_SERVER_MODE: "true"');
 	});
 
-	it("routes the web subcommand through the pi-web wrapper", () => {
+	it("routes the web subcommand through the Tau wrapper", () => {
 		const binContent = readFileSync(join(pkgRoot, "bin", "pi-client.js"), "utf-8");
 		const webContent = readFileSync(join(pkgRoot, "bin", "web.js"), "utf-8");
 		expect(binContent).toContain('args[0] === "web"');
-		expect(webContent).toContain("@jmfederico/pi-web/package.json");
-		expect(webContent).toContain("@jmfederico/pi-web/dist/server/app.js");
+		expect(webContent).toContain("TAU_MIRROR_PORT: options.port");
+		expect(webContent).toContain("TAU_HOST: options.host");
 		expect(webContent).toContain('PI_SERVER_MODE: "true"');
 		expect(webContent).toContain('const defaultPort = "1838"');
-		expect(webContent).toContain("/api/pi-client/pi-server");
-		expect(webContent).toContain("/api/pi-client/global-agents");
-		expect(webContent).toContain("/api/pi-client/projects");
-		expect(webContent).toContain("getAgentDir");
-		expect(webContent).toContain("PiClientProjectService");
-		expect(webContent).toContain("PiWebPluginService");
-	});
-
-	it("bundles the pi-client pi-web plugin", () => {
-		const pluginPkg = JSON.parse(
-			readFileSync(join(pkgRoot, "bin", "pi-web-plugins", "pi-client", "package.json"), "utf-8"),
-		);
-		const pluginContent = readFileSync(
-			join(pkgRoot, "bin", "pi-web-plugins", "pi-client", "pi-web-plugin.js"),
-			"utf-8",
-		);
-		expect(pluginPkg.piWeb.plugins[0].id).toBe("pi-client");
-		expect(pluginContent).toContain("Pi Server Settings");
-		expect(pluginContent).toContain("Global AGENTS.md");
-		expect(pluginContent).toContain("Skill Management");
-		expect(pluginContent).toContain("New Conversation");
-		expect(pluginContent).toContain("Project Visibility");
-		expect(pluginContent).toContain("pi-client-quickbar");
-		expect(pluginContent).toContain("pi-client.server");
+		expect(webContent).toContain("pi install npm:tau-mirror");
+		expect(webContent).toContain("pi-client install npm:tau-mirror");
 	});
 
 	it("publishes under the averyyy pi-client scope", () => {
@@ -69,9 +47,10 @@ describe("pi-client package", () => {
 		);
 	});
 
-	it("depends on pinned pi-web for the web UI", () => {
+	it("does not bundle a separate web UI dependency", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@jmfederico/pi-web"]).toBe("1.202606.7");
+		expect(pkg.dependencies["@jmfederico/pi-web"]).toBeUndefined();
+		expect(pkg.dependencies["tau-mirror"]).toBeUndefined();
 	});
 
 	it("keeps the root lockfile aligned to published runtime dependencies", () => {
@@ -80,7 +59,7 @@ describe("pi-client package", () => {
 		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe(
 			"npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
 		);
-		expect(lock.packages["packages/pi-client"].dependencies["@jmfederico/pi-web"]).toBe("1.202606.7");
-		expect(lock.packages["node_modules/@jmfederico/pi-web"].version).toBe("1.202606.7");
+		expect(lock.packages["packages/pi-client"].dependencies["@jmfederico/pi-web"]).toBeUndefined();
+		expect(lock.packages["node_modules/@jmfederico/pi-web"]).toBeUndefined();
 	});
 });

@@ -27,10 +27,11 @@ PI_SERVER_URL=https://pi.yreva.asia pi-client -p "Say exactly: ok"
 Start the browser UI:
 
 ```bash
+pi install npm:tau-mirror
 PI_SERVER_URL=https://pi.yreva.asia pi-client web
 ```
 
-The web UI listens on `http://127.0.0.1:1838` by default.
+The web command starts `pi-client` in Tau mirror mode. Tau listens on `http://127.0.0.1:1838` by default and uses the same shared `~/.pi/agent` extension install as local `pi`, so installing Tau with either `pi` or `pi-client` works.
 
 ## Server Auth
 

@@ -8,6 +8,7 @@
 - Added chunked `pi-server` request upload support controlled by `PI_CLIENT_MAX_REQUEST_KB`.
 - Added a `pi-client` CLI entrypoint that preserves the original Pi config, extension, skill, prompt, and theme loading path.
 - Reused matching `pi-server` tree hashes to avoid repeating full tree sync when the server already has the same persisted session tree.
+- Added automatic first-turn session naming with the current model when no session name is set.
 
 ### Fixed
 

@@ -25,8 +25,7 @@
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
-		"@jmfederico/pi-web": "1.202606.7"
+		"@earendil-works/pi-coding-agent": "npm:@averyyy/pi-coding-agent@0.80.3-piclient.3"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",

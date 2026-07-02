@@ -74,12 +74,11 @@
 
 ## pi-client Web UI
 
-- `pi-client web` is the client GUI entrypoint and should build on `@jmfederico/pi-web`. Do not use `packages/pi-webui` for this command; that package is a pi-server session inspector/proxy.
-- Keep `PI_SERVER_MODE=true` when launching the web runtime so browser sessions use the same pi-client-to-pi-server transport as the CLI.
-- Keep pi-client-specific web UI additions in the `pi-client web` wrapper routes and bundled PI WEB plugin; do not fork or patch `@jmfederico/pi-web` unless the user explicitly asks.
-- Global `AGENTS.md` web editing should use the coding-agent `getAgentDir()` path (`~/.pi/agent/AGENTS.md` by default) so the web UI and CLI share the same instructions file.
-- Hidden project support in `pi-client web` should stay as a wrapper-layer visibility filter over PI WEB projects; do not fork PI WEB's project store format for client-only visibility.
-- On Windows, `pi-client web` should connect to the PI WEB session daemon over `PI_WEB_SESSIOND_PORT` / `PI_WEB_SESSIOND_URL`; the default `.sock` path is a Unix socket and can fail with `EACCES`.
+- `pi-client web` is the remote-backend Tau entrypoint. It should launch the forked coding-agent CLI with `PI_SERVER_MODE=true`, `PI_SERVER_URL`, and `TAU_MIRROR_PORT=1838`; Tau remains the browser mirror, not the backend selector.
+- Local `pi` and remote `pi-client` may share the same `~/.pi/agent` Tau install. The backend is whichever process loads Tau: `pi` for local provider calls, `pi-client web` for pi-client-to-pi-server transport.
+- Do not revive `@jmfederico/pi-web` or `packages/pi-webui` for `pi-client web` unless the user explicitly asks; `packages/pi-webui` is a pi-server inspector/proxy, not the client GUI.
+- Keep `pi-client web` as a thin wrapper over the normal pi-client interactive runtime. Do not maintain wrapper-only web routes, project stores, global `AGENTS.md` editors, or Pi Web plugins in this package.
+- Bind Tau to localhost by default for `pi-client web` (`TAU_HOST=127.0.0.1`); users can set `TAU_HOST=0.0.0.0` when they intentionally want LAN/mobile access.
 - When publishing the standalone client package, publish `packages/pi-client` as `@averyyy/pi-client` and keep its runtime dependencies as registry versions, not workspace `file:` links.
 - `@jmfederico/pi-web` peers use stable upstream semver ranges, so `@averyyy/*@0.80.3-piclient.N` aliases can trigger non-fatal npm peer override warnings when upstream Pi is already installed globally. For documented/manual fork installs and npm-global updater paths, use `--legacy-peer-deps`; do not install upstream stable peers to silence the warning.
 

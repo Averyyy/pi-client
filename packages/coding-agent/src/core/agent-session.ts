@@ -288,6 +288,10 @@ const INTRA_TURN_COMPACTION_MARKER_TEXT =
 const VALIDATION_HINT_MESSAGE_TYPE = "pi:validation-hint";
 const VALIDATION_HINT_FILE_LIMIT = 12;
 const VALIDATION_HINT_FAILURE_CHAR_LIMIT = 1200;
+const AUTO_SESSION_NAME_INPUT_CHAR_LIMIT = 4000;
+const AUTO_SESSION_NAME_MAX_CHARS = 80;
+const AUTO_SESSION_NAME_PROMPT =
+	"Name this coding session from the transcript below. Return only a concise title, in the user's language when clear. No quotes, no markdown, no explanation. Do not call tools.";
 
 function isPiServerMode(): boolean {
 	return process.env.PI_SERVER_MODE === "true";
@@ -324,6 +328,39 @@ function compactValidationSummary(text: string): string {
 	const trimmed = text.trim();
 	if (trimmed.length <= VALIDATION_HINT_FAILURE_CHAR_LIMIT) return trimmed;
 	return `...${trimmed.slice(trimmed.length - VALIDATION_HINT_FAILURE_CHAR_LIMIT + 3)}`;
+}
+
+function messageTextContent(message: AgentMessage): string {
+	if (!("content" in message)) return "";
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is TextContent => part.type === "text")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+}
+
+function truncateForSessionNameInput(text: string): string {
+	if (text.length <= AUTO_SESSION_NAME_INPUT_CHAR_LIMIT) return text;
+	return text.slice(0, AUTO_SESSION_NAME_INPUT_CHAR_LIMIT).trim();
+}
+
+function sanitizeGeneratedSessionName(text: string): string | undefined {
+	const firstLine = text
+		.split(/\r?\n/u)
+		.map((line) => line.trim())
+		.find((line) => line.length > 0);
+	if (!firstLine) return undefined;
+
+	const title = firstLine
+		.replace(/^title:\s*/iu, "")
+		.replace(/^["'`]+|["'`]+$/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!title) return undefined;
+	return title.length > AUTO_SESSION_NAME_MAX_CHARS ? title.slice(0, AUTO_SESSION_NAME_MAX_CHARS).trim() : title;
 }
 
 interface ValidationFailureState {
@@ -393,6 +430,7 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _autoSessionNameAttempted = false;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -1256,9 +1294,77 @@ export class AgentSession {
 					throw error;
 				}
 			}
+			await this._maybeGenerateSessionName();
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
+		}
+	}
+
+	private _sessionHasInfoEntry(): boolean {
+		return this.sessionManager.getEntries().some((entry) => entry.type === "session_info");
+	}
+
+	private _buildSessionNameTranscript(): string | undefined {
+		const lines: string[] = [];
+		for (const message of this.agent.state.messages) {
+			if (message.role !== "user" && message.role !== "assistant") continue;
+			const text = messageTextContent(message);
+			if (!text) continue;
+			lines.push(`${message.role === "user" ? "User" : "Assistant"}: ${text}`);
+		}
+		const transcript = lines.join("\n\n").trim();
+		return transcript ? truncateForSessionNameInput(transcript) : undefined;
+	}
+
+	private _shouldGenerateSessionName(): boolean {
+		if (this._autoSessionNameAttempted || this._sessionHasInfoEntry()) return false;
+		const userMessages = this.agent.state.messages.filter((message) => message.role === "user");
+		if (userMessages.length !== 1) return false;
+		const lastAssistant = this._findLastAssistantMessage();
+		return lastAssistant !== undefined && !this._isTerminalAssistantFailure(lastAssistant);
+	}
+
+	private async _maybeGenerateSessionName(): Promise<void> {
+		if (!this._shouldGenerateSessionName()) return;
+		this._autoSessionNameAttempted = true;
+
+		const model = this.model;
+		const transcript = this._buildSessionNameTranscript();
+		if (!model || !transcript) return;
+
+		try {
+			const stream = await this.agent.streamFn(
+				model,
+				{
+					systemPrompt: this.systemPrompt,
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: `${AUTO_SESSION_NAME_PROMPT}\n\n${transcript}` }],
+							timestamp: Date.now(),
+						},
+					],
+					tools: this.agent.state.tools,
+				},
+				{
+					maxTokens: 32,
+					reasoning: undefined,
+					sessionId: this.sessionId,
+					transport: this.agent.transport,
+					thinkingBudgets: this.agent.thinkingBudgets,
+					maxRetryDelayMs: this.agent.maxRetryDelayMs,
+				},
+			);
+			for await (const _event of stream) {
+				// Drain the title stream without surfacing it as a chat message.
+			}
+			const response = await stream.result();
+			if (response.stopReason === "error" || response.stopReason === "aborted") return;
+			const title = sanitizeGeneratedSessionName(messageTextContent(response));
+			if (title) this.setSessionName(title);
+		} catch {
+			// Session naming is a post-turn convenience; the completed assistant turn stays authoritative.
 		}
 	}
 
