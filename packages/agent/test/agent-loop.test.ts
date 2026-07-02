@@ -307,6 +307,65 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("coalesces synchronous tool execution updates", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema, { step: number }> = {
+			name: "progress",
+			label: "Progress",
+			description: "Emits progress",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				for (let step = 1; step <= 5; step++) {
+					onUpdate?.({
+						content: [{ type: "text", text: `step ${step}` }],
+						details: { step },
+					});
+				}
+				return {
+					content: [{ type: "text", text: "done" }],
+					details: { step: 6 },
+					terminate: true,
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const stream = agentLoop([createUserMessage("run")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				mockStream.push({
+					type: "done",
+					reason: "toolUse",
+					message: createAssistantMessage(
+						[{ type: "toolCall", id: "tool-1", name: "progress", arguments: {} }],
+						"toolUse",
+					),
+				});
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const updates = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_update" }> =>
+				event.type === "tool_execution_update",
+		);
+		expect(updates).toHaveLength(1);
+		expect(updates[0]!.partialResult.details).toEqual({ step: 5 });
+	});
+
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: Array<string | number> = [];

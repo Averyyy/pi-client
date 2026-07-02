@@ -173,6 +173,7 @@ export class AgentHarness<
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
+	private activeTools: TTool[] = [];
 	private steerQueue: UserMessage[] = [];
 	private steeringQueueMode: QueueMode;
 	private followUpQueue: UserMessage[] = [];
@@ -201,6 +202,7 @@ export class AgentHarness<
 			: (options.tools ?? []).map((tool) => tool.name);
 		this.validateUniqueNames(this.activeToolNames, "Duplicate active tool name(s)");
 		this.validateToolNames(this.activeToolNames);
+		this.activeTools = this.resolveActiveTools(this.activeToolNames);
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 	}
@@ -316,9 +318,7 @@ export class AgentHarness<
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
 		const tools = [...this.tools.values()];
-		const activeTools = this.activeToolNames
-			.map((name) => this.tools.get(name))
-			.filter((tool): tool is TTool => tool !== undefined);
+		const activeTools = this.activeTools.slice();
 		let systemPrompt = "You are a helpful assistant.";
 		if (typeof this.systemPrompt === "string") {
 			systemPrompt = this.systemPrompt;
@@ -457,6 +457,10 @@ export class AgentHarness<
 		this.validateUniqueNames(toolNames, "Duplicate active tool name(s)");
 		const missing = toolNames.filter((name) => !tools.has(name));
 		if (missing.length > 0) throw new AgentHarnessError("invalid_argument", `Unknown tool(s): ${missing.join(", ")}`);
+	}
+
+	private resolveActiveTools(toolNames: string[], tools: Map<string, TTool> = this.tools): TTool[] {
+		return toolNames.map((name) => tools.get(name)!);
 	}
 
 	private async flushPendingSessionWrites(): Promise<void> {
@@ -877,6 +881,7 @@ export class AgentHarness<
 			const nextTools = new Map(tools.map((tool) => [tool.name, tool]));
 			const nextActiveToolNames = activeToolNames ? [...activeToolNames] : this.activeToolNames;
 			this.validateToolNames(nextActiveToolNames, nextTools);
+			const nextActiveTools = this.resolveActiveTools(nextActiveToolNames, nextTools);
 			const previousToolNames = [...this.tools.keys()];
 			const previousActiveToolNames = [...this.activeToolNames];
 			if (this.phase === "idle") {
@@ -886,6 +891,7 @@ export class AgentHarness<
 			}
 			this.tools = nextTools;
 			this.activeToolNames = [...nextActiveToolNames];
+			this.activeTools = nextActiveTools;
 			await this.emitOwn({
 				type: "tools_update",
 				toolNames: [...this.tools.keys()],
@@ -900,12 +906,13 @@ export class AgentHarness<
 	}
 
 	getActiveTools(): TTool[] {
-		return this.activeToolNames.map((name) => this.tools.get(name)!);
+		return this.activeTools.slice();
 	}
 
 	async setActiveTools(toolNames: string[]): Promise<void> {
 		try {
 			this.validateToolNames(toolNames);
+			const nextActiveTools = this.resolveActiveTools(toolNames);
 			const previousToolNames = [...this.tools.keys()];
 			const previousActiveToolNames = [...this.activeToolNames];
 			if (this.phase === "idle") {
@@ -914,6 +921,7 @@ export class AgentHarness<
 				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
 			}
 			this.activeToolNames = [...toolNames];
+			this.activeTools = nextActiveTools;
 			await this.emitOwn({
 				type: "tools_update",
 				toolNames: [...this.tools.keys()],

@@ -672,8 +672,43 @@ async function executePreparedToolCall(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallOutcome> {
-	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
+	let pendingUpdate: AgentToolResult<unknown> | undefined;
+	let updateFlushPromise: Promise<void> | undefined;
+	let updateFlushError: unknown;
+
+	const emitPendingUpdates = async (): Promise<void> => {
+		while (pendingUpdate) {
+			const partialResult = pendingUpdate;
+			pendingUpdate = undefined;
+			await emit({
+				type: "tool_execution_update",
+				toolCallId: prepared.toolCall.id,
+				toolName: prepared.toolCall.name,
+				args: prepared.toolCall.arguments,
+				partialResult,
+			});
+		}
+	};
+	const scheduleUpdateFlush = (): void => {
+		if (updateFlushPromise) return;
+		updateFlushPromise = Promise.resolve()
+			.then(emitPendingUpdates)
+			.catch((error: unknown) => {
+				updateFlushError = error;
+			})
+			.finally(() => {
+				updateFlushPromise = undefined;
+				if (pendingUpdate && acceptingUpdates) scheduleUpdateFlush();
+			});
+	};
+	const flushUpdates = async (): Promise<void> => {
+		while (updateFlushPromise) {
+			await updateFlushPromise;
+		}
+		await emitPendingUpdates();
+		if (updateFlushError) throw updateFlushError;
+	};
 
 	try {
 		const result = await prepared.tool.execute(
@@ -682,25 +717,16 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(
-					Promise.resolve(
-						emit({
-							type: "tool_execution_update",
-							toolCallId: prepared.toolCall.id,
-							toolName: prepared.toolCall.name,
-							args: prepared.toolCall.arguments,
-							partialResult,
-						}),
-					),
-				);
+				pendingUpdate = partialResult;
+				scheduleUpdateFlush();
 			},
 		);
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await flushUpdates();
 		return { result, isError: false };
 	} catch (error) {
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await flushUpdates();
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
