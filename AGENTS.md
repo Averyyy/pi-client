@@ -70,7 +70,7 @@
 - Scheduled Averyyy publishing lives in `.github/workflows/publish-averyyy-npm.yml`. Daily runs must derive the release prefix from the current upstream package version, increment the highest existing `v<base>-piclient.N` tag, and create the GitHub release only after npm publish succeeds so the next run can reliably skip when there are no commits since the latest release.
 - The remote workflow uses npm trusted publishing through environment `npm-publish` with `--provenance`. Configure each package, not just `@averyyy/pi-client`, for that trusted publisher:
   `npx --yes npm@11 trust github @averyyy/<package> --file publish-averyyy-npm.yml --repo Averyyy/pi-client --env npm-publish --allow-publish`.
-- Before relying on remote publishing, verify every package in the script already exists on npm and has trusted publishing configured. A release-triggered publish can fail with `404 Not Found ... or you do not have permission` when the package exists but lacks the trusted publisher, and a new package such as `@averyyy/pi-tui` must be created once before it can be configured.
+- Before relying on remote publishing, verify every package in the script has trusted publishing configured. A release-triggered publish can fail with `404 Not Found ... or you do not have permission` when the package lacks the trusted publisher. For a new package such as `@averyyy/pi-tui`, `npm trust github ... --allow-publish` can grant the workflow `createPackage` permission before the first publish.
 
 ## Commands
 
