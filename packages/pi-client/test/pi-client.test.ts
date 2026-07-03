@@ -32,6 +32,7 @@ describe("pi-client package", () => {
 		expect(webContent).toContain('const defaultPort = "1838"');
 		expect(webContent).toContain("pi install npm:@averyyy/pi-tau-codex");
 		expect(webContent).toContain("pi-client install npm:@averyyy/pi-tau-codex");
+		expect(webContent).toContain("pi-client install git:github.com/Averyyy/pi-tau-codex");
 		expect(webContent).toContain("请安装");
 	});
 

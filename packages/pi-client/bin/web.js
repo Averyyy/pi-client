@@ -9,6 +9,7 @@ const defaultPort = "1838";
 const defaultPiServerUrl = "http://127.0.0.1:4217";
 const tauCodexPackage = "@averyyy/pi-tau-codex";
 const tauCodexInstallTarget = "npm:@averyyy/pi-tau-codex";
+const tauCodexGitTarget = "git:github.com/Averyyy/pi-tau-codex";
 
 export async function runPiClientWeb(args = process.argv.slice(2)) {
 	const parsed = parseArgs(args);
@@ -75,7 +76,9 @@ function specMatchesTauCodex(spec) {
 		spec === tauCodexPackage ||
 		spec === tauCodexInstallTarget ||
 		spec.startsWith(`${tauCodexPackage}@`) ||
-		spec.startsWith(`${tauCodexInstallTarget}@`)
+		spec.startsWith(`${tauCodexInstallTarget}@`) ||
+		spec === tauCodexGitTarget ||
+		spec.includes("github.com/Averyyy/pi-tau-codex")
 	);
 }
 
@@ -136,6 +139,7 @@ Environment:
 Tau must be installed in the shared Pi agent settings:
   pi-client install npm:@averyyy/pi-tau-codex
   # or: pi install npm:@averyyy/pi-tau-codex
+  # dev fallback: pi-client install git:github.com/Averyyy/pi-tau-codex
 `);
 }
 
@@ -143,4 +147,5 @@ function printInstallRequired() {
 	console.error(`请安装 ${tauCodexPackage}:`);
 	console.error("  pi-client install npm:@averyyy/pi-tau-codex");
 	console.error("  # or: pi install npm:@averyyy/pi-tau-codex");
+	console.error("  # dev fallback: pi-client install git:github.com/Averyyy/pi-tau-codex");
 }

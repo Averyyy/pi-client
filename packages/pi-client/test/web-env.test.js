@@ -38,6 +38,8 @@ describe("pi-client web Tau env", () => {
 			const settingsPath = join(dir, "settings.json");
 			writeFileSync(settingsPath, JSON.stringify({ packages: ["npm:@averyyy/pi-tau-codex"] }));
 			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_SETTINGS_PATH: settingsPath })).toBe(true);
+			writeFileSync(settingsPath, JSON.stringify({ packages: [{ source: "git:github.com/Averyyy/pi-tau-codex" }] }));
+			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_SETTINGS_PATH: settingsPath })).toBe(true);
 			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_DIR: join(dir, "missing") })).toBe(false);
 			expect(hasTauCodexExtensionInstalled({ TAU_STATIC_DIR: "/tmp/public" })).toBe(true);
 		} finally {
