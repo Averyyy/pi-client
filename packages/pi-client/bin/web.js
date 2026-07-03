@@ -1,16 +1,25 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const defaultPort = "1838";
 const defaultPiServerUrl = "http://127.0.0.1:4217";
+const tauCodexPackage = "@averyyy/pi-tau-codex";
+const tauCodexInstallTarget = "npm:@averyyy/pi-tau-codex";
 
 export async function runPiClientWeb(args = process.argv.slice(2)) {
 	const parsed = parseArgs(args);
 	if (parsed.help) {
 		printHelp();
 		return 0;
+	}
+
+	if (!hasTauCodexExtensionInstalled(process.env)) {
+		printInstallRequired();
+		return 1;
 	}
 
 	process.title = "pi-client web";
@@ -23,7 +32,6 @@ export async function runPiClientWeb(args = process.argv.slice(2)) {
 	});
 
 	console.log(`pi-client web uses Tau at http://${host}:${port}`);
-	console.log("If Tau is not installed, run: pi install npm:tau-mirror or pi-client install npm:tau-mirror");
 
 	return await new Promise((resolve, reject) => {
 		child.once("error", reject);
@@ -42,6 +50,33 @@ export function piClientWebEnv(env = process.env, options) {
 		TAU_HOST: options.host,
 		TAU_MIRROR_PORT: options.port,
 	};
+}
+
+export function hasTauCodexExtensionInstalled(env = process.env) {
+	if (env.TAU_STATIC_DIR) return true;
+	const settingsPath = env.PI_CODING_AGENT_SETTINGS_PATH ?? join(
+		env.PI_CODING_AGENT_DIR ?? join(env.HOME ?? homedir(), ".pi", "agent"),
+		"settings.json",
+	);
+	if (!existsSync(settingsPath)) return false;
+	const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+	const packages = Array.isArray(settings.packages) ? settings.packages : [];
+	return packages.some(packageSpecMatchesTauCodex);
+}
+
+function packageSpecMatchesTauCodex(spec) {
+	if (typeof spec === "string") return specMatchesTauCodex(spec);
+	if (!spec || typeof spec !== "object") return false;
+	return ["source", "package", "name", "spec"].some((key) => specMatchesTauCodex(spec[key]));
+}
+
+function specMatchesTauCodex(spec) {
+	return typeof spec === "string" && (
+		spec === tauCodexPackage ||
+		spec === tauCodexInstallTarget ||
+		spec.startsWith(`${tauCodexPackage}@`) ||
+		spec.startsWith(`${tauCodexInstallTarget}@`)
+	);
 }
 
 function parseArgs(args) {
@@ -99,7 +134,13 @@ Environment:
   TAU_MIRROR_PORT        Tau port (default: ${defaultPort})
 
 Tau must be installed in the shared Pi agent settings:
-  pi install npm:tau-mirror
-  # or: pi-client install npm:tau-mirror
+  pi-client install npm:@averyyy/pi-tau-codex
+  # or: pi install npm:@averyyy/pi-tau-codex
 `);
+}
+
+function printInstallRequired() {
+	console.error(`请安装 ${tauCodexPackage}:`);
+	console.error("  pi-client install npm:@averyyy/pi-tau-codex");
+	console.error("  # or: pi install npm:@averyyy/pi-tau-codex");
 }

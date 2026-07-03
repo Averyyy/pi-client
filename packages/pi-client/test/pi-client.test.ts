@@ -30,8 +30,9 @@ describe("pi-client package", () => {
 		expect(webContent).toContain("TAU_HOST: options.host");
 		expect(webContent).toContain('PI_SERVER_MODE: "true"');
 		expect(webContent).toContain('const defaultPort = "1838"');
-		expect(webContent).toContain("pi install npm:tau-mirror");
-		expect(webContent).toContain("pi-client install npm:tau-mirror");
+		expect(webContent).toContain("pi install npm:@averyyy/pi-tau-codex");
+		expect(webContent).toContain("pi-client install npm:@averyyy/pi-tau-codex");
+		expect(webContent).toContain("请安装");
 	});
 
 	it("publishes under the averyyy pi-client scope", () => {
@@ -51,6 +52,7 @@ describe("pi-client package", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 		expect(pkg.dependencies["@jmfederico/pi-web"]).toBeUndefined();
 		expect(pkg.dependencies["tau-mirror"]).toBeUndefined();
+		expect(pkg.dependencies["@averyyy/pi-tau-codex"]).toBeUndefined();
 	});
 
 	it("keeps the root lockfile aligned to published runtime dependencies", () => {
