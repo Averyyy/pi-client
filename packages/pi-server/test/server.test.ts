@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as AgentCore from "@earendil-works/pi-agent-core";
+import { compact as compactAgentCore } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import { registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -426,6 +427,189 @@ describe("pi-server HTTP", () => {
 		expect(body.treePatch?.entriesFrom).toBe(2);
 		expect(body.treePatch?.entries).toHaveLength(1);
 		expect(body.treePatch?.leafId).toBe(body.leafId);
+		expect(body.entryCount).toBe(3);
+	});
+
+	it("streams compact heartbeat before upstream compaction finishes", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "old", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "keep", timestamp: 2000 },
+			},
+		];
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "compact-stream", entries, leafId: "u2" }),
+		});
+
+		let resolveCompact: ((value: Awaited<ReturnType<typeof compactAgentCore>>) => void) | undefined;
+		vi.mocked(compactAgentCore).mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					resolveCompact = resolve;
+				}),
+		);
+
+		const res = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "compact-stream",
+				streamResponse: true,
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+		expect(res.body).toBeTruthy();
+
+		const reader = res.body!.getReader();
+		const decoder = new TextDecoder();
+		const firstChunk = await Promise.race([
+			reader.read(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("Timed out waiting for compact heartbeat")), 1000),
+			),
+		]);
+		if (firstChunk.done) {
+			throw new Error("Compact heartbeat stream ended before sending data");
+		}
+		const chunks = [decoder.decode(firstChunk.value)];
+		expect(chunks[0]).toContain(": keep-alive");
+
+		if (!resolveCompact) {
+			throw new Error("Compact mock did not start");
+		}
+		resolveCompact({
+			ok: true,
+			value: {
+				summary: "summary",
+				firstKeptEntryId: "u2",
+				tokensBefore: 10,
+			},
+		});
+
+		while (true) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			chunks.push(decoder.decode(chunk.value));
+		}
+
+		const body = chunks.join("");
+		expect(body).toContain("event: result");
+		expect(body).toContain('"success":true');
+		expect(body).toContain('"summary":"summary"');
+	});
+
+	it("keeps JSON compact clients alive with whitespace heartbeat bytes", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "old", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "keep", timestamp: 2000 },
+			},
+		];
+		const sync = await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({ sessionId: "compact-json-stream", entries, leafId: "u2" }),
+		});
+		const syncBody = (await sync.json()) as ServerResponse;
+
+		let resolveCompact: ((value: Awaited<ReturnType<typeof compactAgentCore>>) => void) | undefined;
+		vi.mocked(compactAgentCore).mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					resolveCompact = resolve;
+				}),
+		);
+
+		const res = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "compact-json-stream",
+				baseTreeHash: syncBody.treeHash,
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toContain("application/json");
+		expect(res.body).toBeTruthy();
+
+		const reader = res.body!.getReader();
+		const decoder = new TextDecoder();
+		const firstChunk = await Promise.race([
+			reader.read(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("Timed out waiting for JSON compact heartbeat")), 1000),
+			),
+		]);
+		if (firstChunk.done) {
+			throw new Error("JSON compact stream ended before sending data");
+		}
+		const chunks = [decoder.decode(firstChunk.value)];
+		expect(chunks[0].trim()).toBe("");
+
+		if (!resolveCompact) {
+			throw new Error("Compact mock did not start");
+		}
+		resolveCompact({
+			ok: true,
+			value: {
+				summary: "summary",
+				firstKeptEntryId: "u2",
+				tokensBefore: 10,
+			},
+		});
+
+		while (true) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			chunks.push(decoder.decode(chunk.value));
+		}
+
+		const body = JSON.parse(chunks.join("")) as ServerResponse;
+		expect(body.treePatch?.baseTreeHash).toBe(syncBody.treeHash);
+		expect(body.treePatch?.entries).toHaveLength(1);
 		expect(body.entryCount).toBe(3);
 	});
 

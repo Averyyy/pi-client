@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import type {
 	CompactionPreparationOptions,
 	CompactResult,
@@ -58,6 +59,8 @@ const sessionTreeEntryCounts = new Map<string, number>();
 const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
 const RESPONSE_BODY_EXCERPT_CHARS = 500;
+const TRANSIENT_PI_SERVER_RETRY_DELAYS_MS = [250, 750, 1500];
+const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([502, 503, 504, 530]);
 
 export function hashStaticContext(ctx: Context): string {
 	return hashPiServerStaticContext(ctx);
@@ -165,6 +168,11 @@ interface PiServerCompactionResponse extends Partial<PiServerCompactionResult> {
 	treePatch?: PiServerTreePatch & { baseTreeHash?: string };
 }
 
+interface ServerSentEvent {
+	event: string;
+	data: string;
+}
+
 interface PiServerRunResponse {
 	runId: string;
 	status: "running" | "completed" | "failed";
@@ -236,6 +244,142 @@ async function readPiServerJson<T>(response: Response, errorPrefix: string): Pro
 	}
 }
 
+function getServerSentEventFieldValue(line: string, field: string): string {
+	const prefix = `${field}:`;
+	const value = line.slice(prefix.length);
+	return value.startsWith(" ") ? value.slice(1) : value;
+}
+
+function parseServerSentEvents(bodyText: string): ServerSentEvent[] {
+	const events: ServerSentEvent[] = [];
+	let event = "message";
+	let dataLines: string[] = [];
+
+	const flush = () => {
+		if (dataLines.length === 0) return;
+		events.push({ event, data: dataLines.join("\n") });
+		event = "message";
+		dataLines = [];
+	};
+
+	for (const line of bodyText.split(/\r?\n/)) {
+		if (line === "") {
+			flush();
+			continue;
+		}
+		if (line.startsWith(":")) continue;
+		if (line.startsWith("event:")) {
+			event = getServerSentEventFieldValue(line, "event");
+			continue;
+		}
+		if (line.startsWith("data:")) {
+			dataLines.push(getServerSentEventFieldValue(line, "data"));
+		}
+	}
+	flush();
+	return events;
+}
+
+function parseServerSentEventData(event: ServerSentEvent, errorPrefix: string): unknown {
+	try {
+		return JSON.parse(event.data) as unknown;
+	} catch {
+		throw new Error(`${errorPrefix} (invalid event-stream JSON data: ${getBodyExcerpt(event.data)})`);
+	}
+}
+
+function formatServerSentEventError(response: Response, payload: unknown): string {
+	const message = isObject(payload) && typeof payload.error === "string" ? payload.error : JSON.stringify(payload);
+	return `${getResponseStatus(response)}; content-type: ${getResponseContentType(response)}; body excerpt: ${getBodyExcerpt(message)}`;
+}
+
+async function readPiServerEventStreamJson<T>(response: Response, errorPrefix: string): Promise<T> {
+	const bodyText = await response.text();
+	for (const event of parseServerSentEvents(bodyText)) {
+		if (event.event === "error") {
+			throw new Error(
+				`${errorPrefix} (${formatServerSentEventError(response, parseServerSentEventData(event, errorPrefix))})`,
+			);
+		}
+		if (event.event === "result") {
+			return parseServerSentEventData(event, errorPrefix) as T;
+		}
+	}
+	throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)}; expected result event)`);
+}
+
+async function readPiServerCompactResponse<T>(response: Response, errorPrefix: string): Promise<T> {
+	const contentType = getResponseContentType(response).toLowerCase().split(";")[0]?.trim();
+	if (contentType === "text/event-stream") {
+		return readPiServerEventStreamJson<T>(response, errorPrefix);
+	}
+	return readPiServerJson<T>(response, errorPrefix);
+}
+
+function isAbortError(error: unknown, signal: AbortSignal | undefined): boolean {
+	return signal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+}
+
+function isTransientPiServerFetchError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /fetch failed|network|socket hang up|terminated|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|CONNECT timeout/i.test(
+		message,
+	);
+}
+
+function isTransientPiServerResponse(response: Response, bodyText: string): boolean {
+	if (!TRANSIENT_PI_SERVER_STATUS_CODES.has(response.status)) return false;
+	if (response.status === 530) return true;
+	return /CONNECT timeout|Bad Gateway|upstream|timeout/i.test(`${response.statusText}\n${bodyText}`);
+}
+
+async function waitForPiServerRetry(attempt: number, signal: AbortSignal | undefined): Promise<void> {
+	await sleep(TRANSIENT_PI_SERVER_RETRY_DELAYS_MS[attempt], undefined, { signal });
+}
+
+async function postPiServerJsonWithTransientRetry<T>(
+	request: ChunkRequest,
+	endpoint: string,
+	body: unknown,
+	errorPrefix: string,
+): Promise<T> {
+	for (let attempt = 0; ; attempt++) {
+		let response: Response;
+		try {
+			response = await request.postJson(endpoint, body);
+		} catch (error) {
+			if (
+				attempt < TRANSIENT_PI_SERVER_RETRY_DELAYS_MS.length &&
+				!isAbortError(error, request.options.signal) &&
+				isTransientPiServerFetchError(error)
+			) {
+				await waitForPiServerRetry(attempt, request.options.signal);
+				continue;
+			}
+			throw error;
+		}
+
+		const bodyText = await response.text();
+		if (!response.ok) {
+			if (
+				attempt < TRANSIENT_PI_SERVER_RETRY_DELAYS_MS.length &&
+				!request.options.signal?.aborted &&
+				isTransientPiServerResponse(response, bodyText)
+			) {
+				await waitForPiServerRetry(attempt, request.options.signal);
+				continue;
+			}
+			throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
+		}
+
+		try {
+			return JSON.parse(bodyText) as T;
+		} catch {
+			throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)}; expected JSON)`);
+		}
+	}
+}
+
 async function ensurePiServerEventStream(response: Response): Promise<void> {
 	const contentType = getResponseContentType(response);
 	if (contentType.toLowerCase().split(";")[0]?.trim() === "text/event-stream") {
@@ -269,9 +413,12 @@ async function ensureSessionInit(
 
 	const endpoint = previousHash === undefined ? "/api/session/init" : "/api/session/update";
 
-	const response = await request.postJson(endpoint, { sessionId, staticContext });
-
-	const result = await readPiServerJson<SessionInitResponse>(response, "Session init failed");
+	const result = await postPiServerJsonWithTransientRetry<SessionInitResponse>(
+		request,
+		endpoint,
+		{ sessionId, staticContext },
+		"Session init failed",
+	);
 	sessionStaticContextHashes.set(sessionId, currentHash);
 	if (result.treeHash !== undefined) {
 		sessionTreeHashes.set(sessionId, result.treeHash);
@@ -309,8 +456,7 @@ async function postTreeJson(
 	body: unknown,
 	errorPrefix: string,
 ): Promise<void> {
-	const response = await request.postJson(endpoint, body);
-	await readPiServerJson<unknown>(response, errorPrefix);
+	await postPiServerJsonWithTransientRetry<unknown>(request, endpoint, body, errorPrefix);
 }
 
 async function fetchPiServerHistory(
@@ -565,6 +711,7 @@ export async function compactPiServer(
 		preparation: options?.preparation,
 		customInstructions: options?.customInstructions,
 		baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
+		streamResponse: true,
 	});
 	let response = await request.postJson("/api/session/compact", makeBody());
 	if (!response.ok) {
@@ -584,7 +731,7 @@ export async function compactPiServer(
 			throw new Error(`Server compaction failed (${failure.details})`);
 		}
 	}
-	const result = await readPiServerJson<PiServerCompactionResponse>(response, "Server compaction failed");
+	const result = await readPiServerCompactResponse<PiServerCompactionResponse>(response, "Server compaction failed");
 	if (!result.compaction) {
 		throw new Error("Server compaction response did not include a compaction result");
 	}

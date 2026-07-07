@@ -93,6 +93,7 @@ interface SessionCompactBody {
 	customInstructions?: string;
 	baseTreeHash?: string;
 	fullResponse?: boolean;
+	streamResponse?: boolean;
 }
 
 function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
@@ -133,6 +134,7 @@ interface StreamRunRecord {
 }
 
 const STREAM_HEARTBEAT = ": keep-alive\n\n";
+const JSON_HEARTBEAT = " \n";
 const STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
 const streamRuns = new Map<string, StreamRunRecord>();
 
@@ -275,6 +277,42 @@ function sessionTreePatchResponseBody(
 	};
 }
 
+type PreparedCompaction = Parameters<typeof compact>[0];
+
+interface PreparedSessionCompact {
+	session: SessionState;
+	preparation: PreparedCompaction;
+	options: SimpleStreamOptions;
+}
+
+interface SessionCompactSuccessBody {
+	success: true;
+	compaction: CompactResult;
+	compactionEntry: SessionTreeEntry;
+	sessionId: string;
+	staticContextHash: string;
+	treeHash: string;
+	messageCount: number;
+	entryCount: number;
+	leafId: string | null;
+	revision: number;
+	staticContext?: SessionStaticContext;
+	treePatch?: {
+		baseTreeHash: string;
+		entriesFrom: number;
+		entries: SessionTreeEntry[];
+		leafId: string | null;
+		revision: number;
+	};
+	entries?: SessionTreeEntry[];
+	messages?: Message[];
+}
+
+interface SessionCompactHttpResponse {
+	status: number;
+	body: { error: string } | SessionCompactSuccessBody;
+}
+
 export function resolveStreamOptions(
 	_config: ServerConfig,
 	model: Model<any>,
@@ -395,81 +433,178 @@ function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBo
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-async function handleSessionCompact(
-	config: ServerConfig,
-	body: SessionCompactBody,
-	res: ServerResponse,
-): Promise<void> {
+function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact | SessionCompactHttpResponse {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
-		return;
+		return { status: 400, body: { error: "sessionId is required" } };
 	}
 	if (!body.model) {
-		sendJson(res, 400, { error: "model is required" });
-		return;
+		return { status: 400, body: { error: "model is required" } };
 	}
 
 	const session = getSession(body.sessionId);
 	if (!session) {
-		sendJson(res, 404, { error: "session not found" });
-		return;
+		return { status: 404, body: { error: "session not found" } };
 	}
 
 	const entries = getSessionBranch(session);
 	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS, body.preparation);
 	if (!preparationResult.ok) {
-		sendJson(res, 400, { error: preparationResult.error.message });
-		return;
+		return { status: 400, body: { error: preparationResult.error.message } };
 	}
 	if (!preparationResult.value) {
-		sendJson(res, 400, { error: "Nothing to compact" });
-		return;
+		return { status: 400, body: { error: "Nothing to compact" } };
 	}
 
 	const options = body.options ?? {};
+	return {
+		session,
+		preparation: preparationResult.value,
+		options,
+	};
+}
+
+async function completeSessionCompact(
+	config: ServerConfig,
+	body: SessionCompactBody,
+	prepared: PreparedSessionCompact,
+): Promise<SessionCompactHttpResponse> {
 	const result = await compact(
-		preparationResult.value,
-		createRequestModels(body.model, options),
+		prepared.preparation,
+		createRequestModels(body.model, prepared.options),
 		body.model,
 		body.customInstructions,
 		undefined,
-		options.reasoning,
+		prepared.options.reasoning,
 	);
 	if (!result.ok) {
-		sendJson(res, 500, { error: result.error.message });
-		return;
+		return { status: 500, body: { error: result.error.message } };
 	}
 
-	const baseTreeHash = session.treeHash;
-	const baseEntryCount = session.entries.length;
+	const baseTreeHash = prepared.session.treeHash;
+	const baseEntryCount = prepared.session.entries.length;
 	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, result.value);
 	persistSession(config, updatedSession);
 	if (!body.fullResponse && body.baseTreeHash === baseTreeHash) {
-		sendJson(res, 200, {
+		return {
+			status: 200,
+			body: {
+				success: true,
+				compaction: result.value satisfies CompactResult,
+				compactionEntry,
+				...sessionResponseBody(updatedSession),
+				staticContext: updatedSession.staticContext,
+				treePatch: {
+					baseTreeHash,
+					entriesFrom: baseEntryCount,
+					entries: [compactionEntry],
+					leafId: updatedSession.leafId,
+					revision: updatedSession.revision,
+				},
+			},
+		};
+	}
+	return {
+		status: 200,
+		body: {
 			success: true,
 			compaction: result.value satisfies CompactResult,
 			compactionEntry,
 			...sessionResponseBody(updatedSession),
 			staticContext: updatedSession.staticContext,
-			treePatch: {
-				baseTreeHash,
-				entriesFrom: baseEntryCount,
-				entries: [compactionEntry],
-				leafId: updatedSession.leafId,
-				revision: updatedSession.revision,
-			},
-		});
+			entries: updatedSession.entries,
+			messages: updatedSession.messages,
+		},
+	};
+}
+
+function writeServerSentEvent(res: ServerResponse, event: string, body: unknown): void {
+	res.write(`event: ${event}\n`);
+	res.write(`data: ${JSON.stringify(body)}\n\n`);
+}
+
+async function handleSessionCompactStream(
+	config: ServerConfig,
+	body: SessionCompactBody,
+	prepared: PreparedSessionCompact,
+	res: ServerResponse,
+): Promise<void> {
+	res.writeHead(200, {
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		Connection: "keep-alive",
+	});
+	res.flushHeaders();
+	res.write(STREAM_HEARTBEAT);
+
+	const heartbeat = setInterval(() => {
+		if (!res.writableEnded) {
+			res.write(STREAM_HEARTBEAT);
+		}
+	}, STREAM_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+
+	try {
+		const result = await completeSessionCompact(config, body, prepared);
+		writeServerSentEvent(res, result.status >= 400 ? "error" : "result", result.body);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		writeServerSentEvent(res, "error", { error: message });
+	} finally {
+		clearInterval(heartbeat);
+		res.end();
+	}
+}
+
+async function handleSessionCompactJsonStream(
+	config: ServerConfig,
+	body: SessionCompactBody,
+	prepared: PreparedSessionCompact,
+	res: ServerResponse,
+): Promise<void> {
+	res.writeHead(200, {
+		"Content-Type": "application/json",
+		"Cache-Control": "no-cache",
+		Connection: "keep-alive",
+	});
+	res.flushHeaders();
+	res.write(JSON_HEARTBEAT);
+
+	const heartbeat = setInterval(() => {
+		if (!res.writableEnded) {
+			res.write(JSON_HEARTBEAT);
+		}
+	}, STREAM_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+
+	try {
+		const result = await completeSessionCompact(config, body, prepared);
+		res.write(JSON.stringify(result.body));
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		res.write(JSON.stringify({ error: message }));
+	} finally {
+		clearInterval(heartbeat);
+		res.end();
+	}
+}
+
+async function handleSessionCompact(
+	config: ServerConfig,
+	body: SessionCompactBody,
+	res: ServerResponse,
+): Promise<void> {
+	const prepared = prepareSessionCompact(body);
+	if ("status" in prepared) {
+		sendJson(res, prepared.status, prepared.body);
 		return;
 	}
-	sendJson(res, 200, {
-		success: true,
-		compaction: result.value satisfies CompactResult,
-		compactionEntry,
-		...sessionResponseBody(updatedSession),
-		staticContext: updatedSession.staticContext,
-		entries: updatedSession.entries,
-		messages: updatedSession.messages,
-	});
+
+	if (body.streamResponse) {
+		await handleSessionCompactStream(config, body, prepared, res);
+		return;
+	}
+
+	await handleSessionCompactJsonStream(config, body, prepared, res);
 }
 
 function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody, res: ServerResponse): void {

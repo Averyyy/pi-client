@@ -38,6 +38,13 @@ function makeMockResponse(events: object[], status = 200): Response {
 	});
 }
 
+function makeCompactEventStreamResponse(body: object): Response {
+	return new Response(`: keep-alive\n\nevent: result\ndata: ${JSON.stringify(body)}\n\n`, {
+		status: 200,
+		headers: { "Content-Type": "text/event-stream" },
+	});
+}
+
 function textMessage(content: string, timestamp: number): Message {
 	return { role: "user", content, timestamp };
 }
@@ -654,6 +661,48 @@ describe("pi-server-client", () => {
 		).toBe(true);
 	});
 
+	it("retries transient Cloudflare tree append failures", async () => {
+		const capturedRequests: { path: string; body: JsonObject }[] = [];
+		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
+		const entries = baseTree().slice(0, 2);
+		const nextEntry = messageEntry("u2", "a1", textMessage("two", 3000));
+		let appendAttempts = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				const path = new URL(url).pathname;
+				capturedRequests.push({ path, body });
+
+				if (path === "/api/session/tree/append") {
+					appendAttempts++;
+					if (appendAttempts === 1) {
+						return new Response(JSON.stringify({ error: "CONNECT timeout" }), {
+							status: 502,
+							statusText: "Bad Gateway",
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		await syncPiServerTree("append-cloudflare-timeout", context, { entries, leafId: "a1" });
+		await syncPiServerTree("append-cloudflare-timeout", context, { entries: [...entries, nextEntry], leafId: "u2" });
+
+		const appendRequests = capturedRequests.filter((request) => request.path === "/api/session/tree/append");
+		expect(appendRequests).toHaveLength(2);
+		expect(
+			appendRequests.every((request) => JSON.stringify(request.body.entries) === JSON.stringify([nextEntry])),
+		).toBe(true);
+	});
+
 	it("rejects non-JSON successful tree sync responses before marking sync state", async () => {
 		const capturedPaths: string[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
@@ -1155,6 +1204,51 @@ describe("pi-server-client", () => {
 
 		const compactBody = capturedBodies.find((request) => request.url.endsWith("/api/session/compact"))?.body;
 		expect(compactBody?.baseTreeHash).toBe(hashEntries(entries));
+		expect(result.entries).toEqual([...entries, serverEntry]);
+		expect(result.leafId).toBe("c1");
+	});
+
+	it("requests streaming compaction and reads the result event", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = baseTree();
+		const serverEntry = compactionEntry("c1", "u2", "summary", "u2");
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+
+				if (url.endsWith("/api/session/compact")) {
+					return makeCompactEventStreamResponse({
+						success: true,
+						compaction: { summary: "summary", firstKeptEntryId: "u2", tokensBefore: 10 },
+						compactionEntry: serverEntry,
+						leafId: "c1",
+						treePatch: {
+							entriesFrom: entries.length,
+							entries: [serverEntry],
+							leafId: "c1",
+							revision: 2,
+						},
+					});
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const result = await compactPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [] },
+			{ sessionId: "compact-tree-stream", apiKey: "sk-client", sessionTree: { entries, leafId: "u2" } },
+		);
+
+		const compactBody = capturedBodies.find((request) => request.url.endsWith("/api/session/compact"))?.body;
+		expect(compactBody?.streamResponse).toBe(true);
 		expect(result.entries).toEqual([...entries, serverEntry]);
 		expect(result.leafId).toBe("c1");
 	});
