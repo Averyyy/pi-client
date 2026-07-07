@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { piClientWebEnv } from "../bin/web.js";
+import { hasTauCodexExtensionInstalled, piClientWebEnv } from "../bin/web.js";
 
 describe("pi-client web Tau env", () => {
 	it("starts the client backend with Tau defaults", () => {
@@ -27,5 +30,20 @@ describe("pi-client web Tau env", () => {
 			TAU_HOST: "0.0.0.0",
 			TAU_MIRROR_PORT: "3001",
 		});
+	});
+
+	it("detects the standalone Pi Tau Codex extension install", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-client-web-"));
+		try {
+			const settingsPath = join(dir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ packages: ["npm:@averyyy/pi-tau-codex"] }));
+			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_SETTINGS_PATH: settingsPath })).toBe(true);
+			writeFileSync(settingsPath, JSON.stringify({ packages: [{ source: "git:github.com/Averyyy/pi-tau-codex" }] }));
+			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_SETTINGS_PATH: settingsPath })).toBe(true);
+			expect(hasTauCodexExtensionInstalled({ PI_CODING_AGENT_DIR: join(dir, "missing") })).toBe(false);
+			expect(hasTauCodexExtensionInstalled({ TAU_STATIC_DIR: "/tmp/public" })).toBe(true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
