@@ -1534,38 +1534,50 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			thinkingFormat: "deepseek",
 		};
 		const xiaomiVariants = [
-			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/v1" },
-			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
-			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
-			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
+			{ source: "xiaomi", provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/v1" },
+			{
+				source: "xiaomi-token-plan-cn",
+				provider: "xiaomi-token-plan-cn",
+				baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+			},
+			{
+				source: "xiaomi-token-plan-ams",
+				provider: "xiaomi-token-plan-ams",
+				baseUrl: "https://token-plan-ams.xiaomimimo.com/v1",
+			},
+			{
+				source: "xiaomi-token-plan-sgp",
+				provider: "xiaomi-token-plan-sgp",
+				baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
+			},
 		] as const;
 
-		if (data.xiaomi?.models) {
-			for (const { provider, baseUrl } of xiaomiVariants) {
-				for (const [modelId, model] of Object.entries(data.xiaomi.models)) {
-					const m = model as ModelsDevModel;
-					if (m.tool_call !== true) continue;
-					if (provider.startsWith("xiaomi-token-plan-") && modelId === "mimo-v2-flash") continue;
+		for (const { source, provider, baseUrl } of xiaomiVariants) {
+			const providerModels = data[source]?.models;
+			if (!providerModels) continue;
 
-					models.push({
-						id: modelId,
-						name: m.name || modelId,
-						api: "openai-completions",
-						provider,
-						baseUrl,
-						compat: xiaomiCompat,
-						reasoning: m.reasoning === true,
-						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-						cost: {
-							input: m.cost?.input || 0,
-							output: m.cost?.output || 0,
-							cacheRead: m.cost?.cache_read || 0,
-							cacheWrite: m.cost?.cache_write || 0,
-						},
-						contextWindow: m.limit?.context || 4096,
-						maxTokens: m.limit?.output || 4096,
-					});
-				}
+			for (const [modelId, model] of Object.entries(providerModels)) {
+				const m = model as ModelsDevModel;
+				if (m.tool_call !== true) continue;
+
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "openai-completions",
+					provider,
+					baseUrl,
+					compat: xiaomiCompat,
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+				});
 			}
 		}
 

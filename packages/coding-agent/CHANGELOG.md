@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Fixed Xiaomi Token Plan model metadata to follow the upstream models.dev token-plan catalogs, removing unsupported `mimo-v2-omni` variants ([#6204](https://github.com/earendil-works/pi/issues/6204)).
 - Fixed startup model selection to skip unauthenticated saved defaults so configured local custom models can be selected instead ([#6231](https://github.com/earendil-works/pi/issues/6231)).
 - Fixed the question extension example to run question tool calls sequentially so multiple questions in one assistant turn remain answerable ([#6189](https://github.com/earendil-works/pi/issues/6189)).
 - Fixed `/login` to report auth storage persistence failures instead of claiming credentials were saved when `auth.json` is locked ([#6223](https://github.com/earendil-works/pi/issues/6223)).
