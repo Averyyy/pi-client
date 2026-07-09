@@ -101,6 +101,7 @@ export type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
+	InlineExtension,
 	SlashCommandInfo,
 	SlashCommandSource,
 	ToolDefinition,
@@ -354,6 +355,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const piServerContext = activeAgentSession
 				? buildPiServerContextSync(activeAgentSession.sessionManager, context.messages as Message[])
 				: undefined;
+			let headers = mergeProviderAttributionHeaders(
+				model,
+				settingsManager,
+				options?.sessionId,
+				auth.headers,
+				options?.headers,
+			);
+			// Let extensions inject/adjust per-request headers (e.g. tracing, session correlation)
+			// after static assembly, before the provider HTTP call.
+			const headerRunner = extensionRunnerRef.current;
+			if (headerRunner?.hasHandlers("before_provider_headers")) {
+				headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
+			}
 			const streamOptions = {
 				...options,
 				sessionTree: piServerContext?.sessionTree,
@@ -368,13 +382,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: mergeProviderAttributionHeaders(
-					model,
-					settingsManager,
-					options?.sessionId,
-					auth.headers,
-					options?.headers,
-				),
+				headers,
 			};
 			if (process.env.PI_SERVER_MODE === "true") {
 				return streamPiServer(model, context, streamOptions);

@@ -80,7 +80,7 @@ const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 // ============================================================================
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
-	reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	textVerbosity?: "low" | "medium" | "high";
@@ -750,6 +750,7 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
+const SESSION_WEBSOCKET_MAX_AGE_MS = 55 * 60 * 1000;
 
 type WebSocketEventType = "open" | "message" | "error" | "close";
 type WebSocketListener = (event: unknown) => void;
@@ -770,6 +771,7 @@ interface CachedWebSocketContinuationState {
 interface CachedWebSocketConnection {
 	socket: WebSocketLike;
 	busy: boolean;
+	createdAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	continuation?: CachedWebSocketContinuationState;
 }
@@ -934,6 +936,10 @@ function isWebSocketReusable(socket: WebSocketLike): boolean {
 	return readyState === undefined || readyState === 1;
 }
 
+function isWebSocketSessionExpired(entry: CachedWebSocketConnection): boolean {
+	return Date.now() - entry.createdAt >= SESSION_WEBSOCKET_MAX_AGE_MS;
+}
+
 function closeWebSocketSilently(socket: WebSocketLike, code = 1000, reason = "done"): void {
 	try {
 		socket.close(code, reason);
@@ -1057,7 +1063,10 @@ async function acquireWebSocket(
 			clearTimeout(cached.idleTimer);
 			cached.idleTimer = undefined;
 		}
-		if (!cached.busy && isWebSocketReusable(cached.socket)) {
+		if (!cached.busy && isWebSocketSessionExpired(cached)) {
+			closeWebSocketSilently(cached.socket, 1000, "connection_age_limit");
+			websocketSessionCache.delete(sessionId);
+		} else if (!cached.busy && isWebSocketReusable(cached.socket)) {
 			cached.busy = true;
 			return {
 				socket: cached.socket,
@@ -1091,7 +1100,7 @@ async function acquireWebSocket(
 	}
 
 	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
-	const entry: CachedWebSocketConnection = { socket, busy: true };
+	const entry: CachedWebSocketConnection = { socket, busy: true, createdAt: Date.now() };
 	websocketSessionCache.set(sessionId, entry);
 	return {
 		socket,
