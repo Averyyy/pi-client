@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const defaultPort = "1838";
@@ -19,8 +20,7 @@ export async function runPiClientWeb(args = process.argv.slice(2)) {
 	}
 
 	if (!hasTauCodexExtensionInstalled(process.env)) {
-		printInstallRequired();
-		return 1;
+		if (!await offerTauCodexInstall()) return 1;
 	}
 
 	process.title = "pi-client web";
@@ -40,6 +40,23 @@ export async function runPiClientWeb(args = process.argv.slice(2)) {
 			resolve(code ?? (signal === "SIGINT" ? 130 : 1));
 		});
 	});
+}
+
+export async function offerTauCodexInstall(env = process.env, input = process.stdin, output = process.stdout) {
+	printInstallRequired();
+	if (!input.isTTY || !output.isTTY) return false;
+
+	const rl = createInterface({ input, output });
+	const answer = (await rl.question("现在安装吗? [y/N] ")).trim().toLowerCase();
+	rl.close();
+	if (answer !== "y" && answer !== "yes") return false;
+
+	const result = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "pi-client.js"), "install", tauCodexInstallTarget], {
+		env,
+		stdio: "inherit",
+	});
+	if (result.error) throw result.error;
+	return result.status === 0 && hasTauCodexExtensionInstalled(env);
 }
 
 export function piClientWebEnv(env = process.env, options) {

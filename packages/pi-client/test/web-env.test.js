@@ -1,8 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { hasTauCodexExtensionInstalled, piClientWebEnv } from "../bin/web.js";
+import { hasTauCodexExtensionInstalled, offerTauCodexInstall, piClientWebEnv } from "../bin/web.js";
 
 describe("pi-client web Tau env", () => {
 	it("starts the client backend with Tau defaults", () => {
@@ -45,5 +46,20 @@ describe("pi-client web Tau env", () => {
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	it("does not prompt for extension install without a tty", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		expect(await offerTauCodexInstall({}, input, output)).toBe(false);
+	});
+
+	it("keeps web stopped when extension install is declined", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		input.isTTY = true;
+		output.isTTY = true;
+		input.end("n\n");
+		expect(await offerTauCodexInstall({}, input, output)).toBe(false);
 	});
 });
