@@ -24,7 +24,7 @@ describe("pi-server package", () => {
 
 	it("depends on published runtime packages", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@earendil-works/pi-ai"]).toBe("npm:@averyyy/pi-ai@0.80.6-piclient.4");
-		expect(pkg.dependencies["@earendil-works/pi-agent-core"]).toBe("npm:@averyyy/pi-agent-core@0.80.6-piclient.4");
+		expect(pkg.dependencies["@earendil-works/pi-ai"]).toBe("npm:@averyyy/pi-ai@0.80.3-piclient.2");
+		expect(pkg.dependencies["@earendil-works/pi-agent-core"]).toBe("npm:@averyyy/pi-agent-core@0.80.3-piclient.2");
 	});
 });
