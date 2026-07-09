@@ -162,9 +162,20 @@ function commandForPlatform(command) {
 	return process.platform === "win32" ? `${command}.cmd` : command;
 }
 
+function npmInvocation(args) {
+	if (process.platform === "win32") {
+		return {
+			command: process.execPath,
+			args: [join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"), ...args],
+		};
+	}
+	return { command: "npm", args };
+}
+
 function run(command, args, options = {}) {
-	console.log(`$ ${[command, ...args].join(" ")}`);
-	const result = spawnSync(commandForPlatform(command), args, {
+	const invocation = command === "npm" ? npmInvocation(args) : { command: commandForPlatform(command), args };
+	console.log(`$ ${[invocation.command, ...invocation.args].join(" ")}`);
+	const result = spawnSync(invocation.command, invocation.args, {
 		cwd: options.cwd,
 		encoding: "utf8",
 		stdio: options.capture ? ["inherit", "pipe", "pipe"] : "inherit",
@@ -172,7 +183,11 @@ function run(command, args, options = {}) {
 
 	if (result.status !== 0) {
 		const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
-		throw new Error(output ? `Command failed: ${command} ${args.join(" ")}\n${output}` : `Command failed: ${command} ${args.join(" ")}`);
+		throw new Error(
+			output
+				? `Command failed: ${invocation.command} ${invocation.args.join(" ")}\n${output}`
+				: `Command failed: ${invocation.command} ${invocation.args.join(" ")}`,
+		);
 	}
 
 	return result;
@@ -243,7 +258,8 @@ function validatePack(pkg) {
 }
 
 function isPublished(name, version) {
-	const result = spawnSync(commandForPlatform("npm"), ["view", `${name}@${version}`, "version", "--json"], {
+	const invocation = npmInvocation(["view", `${name}@${version}`, "version", "--json"]);
+	const result = spawnSync(invocation.command, invocation.args, {
 		encoding: "utf8",
 		stdio: ["inherit", "pipe", "pipe"],
 	});

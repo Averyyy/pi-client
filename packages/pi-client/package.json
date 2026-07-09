@@ -1,11 +1,11 @@
 {
 	"name": "@averyyy/pi-client",
-	"version": "0.80.3-piclient.3",
+	"version": "0.80.6-piclient.4",
 	"description": "Lightweight CLI wrapper that connects to a pi-server instance",
 	"type": "module",
 	"piClient": {
-		"basePiVersion": "0.80.3",
-		"basePiCommit": "85b7c247"
+		"basePiVersion": "0.80.6",
+		"basePiCommit": "2b3fda99"
 	},
 	"bin": {
 		"pi-client": "bin/pi-client.js"
@@ -25,7 +25,7 @@
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "npm:@averyyy/pi-coding-agent@0.80.3-piclient.3"
+		"@earendil-works/pi-coding-agent": "npm:@averyyy/pi-coding-agent@0.80.6-piclient.4"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
