@@ -1,6 +1,6 @@
 {
 	"name": "@averyyy/pi-client",
-	"version": "0.80.6-piclient.4",
+	"version": "0.80.6-piclient.5",
 	"description": "Lightweight CLI wrapper that connects to a pi-server instance",
 	"type": "module",
 	"piClient": {

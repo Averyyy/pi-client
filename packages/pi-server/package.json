@@ -1,6 +1,6 @@
 {
 	"name": "@averyyy/pi-server",
-	"version": "0.80.6-piclient.4",
+	"version": "0.80.6-piclient.5",
 	"description": "Proxy server for pi-client that stores session state and forwards incremental requests to upstream LLM providers",
 	"type": "module",
 	"bin": {
