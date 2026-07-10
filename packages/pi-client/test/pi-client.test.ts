@@ -20,6 +20,8 @@ describe("pi-client package", () => {
 		const binContent = readFileSync(join(pkgRoot, "bin", "pi-client.js"), "utf-8");
 		expect(binContent).toContain('import.meta.resolve("@earendil-works/pi-coding-agent")');
 		expect(binContent).toContain('PI_SERVER_MODE: "true"');
+		expect(binContent).toContain("PI_CLIENT_RELOAD_STATE_PATH");
+		expect(binContent).toContain("result.status !== 75");
 	});
 
 	it("routes the web subcommand through the Tau wrapper", () => {

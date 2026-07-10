@@ -85,6 +85,12 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.t
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
+import {
+	getPiClientUpdateMarkerPath,
+	PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE,
+	readPiClientUpdateMarker,
+	writePiClientRuntimeReloadState,
+} from "../../core/pi-client-runtime-update.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -2737,6 +2743,14 @@ export class InteractiveMode {
 				await this.handleReloadCommand();
 				return;
 			}
+			const pendingPiClientUpdate = readPiClientUpdateMarker();
+			if (pendingPiClientUpdate) {
+				this.showWarning(
+					`pi-client ${pendingPiClientUpdate.version} is installed. Run /reload to continue this session with the new version.`,
+				);
+				this.editor.setText(text);
+				return;
+			}
 			if (text === "/debug") {
 				this.handleDebugCommand();
 				this.editor.setText("");
@@ -5291,6 +5305,29 @@ export class InteractiveMode {
 		if (this.session.isCompacting) {
 			this.showWarning("Wait for compaction to finish before reloading.");
 			return;
+		}
+
+		const pendingPiClientUpdate = readPiClientUpdateMarker();
+		if (pendingPiClientUpdate) {
+			const reloadStatePath = process.env.PI_CLIENT_RELOAD_STATE_PATH;
+			if (!reloadStatePath) {
+				this.showWarning(
+					`pi-client ${pendingPiClientUpdate.version} is installed. Restart pi-client to load the new runtime.`,
+				);
+				return;
+			}
+
+			writePiClientRuntimeReloadState(reloadStatePath, {
+				sessionId: this.sessionManager.getSessionId(),
+				sessionDir: this.sessionManager.usesDefaultSessionDir() ? undefined : this.sessionManager.getSessionDir(),
+				updateMarkerPath: getPiClientUpdateMarkerPath(),
+			});
+			this.isShuttingDown = true;
+			this.themeController.disableAutoSync();
+			await this.ui.terminal.drainInput(1000);
+			this.stop();
+			await this.runtimeHost.dispose();
+			process.exit(PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE);
 		}
 
 		this.resetExtensionUI();

@@ -41,6 +41,10 @@ If your server uses an auth token, set it on the client:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
+## Update
+
+`pi-client update` installs the latest client and server packages without stopping active client sessions. Existing sessions block new prompts until you run `/reload`; `/reload` restarts that session on the new runtime and resumes its persisted history.
+
 ## Related Package
 
 Install the server separately:

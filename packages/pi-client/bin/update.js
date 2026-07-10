@@ -1,14 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function defaultPackageRoot() {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
-}
-
-function defaultRepoRoot() {
-	return resolve(defaultPackageRoot(), "..", "..");
 }
 
 function readPackageMetadata(packageRoot) {
@@ -19,70 +16,53 @@ function runStep(runner, command, args, cwd, stdio = "inherit") {
 	return runner(command, args, { cwd, stdio, encoding: "utf-8" });
 }
 
-function isMissingGitCheckout(result) {
-	const text = `${String(result.stdout ?? "")}\n${String(result.stderr ?? "")}`;
-	return result.status !== 0 && text.includes("not a git repository");
+function defaultUpdateMarkerPath() {
+	return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-client-update.json");
 }
 
-async function runNpmGlobalUpdate(runner, repoRoot, stdout, stderr) {
+function writeUpdateMarker(path) {
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify({ version: "latest", updatedAt: new Date().toISOString() })}\n`);
+}
+
+function runNpmGlobalUpdate(runner, cwd, stdout, stderr, updateMarkerPath) {
 	stdout.write("Updating npm packages: @averyyy/pi-client@latest @averyyy/pi-server@latest\n");
 	const result = runStep(
 		runner,
 		"npm",
-		["install", "-g", "--ignore-scripts", "--legacy-peer-deps", "@averyyy/pi-client@latest", "@averyyy/pi-server@latest"],
-		repoRoot,
+		[
+			"install",
+			"-g",
+			"--ignore-scripts",
+			"--legacy-peer-deps",
+			"--force",
+			"@averyyy/pi-client@latest",
+			"@averyyy/pi-server@latest",
+		],
+		cwd,
 	);
 	if (result.status !== 0) {
 		stderr.write(
-			"pi-client update failed: npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest\n",
+			"pi-client update failed: npm install -g --ignore-scripts --legacy-peer-deps --force @averyyy/pi-client@latest @averyyy/pi-server@latest\n",
 		);
 		return result.status ?? 1;
 	}
+	writeUpdateMarker(updateMarkerPath);
+	stdout.write("Updated package files without stopping active pi-client sessions. Run /reload in each session to switch runtimes.\n");
 	stdout.write("pi-client update complete\n");
 	return 0;
 }
 
 export async function runPiClientUpdate(_args = [], options = {}) {
 	const packageRoot = options.packageRoot ?? defaultPackageRoot();
-	const repoRoot = options.repoRoot ?? defaultRepoRoot();
 	const runner = options.runner ?? spawnSync;
 	const stdout = options.stdout ?? process.stdout;
 	const stderr = options.stderr ?? process.stderr;
+	const updateMarkerPath = options.updateMarkerPath ?? defaultUpdateMarkerPath();
 	const pkg = readPackageMetadata(packageRoot);
 	const baseVersion = pkg.piClient?.basePiVersion ?? "unknown";
 	const baseCommit = pkg.piClient?.basePiCommit ?? "unknown";
 
 	stdout.write(`pi-client ${pkg.version} (based on pi ${baseVersion}, upstream ${baseCommit})\n`);
-	stdout.write(`Updating checkout: ${repoRoot}\n`);
-
-	const status = runStep(runner, "git", ["status", "--porcelain"], repoRoot, "pipe");
-	if (status.status !== 0) {
-		if (isMissingGitCheckout(status)) {
-			return runNpmGlobalUpdate(runner, repoRoot, stdout, stderr);
-		}
-		stderr.write("pi-client update failed: unable to inspect git status\n");
-		return status.status ?? 1;
-	}
-	if (String(status.stdout ?? "").trim().length > 0) {
-		stderr.write("pi-client update failed: working tree has uncommitted changes\n");
-		return 1;
-	}
-
-	const steps = [
-		["git", ["pull", "--ff-only"]],
-		["npm", ["install", "--ignore-scripts"]],
-		["npm", ["run", "install:pi-client"]],
-		["npm", ["run", "install:pi-server"]],
-	];
-
-	for (const [command, args] of steps) {
-		const result = runStep(runner, command, args, repoRoot);
-		if (result.status !== 0) {
-			stderr.write(`pi-client update failed: ${command} ${args.join(" ")}\n`);
-			return result.status ?? 1;
-		}
-	}
-
-	stdout.write("pi-client update complete\n");
-	return 0;
+	return runNpmGlobalUpdate(runner, process.cwd(), stdout, stderr, updateMarkerPath);
 }

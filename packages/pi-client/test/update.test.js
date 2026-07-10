@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -11,8 +12,8 @@ describe("pi-client update", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 
 		expect(pkg.piClient).toEqual({
-			basePiVersion: "0.80.3",
-			basePiCommit: "85b7c247",
+		basePiVersion: "0.80.6",
+		basePiCommit: "2b3fda99",
 		});
 	});
 
@@ -23,10 +24,12 @@ describe("pi-client update", () => {
 		expect(binContent).toContain('import("./update.js")');
 	});
 
-	it("updates the fork checkout and reinstalls both global binaries", async () => {
+	it("updates global packages without modifying the active checkout", async () => {
 		const { runPiClientUpdate } = await import("../bin/update.js");
 		const calls = [];
 		const output = [];
+		const markerDir = mkdtempSync(join(tmpdir(), "pi-client-update-"));
+		const updateMarkerPath = join(markerDir, "pi-client-update.json");
 		const runner = (command, args, options) => {
 			calls.push({ command, args, cwd: options.cwd, stdio: options.stdio });
 			return { status: 0, stdout: "" };
@@ -34,70 +37,16 @@ describe("pi-client update", () => {
 
 		const exitCode = await runPiClientUpdate([], {
 			packageRoot: pkgRoot,
-			repoRoot: "/repo/pi-client",
+			updateMarkerPath,
 			runner,
 			stdout: { write: (value) => output.push(value) },
 			stderr: { write: (value) => output.push(value) },
 		});
 
 		expect(exitCode).toBe(0);
-		expect(output.join("")).toContain("based on pi 0.80.3");
-		expect(output.join("")).toContain("upstream 85b7c247");
+		expect(output.join("")).toContain("based on pi 0.80.6");
+		expect(output.join("")).toContain("Run /reload in each session");
 		expect(calls).toEqual([
-			{ command: "git", args: ["status", "--porcelain"], cwd: "/repo/pi-client", stdio: "pipe" },
-			{ command: "git", args: ["pull", "--ff-only"], cwd: "/repo/pi-client", stdio: "inherit" },
-			{ command: "npm", args: ["install", "--ignore-scripts"], cwd: "/repo/pi-client", stdio: "inherit" },
-			{ command: "npm", args: ["run", "install:pi-client"], cwd: "/repo/pi-client", stdio: "inherit" },
-			{ command: "npm", args: ["run", "install:pi-server"], cwd: "/repo/pi-client", stdio: "inherit" },
-		]);
-	});
-
-	it("refuses to update a dirty checkout", async () => {
-		const { runPiClientUpdate } = await import("../bin/update.js");
-		const calls = [];
-		const errors = [];
-		const runner = (command, args, options) => {
-			calls.push({ command, args, cwd: options.cwd, stdio: options.stdio });
-			return { status: 0, stdout: " M README.md\n" };
-		};
-
-		const exitCode = await runPiClientUpdate([], {
-			packageRoot: pkgRoot,
-			repoRoot: "/repo/pi-client",
-			runner,
-			stdout: { write: () => {} },
-			stderr: { write: (value) => errors.push(value) },
-		});
-
-		expect(exitCode).toBe(1);
-		expect(calls).toHaveLength(1);
-		expect(errors.join("")).toContain("working tree has uncommitted changes");
-	});
-
-	it("updates npm global installs from latest packages", async () => {
-		const { runPiClientUpdate } = await import("../bin/update.js");
-		const calls = [];
-		const output = [];
-		const runner = (command, args, options) => {
-			calls.push({ command, args, cwd: options.cwd, stdio: options.stdio });
-			if (command === "git" && args.join(" ") === "status --porcelain") {
-				return { status: 128, stderr: "fatal: not a git repository\n" };
-			}
-			return { status: 0, stdout: "" };
-		};
-
-		const exitCode = await runPiClientUpdate([], {
-			packageRoot: pkgRoot,
-			repoRoot: "/usr/local/lib/node_modules",
-			runner,
-			stdout: { write: (value) => output.push(value) },
-			stderr: { write: (value) => output.push(value) },
-		});
-
-		expect(exitCode).toBe(0);
-		expect(output.join("")).toContain("Updating npm packages");
-		expect(calls).toEqual([
-			{ command: "git", args: ["status", "--porcelain"], cwd: "/usr/local/lib/node_modules", stdio: "pipe" },
 			{
 				command: "npm",
 				args: [
@@ -105,12 +54,36 @@ describe("pi-client update", () => {
 					"-g",
 					"--ignore-scripts",
 					"--legacy-peer-deps",
+					"--force",
 					"@averyyy/pi-client@latest",
 					"@averyyy/pi-server@latest",
 				],
-				cwd: "/usr/local/lib/node_modules",
+				cwd: process.cwd(),
 				stdio: "inherit",
 			},
 		]);
+		expect(JSON.parse(readFileSync(updateMarkerPath, "utf-8"))).toMatchObject({ version: "latest" });
+		rmSync(markerDir, { recursive: true, force: true });
+	});
+
+	it("does not create a reload marker when the global install fails", async () => {
+		const { runPiClientUpdate } = await import("../bin/update.js");
+		const markerDir = mkdtempSync(join(tmpdir(), "pi-client-update-"));
+		const updateMarkerPath = join(markerDir, "pi-client-update.json");
+		const runner = (command, args, options) => {
+			return { status: 1, stderr: "npm failed", command, args, options };
+		};
+
+		const exitCode = await runPiClientUpdate([], {
+			packageRoot: pkgRoot,
+			updateMarkerPath,
+			runner,
+			stdout: { write: () => {} },
+			stderr: { write: () => {} },
+		});
+
+		expect(exitCode).toBe(1);
+		expect(() => readFileSync(updateMarkerPath, "utf-8")).toThrow();
+		rmSync(markerDir, { recursive: true, force: true });
 	});
 });
