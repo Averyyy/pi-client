@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `Ctrl+X` to copy the last assistant message, or the selected message in `/tree`.
+
 ### Fixed
 
 - Fixed `/login amazon-bedrock` to prompt for and save a Bedrock API key instead of only displaying ambient AWS credential setup instructions.
