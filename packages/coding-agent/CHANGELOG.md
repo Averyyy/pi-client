@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### New Features
+
+- **Cache-friendly dynamic tool loading** - Extensions can add tools during execution while supported Anthropic and OpenAI Responses models preserve prompt-cache prefixes. See [Dynamic Tool Loading](docs/extensions.md#dynamic-tool-loading).
+- **Message copy shortcut** - `Ctrl+X` copies the last assistant message in the transcript or the selected message in `/tree`, making older and branched messages directly copyable. See [Display and Message Queue](docs/keybindings.md#display-and-message-queue).
+- **Fable 5 `xhigh` and `max` thinking** - Native `xhigh` and `max` thinking levels are available across generated provider catalogs. See [Model Options](docs/usage.md#model-options).
+
 ### Added
 
 - Added `pi-client` server mode transport for sending incremental session/model/message deltas to `pi-server`.
@@ -9,11 +15,17 @@
 - Added a `pi-client` CLI entrypoint that preserves the original Pi config, extension, skill, prompt, and theme loading path.
 - Reused matching `pi-server` tree hashes to avoid repeating full tree sync when the server already has the same persisted session tree.
 - Added automatic first-turn session naming with the current model when no session name is set.
+- Added cache-friendly dynamic tool loading for extension tools activated by tool results. Supported Anthropic and OpenAI Responses models load definitions where they become available, preserving the cached prompt prefix. See [Dynamic Tool Loading](docs/extensions.md#dynamic-tool-loading) ([#6474](https://github.com/earendil-works/pi-mono/pull/6474)).
+- Added inherited native `xhigh` and `max` thinking levels for Claude Fable 5 across all generated provider catalogs ([#6490](https://github.com/earendil-works/pi-mono/pull/6490) by [@davidbrai](https://github.com/davidbrai)).
+- Added `Ctrl+X` to copy the last assistant message, or the selected message in `/tree`.
 
 ### Fixed
 
 - Fixed bash tool execution to run as a scheduler barrier so validation commands do not overlap with sibling tool calls.
 - Fixed oversized bash tool timeouts to fail with a clear validation error instead of being clamped to an immediate timeout ([#6181](https://github.com/earendil-works/pi/issues/6181)).
+- Fixed inherited OpenRouter model context windows to use the top provider's actual context length ([#6481](https://github.com/earendil-works/pi-mono/pull/6481) by [@davidbrai](https://github.com/davidbrai)).
+- Fixed `Ctrl+V` to paste clipboard text when the pasteboard does not contain an image.
+- Fixed `/login amazon-bedrock` to prompt for and save a Bedrock API key instead of only displaying ambient AWS credential setup instructions.
 ## [0.80.6] - 2026-07-09
 
 ### New Features

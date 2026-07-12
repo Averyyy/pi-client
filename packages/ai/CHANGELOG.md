@@ -2,10 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added cache-friendly dynamic tool loading. `ToolResultMessage.addedToolNames` marks where tools from `Context.tools` became available; Anthropic and OpenAI Responses use native deferred loading so late tools stay out of the cached prefix, while other providers continue using `Context.tools` normally ([#6474](https://github.com/earendil-works/pi-mono/pull/6474)).
+- Added native `xhigh` and `max` thinking levels for Claude Fable 5 across all generated provider catalogs ([#6490](https://github.com/earendil-works/pi-mono/pull/6490) by [@davidbrai](https://github.com/davidbrai)).
+
+### Fixed
+
+- Fixed OpenRouter model context windows to use the top provider's actual context length ([#6481](https://github.com/earendil-works/pi-mono/pull/6481) by [@davidbrai](https://github.com/davidbrai)).
+- Fixed Amazon Bedrock requests to use the generic `apiKey` stream option as a Bedrock bearer token.
+
 ## [0.80.6] - 2026-07-09
 
 ### Added
-
 - Added a separate opt-in `max` thinking level, including native `xhigh` and `max` support for GPT-5.6 and Anthropic adaptive-thinking effort metadata matching Anthropic's documentation: `max` on all adaptive Claude models, native `xhigh` on Opus 4.7/4.8, Sonnet 5, and Fable 5 only.
 - Added request-wide input-token pricing tiers to model cost metadata and usage cost calculation.
 
@@ -33,6 +42,7 @@
 - Fixed Amazon Bedrock Claude 5 prompt-cache pricing metadata by removing stale fallback overrides.
 - Fixed DS4 server context overflow detection for `Prompt has ... tokens, but the configured context size is ... tokens` errors ([#6262](https://github.com/earendil-works/pi/issues/6262)).
 - Fixed OpenAI Codex WebSocket sessions to rotate cached connections before the backend's 60-minute limit, avoiding connection-limit failures on long sessions ([#6268](https://github.com/earendil-works/pi/issues/6268)).
+- Fixed Cloudflare Workers AI / AI Gateway auth to fall back to the ambient `CLOUDFLARE_ACCOUNT_ID` (and `CLOUDFLARE_GATEWAY_ID`) when the stored credential carries only the API key, so `/login`-style key-only credentials no longer leave the `{CLOUDFLARE_ACCOUNT_ID}` placeholder unresolved and return 404 ([#6021](https://github.com/earendil-works/pi/issues/6021)).
 - Fixed OpenAI Completions and Responses providers to send `(no tool output)` instead of `(see attached image)` when a tool result has empty text and no image content, preventing the model from hallucinating image attachments.
 - Fixed OpenAI Responses and Azure OpenAI Responses requests to avoid sending `max_output_tokens` values below the provider minimum ([#6265](https://github.com/earendil-works/pi/issues/6265)).
 - Fixed retry classification for Cloudflare 524 timeout responses ([#6239](https://github.com/earendil-works/pi/issues/6239)).

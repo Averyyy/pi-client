@@ -45,7 +45,7 @@ npm i -g --ignore-scripts @averyyy/pi-server
 pi-server
 ```
 
-The npm fork releases use `0.80.3-piclient.N`, based on upstream Pi `0.80.3`.
+The npm fork releases use `0.80.6-piclient.N`, based on upstream Pi `0.80.6`.
 
 `--legacy-peer-deps` prevents npm from replacing the forked prerelease peer with upstream stable Pi when both are installed globally.
 
@@ -73,7 +73,7 @@ This installs:
 - `pi-client`: the forked client CLI. It does not overwrite an existing `pi` install.
 - `pi-server`: the local HTTP proxy that stores session state and forwards upstream LLM requests using request metadata supplied by `pi-client`.
 
-This fork is based on upstream Pi `0.80.3`.
+This fork is based on upstream Pi `0.80.6`.
 
 ### 3. Configure and start pi-server
 
@@ -163,7 +163,7 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 - `pi-client`：基于原始 Pi coding agent 的客户端。它仍然读取和复用 `~/.pi/agent`，所以已有的配置、extension、skill、prompt、theme、session 和项目发现逻辑保持不变。它不会安装或覆盖 `pi` 命令。
 - `pi-server`：本地或远程 HTTP 服务。它按 `sessionId` 保存完整历史，把 `pi-client` 发来的增量消息拼回完整请求，再转发到真正的 LLM API。
 
-npm fork release 使用 `0.80.3-piclient.N` 版本格式，基于 upstream Pi `0.80.3`。
+npm fork release 使用 `0.80.6-piclient.N` 版本格式，基于 upstream Pi `0.80.6`。
 
 ### npm 安装
 

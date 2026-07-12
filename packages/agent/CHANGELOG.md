@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `AgentToolResult.addedToolNames` propagation to `ToolResultMessage` so tools introduced by a result can be loaded from that transcript point onward ([#6474](https://github.com/earendil-works/pi-mono/pull/6474)).
+
 ### Fixed
 
 - Fixed parallel tool scheduling so sequential tools act as source-order barriers instead of forcing the whole tool batch to run serially.
