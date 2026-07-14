@@ -5,7 +5,7 @@
 	"type": "module",
 	"piClient": {
 		"basePiVersion": "0.80.6",
-		"basePiCommit": "8479bd84"
+		"basePiCommit": "0e6909f0"
 	},
 	"bin": {
 		"pi-client": "bin/pi-client.js"

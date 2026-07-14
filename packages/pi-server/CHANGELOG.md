@@ -23,4 +23,5 @@
 
 ### Changed
 
+- Updated the upstream Pi base through commit `0e6909f0`, including the latest provider and compaction fixes.
 - Rebased the server on upstream Pi `0.80.6`, including GPT-5.6 model metadata and `max` thinking support.

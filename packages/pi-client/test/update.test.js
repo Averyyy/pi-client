@@ -13,7 +13,7 @@ describe("pi-client update", () => {
 
 		expect(pkg.piClient).toEqual({
 		basePiVersion: "0.80.6",
-		basePiCommit: "8479bd84",
+		basePiCommit: "0e6909f0",
 		});
 	});
 

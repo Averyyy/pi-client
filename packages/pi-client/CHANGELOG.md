@@ -15,5 +15,6 @@
 
 ### Changed
 
+- Updated the upstream Pi base through commit `0e6909f0`, including the latest provider and compaction fixes.
 - Rebased the client on upstream Pi `0.80.6`, including GPT-5.6 model metadata and `max` thinking support.
 - Changed `pi-client update` to update global packages without reinstalling the active checkout or stopping sessions; updated sessions require `/reload` to restart on the new runtime with their existing history.
