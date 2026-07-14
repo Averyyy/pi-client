@@ -2684,10 +2684,7 @@ export class AgentSession {
 		if (contextWindow <= 0) return false;
 
 		const projectedTokens = estimateContextTokens(turn.context.messages).tokens;
-		if (projectedTokens >= contextWindow - settings.reserveTokens) return true;
-
-		const toolResultTokens = estimateMessagesTokens(turn.toolResults);
-		return toolResultTokens >= settings.keepRecentTokens;
+		return projectedTokens >= contextWindow - settings.reserveTokens;
 	}
 
 	private _appendIntraTurnCompactionMarker(): string {

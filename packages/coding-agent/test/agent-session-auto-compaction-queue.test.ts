@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -131,6 +131,28 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await expect(runAutoCompaction("threshold", false)).resolves.toBe(true);
 
 		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("should not compact a large tool result while projected context remains below the threshold", () => {
+		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		const toolResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "large-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const shouldCompact = (
+			session as unknown as {
+				_shouldCompactBeforeNextProviderRequest: (turn: {
+					toolResults: AgentMessage[];
+					context: { messages: AgentMessage[] };
+				}) => boolean;
+			}
+		)._shouldCompactBeforeNextProviderRequest.bind(session);
+
+		expect(shouldCompact({ toolResults: [toolResult], context: { messages: [toolResult] } })).toBe(false);
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {

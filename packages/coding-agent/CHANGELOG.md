@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- Fixed large tool results from triggering compaction before the projected context reaches the model threshold.
 - Fixed bash tool execution to run as a scheduler barrier so validation commands do not overlap with sibling tool calls.
 - Fixed oversized bash tool timeouts to fail with a clear validation error instead of being clamped to an immediate timeout ([#6181](https://github.com/earendil-works/pi/issues/6181)).
 - Fixed inherited OpenRouter model context windows to use the top provider's actual context length ([#6481](https://github.com/earendil-works/pi-mono/pull/6481) by [@davidbrai](https://github.com/davidbrai)).
