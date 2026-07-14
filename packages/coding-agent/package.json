@@ -21,6 +21,10 @@
 		},
 		"./pi-client-cli": {
 			"import": "./dist/pi-client-cli.js"
+		},
+		"./pi-server-request": {
+			"types": "./dist/core/pi-server-request.d.ts",
+			"import": "./dist/core/pi-server-request.js"
 		}
 	},
 	"files": [

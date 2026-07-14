@@ -1,5 +1,5 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
@@ -17,6 +17,7 @@ describe("config", () => {
 			"PI_SERVER_PROVIDER_HEADERS",
 			"PI_SERVER_CONFIG",
 			"PI_SERVER_SESSION_STORE_DIR",
+			"PI_SERVER_UPLOAD_DIR",
 		]) {
 			savedEnv[key] = process.env[key];
 			delete process.env[key];
@@ -36,6 +37,7 @@ describe("config", () => {
 		expect(config.port).toBe(4217);
 		expect(config.authToken).toBeUndefined();
 		expect(config.sessionStoreDir).toBe(resolve(".pi", "pi-server", "sessions"));
+		expect(config.uploadDir).toBe(join(homedir(), ".pi", "upload_files"));
 	});
 
 	it("does not load upstream provider request config", () => {
@@ -54,12 +56,14 @@ describe("config", () => {
 		process.env.PI_SERVER_PORT = "9999";
 		process.env.PI_SERVER_AUTH_TOKEN = "test-token";
 		process.env.PI_SERVER_SESSION_STORE_DIR = "env-sessions";
+		process.env.PI_SERVER_UPLOAD_DIR = "env-uploads";
 
 		const config = loadConfig();
 		expect(config.host).toBe("0.0.0.0");
 		expect(config.port).toBe(9999);
 		expect(config.authToken).toBe("test-token");
 		expect(config.sessionStoreDir).toBe(resolve("env-sessions"));
+		expect(config.uploadDir).toBe(resolve("env-uploads"));
 	});
 
 	it("overrides from explicit config object", () => {
@@ -68,11 +72,13 @@ describe("config", () => {
 			port: 8080,
 			authToken: "my-token",
 			sessionStoreDir: "override-sessions",
+			uploadDir: "override-uploads",
 		});
 		expect(config.host).toBe("192.168.1.1");
 		expect(config.port).toBe(8080);
 		expect(config.authToken).toBe("my-token");
 		expect(config.sessionStoreDir).toBe(resolve("override-sessions"));
+		expect(config.uploadDir).toBe(resolve("override-uploads"));
 	});
 
 	it("loads config from JSON file via PI_SERVER_CONFIG", () => {
@@ -86,6 +92,7 @@ describe("config", () => {
 				port: 5555,
 				authToken: "file-token",
 				sessionStoreDir: "file-sessions",
+				uploadDir: "file-uploads",
 			}),
 		);
 
@@ -95,6 +102,7 @@ describe("config", () => {
 		expect(config.port).toBe(5555);
 		expect(config.authToken).toBe("file-token");
 		expect(config.sessionStoreDir).toBe(resolve("file-sessions"));
+		expect(config.uploadDir).toBe(resolve("file-uploads"));
 
 		rmSync(tmpDir, { recursive: true, force: true });
 	});

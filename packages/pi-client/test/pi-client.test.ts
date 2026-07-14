@@ -38,6 +38,14 @@ describe("pi-client package", () => {
 		expect(webContent).toContain("请安装");
 	});
 
+	it("routes the send subcommand through the chunked pi-server request", () => {
+		const binContent = readFileSync(join(pkgRoot, "bin", "pi-client.js"), "utf-8");
+		const sendContent = readFileSync(join(pkgRoot, "bin", "send.js"), "utf-8");
+		expect(binContent).toContain('args[0] === "send"');
+		expect(sendContent).toContain('request.postJson("/api/receive"');
+		expect(sendContent).toContain("ChunkRequest");
+	});
+
 	it("publishes under the averyyy pi-client scope", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 		expect(pkg.name).toBe("@averyyy/pi-client");

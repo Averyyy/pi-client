@@ -4,10 +4,15 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runPiClientSend } from "./send.js";
 
 const args = process.argv.slice(2);
 const modulePromise =
-	args[0] === "update"
+	args[0] === "send"
+		? runPiClientSend(args.slice(1)).then((code) => {
+				process.exitCode = code;
+			})
+		: args[0] === "update"
 		? import("./update.js").then(async ({ runPiClientUpdate }) => {
 				process.exitCode = await runPiClientUpdate(args.slice(1));
 			})

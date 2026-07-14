@@ -24,6 +24,14 @@ Send one prompt and exit:
 PI_SERVER_URL=https://pi.yreva.asia pi-client -p "Say exactly: ok"
 ```
 
+Send a file or folder to the server:
+
+```bash
+PI_SERVER_URL=https://pi.yreva.asia pi-client send /path/to/file-or-folder
+```
+
+The server saves it under its configured upload directory, which defaults to `~/.pi/upload_files`.
+
 Start the browser UI:
 
 ```bash

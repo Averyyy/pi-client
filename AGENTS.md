@@ -51,6 +51,7 @@
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
 - Keep server update-command install-shape handling in its updater wrapper: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 - `pi-client update` must not reinstall a source checkout into the active global path: update the published global packages, leave active sessions running, and require `/reload` to restart a session on the new runtime.
+- Route `pi-client send <path>` through `ChunkRequest` to `/api/receive`; pi-server saves the basename under `PI_SERVER_UPLOAD_DIR` (default `~/.pi/upload_files`) and must reject path traversal and existing destinations.
 
 ## pi-client / pi-server Compact and Resilience
 

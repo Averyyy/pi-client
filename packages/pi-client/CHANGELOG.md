@@ -7,6 +7,7 @@
 - `pi-client update` command for updating the fork checkout and reinstalling both `pi-client` and `pi-server`.
 - npm global package updates during `pi-client update`.
 - `pi-client web` command that starts the client backend in Tau mirror mode on port `1838` by default.
+- `pi-client send <path>` command for chunked file and folder uploads to pi-server.
 
 ### Fixed
 

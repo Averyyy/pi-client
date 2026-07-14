@@ -14,6 +14,7 @@ const ALLOWED_TARGETS = new Set([
 	"/api/session/drop-last-assistant-error",
 	"/api/session/compact",
 	"/api/stream",
+	"/api/receive",
 ]);
 
 export interface RequestChunkBody {

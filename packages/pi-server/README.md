@@ -31,7 +31,10 @@ PI_SERVER_HOST=127.0.0.1
 PI_SERVER_PORT=4217
 PI_SERVER_AUTH_TOKEN=your-token
 PI_SERVER_SESSION_STORE_DIR=/path/to/sessions
+PI_SERVER_UPLOAD_DIR=/path/to/upload_files
 ```
+
+Received files default to `~/.pi/upload_files`.
 
 ## Connect A Client
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -77,11 +77,13 @@ describe("pi-server HTTP", () => {
 	let server: Server;
 	let baseUrl: string;
 	let sessionStoreDir: string;
+	let uploadDir: string;
 
 	beforeEach(() => {
 		clearAllSessions();
 		sessionStoreDir = mkdtempSync(join(tmpdir(), "pi-server-http-sessions-"));
-		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
+		uploadDir = join(sessionStoreDir, "uploads");
+		server = createPiServer({ authToken: "test-token", sessionStoreDir, uploadDir } as Partial<ServerConfig>);
 		server.listen(0);
 		const addr = server.address();
 		if (typeof addr === "object" && addr !== null) {
@@ -106,7 +108,7 @@ describe("pi-server HTTP", () => {
 			server.close(() => resolve());
 		});
 		clearAllSessions();
-		server = createPiServer({ authToken: "test-token", sessionStoreDir } as Partial<ServerConfig>);
+		server = createPiServer({ authToken: "test-token", sessionStoreDir, uploadDir } as Partial<ServerConfig>);
 		server.listen(0);
 		const addr = server.address();
 		if (typeof addr !== "object" || addr === null) {
@@ -167,11 +169,12 @@ describe("pi-server HTTP", () => {
 
 	it("reassembles chunked requests and dispatches them to the target endpoint", async () => {
 		const originalBody = {
-			sessionId: "chunked-init",
-			staticContext: {
-				systemPrompt: "You are helpful. ".repeat(300),
-				tools: [],
-			},
+			name: "chunked-upload",
+			entries: [
+				{ path: "", type: "directory" },
+				{ path: "nested", type: "directory" },
+				{ path: "nested/file.txt", type: "file", data: Buffer.from("hello").toString("base64") },
+			],
 		};
 		const encoded = Buffer.from(JSON.stringify(originalBody), "utf-8").toString("base64");
 		const midpoint = Math.ceil(encoded.length / 2);
@@ -187,7 +190,7 @@ describe("pi-server HTTP", () => {
 			},
 			body: JSON.stringify({
 				requestId,
-				target: "/api/session/init",
+				target: "/api/receive",
 				chunkIndex: 0,
 				totalChunks: 2,
 				sha256: sha256(firstChunk),
@@ -205,7 +208,7 @@ describe("pi-server HTTP", () => {
 			},
 			body: JSON.stringify({
 				requestId,
-				target: "/api/session/init",
+				target: "/api/receive",
 				chunkIndex: 1,
 				totalChunks: 2,
 				sha256: sha256(secondChunk),
@@ -214,10 +217,39 @@ describe("pi-server HTTP", () => {
 		});
 		expect(second.status).toBe(200);
 
-		const responseBody = (await second.json()) as ServerResponse;
-		expect(responseBody.sessionId).toBe("chunked-init");
-		expect(responseBody.messageCount).toBe(0);
-		expect(getSession("chunked-init")?.staticContext?.systemPrompt).toBe(originalBody.staticContext.systemPrompt);
+		const responseBody = (await second.json()) as { path: string; files: number };
+		expect(responseBody.path).toBe(join(uploadDir, "chunked-upload"));
+		expect(responseBody.files).toBe(1);
+		expect(readFileSync(join(uploadDir, "chunked-upload", "nested", "file.txt"), "utf-8")).toBe("hello");
+	});
+
+	it("rejects receive paths that could escape the upload directory", async () => {
+		const res = await fetch(`${baseUrl}/api/receive`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({
+				name: "unsafe",
+				entries: [
+					{ path: "", type: "directory" },
+					{ path: "../outside", type: "file", data: "" },
+				],
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(existsSync(join(sessionStoreDir, "outside"))).toBe(false);
+	});
+
+	it("receives a single file", async () => {
+		const res = await fetch(`${baseUrl}/api/receive`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({
+				name: "file.txt",
+				entries: [{ path: "", type: "file", data: Buffer.from("hello").toString("base64") }],
+			}),
+		});
+		expect(res.status).toBe(200);
+		expect(readFileSync(join(uploadDir, "file.txt"), "utf-8")).toBe("hello");
 	});
 
 	it("syncs a replaced local message history", async () => {
@@ -1087,6 +1119,7 @@ describe("resolveStreamOptions", () => {
 			port: 4217,
 			authToken: undefined,
 			sessionStoreDir: "unused",
+			uploadDir: "unused",
 		};
 		const { model, options } = resolveStreamOptions(config, baseModel, {
 			sessionId: "s1",
@@ -1102,6 +1135,7 @@ describe("resolveStreamOptions", () => {
 			port: 4217,
 			authToken: undefined,
 			sessionStoreDir: "unused",
+			uploadDir: "unused",
 			providerApiKey: "sk-server",
 			providerBaseUrl: "https://server-proxy.example.com/v1",
 			providerHeaders: { "X-Server": "yes" },

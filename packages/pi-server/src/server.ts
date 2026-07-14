@@ -23,6 +23,7 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
+import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
 import {
@@ -775,6 +776,16 @@ async function handlePostRequest(
 	body: unknown,
 	res: ServerResponse,
 ): Promise<boolean> {
+	if (pathname === "/api/receive") {
+		try {
+			sendJson(res, 200, receiveUpload(config.uploadDir, body));
+		} catch (error) {
+			if (!(error instanceof ReceiveUploadError)) throw error;
+			sendJson(res, error.status, { error: error.message });
+		}
+		return true;
+	}
+
 	if (pathname === "/api/session/init") {
 		handleSessionInit(config, body as SessionInitBody, res);
 		return true;

@@ -83,6 +83,7 @@ Environment configuration:
 export PI_SERVER_HOST=127.0.0.1
 export PI_SERVER_PORT=4217
 export PI_SERVER_AUTH_TOKEN="change-me"
+export PI_SERVER_UPLOAD_DIR="$HOME/.pi/upload_files"
 
 pi-server
 ```
@@ -93,7 +94,8 @@ pi-server
 {
 	"host": "127.0.0.1",
 	"port": 4217,
-	"authToken": "change-me"
+	"authToken": "change-me",
+	"uploadDir": "/path/to/upload_files"
 }
 ```
 
@@ -120,6 +122,14 @@ pi-client --provider opencode-go --model glm-5.1
 Configure provider models, base URLs, API keys, and headers on the client side through the normal Pi `~/.pi/agent/models.json` and auth settings. For OpenCode Go, use the OpenAI-compatible base URL there, for example `https://opencode.ai/zen/go/v1`.
 
 `PI_CLIENT_MAX_REQUEST_KB` caps every client-to-server JSON POST body. When a request is larger than this limit, `pi-client` splits it into multiple `/api/request/chunk` uploads and `pi-server` reassembles the original request before dispatching it. The default is `512` KB.
+
+Send a file or folder through the same chunked transport:
+
+```bash
+pi-client send /path/to/file-or-folder
+```
+
+The server saves it under `PI_SERVER_UPLOAD_DIR`, which defaults to `~/.pi/upload_files`.
 
 ### Existing pi users
 
@@ -215,6 +225,7 @@ npm run install:pi-server
 export PI_SERVER_HOST=127.0.0.1
 export PI_SERVER_PORT=4217
 export PI_SERVER_AUTH_TOKEN="change-me"
+export PI_SERVER_UPLOAD_DIR="$HOME/.pi/upload_files"
 
 pi-server
 ```
@@ -225,7 +236,8 @@ pi-server
 {
 	"host": "127.0.0.1",
 	"port": 4217,
-	"authToken": "change-me"
+	"authToken": "change-me",
+	"uploadDir": "/path/to/upload_files"
 }
 ```
 
@@ -252,6 +264,14 @@ pi-client --provider opencode-go --model glm-5.1
 provider 的 model、base URL、API key 和 headers 仍在 client 侧按原始 Pi 的方式配置，也就是 `~/.pi/agent/models.json` 和 auth 相关配置。比如 OpenCode Go 的 OpenAI-compatible base URL 应该配置在 client 侧：`https://opencode.ai/zen/go/v1`。
 
 `PI_CLIENT_MAX_REQUEST_KB` 用来限制 `pi-client` 到 `pi-server` 的单次 JSON POST 大小，单位是 KB。超过限制时，`pi-client` 会把请求拆成多次 `/api/request/chunk` 上传，`pi-server` 收齐后再还原原始请求。默认值是 `512`。
+
+文件和文件夹使用同一套分块传输：
+
+```bash
+pi-client send /path/to/file-or-folder
+```
+
+服务端保存到 `PI_SERVER_UPLOAD_DIR`，默认是 `~/.pi/upload_files`。
 
 ### 已经安装过原始 Pi 的用户
 

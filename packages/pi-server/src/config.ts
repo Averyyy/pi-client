@@ -1,11 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 export interface ServerConfig {
 	host: string;
 	port: number;
 	authToken: string | undefined;
 	sessionStoreDir: string;
+	uploadDir: string;
 }
 
 const DEFAULT_CONFIG: ServerConfig = {
@@ -13,6 +15,7 @@ const DEFAULT_CONFIG: ServerConfig = {
 	port: 4217,
 	authToken: undefined,
 	sessionStoreDir: resolve(".pi", "pi-server", "sessions"),
+	uploadDir: join(homedir(), ".pi", "upload_files"),
 };
 
 function loadConfigFile(): Partial<ServerConfig> {
@@ -47,6 +50,9 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
 				process.env.PI_SERVER_SESSION_STORE_DIR ??
 				fileConfig.sessionStoreDir ??
 				DEFAULT_CONFIG.sessionStoreDir,
+		),
+		uploadDir: resolve(
+			overrides?.uploadDir ?? process.env.PI_SERVER_UPLOAD_DIR ?? fileConfig.uploadDir ?? DEFAULT_CONFIG.uploadDir,
 		),
 	};
 }
