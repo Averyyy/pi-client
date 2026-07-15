@@ -255,7 +255,7 @@ describe("AgentSession compaction characterization", () => {
 		let nextProviderContext = "";
 		const harness = await createHarness({
 			tools: [largeTool],
-			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 1000 }],
+			models: [{ id: "faux-1", contextWindow: 1_000, maxTokens: 1000 }],
 			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 20 } },
 			extensionFactories: [
 				(pi) => {

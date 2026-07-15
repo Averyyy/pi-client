@@ -122,6 +122,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
+			autoSessionName: false,
 		});
 
 		return session;
@@ -257,6 +258,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader({ extensionsResult }),
+			autoSessionName: false,
 		});
 		session.subscribe((event) => {
 			if (event.type === "queue_update") {
@@ -324,6 +326,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
+			autoSessionName: false,
 		});
 
 		// First prompt completes
@@ -431,6 +434,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
 			baseToolsOverride: { dummy: tool },
+			autoSessionName: false,
 		});
 
 		const snapshots: string[][] = [];
@@ -578,6 +582,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
 			baseToolsOverride: { dummy: tool },
+			autoSessionName: false,
 		});
 
 		const sessionWithRunner = session as unknown as {

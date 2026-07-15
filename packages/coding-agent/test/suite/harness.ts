@@ -62,6 +62,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 
 export interface HarnessOptions {
 	models?: FauxModelDefinition[];
+	autoSessionName?: boolean;
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
 	tools?: AgentTool[];
@@ -185,6 +186,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		allowedToolNames: options.allowedToolNames,
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
+		autoSessionName: options.autoSessionName ?? false,
 	});
 
 	const events: AgentSessionEvent[] = [];

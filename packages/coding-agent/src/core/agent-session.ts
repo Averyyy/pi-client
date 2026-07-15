@@ -212,6 +212,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Whether to generate a display name with an extra provider request after the first turn. */
+	autoSessionName?: boolean;
 }
 
 export interface ExtensionBindings {
@@ -435,6 +437,7 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _autoSessionNameEnabled: boolean;
 	private _autoSessionNameAttempted = false;
 
 	// Model registry for API key resolution
@@ -466,6 +469,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._autoSessionNameEnabled = config.autoSessionName ?? true;
 
 		if (isPiServerMode()) {
 			this._detachPiServerTerminalAssistantFailure();
@@ -1369,7 +1373,7 @@ export class AgentSession {
 	}
 
 	private _shouldGenerateSessionName(): boolean {
-		if (this._autoSessionNameAttempted || this._sessionHasInfoEntry()) return false;
+		if (!this._autoSessionNameEnabled || this._autoSessionNameAttempted || this._sessionHasInfoEntry()) return false;
 		const userMessages = this.agent.state.messages.filter((message) => message.role === "user");
 		if (userMessages.length !== 1) return false;
 		const lastAssistant = this._findLastAssistantMessage();

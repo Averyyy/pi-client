@@ -320,6 +320,8 @@ export function createFauxStreamFn(responses: FauxResponseInput[]): {
 export interface HarnessOptions {
 	/** Response sequence for the faux provider. Default: single "ok" response. */
 	responses?: FauxResponseInput[];
+	/** Allow the first turn to trigger production's automatic session naming. */
+	autoSessionName?: boolean;
 	/** Model to use. Default: fauxModel. */
 	model?: Model<any>;
 	/** Context window override (applied to the model). */
@@ -400,6 +402,7 @@ function createHarnessWithResourceLoader(
 		modelRegistry,
 		resourceLoader,
 		baseToolsOverride: options.baseToolsOverride,
+		autoSessionName: options.autoSessionName ?? false,
 	});
 
 	const events: AgentSessionEvent[] = [];

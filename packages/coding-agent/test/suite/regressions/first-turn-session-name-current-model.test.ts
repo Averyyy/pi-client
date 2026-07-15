@@ -20,7 +20,7 @@ describe("first-turn session naming", () => {
 	});
 
 	it("uses the current model to name an unnamed session after the first turn", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ autoSessionName: true });
 		harnesses.push(harness);
 		let titlePrompt = "";
 		harness.setResponses([

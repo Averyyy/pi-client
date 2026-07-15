@@ -119,6 +119,7 @@ describe("AgentSession retry", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
+			autoSessionName: false,
 		});
 
 		if (delayAssistantMessageEndMs > 0) {
@@ -235,6 +236,7 @@ describe("AgentSession retry", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
+			autoSessionName: false,
 		});
 
 		const events: string[] = [];
@@ -322,6 +324,7 @@ describe("AgentSession retry", () => {
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
 			baseToolsOverride: { echo: echoTool },
+			autoSessionName: false,
 		});
 
 		await session.prompt("Test");

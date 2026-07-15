@@ -5,11 +5,15 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
-import { createAgentSession } from "../src/core/sdk.ts";
+import { createAgentSession as createSdkAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createHarness } from "./test-harness.ts";
 import { createTestResourceLoader } from "./utilities.ts";
+
+async function createAgentSession(options: Parameters<typeof createSdkAgentSession>[0] = {}) {
+	return createSdkAgentSession({ autoSessionName: false, ...options });
+}
 
 function parseJsonObject(rawBody: string): Record<string, unknown> {
 	if (!rawBody) return {};

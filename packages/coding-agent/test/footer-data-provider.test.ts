@@ -215,7 +215,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 	});
 
 	it("updates the cached branch when the reftable directory changes", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
 		const provider = new FooterDataProvider(worktreeDir);
@@ -224,16 +224,18 @@ describe("FooterDataProvider reftable branch detection", () => {
 			resolvedBranch = "foo";
 			const onBranchChange = vi.fn();
 			provider.onBranchChange(onBranchChange);
-
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await waitFor(() => provider.getGitBranch() === "foo");
+			vi.useFakeTimers();
+			const providerWithInternals = provider as unknown as { scheduleRefresh: () => void };
+			providerWithInternals.scheduleRefresh();
+			await vi.advanceTimersByTimeAsync(500);
+			await vi.runOnlyPendingTimersAsync();
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 			expect(provider.getGitBranch()).toBe("foo");
 			expect(onBranchChange).toHaveBeenCalledTimes(1);
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 
