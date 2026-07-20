@@ -4,15 +4,22 @@ import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession as createSdkAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createHarness } from "./test-harness.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 async function createAgentSession(options: Parameters<typeof createSdkAgentSession>[0] = {}) {
 	return createSdkAgentSession({ autoSessionName: false, ...options });
+}
+
+async function createTestModelRuntime(provider: string) {
+	const authStorage = AuthStorage.inMemory();
+	await authStorage.modify(provider, async () => ({ type: "api_key", key: "test-key" }));
+	const modelRegistry = await createInMemoryModelRegistry(authStorage);
+	return getModelRuntime(modelRegistry);
 }
 
 function parseJsonObject(rawBody: string): Record<string, unknown> {
@@ -32,7 +39,7 @@ describe("AgentSession pi-server sync", () => {
 	});
 
 	it("syncs the session tree to pi-server after explicit tree navigation without uploading flat messages", async () => {
-		const harness = createHarness({ responses: ["answer one", "answer two"] });
+		const harness = await createHarness({ responses: ["answer one", "answer two"] });
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 
 		try {
@@ -107,9 +114,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const legacyUserId = sessionManager.appendMessage({ role: "user", content: "legacy question", timestamp: 1000 });
 		const legacyAssistantId = sessionManager.appendMessage({
@@ -169,8 +174,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
@@ -217,9 +221,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
@@ -271,8 +273,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				settingsManager,
 				resourceLoader: createTestResourceLoader(),
@@ -313,9 +314,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
@@ -353,8 +352,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				settingsManager,
 				resourceLoader: createTestResourceLoader(),
@@ -388,9 +386,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
@@ -439,8 +435,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				settingsManager,
 				resourceLoader: createTestResourceLoader(),
@@ -497,9 +492,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		sessionManager.appendMessage({ role: "user", content: "old question", timestamp: 1000 });
 		const oldErrorId = sessionManager.appendMessage({
@@ -560,8 +553,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
@@ -601,9 +593,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		for (let index = 0; index < 30; index++) {
 			sessionManager.appendMessage({
@@ -706,8 +696,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
@@ -742,9 +731,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 		let streamRequestStarted = () => {};
@@ -791,8 +778,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
@@ -834,9 +820,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const treeSignals: Array<AbortSignal | null> = [];
 
@@ -880,8 +864,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				resourceLoader: createTestResourceLoader(),
 			});
@@ -909,9 +892,7 @@ describe("AgentSession pi-server sync", () => {
 		mkdirSync(agentDir, { recursive: true });
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model!.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
@@ -965,8 +946,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model: model!,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				settingsManager,
 				resourceLoader: createTestResourceLoader(),
@@ -1014,9 +994,7 @@ describe("AgentSession pi-server sync", () => {
 		const baseModel = getModel("anthropic", "claude-sonnet-4-5");
 		expect(baseModel).toBeDefined();
 		const model = { ...baseModel!, contextWindow: 100, maxTokens: 20 };
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(model.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({ compaction: { enabled: true, reserveTokens: 20, keepRecentTokens: 1 } });
@@ -1123,8 +1101,7 @@ describe("AgentSession pi-server sync", () => {
 				agentDir,
 				model,
 				thinkingLevel: "off",
-				authStorage,
-				modelRegistry,
+				modelRuntime,
 				sessionManager,
 				settingsManager,
 				resourceLoader: createTestResourceLoader(),
