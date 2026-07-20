@@ -1,4 +1,5 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import {
 	type CompactionPreparationOptions,
 	type CompactionSettings,
@@ -45,6 +46,13 @@ import {
 } from "./session-store.ts";
 
 export { loadConfig, type ServerConfig } from "./config.ts";
+
+interface PackageMetadata {
+	version: string;
+}
+
+const packageMetadata = createRequire(import.meta.url)("../package.json") as PackageMetadata;
+const PI_SERVER_VERSION = packageMetadata.version;
 
 interface SessionInitBody {
 	sessionId: string;
@@ -852,7 +860,11 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		}
 
 		if (!authenticate(config, req)) {
-			sendJson(res, 401, { error: "Unauthorized" });
+			const body =
+				req.method === "GET" && url.pathname === "/"
+					? { error: "Unauthorized", version: PI_SERVER_VERSION }
+					: { error: "Unauthorized" };
+			sendJson(res, 401, body);
 			return;
 		}
 

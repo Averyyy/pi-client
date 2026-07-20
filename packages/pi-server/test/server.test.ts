@@ -28,6 +28,7 @@ vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
 
 interface ServerResponse {
 	status?: string;
+	version?: string;
 	sessionId?: string;
 	staticContextHash?: string;
 	treeHash?: string;
@@ -122,6 +123,14 @@ describe("pi-server HTTP", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as ServerResponse;
 		expect(body.status).toBe("ok");
+	});
+
+	it("includes the package version with an unauthorized root response", async () => {
+		const res = await fetch(`${baseUrl}/`);
+		expect(res.status).toBe(401);
+		const body = (await res.json()) as ServerResponse;
+		expect(body.error).toBe("Unauthorized");
+		expect(body.version).toMatch(/^\d+\.\d+\.\d+-piclient\.\d+$/);
 	});
 
 	it("rejects requests without auth token when configured", async () => {
