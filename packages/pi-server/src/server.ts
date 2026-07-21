@@ -491,14 +491,23 @@ async function completeSessionCompact(
 
 	const baseTreeHash = prepared.session.treeHash;
 	const baseEntryCount = prepared.session.entries.length;
-	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, result.value);
+	const compaction = result.value;
+	const firstKeptEntryId = compaction.firstKeptEntryId;
+	if (!firstKeptEntryId) {
+		return { status: 500, body: { error: "Compaction result is missing firstKeptEntryId" } };
+	}
+	const normalizedCompaction = { ...compaction, firstKeptEntryId };
+	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(
+		body.sessionId,
+		normalizedCompaction,
+	);
 	persistSession(config, updatedSession);
 	if (!body.fullResponse && body.baseTreeHash === baseTreeHash) {
 		return {
 			status: 200,
 			body: {
 				success: true,
-				compaction: result.value satisfies CompactResult,
+				compaction: normalizedCompaction satisfies CompactResult,
 				compactionEntry,
 				...sessionResponseBody(updatedSession),
 				staticContext: updatedSession.staticContext,
@@ -516,7 +525,7 @@ async function completeSessionCompact(
 		status: 200,
 		body: {
 			success: true,
-			compaction: result.value satisfies CompactResult,
+			compaction: normalizedCompaction satisfies CompactResult,
 			compactionEntry,
 			...sessionResponseBody(updatedSession),
 			staticContext: updatedSession.staticContext,

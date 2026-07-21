@@ -6,7 +6,8 @@
  */
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai/compat";
+import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai/compat";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { estimateTokens, summarizeMessages } from "./compaction.ts";
@@ -24,6 +25,7 @@ import {
 
 export interface BranchSummaryResult {
 	summary?: string;
+	usage?: Usage;
 	readFiles?: string[];
 	modifiedFiles?: string[];
 	aborted?: boolean;
@@ -73,6 +75,10 @@ export interface GenerateBranchSummaryOptions {
 	reserveTokens?: number;
 	/** Optional session stream function. Used to preserve SDK request behavior without mutating agent state. */
 	streamFn?: StreamFn;
+	/** Retry policy for transient summarization errors. Reuses coding-agent's `settings.retry`. */
+	retry?: RetryPolicy;
+	/** Optional callbacks for retry reporting (e.g. TUI retry indicators). */
+	callbacks?: RetryCallbacks;
 }
 
 // ============================================================================
@@ -302,6 +308,8 @@ export async function generateBranchSummary(
 		replaceInstructions,
 		reserveTokens = 16384,
 		streamFn,
+		retry,
+		callbacks,
 	} = options;
 
 	const { messages, fileOps } = prepareBranchEntries(entries);
@@ -329,8 +337,9 @@ export async function generateBranchSummary(
 	);
 
 	let summary: string;
+	let summaryUsage: Usage;
 	try {
-		summary = await summarizeMessages(
+		const result = await summarizeMessages(
 			messages,
 			model,
 			maxTokens,
@@ -343,7 +352,11 @@ export async function generateBranchSummary(
 			instructions,
 			updateInstructions,
 			undefined,
+			retry,
+			callbacks,
 		);
+		summary = result.text;
+		summaryUsage = result.usage;
 	} catch (error) {
 		if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 			return { aborted: true };
@@ -354,7 +367,6 @@ export async function generateBranchSummary(
 	if (signal.aborted) {
 		return { aborted: true };
 	}
-
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 
@@ -364,6 +376,7 @@ export async function generateBranchSummary(
 
 	return {
 		summary: summary || "No summary generated",
+		usage: summaryUsage,
 		readFiles,
 		modifiedFiles,
 	};

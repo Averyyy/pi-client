@@ -89,6 +89,7 @@ describe("session-persistence rename retry", () => {
 	});
 
 	it("does not retry EPERM outside Windows", () => {
+		setPlatform("linux");
 		const error = errno("EPERM");
 		fsMock.renameSync.mockImplementationOnce(() => {
 			throw error;
