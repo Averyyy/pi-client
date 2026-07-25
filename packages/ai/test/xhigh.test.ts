@@ -15,10 +15,10 @@ function makeContext(): Context {
 }
 
 describe.skipIf(!process.env.OPENAI_API_KEY)("xhigh reasoning", () => {
-	describe("gpt-5.2 (supports xhigh)", () => {
-		// Note: gpt-5.2 supports xhigh through the OpenAI Responses API.
+	describe("gpt 5.5 (supports xhigh)", () => {
+		// Note: codex models only support the responses API, not chat completions
 		it("should work with openai-responses", async () => {
-			const model = getModel("openai", "gpt-5.2");
+			const model = getModel("openai", "gpt-5.5");
 			const s = stream(model, makeContext(), { reasoningEffort: "xhigh" });
 			let hasThinking = false;
 
