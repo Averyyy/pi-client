@@ -640,6 +640,9 @@ describe("harness compaction", () => {
 		getOrThrow(await compact(preparation, models, model));
 
 		expect(seenOptions.map((options) => options?.maxTokens)).toEqual([128000, 128000]);
+		expect(seenOptions.map((options) => options?.cacheRetention)).toEqual(["none", "none"]);
+		const sessionIds = seenOptions.map((options) => options?.sessionId);
+		expect(sessionIds[0]).not.toBe(sessionIds[1]);
 	});
 
 	it("chunks summary input to fit the active model context window", async () => {
