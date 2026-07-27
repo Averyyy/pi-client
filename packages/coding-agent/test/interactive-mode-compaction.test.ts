@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 describe("InteractiveMode compaction events", () => {
-	test("rebuilds chat and appends a synthetic compaction summary at the bottom", async () => {
+	test("rebuilds chat without appending a duplicate compaction summary", async () => {
 		const fakeThis = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
@@ -19,6 +19,7 @@ describe("InteractiveMode compaction events", () => {
 			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
 			settingsManager: { getShowTerminalProgress: () => false },
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+			restoreWorkingIndicator: vi.fn(),
 		};
 
 		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
@@ -44,17 +45,66 @@ describe("InteractiveMode compaction events", () => {
 			willRetry: false,
 		});
 
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
 		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledTimes(1);
-		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
-		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
-			expect.objectContaining({
-				role: "compactionSummary",
-				tokensBefore: 123,
-				summary: "summary",
-			}),
-		);
+		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
+		expect(fakeThis.restoreWorkingIndicator).toHaveBeenCalledTimes(1);
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+	});
+
+	test("renders the full active branch instead of the compacted model context", () => {
+		const branch = [
+			{ type: "message", id: "old" },
+			{ type: "compaction", id: "compact" },
+		];
+		const fakeThis = {
+			chatContainer: { clear: vi.fn() },
+			sessionManager: {
+				getBranch: vi.fn().mockReturnValue(branch),
+				buildContextEntries: vi.fn(),
+			},
+			renderSessionEntries: vi.fn(),
+		};
+
+		const rebuildChatFromMessages = Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages") as (
+			this: typeof fakeThis,
+		) => void;
+
+		rebuildChatFromMessages.call(fakeThis);
+
+		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
+		expect(fakeThis.sessionManager.getBranch).toHaveBeenCalledTimes(1);
+		expect(fakeThis.sessionManager.buildContextEntries).not.toHaveBeenCalled();
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(branch);
+	});
+
+	test("keeps working active through agent_end and clears it at agent_settled", async () => {
+		const fakeThis = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			settingsManager: { getShowTerminalProgress: () => true },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+			clearStatusIndicator: vi.fn(),
+			streamingComponent: undefined,
+			streamingMessage: undefined,
+			pendingTools: new Map(),
+			checkShutdownRequested: vi.fn().mockResolvedValue(undefined),
+		};
+
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: { type: "agent_end" } | { type: "agent_settled" },
+		) => Promise<void>;
+
+		await handleEvent.call(fakeThis, { type: "agent_end" });
+
+		expect(fakeThis.ui.terminal.setProgress).not.toHaveBeenCalled();
+		expect(fakeThis.clearStatusIndicator).not.toHaveBeenCalled();
+
+		await handleEvent.call(fakeThis, { type: "agent_settled" });
+
+		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(false);
+		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith("working");
+		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});
 
 	test("preserves steering behavior when flushing into an active agent run", async () => {

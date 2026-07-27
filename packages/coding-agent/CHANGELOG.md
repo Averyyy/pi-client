@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
+
 ## [0.82.1] - 2026-07-25
 
 ### New Features

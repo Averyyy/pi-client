@@ -75,7 +75,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
-import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
@@ -1891,6 +1890,22 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private restoreWorkingIndicator(): void {
+		if (!this.session.isStreaming || !this.workingVisible) {
+			return;
+		}
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(true);
+		}
+		this.showStatusIndicator(
+			new WorkingStatusIndicator(
+				this.ui,
+				this.workingMessage ?? this.defaultWorkingMessage,
+				this.workingIndicatorOptions,
+			),
+		);
+	}
+
 	private setHiddenThinkingLabel(label?: string): void {
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
 		for (const child of this.chatContainer.children) {
@@ -3052,10 +3067,6 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
-				if (this.settingsManager.getShowTerminalProgress()) {
-					this.ui.terminal.setProgress(false);
-				}
-				this.clearStatusIndicator("working");
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -3067,7 +3078,12 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.settingsManager.getShowTerminalProgress()) {
+					this.ui.terminal.setProgress(false);
+				}
+				this.clearStatusIndicator("working");
 				await this.checkShutdownRequested();
+				this.ui.requestRender();
 				break;
 
 			case "compaction_start": {
@@ -3100,15 +3116,7 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
-					this.chatContainer.clear();
 					this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-					);
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3118,6 +3126,7 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 					}
 				}
+				this.restoreWorkingIndicator();
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
 				break;
@@ -3147,6 +3156,7 @@ export class InteractiveMode {
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				}
+				this.restoreWorkingIndicator();
 				this.ui.requestRender();
 				break;
 			}
@@ -3427,8 +3437,8 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Render session entries to chat. Used for initial load and rebuild after compaction.
-	 * @param entries Compaction-aware session entries to render
+	 * Render session entries to chat. Used for initial load and transcript rebuilds.
+	 * @param entries Active-branch session entries to render
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 */
@@ -3475,7 +3485,7 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.buildContextEntries();
+		const entries = this.sessionManager.getBranch();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -3527,7 +3537,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderSessionEntries(this.sessionManager.getBranch());
 	}
 
 	// =========================================================================
