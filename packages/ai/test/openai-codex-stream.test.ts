@@ -381,6 +381,157 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toBe("Codex SSE response headers timed out after 10ms");
 	});
 
+	it("errors and cancels the SSE body when no upstream bytes arrive before the idle timeout", async () => {
+		vi.useFakeTimers();
+		const token = mockToken();
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			cancel() {
+				cancelled = true;
+			},
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })),
+		);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const resultPromise = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			timeoutMs: 50,
+		}).result();
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(50);
+
+		const result = await resultPromise;
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Codex SSE idle timeout after 50ms");
+		expect(cancelled).toBe(true);
+	});
+
+	it("does not treat zero-byte SSE chunks as upstream progress", async () => {
+		vi.useFakeTimers();
+		const token = mockToken();
+		let cancelled = false;
+		let timer: ReturnType<typeof setInterval> | undefined;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array());
+				timer = setInterval(() => controller.enqueue(new Uint8Array()), 10);
+			},
+			cancel() {
+				cancelled = true;
+				if (timer) clearInterval(timer);
+			},
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })),
+		);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const resultPromise = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			timeoutMs: 50,
+		}).result();
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(50);
+		await vi.advanceTimersByTimeAsync(1);
+
+		const result = await resultPromise;
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Codex SSE idle timeout after 50ms");
+		expect(cancelled).toBe(true);
+	});
+
+	it("resets the SSE idle timeout for each upstream byte chunk without imposing a total deadline", async () => {
+		vi.useFakeTimers();
+		const token = mockToken();
+		const encoder = new TextEncoder();
+		const payload = buildSSEPayload({ status: "completed" });
+		const chunkSize = Math.ceil(payload.length / 4);
+		const chunks = Array.from({ length: 4 }, (_, index) =>
+			encoder.encode(payload.slice(index * chunkSize, (index + 1) * chunkSize)),
+		);
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(chunks[0]);
+				for (let index = 1; index < chunks.length; index++) {
+					setTimeout(() => {
+						controller.enqueue(chunks[index]);
+						if (index === chunks.length - 1) controller.close();
+					}, index * 40);
+				}
+			},
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })),
+		);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const resultPromise = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			timeoutMs: 50,
+		}).result();
+		await vi.advanceTimersByTimeAsync(120);
+
+		const result = await resultPromise;
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
+	});
+
 	it("aborts SSE body reads after response headers arrive", async () => {
 		const token = mockToken();
 		const encoder = new TextEncoder();

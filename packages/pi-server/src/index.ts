@@ -1,18 +1,31 @@
 export { loadConfig, type ServerConfig } from "./config.ts";
 export { encodeErrorEvent, encodeProxyEvent, parseProxyEvent } from "./event-encoding.ts";
-export { createPiServer, startServer } from "./server.ts";
+export { createPiServer, type PiServerOptions, startServer } from "./server.ts";
 export {
 	appendAssistantResponse,
 	appendMessages,
+	applySessionMutation,
+	calculateSessionLogicalBytes,
 	clearAllSessions,
+	configureSessionCapacityLimits,
+	DEFAULT_SESSION_CAPACITY_LIMITS,
 	deleteSession,
 	exportSessionState,
 	getOrCreateSession,
 	getSession,
+	getSessionCapacityLimits,
+	getSessionCapacityUsage,
 	hashSessionEntries,
 	listSessions,
 	type PersistedSessionState,
+	preflightSessionCapacityMutation,
+	resetSessionCapacityLimits,
 	restoreSessionState,
+	SessionCapacityError,
+	type SessionCapacityLimits,
+	type SessionCapacityMutation,
+	type SessionCapacityProjection,
+	type SessionCapacityUsage,
 	type SessionState,
 	type SessionStaticContext,
 	type SessionSummary,

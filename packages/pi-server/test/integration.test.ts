@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getCompatProviderExecutionRoute } from "@earendil-works/pi-ai/compat";
+import { hashRemoteProviderExecution } from "@earendil-works/pi-ai/provider-execution-node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PI_SERVER_EMPTY_TREE_HASH } from "../src/pi-server-protocol.ts";
 import { createPiServer, type ServerConfig } from "../src/server.ts";
 import {
 	appendMessages,
@@ -19,6 +23,27 @@ interface ServerResponse {
 	messageCount?: number;
 	error?: string;
 	deleted?: string;
+}
+
+const streamModel: Model<"openai-completions"> = {
+	id: "test-model",
+	api: "openai-completions",
+	provider: "opencode-go",
+	baseUrl: "https://example.com",
+	name: "Test",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1000,
+	maxTokens: 100,
+};
+
+function executionFingerprint(model: Model<Api>): string {
+	const route = getCompatProviderExecutionRoute(model);
+	if (route.kind !== "builtin_provider" && route.kind !== "builtin_api") {
+		throw new Error(`Test model ${model.provider}/${model.id} has unsupported route ${route.kind}`);
+	}
+	return hashRemoteProviderExecution(model, route);
 }
 
 describe("pi-server integration", () => {
@@ -118,18 +143,10 @@ describe("pi-server integration", () => {
 			},
 			body: JSON.stringify({
 				sessionId: "no-ctx-stream",
-				model: {
-					id: "test-model",
-					api: "openai-completions",
-					provider: "opencode-go",
-					baseUrl: "https://example.com",
-					name: "Test",
-					reasoning: false,
-					input: ["text"],
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 1000,
-					maxTokens: 100,
-				},
+				baseStaticContextHash: "",
+				baseRevision: 0,
+				providerExecutionFingerprint: executionFingerprint(streamModel),
+				model: streamModel,
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 			}),
 		});
@@ -147,18 +164,13 @@ describe("pi-server integration", () => {
 			},
 			body: JSON.stringify({
 				sessionId: "inline-ctx-stream",
-				model: {
-					id: "test-model",
-					api: "openai-completions",
-					provider: "opencode-go",
-					baseUrl: "https://example.com",
-					name: "Test",
-					reasoning: false,
-					input: ["text"],
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 1000,
-					maxTokens: 100,
-				},
+				baseStaticContextHash: "",
+				baseRevision: 0,
+				baseTreeHash: PI_SERVER_EMPTY_TREE_HASH,
+				baseEntryCount: 0,
+				baseLeafId: null,
+				providerExecutionFingerprint: executionFingerprint(streamModel),
+				model: streamModel,
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 				staticContext: {
 					systemPrompt: "You are helpful.",

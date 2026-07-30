@@ -1,5 +1,4 @@
-import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -49,10 +48,10 @@ describe("loadEntriesFromFile", () => {
 		expect(loadEntriesFromFile(file)).toEqual([]);
 	});
 
-	it("returns empty array for malformed JSON", () => {
+	it("rejects malformed JSON", () => {
 		const file = join(tempDir, "malformed.jsonl");
 		writeFileSync(file, "not json\n");
-		expect(loadEntriesFromFile(file)).toEqual([]);
+		expect(() => loadEntriesFromFile(file)).toThrow(`Malformed session JSONL at ${file}:1`);
 	});
 
 	it("loads valid session file", () => {
@@ -68,7 +67,7 @@ describe("loadEntriesFromFile", () => {
 		expect(entries[1].type).toBe("message");
 	});
 
-	it("skips malformed lines but keeps valid ones", () => {
+	it("rejects malformed lines instead of silently dropping history", () => {
 		const file = join(tempDir, "mixed.jsonl");
 		writeFileSync(
 			file,
@@ -76,13 +75,20 @@ describe("loadEntriesFromFile", () => {
 				"not valid json\n" +
 				'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}\n',
 		);
-		const entries = loadEntriesFromFile(file);
-		expect(entries).toHaveLength(2);
+		expect(() => loadEntriesFromFile(file)).toThrow(`Malformed session JSONL at ${file}:2`);
+	});
+
+	it("rejects a torn final append instead of resuming with truncated history", () => {
+		const file = join(tempDir, "torn-final.jsonl");
+		const original =
+			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n{"type":"message"';
+		writeFileSync(file, original);
+		expect(() => SessionManager.open(file, tempDir)).toThrow(`Malformed session JSONL at ${file}:2`);
+		expect(readFileSync(file, "utf8")).toBe(original);
 	});
 
 	it.each([
 		["leading blank lines", "\n  \n", "leading-blank"],
-		["leading malformed lines", "not json\n{broken json\n", "leading-malformed"],
 		["a multi-buffer header", "", "a".repeat(8192)],
 	])("reads cwd from a session with %s", (_description, prefix, sessionId) => {
 		const file = join(tempDir, "header.jsonl");
@@ -94,17 +100,16 @@ describe("loadEntriesFromFile", () => {
 		expect(sessionManager.getCwd()).toBe(storedCwd);
 	});
 
+	it("rejects malformed content before a valid header", () => {
+		const file = join(tempDir, "malformed-prefix.jsonl");
+		writeSessionHeader(file, tempDir, "valid-header", "not json\n");
+		expect(() => SessionManager.open(file, tempDir)).toThrow(`Malformed session JSONL at ${file}:1`);
+	});
+
 	it("opens compatible sessions beyond the discovery scan limit", () => {
 		const storedCwd = join(tempDir, "stored-project");
 		const overrideCwd = join(tempDir, "override-project");
-		const cases = [
-			{ name: "large-header", id: "a".repeat(HEADER_SCAN_LIMIT_BYTES + 1), prefix: "" },
-			{
-				name: "large-prefix",
-				id: "large-prefix",
-				prefix: `${"x".repeat(HEADER_SCAN_LIMIT_BYTES + 1)}\n`,
-			},
-		];
+		const cases = [{ name: "large-header", id: "a".repeat(HEADER_SCAN_LIMIT_BYTES + 1), prefix: "" }];
 
 		for (const { name, id, prefix } of cases) {
 			const file = join(tempDir, `${name}.jsonl`);
@@ -117,27 +122,16 @@ describe("loadEntriesFromFile", () => {
 		}
 	});
 
-	it("opens session files larger than Node's max string length", () => {
+	it("streams session files larger than the read buffer", () => {
 		const file = join(tempDir, "large.jsonl");
 		writeFileSync(
 			file,
 			'{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n',
 		);
 
-		const fd = openSync(file, "r+");
-		try {
-			const newline = Buffer.from("\n");
-			const stride = 16 * 1024 * 1024;
-			for (let offset = stride; offset <= bufferConstants.MAX_STRING_LENGTH + stride; offset += stride) {
-				writeSync(fd, newline, 0, newline.length, offset);
-			}
-		} finally {
-			closeSync(fd);
-		}
-
 		appendFileSync(
 			file,
-			'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}\n',
+			`${" ".repeat(2 * 1024 * 1024)}\n{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}\n`,
 		);
 
 		const sessionManager = SessionManager.open(file, tempDir);
@@ -281,6 +275,18 @@ describe("SessionManager custom flat session directory", () => {
 		return sessionFile;
 	}
 
+	it("flushes an existing persisted session file and skips non-materialized sessions", () => {
+		const sessionFile = createPersistedSession(projectA, "durable reply");
+		const session = SessionManager.open(sessionFile, tempDir);
+
+		expect(() => session.flushSessionFile()).not.toThrow();
+		expect(readFileSync(sessionFile, "utf-8")).toContain("reply to durable reply");
+		expect(() => SessionManager.inMemory(projectA).flushSessionFile()).not.toThrow();
+
+		rmSync(sessionFile);
+		expect(() => session.flushSessionFile()).not.toThrow();
+	});
+
 	it("scopes current-folder APIs by cwd while listing all flat sessions", async () => {
 		const sessionA = createPersistedSession(projectA, "from A");
 		await new Promise((r) => setTimeout(r, 10));
@@ -294,6 +300,15 @@ describe("SessionManager custom flat session directory", () => {
 
 		const continuedA = SessionManager.continueRecent(projectA, tempDir);
 		expect(continuedA.getSessionFile()).toBe(sessionA);
+	});
+
+	it("drains concurrent session readers before surfacing corruption", async () => {
+		for (let index = 0; index < 12; index++) {
+			writeFileSync(join(tempDir, `corrupt-${index}.jsonl`), `{"type":"session"\n`);
+		}
+
+		await expect(SessionManager.listAll(tempDir)).rejects.toThrow("Malformed session JSONL");
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	});
 });
 

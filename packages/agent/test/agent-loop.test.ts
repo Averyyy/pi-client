@@ -7,9 +7,13 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
+import {
+	TOOL_PROGRESS_UPDATE_INTERVAL_MS,
+	ToolProgressUpdateScheduler,
+} from "../src/tool-progress-update-scheduler.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -80,6 +84,96 @@ function createUserMessage(text: string): UserMessage {
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
+
+describe("ToolProgressUpdateScheduler", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("emits the first update immediately and flushes only the latest burst value", async () => {
+		vi.useFakeTimers();
+		const emitted: number[] = [];
+		const scheduler = new ToolProgressUpdateScheduler<number>((value) => {
+			emitted.push(value);
+		});
+
+		for (let value = 1; value <= 5; value++) {
+			scheduler.update(value);
+		}
+
+		expect(emitted).toEqual([1]);
+		await scheduler.finish();
+		expect(emitted).toEqual([1, 5]);
+
+		await vi.runAllTimersAsync();
+		scheduler.update(6);
+		expect(emitted).toEqual([1, 5]);
+	});
+
+	it("bounds sustained cross-tick updates to one emission per interval plus the final flush", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const emitted: Array<{ value: number; at: number }> = [];
+		const scheduler = new ToolProgressUpdateScheduler<number>((value) => {
+			emitted.push({ value, at: Date.now() });
+		});
+
+		scheduler.update(0);
+		for (let value = 1; value <= 25; value++) {
+			await vi.advanceTimersByTimeAsync(10);
+			scheduler.update(value);
+		}
+
+		expect(emitted.length).toBeLessThanOrEqual(3);
+		for (let index = 1; index < emitted.length; index++) {
+			expect(emitted[index]!.at - emitted[index - 1]!.at).toBeGreaterThanOrEqual(TOOL_PROGRESS_UPDATE_INTERVAL_MS);
+		}
+
+		await scheduler.finish();
+		expect(emitted.at(-1)?.value).toBe(25);
+		expect(emitted.length).toBeLessThanOrEqual(4);
+	});
+
+	it("flushes the latest update without waiting for the throttle timer during cancellation", async () => {
+		vi.useFakeTimers();
+		const emitted: string[] = [];
+		const scheduler = new ToolProgressUpdateScheduler<string>((value) => {
+			emitted.push(value);
+		});
+
+		scheduler.update("first");
+		scheduler.update("latest");
+		const controller = new AbortController();
+		controller.abort();
+		await scheduler.finish();
+
+		expect(controller.signal.aborted).toBe(true);
+		expect(emitted).toEqual(["first", "latest"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("waits for an in-flight first update before flushing the latest update", async () => {
+		let releaseFirst: (() => void) | undefined;
+		const firstFinished = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const emitted: string[] = [];
+		const scheduler = new ToolProgressUpdateScheduler<string>(async (value) => {
+			emitted.push(value);
+			if (value === "first") await firstFinished;
+		});
+
+		scheduler.update("first");
+		scheduler.update("latest");
+		const finishPromise = scheduler.finish();
+		await Promise.resolve();
+		expect(emitted).toEqual(["first"]);
+
+		releaseFirst?.();
+		await finishPromise;
+		expect(emitted).toEqual(["first", "latest"]);
+	});
+});
 
 describe("default stream function compatibility", () => {
 	it("uses the configured default when a legacy caller omits streamFn", async () => {
@@ -368,7 +462,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(patchedToolUsage);
 	});
 
-	it("coalesces synchronous tool execution updates", async () => {
+	it("emits the first and latest synchronous tool updates before the authoritative final result", async () => {
 		const toolSchema = Type.Object({});
 		const tool: AgentTool<typeof toolSchema, { step: number }> = {
 			name: "progress",
@@ -423,8 +517,83 @@ describe("agentLoop with AgentMessage", () => {
 			(event): event is Extract<AgentEvent, { type: "tool_execution_update" }> =>
 				event.type === "tool_execution_update",
 		);
-		expect(updates).toHaveLength(1);
-		expect(updates[0]!.partialResult.details).toEqual({ step: 5 });
+		expect(updates.map((update) => update.partialResult.details)).toEqual([{ step: 1 }, { step: 5 }]);
+		const toolEndIndex = events.findIndex((event) => event.type === "tool_execution_end");
+		expect(toolEndIndex).toBeGreaterThan(events.lastIndexOf(updates[1]!));
+		const toolEnd = events[toolEndIndex];
+		expect(toolEnd?.type).toBe("tool_execution_end");
+		if (toolEnd?.type === "tool_execution_end") {
+			expect(toolEnd.result).toEqual({
+				content: [{ type: "text", text: "done" }],
+				details: { step: 6 },
+				terminate: true,
+			});
+			expect(toolEnd.isError).toBe(false);
+		}
+	});
+
+	it("flushes the latest tool update before an execution error", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema, { step: number }> = {
+			name: "progress",
+			label: "Progress",
+			description: "Emits progress then fails",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				onUpdate?.({
+					content: [{ type: "text", text: "step 1" }],
+					details: { step: 1 },
+				});
+				onUpdate?.({
+					content: [{ type: "text", text: "step 2" }],
+					details: { step: 2 },
+				});
+				throw new Error("boom");
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			shouldStopAfterTurn: () => true,
+		};
+		const stream = agentLoop([createUserMessage("run")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				mockStream.push({
+					type: "done",
+					reason: "toolUse",
+					message: createAssistantMessage(
+						[{ type: "toolCall", id: "tool-1", name: "progress", arguments: {} }],
+						"toolUse",
+					),
+				});
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const updates = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_update" }> =>
+				event.type === "tool_execution_update",
+		);
+		expect(updates.map((update) => update.partialResult.details)).toEqual([{ step: 1 }, { step: 2 }]);
+		const toolEndIndex = events.findIndex((event) => event.type === "tool_execution_end");
+		expect(toolEndIndex).toBeGreaterThan(events.lastIndexOf(updates[1]!));
+		const toolEnd = events[toolEndIndex];
+		expect(toolEnd?.type).toBe("tool_execution_end");
+		if (toolEnd?.type === "tool_execution_end") {
+			expect(toolEnd.result.content).toEqual([{ type: "text", text: "boom" }]);
+			expect(toolEnd.isError).toBe(true);
+		}
 	});
 
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
@@ -657,6 +826,13 @@ describe("agentLoop with AgentMessage", () => {
 			}
 			return event.toolResults.map((toolResult) => toolResult.toolCallId);
 		});
+		const toolEndById = new Map(
+			events.flatMap((event) => (event.type === "tool_execution_end" ? [[event.toolCallId, event] as const] : [])),
+		);
+		for (const event of events) {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") continue;
+			expect(toolEndById.get(event.message.toolCallId)?.toolResult).toBe(event.message);
+		}
 
 		expect(parallelObserved).toBe(true);
 		expect(toolExecutionEndIds).toEqual(["tool-2", "tool-1"]);
@@ -1026,6 +1202,99 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(parallelObserved).toBe(true);
 		expect(validationStartedAfterFirst).toBe(true);
+	});
+
+	it("flushes parallel tool progress before crossing a sequential execution barrier", async () => {
+		const toolSchema = Type.Object({});
+		const trace: string[] = [];
+		const parallelTool: AgentTool<typeof toolSchema, { state: string }> = {
+			name: "parallel-progress",
+			label: "Parallel progress",
+			description: "Emits progress",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				trace.push("parallel:execute");
+				onUpdate?.({
+					content: [{ type: "text", text: "first" }],
+					details: { state: "first" },
+				});
+				onUpdate?.({
+					content: [{ type: "text", text: "latest" }],
+					details: { state: "latest" },
+				});
+				return {
+					content: [{ type: "text", text: "parallel done" }],
+					details: { state: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const sequentialTool: AgentTool<typeof toolSchema, { state: string }> = {
+			name: "sequential",
+			label: "Sequential",
+			description: "Runs after the parallel group",
+			parameters: toolSchema,
+			executionMode: "sequential",
+			async execute() {
+				trace.push("sequential:execute");
+				return {
+					content: [{ type: "text", text: "sequential done" }],
+					details: { state: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [parallelTool, sequentialTool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "toolUse",
+					message: createAssistantMessage(
+						[
+							{ type: "toolCall", id: "parallel-1", name: "parallel-progress", arguments: {} },
+							{ type: "toolCall", id: "sequential-1", name: "sequential", arguments: {} },
+						],
+						"toolUse",
+					),
+				});
+			});
+			return stream;
+		};
+
+		await runAgentLoop(
+			[createUserMessage("run tools")],
+			context,
+			config,
+			(event) => {
+				if (event.type === "tool_execution_update" && event.toolCallId === "parallel-1") {
+					trace.push(`parallel:update:${String(event.partialResult.details.state)}`);
+				}
+				if (event.type === "tool_execution_end") {
+					trace.push(`${event.toolCallId}:end`);
+				}
+			},
+			undefined,
+			streamFn,
+		);
+
+		expect(trace).toEqual([
+			"parallel:execute",
+			"parallel:update:first",
+			"parallel:update:latest",
+			"parallel-1:end",
+			"sequential:execute",
+			"sequential-1:end",
+		]);
 	});
 
 	it("should allow parallel execution when all tools have executionMode=parallel", async () => {

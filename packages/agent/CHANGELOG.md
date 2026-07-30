@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed proxy streams to bound header/body stalls and individual SSE events, consume final SSE events without a trailing newline, return an explicit error on premature EOF, and preserve provider response metadata and diagnostics.
+- Rate-limited sustained tool progress updates while flushing the latest update before the final result, preventing high-output tools from flooding terminal rendering.
+- Fixed tool execution events to reuse the exact finalized `ToolResultMessage` through `tool_execution_end` and subsequent message lifecycle events.
+
 ## [0.82.1] - 2026-07-25
 
 ## [0.82.0] - 2026-07-24

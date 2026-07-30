@@ -12,6 +12,7 @@
 ### Fixed
 
 - Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
+- Made `pi-client send` use bounded, checksummed, retry-safe chunk transport and treat an identical existing upload as the successful result of an uncertain retry.
 
 ### Changed
 

@@ -16,6 +16,11 @@ on:
         description: 'Git ref to publish from (defaults to selected branch)'
         required: false
         type: string
+      create_release:
+        description: 'Create the GitHub Release/tag only after all npm packages publish successfully'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -32,6 +37,7 @@ jobs:
     env:
       RELEASE_VERSION: ${{ github.event.release.tag_name || inputs.version }}
       SOURCE_REF: ${{ inputs.ref || github.event.release.tag_name || github.ref_name }}
+      CREATE_RELEASE: ${{ inputs.create_release || 'false' }}
     steps:
       - name: Checkout workflow ref
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -52,6 +58,12 @@ jobs:
           ref: ${{ env.SOURCE_REF }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Resolve source commit
+        if: steps.resolve.outputs.should_publish == 'true'
+        id: source
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Node.js
         if: steps.resolve.outputs.should_publish == 'true'
@@ -91,6 +103,6 @@ jobs:
         run: |
           gh release create "${{ steps.resolve.outputs.release_tag }}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
+            --target "${{ steps.source.outputs.commit }}" \
             --title "${{ steps.resolve.outputs.release_tag }}" \
             --generate-notes

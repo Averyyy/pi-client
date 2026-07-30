@@ -597,6 +597,7 @@ The TUI uses three rendering strategies:
 3. **Normal Update**: Move cursor to first changed line, clear to end, render changed lines
 
 All updates are wrapped in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
+Each render, including cursor placement, is submitted as one write. When a terminal reports output backpressure, rendering pauses and coalesces updates to the latest component state until `drain`; input handling continues normally.
 
 ## Terminal Interface
 
@@ -606,17 +607,23 @@ The TUI works with any object implementing the `Terminal` interface:
 interface Terminal {
   start(onInput: (data: string) => void, onResize: () => void): void;
   stop(): void;
-  write(data: string): void;
+  write(data: string): boolean | void;
+  onDrain?(listener: () => void): () => void;
   get columns(): number;
   get rows(): number;
-  moveBy(lines: number): void;
-  hideCursor(): void;
-  showCursor(): void;
-  clearLine(): void;
-  clearFromCursor(): void;
-  clearScreen(): void;
+  get kittyProtocolActive(): boolean;
+  moveBy(lines: number): boolean | void;
+  hideCursor(): boolean | void;
+  showCursor(): boolean | void;
+  clearLine(): boolean | void;
+  clearFromCursor(): boolean | void;
+  clearScreen(): boolean | void;
+  setTitle(title: string): boolean | void;
+  setProgress(active: boolean): boolean | void;
 }
 ```
+
+`write()` and the direct terminal-control methods may return `false` when their data was accepted but the output is backpressured. Existing implementations that return `void` remain valid; any implementation that can return `false` must implement `onDrain()`.
 
 **Built-in implementations:**
 - `ProcessTerminal` - Uses `process.stdin/stdout`

@@ -423,11 +423,20 @@ describe("Coding Agent Tools", () => {
 
 		it("should include EACCES for read-only files", async () => {
 			const testFile = join(testDir, "edit-readonly.txt");
-			writeFileSync(testFile, "hello\n");
-			chmodSync(testFile, 0o444);
+			const accessError = new Error("access denied") as NodeJS.ErrnoException;
+			accessError.code = "EACCES";
+			const deniedEditTool = createEditTool(testDir, {
+				operations: {
+					access: async () => {
+						throw accessError;
+					},
+					readFile: async () => Buffer.from("hello\n", "utf-8"),
+					writeFile: async () => {},
+				},
+			});
 
 			await expect(
-				editTool.execute("test-call-14", {
+				deniedEditTool.execute("test-call-14", {
 					path: testFile,
 					edits: [{ oldText: "hello", newText: "world" }],
 				}),
@@ -460,15 +469,18 @@ describe("Coding Agent Tools", () => {
 			expect(result).toEqual({ error: `Could not edit file: ${missingFile}. Error code: ENOENT.` });
 		});
 
-		it("should include EACCES in diff preview for unreadable files", async () => {
-			const unreadableFile = join(testDir, "unreadable-preview.txt");
-			writeFileSync(unreadableFile, "hello\n");
-			chmodSync(unreadableFile, 0o222);
+		it.skipIf(process.platform === "win32")(
+			"should include EACCES in diff preview for unreadable files",
+			async () => {
+				const unreadableFile = join(testDir, "unreadable-preview.txt");
+				writeFileSync(unreadableFile, "hello\n");
+				chmodSync(unreadableFile, 0o222);
 
-			const result = await computeEditsDiff(unreadableFile, [{ oldText: "hello", newText: "world" }], testDir);
+				const result = await computeEditsDiff(unreadableFile, [{ oldText: "hello", newText: "world" }], testDir);
 
-			expect(result).toEqual({ error: `Could not edit file: ${unreadableFile}. Error code: EACCES.` });
-		});
+				expect(result).toEqual({ error: `Could not edit file: ${unreadableFile}. Error code: EACCES.` });
+			},
+		);
 	});
 
 	describe("bash tool", () => {
@@ -804,21 +816,37 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain("match two");
 		});
 
-		it("should treat flag-like patterns as search text", async () => {
+		it("should treat literal flag-like patterns as search text", async () => {
 			const marker = join(testDir, "grep-injection-marker");
 			const payload = join(testDir, "payload.sh");
 			const testFile = join(testDir, "target.txt");
 			writeFileSync(payload, `#!/bin/sh\necho executed > ${marker}\ncat "$1"\n`);
 			chmodSync(payload, 0o755);
-			writeFileSync(testFile, "target\n");
+			const pattern = `--pre=${payload}`;
+			writeFileSync(testFile, `${pattern}\n`);
 
 			const result = await grepTool.execute("test-call-grep-injection", {
-				pattern: `--pre=${payload}`,
+				pattern,
 				path: testDir,
+				literal: true,
 			});
 
-			expect(getTextOutput(result)).toContain("No matches found");
+			expect(getTextOutput(result)).toContain(`target.txt:1: ${pattern}`);
 			expect(existsSync(marker)).toBe(false);
+		});
+
+		it("should match Windows paths containing backslashes as literal text", async () => {
+			const pattern = String.raw`--pre=C:\Users\Avery\payload.sh`;
+			const testFile = join(testDir, "windows-path.txt");
+			writeFileSync(testFile, `${pattern}\n`);
+
+			const result = await grepTool.execute("test-call-grep-windows-literal", {
+				pattern,
+				path: testFile,
+				literal: true,
+			});
+
+			expect(getTextOutput(result)).toContain(`windows-path.txt:1: ${pattern}`);
 		});
 	});
 

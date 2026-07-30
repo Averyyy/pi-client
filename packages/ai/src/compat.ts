@@ -40,6 +40,7 @@ import { openAIResponsesApi } from "./api/openai-responses.lazy.ts";
 import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
+import type { ProviderExecutionRoute } from "./provider-execution.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
@@ -234,9 +235,21 @@ function hasResolvedCloudflareAuth(options: StreamOptions | undefined): boolean 
 }
 
 function getBuiltinProviderForModel(model: Model<Api>) {
-	if (getApiProvider(model.api) !== builtinApiProviderInstances.get(model.api)) return undefined;
+	const route = getCompatProviderExecutionRoute(model);
+	if (route.kind !== "builtin_provider") return undefined;
+	return compatModels.getProvider(route.id);
+}
+
+export function getCompatProviderExecutionRoute(model: Model<Api>): ProviderExecutionRoute {
+	const apiProvider = getApiProvider(model.api);
+	if (!apiProvider) return { kind: "missing_api", id: model.api };
+	if (apiProvider !== builtinApiProviderInstances.get(model.api)) {
+		return { kind: "custom_api", id: model.api };
+	}
 	const provider = compatModels.getProvider(model.provider);
-	return provider?.getModels().some((candidate) => candidate.api === model.api) ? provider : undefined;
+	return provider?.getModels().some((candidate) => candidate.api === model.api)
+		? { kind: "builtin_provider", id: provider.id }
+		: { kind: "builtin_api", id: model.api };
 }
 
 function resolveApiProvider(api: Api) {

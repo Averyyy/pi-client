@@ -73,11 +73,13 @@ describe("AgentSession retry", () => {
 		maxRetries?: number;
 		delayAssistantMessageEndMs?: number;
 		errorMessage?: string;
+		diagnostics?: AssistantMessage["diagnostics"];
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
 		const delayAssistantMessageEndMs = options?.delayAssistantMessageEndMs ?? 0;
 		const errorMessage = options?.errorMessage ?? "overloaded_error";
+		const diagnostics = options?.diagnostics;
 		let callCount = 0;
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -92,6 +94,7 @@ describe("AgentSession retry", () => {
 						const msg = createAssistantMessage("", {
 							stopReason: "error",
 							errorMessage,
+							diagnostics,
 						});
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "error", reason: "error", error: msg });
@@ -157,6 +160,31 @@ describe("AgentSession retry", () => {
 		created.session.subscribe((event) => {
 			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
 			if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(1);
+		expect(events).toEqual([]);
+		expect(created.session.isRetrying).toBe(false);
+	});
+
+	it("does not retry a provider-stream failure explicitly marked non-retryable", async () => {
+		const created = await createSession({
+			failCount: 99,
+			errorMessage: "connection lost while the original run remains active",
+			diagnostics: [
+				{
+					type: "pi_server_failure",
+					timestamp: 1,
+					error: { name: "Error", message: "connection lost" },
+					details: { phase: "provider_stream", source: "pi-server", retryable: false },
+				},
+			],
+		});
+		const events: string[] = [];
+		created.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
 		});
 
 		await created.session.prompt("Test");

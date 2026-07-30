@@ -1,5 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type StreamFn,
+	setDefaultStreamFn,
+	type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -11,6 +18,8 @@ import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { type PiServerHistorySnapshot, type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
+import { assertPiServerProviderExecution } from "./pi-server-provider-execution.ts";
+import { getPiServerRunStatePath } from "./pi-server-run-state.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -331,15 +340,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			tools: [],
-		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
+	const streamWithPiServerRunMode =
+		(runMode: "main-durable" | "auxiliary-transient"): StreamFn =>
+		async (model, context, options) => {
+			const headerRunner = extensionRunnerRef.current;
+			const piServerExecution =
+				process.env.PI_SERVER_MODE === "true"
+					? assertPiServerProviderExecution(modelRuntime, model, headerRunner)
+					: undefined;
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -349,12 +357,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const activeAgentSession = agentSession;
-			const piServerContext = activeAgentSession
-				? buildPiServerContextSync(activeAgentSession.sessionManager, context.messages as Message[])
-				: undefined;
-			const headerRunner = extensionRunnerRef.current;
+			const piServerContext =
+				runMode === "main-durable" && activeAgentSession
+					? buildPiServerContextSync(activeAgentSession.sessionManager, context.messages as Message[])
+					: undefined;
+			const mainSessionId = sessionManager.getSessionId();
+			const piServerSessionId = runMode === "main-durable" ? mainSessionId : (options?.sessionId ?? randomUUID());
+			if (runMode === "auxiliary-transient" && piServerSessionId === mainSessionId) {
+				throw new Error("Auxiliary provider streams must use a session id independent from the main session");
+			}
+			const piServerSessionFile =
+				runMode === "main-durable" ? activeAgentSession?.sessionManager.getSessionFile() : undefined;
 			const commonOptions = {
 				...options,
+				sessionId: piServerSessionId,
 				timeoutMs,
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
@@ -368,21 +384,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				let headers = mergeProviderAttributionHeaders(
 					model,
 					settingsManager,
-					options?.sessionId,
+					piServerSessionId,
 					auth.auth.headers,
 					options?.headers,
 				);
 				if (headerRunner?.hasHandlers("before_provider_headers")) {
 					headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
 				}
-				return streamPiServer(model, context, {
+				const requestModel = auth.auth.baseUrl ? { ...model, baseUrl: auth.auth.baseUrl } : model;
+				return streamPiServer(requestModel, context, {
 					...commonOptions,
+					runMode,
 					sessionTree: piServerContext?.sessionTree,
 					ephemeralMessages: piServerContext?.ephemeralMessages,
 					contextOverlay: piServerContext?.contextOverlay,
-					onHistoryReconciled: activeAgentSession
-						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
-						: undefined,
+					providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
+					piServerRunStatePath: piServerSessionFile ? getPiServerRunStatePath(piServerSessionFile) : undefined,
+					onHistoryReconciled:
+						runMode === "main-durable" && activeAgentSession
+							? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
+							: undefined,
 					apiKey: auth.auth.apiKey,
 					env: auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined,
 					headers,
@@ -394,7 +415,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const headers = mergeProviderAttributionHeaders(
 						model,
 						settingsManager,
-						options?.sessionId,
+						piServerSessionId,
 						requestHeaders,
 					);
 					return headerRunner?.hasHandlers("before_provider_headers")
@@ -402,7 +423,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: (headers ?? {});
 				},
 			});
+		};
+	const mainStreamFunction = streamWithPiServerRunMode("main-durable");
+	const auxiliaryStreamFunction = streamWithPiServerRunMode("auxiliary-transient");
+
+	agent = new Agent({
+		initialState: {
+			systemPrompt: "",
+			model,
+			thinkingLevel,
+			tools: [],
 		},
+		convertToLlm: convertToLlmWithBlockImages,
+		streamFn: mainStreamFunction,
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
@@ -461,6 +494,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		allowedToolNames,
 		excludedToolNames,
 		extensionRunnerRef,
+		auxiliaryStreamFunction: process.env.PI_SERVER_MODE === "true" ? auxiliaryStreamFunction : undefined,
 		sessionStartEvent: options.sessionStartEvent,
 		autoSessionName: options.autoSessionName,
 	});

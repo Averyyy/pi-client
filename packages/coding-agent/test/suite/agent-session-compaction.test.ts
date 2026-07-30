@@ -1,4 +1,4 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -255,6 +255,92 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionEntries).toHaveLength(1);
 		expect(compactionEnd?.result?.estimatedTokensAfter).toBeGreaterThan(0);
 		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("keeps an explicit auxiliary stream isolated from later main stream replacement", async () => {
+		let auxiliaryCallCount = 0;
+		let mainCallCount = 0;
+		const auxiliaryStreamFunction: StreamFn = (model) => {
+			auxiliaryCallCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("summary from isolated auxiliary stream"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: createUsage(10),
+					},
+				});
+			});
+			return stream;
+		};
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			auxiliaryStreamFunction,
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = (model) => {
+			mainCallCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("summary from replacement main stream"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: createUsage(10),
+					},
+				});
+			});
+			return stream;
+		};
+
+		const result = await harness.session.compact();
+
+		expect(result?.summary).toContain("summary from isolated auxiliary stream");
+		expect(auxiliaryCallCount).toBe(1);
+		expect(mainCallCount).toBe(0);
+	});
+
+	it("does not require main-stream auth for an explicit auxiliary stream", async () => {
+		let auxiliaryCallCount = 0;
+		const auxiliaryStreamFunction: StreamFn = (model) => {
+			auxiliaryCallCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("summary from explicit auxiliary stream"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: createUsage(10),
+					},
+				});
+			});
+			return stream;
+		};
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			auxiliaryStreamFunction,
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		const result = await harness.session.compact();
+
+		expect(result?.summary).toContain("summary from explicit auxiliary stream");
+		expect(auxiliaryCallCount).toBe(1);
 	});
 
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {

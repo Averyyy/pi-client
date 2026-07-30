@@ -44,8 +44,20 @@ import {
 	resolveConfiguredModelHeaders,
 	validateExtensionProvider,
 } from "./provider-composer.ts";
+import {
+	createProviderExecutionContract,
+	type ProviderExecutionContract,
+	type ProviderExecutionContractDescriptor,
+} from "./provider-execution-contract.ts";
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
+
+export type {
+	ProviderExecutionContract,
+	ProviderExecutionContractDescriptor,
+	ProviderExecutionKind,
+	ProviderExecutionMode,
+} from "./provider-execution-contract.ts";
 
 interface ModelRuntimeSnapshot {
 	all: readonly Model<Api>[];
@@ -352,6 +364,74 @@ export class ModelRuntime implements Models {
 
 	getRegisteredNativeProvider(providerId: string): Provider | undefined {
 		return this.nativeExtensionProviders.get(providerId);
+	}
+
+	/**
+	 * Describes the code path that will execute a model request without inspecting
+	 * function source or including request credentials.
+	 */
+	getProviderExecutionContract(model: Model<Api>): ProviderExecutionContract {
+		if (!this.models.getProvider(model.provider)) {
+			throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+		}
+
+		const modelsJsonOverlay = this.config.getProvider(model.provider) !== undefined;
+		const extension = this.extensionProviders.get(model.provider);
+		const extensionOverlay = extension !== undefined;
+		const nativeProvider = this.nativeExtensionProviders.get(model.provider);
+		const builtinProvider = this.builtins.get(model.provider);
+		const descriptorBase = {
+			version: 1 as const,
+			providerId: model.provider,
+			modelId: model.id,
+			api: model.api,
+			overlays: {
+				modelsJson: modelsJsonOverlay,
+				extensionConfig: extensionOverlay,
+			},
+		};
+		let descriptor: ProviderExecutionContractDescriptor;
+
+		if (extension?.streamSimple && model.api === extension.api) {
+			descriptor = {
+				...descriptorBase,
+				mode: "provider_config_stream_simple",
+				executor: { kind: "provider_config_stream_simple", id: model.provider },
+				piServerCompatible: false,
+			};
+		} else if (nativeProvider && !modelsJsonOverlay && !extensionOverlay) {
+			// An uncomposed native provider receives every model passed to it.
+			descriptor = {
+				...descriptorBase,
+				mode: "native_provider",
+				executor: { kind: "native_provider", id: nativeProvider.id },
+				piServerCompatible: false,
+			};
+		} else {
+			const baseProvider = nativeProvider ?? builtinProvider;
+			const baseSupportsApi =
+				baseProvider?.getModels().some((registeredModel) => registeredModel.api === model.api) ?? false;
+			if (nativeProvider && baseSupportsApi) {
+				descriptor = {
+					...descriptorBase,
+					mode: "native_provider",
+					executor: { kind: "native_provider", id: nativeProvider.id },
+					piServerCompatible: false,
+				};
+			} else {
+				descriptor = {
+					...descriptorBase,
+					mode: modelsJsonOverlay || extensionOverlay ? "serializable_overlay" : "builtin",
+					executor:
+						builtinProvider && baseSupportsApi
+							? { kind: "builtin_provider", id: builtinProvider.id }
+							: { kind: "builtin_api", id: model.api },
+					piServerCompatible: true,
+				};
+			}
+		}
+
+		return createProviderExecutionContract(descriptor);
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */

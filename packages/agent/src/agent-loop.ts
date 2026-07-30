@@ -11,6 +11,7 @@ import {
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+import { ToolProgressUpdateScheduler } from "./tool-progress-update-scheduler.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -397,10 +398,10 @@ async function failToolCallsFromTruncatedMessage(
 			),
 			isError: true,
 		};
-		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
-		messages.push(toolResultMessage);
+		const completed = completeToolCall(finalized);
+		await emitToolExecutionEnd(completed, emit);
+		await emitToolResultMessage(completed.toolResult, emit);
+		messages.push(completed.toolResult);
 	}
 	return { messages, terminate: false };
 }
@@ -435,7 +436,7 @@ async function executeToolCallsSequential(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const finalizedCalls: FinalizedToolCallOutcome[] = [];
+	const completedCalls: CompletedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
 
 	for (const toolCall of toolCalls) {
@@ -466,11 +467,11 @@ async function executeToolCallsSequential(
 			);
 		}
 
-		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
-		finalizedCalls.push(finalized);
-		messages.push(toolResultMessage);
+		const completed = completeToolCall(finalized);
+		await emitToolExecutionEnd(completed, emit);
+		await emitToolResultMessage(completed.toolResult, emit);
+		completedCalls.push(completed);
+		messages.push(completed.toolResult);
 
 		if (signal?.aborted) {
 			break;
@@ -479,7 +480,7 @@ async function executeToolCallsSequential(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(finalizedCalls),
+		terminate: shouldTerminateToolBatch(completedCalls),
 	};
 }
 
@@ -508,8 +509,9 @@ async function executeToolCallsParallel(
 				result: preparation.result,
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
-			await emitToolExecutionEnd(finalized, emit);
-			scheduledCalls.push(finalized);
+			const completed = completeToolCall(finalized);
+			await emitToolExecutionEnd(completed, emit);
+			scheduledCalls.push(completed);
 			if (signal?.aborted) {
 				break;
 			}
@@ -522,7 +524,7 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	const orderedFinalizedCalls = await executeScheduledToolCalls(
+	const orderedCompletedCalls = await executeScheduledToolCalls(
 		currentContext,
 		assistantMessage,
 		scheduledCalls,
@@ -531,15 +533,14 @@ async function executeToolCallsParallel(
 		emit,
 	);
 	const messages: ToolResultMessage[] = [];
-	for (const finalized of orderedFinalizedCalls) {
-		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
-		messages.push(toolResultMessage);
+	for (const completed of orderedCompletedCalls) {
+		await emitToolResultMessage(completed.toolResult, emit);
+		messages.push(completed.toolResult);
 	}
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		terminate: shouldTerminateToolBatch(orderedCompletedCalls),
 	};
 }
 
@@ -567,7 +568,11 @@ type FinalizedToolCallOutcome = {
 	isError: boolean;
 };
 
-type ScheduledToolCallEntry = FinalizedToolCallOutcome | { preparation: PreparedToolCall };
+type CompletedToolCallOutcome = FinalizedToolCallOutcome & {
+	toolResult: ToolResultMessage;
+};
+
+type ScheduledToolCallEntry = CompletedToolCallOutcome | { preparation: PreparedToolCall };
 
 async function executeScheduledToolCalls(
 	currentContext: AgentContext,
@@ -576,8 +581,8 @@ async function executeScheduledToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
-): Promise<FinalizedToolCallOutcome[]> {
-	const orderedFinalizedCalls: FinalizedToolCallOutcome[] = [];
+): Promise<CompletedToolCallOutcome[]> {
+	const orderedCompletedCalls: CompletedToolCallOutcome[] = [];
 	let parallelBatch: Array<{ index: number; preparation: PreparedToolCall }> = [];
 
 	const runPrepared = async (preparation: PreparedToolCall) => {
@@ -590,8 +595,9 @@ async function executeScheduledToolCalls(
 			config,
 			signal,
 		);
-		await emitToolExecutionEnd(finalized, emit);
-		return finalized;
+		const completed = completeToolCall(finalized);
+		await emitToolExecutionEnd(completed, emit);
+		return completed;
 	};
 
 	const flushParallelBatch = async () => {
@@ -600,25 +606,25 @@ async function executeScheduledToolCalls(
 		parallelBatch = [];
 		const finalizedBatch = await Promise.all(batch.map(({ preparation }) => runPrepared(preparation)));
 		for (let i = 0; i < batch.length; i++) {
-			orderedFinalizedCalls[batch[i].index] = finalizedBatch[i];
+			orderedCompletedCalls[batch[i].index] = finalizedBatch[i];
 		}
 	};
 
 	for (const [index, entry] of scheduledCalls.entries()) {
 		if (!("preparation" in entry)) {
-			orderedFinalizedCalls[index] = entry;
+			orderedCompletedCalls[index] = entry;
 			continue;
 		}
 		if (entry.preparation.tool.executionMode === "sequential") {
 			await flushParallelBatch();
-			orderedFinalizedCalls[index] = await runPrepared(entry.preparation);
+			orderedCompletedCalls[index] = await runPrepared(entry.preparation);
 			continue;
 		}
 		parallelBatch.push({ index, preparation: entry.preparation });
 	}
 	await flushParallelBatch();
 
-	return orderedFinalizedCalls;
+	return orderedCompletedCalls;
 }
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
@@ -710,68 +716,32 @@ async function executePreparedToolCall(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallOutcome> {
-	let acceptingUpdates = true;
-	let pendingUpdate: AgentToolResult<unknown> | undefined;
-	let updateFlushPromise: Promise<void> | undefined;
-	let updateFlushError: unknown;
-
-	const emitPendingUpdates = async (): Promise<void> => {
-		while (pendingUpdate) {
-			const partialResult = pendingUpdate;
-			pendingUpdate = undefined;
-			await emit({
-				type: "tool_execution_update",
-				toolCallId: prepared.toolCall.id,
-				toolName: prepared.toolCall.name,
-				args: prepared.toolCall.arguments,
-				partialResult,
-			});
-		}
-	};
-	const scheduleUpdateFlush = (): void => {
-		if (updateFlushPromise) return;
-		updateFlushPromise = Promise.resolve()
-			.then(emitPendingUpdates)
-			.catch((error: unknown) => {
-				updateFlushError = error;
-			})
-			.finally(() => {
-				updateFlushPromise = undefined;
-				if (pendingUpdate && acceptingUpdates) scheduleUpdateFlush();
-			});
-	};
-	const flushUpdates = async (): Promise<void> => {
-		while (updateFlushPromise) {
-			await updateFlushPromise;
-		}
-		await emitPendingUpdates();
-		if (updateFlushError) throw updateFlushError;
-	};
-
+	const progress = new ToolProgressUpdateScheduler<AgentToolResult<unknown>>((partialResult) =>
+		emit({
+			type: "tool_execution_update",
+			toolCallId: prepared.toolCall.id,
+			toolName: prepared.toolCall.name,
+			args: prepared.toolCall.arguments,
+			partialResult,
+		}),
+	);
+	let result: AgentToolResult<unknown>;
+	let isError = false;
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
-				if (!acceptingUpdates) return;
-				pendingUpdate = partialResult;
-				scheduleUpdateFlush();
-			},
+		result = await prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) =>
+			progress.update(partialResult),
 		);
-		acceptingUpdates = false;
-		await flushUpdates();
-		return { result, isError: false };
 	} catch (error) {
-		acceptingUpdates = false;
-		await flushUpdates();
-		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
-			isError: true,
-		};
-	} finally {
-		acceptingUpdates = false;
+		result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+		isError = true;
 	}
+	try {
+		await progress.finish();
+	} catch (error) {
+		result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+		isError = true;
+	}
+	return { result, isError };
 }
 
 async function finalizeExecutedToolCall(
@@ -828,13 +798,21 @@ function createErrorToolResult(message: string): AgentToolResult<any> {
 	};
 }
 
-async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: AgentEventSink): Promise<void> {
+function completeToolCall(finalized: FinalizedToolCallOutcome): CompletedToolCallOutcome {
+	return {
+		...finalized,
+		toolResult: createToolResultMessage(finalized),
+	};
+}
+
+async function emitToolExecutionEnd(completed: CompletedToolCallOutcome, emit: AgentEventSink): Promise<void> {
 	await emit({
 		type: "tool_execution_end",
-		toolCallId: finalized.toolCall.id,
-		toolName: finalized.toolCall.name,
-		result: finalized.result,
-		isError: finalized.isError,
+		toolCallId: completed.toolCall.id,
+		toolName: completed.toolCall.name,
+		result: completed.result,
+		isError: completed.isError,
+		toolResult: completed.toolResult,
 	});
 }
 

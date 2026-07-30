@@ -11,11 +11,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { beginSessionToolEffect, writeSessionToolEffectResult } from "../src/core/tool-effect-journal.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxLoaderPath = resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -33,22 +38,29 @@ function createTempDir(): string {
 	return dir;
 }
 
-function hasSessionWithId(root: string, sessionId: string): boolean {
-	if (!existsSync(root)) return false;
+function findSessionWithId(root: string, sessionId: string): string | undefined {
+	if (!existsSync(root)) return undefined;
 	for (const entry of readdirSync(root, { withFileTypes: true })) {
 		const path = join(root, entry.name);
-		if (entry.isDirectory() && hasSessionWithId(path, sessionId)) return true;
+		if (entry.isDirectory()) {
+			const nested = findSessionWithId(path, sessionId);
+			if (nested) return nested;
+		}
 		if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
 
 		try {
 			const firstLine = readFileSync(path, "utf8").split("\n", 1)[0];
 			const header = JSON.parse(firstLine) as { type?: string; id?: string };
-			if (header.type === "session" && header.id === sessionId) return true;
+			if (header.type === "session" && header.id === sessionId) return path;
 		} catch {
 			// Ignore malformed session files.
 		}
 	}
-	return false;
+	return undefined;
+}
+
+function hasSessionWithId(root: string, sessionId: string): boolean {
+	return findSessionWithId(root, sessionId) !== undefined;
 }
 
 interface CliDirs {
@@ -60,7 +72,7 @@ interface CliDirs {
 async function runCli(
 	args: string[] | ((dirs: CliDirs) => string[]),
 	setup?: (dirs: CliDirs) => void,
-): Promise<{ code: number | null; agentDir: string; stderr: string }> {
+): Promise<{ code: number | null; agentDir: string; projectDir: string; sessionDir: string; stderr: string }> {
 	const tempRoot = createTempDir();
 	const dirs: CliDirs = {
 		agentDir: join(tempRoot, "agent"),
@@ -74,7 +86,7 @@ async function runCli(
 
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderPath, cliPath, ...resolvedArgs], {
+		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...resolvedArgs], {
 			cwd: dirs.projectDir,
 			env: {
 				...process.env,
@@ -91,7 +103,7 @@ async function runCli(
 		child.on("close", resolvePromise);
 	});
 
-	return { code, agentDir: dirs.agentDir, stderr };
+	return { code, agentDir: dirs.agentDir, projectDir: dirs.projectDir, sessionDir: dirs.sessionDir, stderr };
 }
 
 function writeSession(sessionDir: string, cwd: string, id: string): void {
@@ -99,6 +111,35 @@ function writeSession(sessionDir: string, cwd: string, id: string): void {
 		join(sessionDir, `${id}.jsonl`),
 		`${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd })}\n`,
 	);
+}
+
+function writeToolEffectSession(dirs: CliDirs, id: string, durableResult: boolean): void {
+	const manager = SessionManager.create(dirs.projectDir, dirs.sessionDir, { id });
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: "run tool" }], timestamp: 1 });
+	manager.appendMessage(
+		fauxAssistantMessage([{ ...fauxToolCall("external_write", { value: "done" }), id: "call-fork" }], {
+			stopReason: "toolUse",
+			timestamp: 2,
+		}),
+	);
+	manager.flushSessionFile();
+	beginSessionToolEffect(manager, {
+		toolCallId: "call-fork",
+		toolName: "external_write",
+		args: { value: "done" },
+	});
+	if (durableResult) {
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-fork",
+			toolName: "external_write",
+			content: [{ type: "text", text: "external write complete" }],
+			details: { value: "done" },
+			isError: false,
+			timestamp: 3,
+		};
+		writeSessionToolEffectResult(manager, result);
+	}
 }
 
 describe("--session-id read-only commands", () => {
@@ -175,6 +216,69 @@ describe("--session-id read-only commands", () => {
 
 		expect(result.code).toBe(1);
 		expect(result.stderr).toContain("Session already exists with id 'existing-id'");
+	});
+
+	it("recovers a durable source tool result before forking", async () => {
+		const result = await runCli(
+			(dirs) => [
+				"--session-dir",
+				dirs.sessionDir,
+				"--fork",
+				"source-tool-effect",
+				"--session-id",
+				"recovered-fork",
+				"--model",
+				"missing-model",
+				"-p",
+				"hi",
+			],
+			(dirs) => {
+				mkdirSync(dirs.sessionDir, { recursive: true });
+				writeToolEffectSession(dirs, "source-tool-effect", true);
+			},
+		);
+
+		expect(result.code).toBe(1);
+		const forkPath = findSessionWithId(result.sessionDir, "recovered-fork");
+		if (!forkPath) throw new Error("Expected recovered fork session");
+		const forkEntries = readFileSync(forkPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { type?: string; message?: ToolResultMessage });
+		expect(
+			forkEntries.some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message?.role === "toolResult" &&
+					entry.message.toolCallId === "call-fork" &&
+					entry.message.content.some(
+						(content) => content.type === "text" && content.text === "external write complete",
+					),
+			),
+		).toBe(true);
+	});
+
+	it("blocks a fork when the source tool outcome is unknown", async () => {
+		const result = await runCli(
+			(dirs) => [
+				"--session-dir",
+				dirs.sessionDir,
+				"--fork",
+				"source-unknown-effect",
+				"--session-id",
+				"blocked-fork",
+				"-p",
+				"hi",
+			],
+			(dirs) => {
+				mkdirSync(dirs.sessionDir, { recursive: true });
+				writeToolEffectSession(dirs, "source-unknown-effect", false);
+			},
+		);
+
+		expect(result.code).toBe(1);
+		expect(result.stderr).toContain("outcomes are unknown");
+		expect(findSessionWithId(result.sessionDir, "blocked-fork")).toBeUndefined();
 	});
 });
 

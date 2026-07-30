@@ -1,6 +1,9 @@
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
-import { ChunkRequest } from "@earendil-works/pi-coding-agent/pi-server-request";
+import {
+	ChunkRequest,
+	readPiServerResponseJson,
+} from "@earendil-works/pi-coding-agent/pi-server-request";
 
 function addDirectoryEntries(root, directory, entries) {
 	const path = relative(root, directory).split(sep).join("/");
@@ -39,7 +42,10 @@ export async function runPiClientSend(args) {
 		authToken: process.env.PI_SERVER_AUTH_TOKEN ?? "",
 	});
 	const response = await request.postJson("/api/receive", createUploadBody(args[0]));
-	const body = await response.json();
+	const body = await readPiServerResponseJson(response);
+	if (typeof body !== "object" || body === null || Array.isArray(body)) {
+		throw new Error("pi-client send failed: pi-server returned an invalid JSON response");
+	}
 	if (!response.ok) {
 		console.error(`pi-client send failed (${response.status}): ${body.error ?? response.statusText}`);
 		return 1;

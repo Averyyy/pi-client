@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -23,10 +24,12 @@ import type {
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
+	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
+	Api,
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
@@ -101,11 +104,25 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import {
+	acknowledgePiServerCompaction,
+	acknowledgePiServerRunMessage,
+	acquirePiServerSessionLease,
 	compactPiServer,
+	getPiServerRunDiagnostic,
 	type PiServerCompactionResult,
 	type PiServerHistorySnapshot,
+	recordPiServerCompactionApplied,
+	recoverPendingPiServerCompaction,
+	releasePiServerRunLease,
+	releasePiServerSessionLease,
 	syncPiServerTree,
 } from "./pi-server-client.ts";
+import { getPiServerCompactStatePath, readPiServerPendingCompact } from "./pi-server-compact-state.ts";
+import {
+	assertPiServerProviderExecution,
+	type PiServerProviderExecutionPreflight,
+} from "./pi-server-provider-execution.ts";
+import { getPiServerRunStatePath, readPiServerPendingRun } from "./pi-server-run-state.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type {
@@ -120,6 +137,14 @@ import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import {
+	beginSessionToolEffect,
+	beginSessionToolEffectFinalization,
+	commitSessionToolEffect,
+	recoverToolEffects,
+	writeSessionToolEffectFinalResult,
+	writeSessionToolEffectResult,
+} from "./tool-effect-journal.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
@@ -224,6 +249,8 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
+	/** Provider stream used for summaries and titles that must not mutate the main durable run. */
+	auxiliaryStreamFunction?: StreamFn;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
@@ -340,13 +367,28 @@ function getStringField(input: unknown, key: string): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-function getPiServerFailurePhase(message: AssistantMessage): string | undefined {
+function getPiServerFailureMetadata(
+	message: AssistantMessage,
+): { phase: string | undefined; retryable: boolean | undefined } | undefined {
 	for (const diagnostic of message.diagnostics ?? []) {
 		if (diagnostic.type !== "pi_server_failure") continue;
 		const phase = diagnostic.details?.phase;
-		if (typeof phase === "string") return phase;
+		const retryable = diagnostic.details?.retryable;
+		return {
+			phase: typeof phase === "string" ? phase : undefined,
+			retryable: typeof retryable === "boolean" ? retryable : undefined,
+		};
 	}
 	return undefined;
+}
+
+function isPiServerControlPlaneFailure(message: AssistantMessage): boolean {
+	const hasFailure = message.diagnostics?.some((diagnostic) => diagnostic.type === "pi_server_failure") === true;
+	return hasFailure && getPiServerRunDiagnostic(message) === undefined;
+}
+
+function isPiServerRestartUncertainty(message: AssistantMessage): boolean {
+	return getPiServerRunDiagnostic(message)?.restartUnknown === true;
 }
 
 function toolTextContent(content: Array<TextContent | ImageContent>): string {
@@ -418,6 +460,7 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _toolResultsInFinalization = new WeakSet<AgentMessage>();
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -431,6 +474,7 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _lastServerCompactionTimestamp: number | undefined = undefined;
+	private _piServerSessionLeaseOwner: symbol | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -468,6 +512,7 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 	private _autoSessionNameEnabled: boolean;
 	private _autoSessionNameAttempted = false;
+	private _auxiliaryStreamFunction: StreamFn | undefined;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -491,6 +536,7 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
+		this._auxiliaryStreamFunction = config.auxiliaryStreamFunction;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -498,6 +544,11 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._autoSessionNameEnabled = config.autoSessionName ?? true;
+
+		const toolEffectRecovery = recoverToolEffects(this.sessionManager);
+		if (toolEffectRecovery.recoveredToolCallIds.length > 0) {
+			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		}
 
 		if (isPiServerMode()) {
 			this._detachPiServerTerminalAssistantFailure();
@@ -519,6 +570,10 @@ export class AgentSession {
 		return this._modelRuntime;
 	}
 
+	private _getAuxiliaryStreamFunction(): StreamFn {
+		return this._auxiliaryStreamFunction ?? this.agent.streamFunction;
+	}
+
 	reconcilePiServerHistory(snapshot: PiServerHistorySnapshot): void {
 		this.sessionManager.replaceTree(snapshot.entries as unknown as SessionEntry[], snapshot.leafId);
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -528,6 +583,128 @@ export class AgentSession {
 			entryCount: snapshot.entries.length,
 			messageCount: snapshot.messages.length,
 		});
+	}
+
+	private async _syncAndAcknowledgePiServerAssistantMessage(
+		message: AssistantMessage,
+		signal: AbortSignal,
+	): Promise<void> {
+		const persistenceSignal = signal.aborted ? undefined : signal;
+		const sessionFile = this.sessionManager.getSessionFile();
+		const runStatePath = sessionFile ? getPiServerRunStatePath(sessionFile) : undefined;
+		try {
+			await syncPiServerTree(
+				this.sessionId,
+				{
+					systemPrompt: this.systemPrompt,
+					messages: this.agent.state.messages as Message[],
+					tools: this.agent.state.tools,
+				},
+				{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+				{
+					signal: persistenceSignal,
+					onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
+				},
+			);
+
+			this.sessionManager.flushSessionFile();
+			await acknowledgePiServerRunMessage(this.sessionId, message, runStatePath, persistenceSignal);
+		} catch (error) {
+			releasePiServerRunLease(this.sessionId, runStatePath);
+			throw error;
+		}
+	}
+
+	private _acquirePiServerOperationLease(reentrantOwner?: symbol): {
+		path: string | undefined;
+		acquired: boolean;
+		owner: symbol | undefined;
+	} {
+		if (!isPiServerMode()) return { path: undefined, acquired: false, owner: undefined };
+		const sessionFile = this.sessionManager.getSessionFile();
+		const path = sessionFile ? getPiServerRunStatePath(sessionFile) : undefined;
+		if (this._piServerSessionLeaseOwner) {
+			if (reentrantOwner !== this._piServerSessionLeaseOwner) {
+				throw new Error(`Cannot start a concurrent durable pi-server operation for session ${this.sessionId}`);
+			}
+			return { path, acquired: false, owner: this._piServerSessionLeaseOwner };
+		}
+		const owner = Symbol("pi-server-session-lease");
+		if (path) acquirePiServerSessionLease(this.sessionId, path);
+		this._piServerSessionLeaseOwner = owner;
+		return { path, acquired: true, owner };
+	}
+
+	private _releasePiServerOperationLease(
+		path: string | undefined,
+		acquired: boolean,
+		owner: symbol | undefined,
+	): void {
+		if (!acquired) return;
+		if (!owner || this._piServerSessionLeaseOwner !== owner) {
+			throw new Error(`Cannot release a durable pi-server operation lease owned by another operation`);
+		}
+		if (path) releasePiServerSessionLease(this.sessionId, path);
+		this._piServerSessionLeaseOwner = undefined;
+	}
+
+	private async _recoverPendingPiServerRunBeforeControlOperation(signal?: AbortSignal): Promise<void> {
+		if (!isPiServerMode()) return;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Durable pi-server operations require a persisted session file");
+		}
+		const runStatePath = getPiServerRunStatePath(sessionFile);
+		const pending = readPiServerPendingRun(runStatePath);
+		if (!pending) return;
+		let terminal: AssistantMessage | undefined;
+		const entries = this.sessionManager.getEntries();
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const message = entry.message as AssistantMessage;
+			const diagnostic = getPiServerRunDiagnostic(message);
+			if (!diagnostic || diagnostic.runId !== pending.runId) continue;
+			if (
+				diagnostic.sessionId !== pending.sessionId ||
+				diagnostic.requestMac !== pending.requestHash ||
+				pending.sessionId !== this.sessionId
+			) {
+				throw new Error("Pending pi-server run terminal does not match its durable client marker");
+			}
+			terminal = message;
+			break;
+		}
+		if (!terminal) {
+			throw new Error(
+				`Cannot start compaction while pi-server run ${pending.runId} is pending without a durable terminal assistant`,
+			);
+		}
+		await this._syncAndAcknowledgePiServerAssistantMessage(terminal, signal ?? new AbortController().signal);
+	}
+
+	private async _recoverPendingPiServerCompaction(
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
+		signal?: AbortSignal,
+	): Promise<CompactionResult | undefined> {
+		if (!isPiServerMode()) return undefined;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile) return undefined;
+		const compactStatePath = getPiServerCompactStatePath(sessionFile);
+		if (!readPiServerPendingCompact(compactStatePath)) return undefined;
+		const result = await recoverPendingPiServerCompaction(
+			this.sessionId,
+			{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+			compactStatePath,
+			{ signal },
+		);
+		if (!result) return undefined;
+		return this._applyPiServerCompactionResult(result, reason, willRetry);
+	}
+
+	private _assertPiServerProviderExecution(model: Model<Api>): PiServerProviderExecutionPreflight {
+		return assertPiServerProviderExecution(this._modelRuntime, model, this._extensionRunner);
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -569,7 +746,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
-		if (this.agent.streamFunction === streamSimple) {
+		if (this._getAuxiliaryStreamFunction() === streamSimple) {
 			return this._getRequiredRequestAuth(model);
 		}
 
@@ -800,12 +977,8 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
-		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
-		} finally {
-			this._resolveIdleWaitIfIdle();
-		}
+		await this._extensionRunner.emit({ type: "agent_settled" });
+		this._emit({ type: "agent_settled" });
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -813,6 +986,28 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
+		if (event.type === "tool_execution_start") {
+			beginSessionToolEffect(this.sessionManager, event);
+		} else if (event.type === "tool_execution_end") {
+			writeSessionToolEffectResult(this.sessionManager, event.toolResult, { finalizationPending: true });
+			this._toolResultsInFinalization.add(event.toolResult);
+		} else if (
+			event.type === "message_start" &&
+			event.message.role === "toolResult" &&
+			!this._toolResultsInFinalization.has(event.message)
+		) {
+			beginSessionToolEffectFinalization(this.sessionManager, event.message);
+			this._toolResultsInFinalization.add(event.message);
+		} else if (
+			event.type === "message_end" &&
+			event.message.role === "toolResult" &&
+			!this._toolResultsInFinalization.has(event.message)
+		) {
+			beginSessionToolEffectFinalization(this.sessionManager, event.message);
+			this._toolResultsInFinalization.add(event.message);
+		}
+		const finalizingToolResult = event.type === "message_end" && this._toolResultsInFinalization.has(event.message);
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -841,6 +1036,14 @@ export class AgentSession {
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
+		if (finalizingToolResult) {
+			if (event.message.role !== "toolResult") {
+				throw new Error("A toolResult message_end replacement must remain a toolResult");
+			}
+			writeSessionToolEffectFinalResult(this.sessionManager, event.message);
+			this._toolResultsInFinalization.delete(event.message);
+		}
+
 		// Handle session persistence
 		if (event.type === "message_end") {
 			// Check if this is a custom message from extensions
@@ -858,7 +1061,11 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const sessionEntryId = this.sessionManager.appendMessage(event.message);
+				if (event.message.role === "toolResult") {
+					this.sessionManager.flushSessionFile();
+					commitSessionToolEffect(this.sessionManager, event.message, sessionEntryId);
+				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -882,17 +1089,12 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 
-				if (isPiServerMode() && !this._isTerminalAssistantFailure(assistantMsg)) {
-					await syncPiServerTree(
-						this.sessionId,
-						{
-							systemPrompt: this.systemPrompt,
-							messages: this.agent.state.messages as Message[],
-							tools: this.agent.state.tools,
-						},
-						{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						{ signal, onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot) },
-					);
+				if (
+					isPiServerMode() &&
+					!this._isPostAssistantPiServerSyncFailure(assistantMsg) &&
+					!isPiServerControlPlaneFailure(assistantMsg)
+				) {
+					await this._syncAndAcknowledgePiServerAssistantMessage(assistantMsg, signal);
 				}
 			}
 		}
@@ -1180,7 +1382,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this._piServerSessionLeaseOwner;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1360,9 +1562,14 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		if (isPiServerMode() && this.model) {
+			this._assertPiServerProviderExecution(this.model);
+		}
+		const piServerLease = this._acquirePiServerOperationLease();
 		this._resetValidationHintState();
 		this._isAgentRunActive = true;
 		try {
+			await this._recoverPendingPiServerCompaction("threshold", false);
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				try {
@@ -1383,9 +1590,14 @@ export class AgentSession {
 			}
 			await this._maybeGenerateSessionName();
 		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			try {
+				this._systemPromptOverride = undefined;
+				this._flushPendingBashMessages();
+				await this._emitAgentSettled();
+			} finally {
+				this._releasePiServerOperationLease(piServerLease.path, piServerLease.acquired, piServerLease.owner);
+				this._resolveIdleWaitIfIdle();
+			}
 		}
 	}
 
@@ -1422,7 +1634,7 @@ export class AgentSession {
 		if (!model || !transcript) return;
 
 		try {
-			const stream = await this.agent.streamFunction(
+			const stream = await this._getAuxiliaryStreamFunction()(
 				model,
 				{
 					systemPrompt: this.systemPrompt,
@@ -1438,7 +1650,7 @@ export class AgentSession {
 				{
 					maxTokens: 32,
 					reasoning: undefined,
-					sessionId: this.sessionId,
+					sessionId: randomUUID(),
 					transport: this.agent.transport,
 					thinkingBudgets: this.agent.thinkingBudgets,
 					maxRetryDelayMs: this.agent.maxRetryDelayMs,
@@ -1567,6 +1779,9 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
+			if (isPiServerMode()) {
+				this._assertPiServerProviderExecution(this.model);
+			}
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
 				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
@@ -2176,9 +2391,34 @@ export class AgentSession {
 		reason: "manual" | "threshold" | "overflow",
 		willRetry: boolean,
 	): Promise<CompactionResult> {
-		this.sessionManager.replaceTree(result.entries as unknown as SessionEntry[], result.leafId);
+		const compactionEntry = result.compactionEntry as CompactionEntry & {
+			piServerCompactOperation?: {
+				baseEntryCount?: unknown;
+				baseLeafId?: unknown;
+				baseTreeHash?: unknown;
+			};
+		};
+		const operation = compactionEntry.piServerCompactOperation;
+		if (
+			!operation ||
+			!Number.isSafeInteger(operation.baseEntryCount) ||
+			(operation.baseEntryCount as number) < 0 ||
+			(operation.baseLeafId !== null &&
+				(typeof operation.baseLeafId !== "string" || operation.baseLeafId.length === 0)) ||
+			typeof operation.baseTreeHash !== "string" ||
+			!/^[a-f0-9]{64}$/u.test(operation.baseTreeHash)
+		) {
+			throw new Error("Pi-server compaction result is missing a valid durable base identity");
+		}
+		this.sessionManager.appendCompactionEntry(compactionEntry, {
+			baseEntryCount: operation.baseEntryCount as number,
+			baseLeafId: operation.baseLeafId as string | null,
+			baseTreeHash: operation.baseTreeHash,
+		});
+		recordPiServerCompactionApplied(result);
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
+		await acknowledgePiServerCompaction(result);
 		const firstKeptEntryId = result.compaction.firstKeptEntryId;
 		if (!firstKeptEntryId) {
 			throw new Error("Pi-server compaction result is missing firstKeptEntryId");
@@ -2201,7 +2441,7 @@ export class AgentSession {
 			await this._extensionRunner.emit({
 				type: "session_compact",
 				compactionEntry: savedCompactionEntry,
-				fromExtension: false,
+				fromExtension: savedCompactionEntry.fromHook === true,
 				reason,
 				willRetry,
 			});
@@ -2216,12 +2456,36 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
+		const piServerExecution =
+			isPiServerMode() && this.model ? this._assertPiServerProviderExecution(this.model) : undefined;
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
+		let piServerLease: { path: string | undefined; acquired: boolean; owner: symbol | undefined } = {
+			path: undefined,
+			acquired: false,
+			owner: undefined,
+		};
 
 		try {
+			piServerLease = this._acquirePiServerOperationLease();
+			await this._recoverPendingPiServerRunBeforeControlOperation(this._compactionAbortController.signal);
+			const recoveredCompaction = await this._recoverPendingPiServerCompaction(
+				"manual",
+				false,
+				this._compactionAbortController.signal,
+			);
+			if (recoveredCompaction) {
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result: recoveredCompaction,
+					aborted: false,
+					willRetry: false,
+				});
+				return recoveredCompaction;
+			}
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
@@ -2230,35 +2494,6 @@ export class AgentSession {
 
 			if (isPiServerMode()) {
 				this._detachPiServerTerminalAssistantFailure();
-				const piServerResult = await compactPiServer(
-					this.model,
-					{
-						systemPrompt: this.systemPrompt,
-						messages: this.agent.state.messages as Message[],
-						tools: this.agent.state.tools,
-					},
-					{
-						sessionId: this.sessionId,
-						apiKey,
-						headers,
-						customInstructions,
-						settings: this.settingsManager.getCompactionSettings(),
-						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						signal: this._compactionAbortController.signal,
-						reasoning: toProviderReasoning(this.thinkingLevel),
-						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
-					},
-				);
-				const result = await this._applyPiServerCompactionResult(piServerResult, "manual", false);
-				this._lastServerCompactionTimestamp = Date.now();
-				this._emit({
-					type: "compaction_end",
-					reason: "manual",
-					result,
-					aborted: false,
-					willRetry: false,
-				});
-				return result;
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
@@ -2298,6 +2533,48 @@ export class AgentSession {
 				}
 			}
 
+			if (isPiServerMode()) {
+				const sessionFile = this.sessionManager.getSessionFile();
+				if (!sessionFile) {
+					throw new Error("Durable pi-server compaction requires a persisted session file");
+				}
+				const piServerResult = await compactPiServer(
+					this.model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						env,
+						customInstructions,
+						settings,
+						preparation: { firstKeptEntryId: preparation.firstKeptEntryId },
+						extensionCompaction,
+						retry: this.settingsManager.getRetrySettings(),
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+						providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
+						piServerCompactStatePath: getPiServerCompactStatePath(sessionFile),
+						signal: this._compactionAbortController.signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
+					},
+				);
+				const result = await this._applyPiServerCompactionResult(piServerResult, "manual", false);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result,
+					aborted: false,
+					willRetry: false,
+				});
+				return result;
+			}
+
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2321,7 +2598,7 @@ export class AgentSession {
 					customInstructions,
 					this._compactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFunction,
+					this._getAuxiliaryStreamFunction(),
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
@@ -2387,6 +2664,7 @@ export class AgentSession {
 			});
 			throw error;
 		} finally {
+			this._releasePiServerOperationLease(piServerLease.path, piServerLease.acquired, piServerLease.owner);
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
 		}
@@ -2451,6 +2729,9 @@ export class AgentSession {
 		// but must not retry: the assistant answer already completed and agent.continue() cannot
 		// continue from an assistant message.
 		if (sameModel && isContextOverflow(assistantMessage, contextWindow)) {
+			if (isPiServerMode() && this.model) {
+				this._assertPiServerProviderExecution(this.model);
+			}
 			const willRetry = assistantMessage.stopReason !== "stop";
 
 			if (!willRetry) {
@@ -2513,6 +2794,9 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			if (isPiServerMode() && this.model) {
+				this._assertPiServerProviderExecution(this.model);
+			}
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -2528,51 +2812,38 @@ export class AgentSession {
 		preparationOptions?: CompactionPreparationOptions,
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const model = this.model;
+		const piServerExecution = isPiServerMode() && model ? this._assertPiServerProviderExecution(model) : undefined;
 		let started = false;
+		let piServerLease: { path: string | undefined; acquired: boolean; owner: symbol | undefined } = {
+			path: undefined,
+			acquired: false,
+			owner: undefined,
+		};
 
 		try {
-			if (!this.model) {
+			piServerLease = this._acquirePiServerOperationLease(
+				this._isAgentRunActive ? this._piServerSessionLeaseOwner : undefined,
+			);
+			if (!this._isAgentRunActive) {
+				await this._recoverPendingPiServerRunBeforeControlOperation();
+			}
+			const recoveredCompaction = await this._recoverPendingPiServerCompaction(reason, willRetry);
+			if (recoveredCompaction) {
+				this._emit({ type: "compaction_start", reason });
+				started = true;
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({ type: "compaction_end", reason, result: recoveredCompaction, aborted: false, willRetry });
+				return willRetry ? true : this.agent.hasQueuedMessages();
+			}
+			if (!model) {
 				return false;
 			}
 
 			let apiKey: string | undefined;
 			let headers: Record<string, string> | undefined;
 			let env: Record<string, string> | undefined;
-			if (this.agent.streamFunction === streamSimple) {
-				({ apiKey, headers, env } = await this._getRequiredRequestAuth(this.model));
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
-			}
-
-			if (isPiServerMode()) {
-				this._emit({ type: "compaction_start", reason });
-				this._autoCompactionAbortController = new AbortController();
-				started = true;
-				const signal = this._autoCompactionAbortController.signal;
-				const piServerResult = await compactPiServer(
-					this.model,
-					{
-						systemPrompt: this.systemPrompt,
-						messages: this.agent.state.messages as Message[],
-						tools: this.agent.state.tools,
-					},
-					{
-						sessionId: this.sessionId,
-						apiKey,
-						headers,
-						settings,
-						preparation: preparationOptions,
-						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						signal,
-						reasoning: toProviderReasoning(this.thinkingLevel),
-						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
-					},
-				);
-				const result = await this._applyPiServerCompactionResult(piServerResult, reason, willRetry);
-				this._lastServerCompactionTimestamp = Date.now();
-				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
-				return willRetry ? true : this.agent.hasQueuedMessages();
-			}
+			({ apiKey, headers, env } = await this._getSummarizationRequestAuth(model));
 
 			const pathEntries = this.sessionManager.getBranch();
 			const preparation = preparationOverride ?? prepareCompaction(pathEntries, settings);
@@ -2583,6 +2854,7 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+			const signal = this._autoCompactionAbortController.signal;
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -2595,7 +2867,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
-					signal: this._autoCompactionAbortController.signal,
+					signal,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
@@ -2615,6 +2887,41 @@ export class AgentSession {
 				}
 			}
 
+			if (isPiServerMode()) {
+				const sessionFile = this.sessionManager.getSessionFile();
+				if (!sessionFile) {
+					throw new Error("Durable pi-server compaction requires a persisted session file");
+				}
+				const piServerResult = await compactPiServer(
+					model,
+					{
+						systemPrompt: this.systemPrompt,
+						messages: this.agent.state.messages as Message[],
+						tools: this.agent.state.tools,
+					},
+					{
+						sessionId: this.sessionId,
+						apiKey,
+						headers,
+						env,
+						settings,
+						retry: this.settingsManager.getRetrySettings(),
+						preparation: preparationOptions ?? { firstKeptEntryId: preparation.firstKeptEntryId },
+						extensionCompaction,
+						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
+						providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
+						piServerCompactStatePath: getPiServerCompactStatePath(sessionFile),
+						signal,
+						reasoning: toProviderReasoning(this.thinkingLevel),
+						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
+					},
+				);
+				const result = await this._applyPiServerCompactionResult(piServerResult, reason, willRetry);
+				this._lastServerCompactionTimestamp = Date.now();
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				return willRetry ? true : this.agent.hasQueuedMessages();
+			}
+
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2632,13 +2939,13 @@ export class AgentSession {
 				// Generate compaction result
 				const compactResult = await compact(
 					preparation,
-					this.model,
+					model,
 					apiKey,
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFunction,
+					this._getAuxiliaryStreamFunction(),
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
@@ -2721,6 +3028,7 @@ export class AgentSession {
 			}
 			return false;
 		} finally {
+			this._releasePiServerOperationLease(piServerLease.path, piServerLease.acquired, piServerLease.owner);
 			this._autoCompactionAbortController = undefined;
 		}
 	}
@@ -2786,6 +3094,9 @@ export class AgentSession {
 
 		const settings = this.settingsManager.getCompactionSettings();
 		const markerParentId = this.sessionManager.getLeafId();
+		if (isPiServerMode() && this.model) {
+			this._assertPiServerProviderExecution(this.model);
+		}
 		const markerId = this._appendIntraTurnCompactionMarker();
 		const preparationOptions: CompactionPreparationOptions = { firstKeptEntryId: markerId };
 		const branchWithMarker = this.sessionManager.getBranch();
@@ -3221,8 +3532,10 @@ export class AgentSession {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
-		const piServerPhase = getPiServerFailurePhase(message);
-		if (piServerPhase && piServerPhase !== "provider_stream") return false;
+		if (isPiServerRestartUncertainty(message)) return false;
+		const piServerFailure = getPiServerFailureMetadata(message);
+		if (piServerFailure?.phase && piServerFailure.phase !== "provider_stream") return false;
+		if (piServerFailure?.retryable === false) return false;
 		if (message.errorMessage && this._isNonRetryableProviderLimitError(message.errorMessage)) return false;
 		return isRetryableAssistantError(message);
 	}
@@ -3499,6 +3812,9 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (isPiServerMode() && options.summarize && this.model) {
+			this._assertPiServerProviderExecution(this.model);
+		}
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
@@ -3539,6 +3855,7 @@ export class AgentSession {
 			label,
 		};
 
+		const piServerLease = this._acquirePiServerOperationLease();
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
 
@@ -3592,7 +3909,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
+					streamFn: this._getAuxiliaryStreamFunction(),
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});
@@ -3691,6 +4008,7 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
+			this._releasePiServerOperationLease(piServerLease.path, piServerLease.acquired, piServerLease.owner);
 			this._branchSummaryAbortController = undefined;
 		}
 	}

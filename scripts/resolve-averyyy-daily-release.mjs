@@ -15,13 +15,17 @@ if (args.selfTest) {
 	process.exit(0);
 }
 
-const outputs = args.event === "schedule" ? resolveScheduledRelease() : resolveRequestedRelease(args.releaseVersion);
+const outputs =
+	args.event === "schedule"
+		? resolveScheduledRelease()
+		: resolveRequestedRelease(args.releaseVersion, args.createRelease);
 writeOutputs(outputs);
 
 function parseArgs(argv) {
 	const parsed = {
 		event: process.env.GITHUB_EVENT_NAME ?? "",
 		releaseVersion: process.env.RELEASE_VERSION ?? "",
+		createRelease: process.env.CREATE_RELEASE === "true",
 		output: process.env.GITHUB_OUTPUT,
 		selfTest: false,
 	};
@@ -34,6 +38,8 @@ function parseArgs(argv) {
 			parsed.releaseVersion = requiredValue(argv[++i], arg);
 		} else if (arg === "--output") {
 			parsed.output = requiredValue(argv[++i], arg);
+		} else if (arg === "--create-release") {
+			parsed.createRelease = true;
 		} else if (arg === "--self-test") {
 			parsed.selfTest = true;
 		} else {
@@ -51,12 +57,12 @@ function requiredValue(value, flag) {
 	return value;
 }
 
-function resolveRequestedRelease(value) {
+function resolveRequestedRelease(value, createRelease = false) {
 	const version = normalizeVersion(value);
 	assertForkVersion(version);
 	return {
 		should_publish: "true",
-		create_release: "false",
+		create_release: String(createRelease),
 		release_version: version,
 		release_tag: `v${version}`,
 		latest_release_tag: "",
@@ -168,6 +174,8 @@ function run(command, commandArgs, options = {}) {
 
 function selfTest() {
 	assertEqual(normalizeVersion("v0.80.3-piclient.5"), "0.80.3-piclient.5");
+	assertEqual(resolveRequestedRelease("0.80.3-piclient.5").create_release, "false");
+	assertEqual(resolveRequestedRelease("0.80.3-piclient.5", true).create_release, "true");
 	assertEqual(basePiVersion({ version: "0.80.3-piclient.3", piClient: { basePiVersion: "0.80.3" } }), "0.80.3");
 	assertEqual(nextForkVersion("0.80.3", ["v0.80.3-piclient.4", "v0.80.3-piclient.5", "v0.80.2-piclient.9"], "0.80.3-piclient.3"), "0.80.3-piclient.6");
 	assertEqual(nextForkVersion("0.81.0", [], "0.81.0-piclient.0"), "0.81.0-piclient.1");

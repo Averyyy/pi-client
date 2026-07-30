@@ -15,9 +15,9 @@ class FullViewportContent implements Component {
 class CapturingVirtualTerminal extends VirtualTerminal {
 	private output = "";
 
-	override write(data: string): void {
+	override write(data: string): boolean {
 		this.output += data;
-		super.write(data);
+		return super.write(data);
 	}
 
 	getOutput(): string {
