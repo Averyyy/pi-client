@@ -30,6 +30,7 @@
 - Made session tree mutation and file receive retries idempotent while rejecting divergent duplicate IDs or destination contents.
 - Added per-filesystem-operation no-progress watchdogs for durable run persistence and a bounded CLI fatal-shutdown grace, without imposing a total provider-run deadline or retrying indeterminate writes.
 - Made compaction capacity admission exact and atomic before provider execution and journal settlement, serialized deletion against queued work, and enforced single-owner fail-stop persistence within and across processes.
+- Removed provider-execution fingerprint admission checks so established custom-provider pi-client sessions are accepted again.
 
 ### Changed
 

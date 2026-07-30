@@ -10,7 +10,7 @@
 - Made pi-server stream and compaction recovery use no-progress detection, bounded protocol frames, deterministic error classification, and configurable outage windows instead of short total deadlines.
 - Added session-wide process leases and durable tool-effect journals so crashes cannot duplicate provider or tool side effects; unknown tool outcomes now require an explicit `tool-effects mark-failed` or `accept-result` resolution.
 - Isolated naming and branch-summary provider calls from the durable main session, and restored native compaction hook, cancellation, replacement, and `fromExtension` behavior in pi-server mode.
-- Rejected client-only provider executors and provider hooks before auth, session mutation, or network I/O when pi-server cannot reproduce native Pi execution exactly.
+- Removed the speculative pi-server provider-execution guard that rejected established custom provider registrations and active provider hooks before remote execution.
 - Bounded streamed command output in memory while durably spooling the exact full output to a private temporary file when truncation is required.
 - Fixed interrupted tool execution recovery to journal exact results, fail closed on unknown external side effects, and provide explicit `tool-effects` resolution commands without re-executing tools.
 - Bounded long-running tool-effect journals with atomic integrity checkpoints that retain every unresolved effect and reject new side effects before unresolved count or byte limits are exceeded.

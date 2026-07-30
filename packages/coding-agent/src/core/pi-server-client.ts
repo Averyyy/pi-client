@@ -247,7 +247,6 @@ export interface PiServerStreamOptions extends SimpleStreamOptions {
 	sessionTree?: PiServerTreeSnapshot;
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
-	providerExecutionFingerprint?: string;
 	piServerRunStatePath?: string;
 	piServerRecoveryWindowMs?: number;
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
@@ -352,12 +351,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isNonNegativeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function validateProviderExecutionFingerprint(value: string | undefined): void {
-	if (value !== undefined && !/^[a-f0-9]{64}$/u.test(value)) {
-		throw new Error("pi-server provider execution fingerprint must be a lowercase SHA-256 digest");
-	}
 }
 
 export interface PiServerRunDiagnostic {
@@ -1446,7 +1439,6 @@ interface PiServerCompactRequestBody {
 	protocolVersion: number;
 	sessionId: string;
 	operationId: string;
-	providerExecutionFingerprint?: string;
 	model: Model<any>;
 	options: SimpleStreamOptions;
 	settings?: unknown;
@@ -1466,7 +1458,6 @@ export function hashPiServerCompactRequest(body: PiServerCompactRequestBody): st
 	const serialized = canonicalJsonStringify({
 		protocolVersion: body.protocolVersion,
 		sessionId: body.sessionId,
-		providerExecutionFingerprint: body.providerExecutionFingerprint,
 		model: body.model,
 		options: body.options,
 		settings: body.settings,
@@ -1494,7 +1485,6 @@ export interface PiServerCompactOptions extends SimpleStreamOptions {
 	extensionCompaction?: CompactResult;
 	retry?: RetryPolicy;
 	sessionTree?: PiServerTreeSnapshot;
-	providerExecutionFingerprint?: string;
 	piServerRecoveryWindowMs?: number;
 	piServerCompactStatePath?: string;
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
@@ -1879,7 +1869,6 @@ export async function compactPiServer(
 	context: Context,
 	options?: PiServerCompactOptions,
 ): Promise<PiServerCompactionResult> {
-	validateProviderExecutionFingerprint(options?.providerExecutionFingerprint);
 	const sessionId = options?.sessionId ?? "default";
 	const signal = options?.signal;
 	const recoveryWindowMs = getPiServerCompactRecoveryWindowMs(options?.piServerRecoveryWindowMs);
@@ -1929,7 +1918,6 @@ export async function compactPiServer(
 					protocolVersion: PI_SERVER_PROTOCOL_VERSION,
 					sessionId,
 					operationId,
-					providerExecutionFingerprint: options?.providerExecutionFingerprint,
 					model,
 					options: serializeOptions(options),
 					settings: options?.settings,
@@ -2520,7 +2508,6 @@ export async function streamPiServer(
 	context: Context,
 	options?: PiServerStreamOptions,
 ): Promise<PiServerEventStream> {
-	validateProviderExecutionFingerprint(options?.providerExecutionFingerprint);
 	const runMode = options?.runMode;
 	if (runMode === "auxiliary-transient" && options?.piServerRunStatePath) {
 		throw new Error("Auxiliary pi-server streams cannot use the main durable run-state path");
@@ -2873,7 +2860,6 @@ export async function streamPiServer(
 						runMode,
 						model,
 						options: serializeOptions(options),
-						providerExecutionFingerprint: options?.providerExecutionFingerprint,
 						ephemeralMessages: options?.ephemeralMessages,
 						contextOverlay: options?.contextOverlay,
 						baseTreeHash,

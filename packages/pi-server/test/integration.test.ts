@@ -2,9 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import { getCompatProviderExecutionRoute } from "@earendil-works/pi-ai/compat";
-import { hashRemoteProviderExecution } from "@earendil-works/pi-ai/provider-execution-node";
+import type { Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PI_SERVER_EMPTY_TREE_HASH } from "../src/pi-server-protocol.ts";
 import { createPiServer, type ServerConfig } from "../src/server.ts";
@@ -37,14 +35,6 @@ const streamModel: Model<"openai-completions"> = {
 	contextWindow: 1000,
 	maxTokens: 100,
 };
-
-function executionFingerprint(model: Model<Api>): string {
-	const route = getCompatProviderExecutionRoute(model);
-	if (route.kind !== "builtin_provider" && route.kind !== "builtin_api") {
-		throw new Error(`Test model ${model.provider}/${model.id} has unsupported route ${route.kind}`);
-	}
-	return hashRemoteProviderExecution(model, route);
-}
 
 describe("pi-server integration", () => {
 	let server: Server;
@@ -145,7 +135,6 @@ describe("pi-server integration", () => {
 				sessionId: "no-ctx-stream",
 				baseStaticContextHash: "",
 				baseRevision: 0,
-				providerExecutionFingerprint: executionFingerprint(streamModel),
 				model: streamModel,
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 			}),
@@ -169,7 +158,6 @@ describe("pi-server integration", () => {
 				baseTreeHash: PI_SERVER_EMPTY_TREE_HASH,
 				baseEntryCount: 0,
 				baseLeafId: null,
-				providerExecutionFingerprint: executionFingerprint(streamModel),
 				model: streamModel,
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 				staticContext: {

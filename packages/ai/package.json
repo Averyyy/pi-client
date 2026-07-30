@@ -19,10 +19,6 @@
 			"types": "./dist/compat.d.ts",
 			"import": "./dist/compat.js"
 		},
-		"./provider-execution-node": {
-			"types": "./dist/provider-execution-node.d.ts",
-			"import": "./dist/provider-execution-node.js"
-		},
 		"./providers/*": {
 			"types": "./dist/providers/*.d.ts",
 			"import": "./dist/providers/*.js"

@@ -34,6 +34,7 @@
 - Treat terminal output backpressure as flow control: each TUI render must be one complete synchronized-output frame, stop after the first `write()` false, retain only the latest requested render state until `drain`, coalesce repeating direct controls, and best-effort end synchronized output during stop, fatal render errors, process exit, and termination signals.
 - Keep forced TUI redraws as pending intent until the replacement frame is accepted, and bound deferred non-render terminal writes explicitly; neither path may destroy committed cursor state or keep writing after stdout backpressure.
 - When replaying OpenAI Responses history after a tool changes representation, keep `call_id` as the tool-call/output pairing key and omit the optional item `id` unless its prefix matches the serialized item type: `fc_*` for `function_call`, `ctc_*` for `custom_tool_call`.
+- Do not add speculative provider-execution fingerprints or reject custom `ProviderConfig.streamSimple` registrations or provider hooks in pi-server mode. Preserve the established remote stream path unless an executor is explicitly serialized and executed server-side.
 
 ## pi-client / pi-server Request Sync
 

@@ -2,14 +2,13 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { PrepareNextTurnContext, SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	type Model,
 	type SimpleStreamOptions,
-	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -20,7 +19,6 @@ import {
 	PI_SERVER_EMPTY_TREE_HASH,
 	PI_SERVER_PROTOCOL_VERSION,
 } from "../src/core/pi-server-protocol.ts";
-import { assertPiServerProviderExecution } from "../src/core/pi-server-provider-execution.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
@@ -256,7 +254,7 @@ describe("createAgentSession stream options", () => {
 		}
 	});
 
-	it("applies the credential-scoped baseUrl to the pi-server request model", async () => {
+	it("allows a custom provider executor and applies the credential-scoped baseUrl to pi-server", async () => {
 		const model = createModel("openai-completions");
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
@@ -264,6 +262,7 @@ describe("createAgentSession stream options", () => {
 		modelRegistry.registerProvider(model.provider, {
 			api: model.api,
 			baseUrl: model.baseUrl,
+			streamSimple: () => createDoneStream(model.api),
 			models: [
 				{
 					id: model.id,
@@ -277,10 +276,6 @@ describe("createAgentSession stream options", () => {
 			],
 		});
 		const modelRuntime = getModelRuntime(modelRegistry);
-		const expectedProviderExecutionFingerprint = assertPiServerProviderExecution(
-			modelRuntime,
-			model,
-		).providerExecutionFingerprint;
 		vi.spyOn(modelRuntime, "getAuth").mockResolvedValue({
 			auth: {
 				apiKey: "credential-api-key",
@@ -288,8 +283,6 @@ describe("createAgentSession stream options", () => {
 			},
 		});
 		let requestModel: Record<string, unknown> | undefined;
-		let providerExecutionFingerprint: unknown;
-		let compactProviderExecutionFingerprint: unknown;
 		let serverEntries: SessionTreeEntry[] = [];
 		let serverLeafId: string | null = null;
 		let serverStaticContextHash = "";
@@ -303,7 +296,6 @@ describe("createAgentSession stream options", () => {
 				const body = JSON.parse((init?.body as string | undefined) ?? "{}") as Record<string, unknown>;
 				if (url.endsWith("/api/stream")) {
 					requestModel = body.model as Record<string, unknown>;
-					providerExecutionFingerprint = body.providerExecutionFingerprint;
 					streamRunId = body.runId as string;
 					const { eventCursor: _eventCursor, runId: _runId, ...requestIdentity } = body;
 					const serializedIdentity = canonicalJsonStringify(requestIdentity);
@@ -343,7 +335,6 @@ describe("createAgentSession stream options", () => {
 					);
 				}
 				if (url.endsWith("/api/session/compact")) {
-					compactProviderExecutionFingerprint = body.providerExecutionFingerprint;
 					const requestHash = hashPiServerCompactRequest(
 						body as unknown as Parameters<typeof hashPiServerCompactRequest>[0],
 					);
@@ -415,162 +406,7 @@ describe("createAgentSession stream options", () => {
 			id: model.id,
 			baseUrl: "https://credential-endpoint.invalid/v1",
 		});
-		expect(providerExecutionFingerprint).toBe(expectedProviderExecutionFingerprint);
-		expect(compactProviderExecutionFingerprint).toBe(expectedProviderExecutionFingerprint);
 		expect(model.baseUrl).toBe("https://capture.invalid/v1");
-	});
-
-	it("rejects a custom provider executor before auth or pi-server network I/O", async () => {
-		const model = createModel("openai-completions");
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
-		modelRegistry.registerProvider(model.provider, {
-			api: model.api,
-			streamSimple: () => createDoneStream(model.api),
-			models: [
-				{
-					id: model.id,
-					name: model.name,
-					reasoning: model.reasoning,
-					input: model.input,
-					cost: model.cost,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-					baseUrl: model.baseUrl,
-				},
-			],
-		});
-		const modelRuntime = getModelRuntime(modelRegistry);
-		process.env.PI_SERVER_MODE = "true";
-		const settingsManager = SettingsManager.inMemory({
-			compaction: { enabled: true, reserveTokens: 1000 },
-		});
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			model,
-			modelRuntime,
-			settingsManager,
-			sessionManager: SessionManager.inMemory(cwd),
-		});
-		const getAuth = vi.spyOn(modelRuntime, "getAuth");
-		const fetchMock = vi.fn();
-		vi.stubGlobal("fetch", fetchMock);
-		const sessionEvents: string[] = [];
-		session.subscribe((event) => sessionEvents.push(event.type));
-		const entryCount = session.sessionManager.getEntries().length;
-
-		try {
-			await expect(session.agent.streamFunction(model, { messages: [] })).rejects.toThrow(
-				"mode=provider_config_stream_simple",
-			);
-			await expect(session.prompt("must not be persisted")).rejects.toThrow("mode=provider_config_stream_simple");
-			await expect(session.compact()).rejects.toThrow("mode=provider_config_stream_simple");
-
-			const assistant: AssistantMessage = {
-				role: "assistant",
-				content: [],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "toolUse",
-				timestamp: Date.now(),
-			};
-			const toolResult: ToolResultMessage = {
-				role: "toolResult",
-				toolCallId: "large-tool-result",
-				toolName: "read",
-				content: [{ type: "text", text: "x".repeat(600_000) }],
-				isError: false,
-				timestamp: Date.now(),
-			};
-			const prepareNextTurn = session.agent.prepareNextTurnWithContext;
-			if (!prepareNextTurn) throw new Error("prepareNextTurnWithContext was not installed");
-			const nextTurn: PrepareNextTurnContext = {
-				message: assistant,
-				toolResults: [toolResult],
-				context: { systemPrompt: "", messages: [assistant, toolResult], tools: [] },
-				newMessages: [assistant, toolResult],
-			};
-			await expect(prepareNextTurn(nextTurn)).rejects.toThrow("mode=provider_config_stream_simple");
-
-			expect(getAuth).not.toHaveBeenCalled();
-			expect(fetchMock).not.toHaveBeenCalled();
-			expect(sessionEvents).not.toContain("compaction_start");
-			expect(session.sessionManager.getEntries()).toHaveLength(entryCount);
-		} finally {
-			session.dispose();
-			modelRegistry.unregisterProvider(model.provider);
-		}
-	});
-
-	it("rejects active provider hooks before auth, hook execution, or pi-server network I/O", async () => {
-		const extensionsDir = join(agentDir, "extensions");
-		mkdirSync(extensionsDir, { recursive: true });
-		writeFileSync(
-			join(extensionsDir, "provider-hooks.ts"),
-			`export default function (pi) {
-				pi.on("before_provider_request", () => { throw new Error("hook executed"); });
-				pi.on("before_provider_headers", () => { throw new Error("hook executed"); });
-				pi.on("after_provider_response", () => { throw new Error("hook executed"); });
-			}`,
-		);
-		const model = createModel("openai-completions");
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
-		modelRegistry.registerProvider(model.provider, {
-			api: model.api,
-			baseUrl: model.baseUrl,
-			models: [
-				{
-					id: model.id,
-					name: model.name,
-					reasoning: model.reasoning,
-					input: model.input,
-					cost: model.cost,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-				},
-			],
-		});
-		const modelRuntime = getModelRuntime(modelRegistry);
-		process.env.PI_SERVER_MODE = "true";
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			model,
-			modelRuntime,
-			settingsManager: SettingsManager.inMemory({}),
-			sessionManager: SessionManager.inMemory(cwd),
-		});
-		const getAuth = vi.spyOn(modelRuntime, "getAuth");
-		const fetchMock = vi.fn();
-		vi.stubGlobal("fetch", fetchMock);
-		const sessionEvents: string[] = [];
-		session.subscribe((event) => sessionEvents.push(event.type));
-
-		try {
-			await expect(session.agent.streamFunction(model, { messages: [] })).rejects.toThrow(
-				"before_provider_request, before_provider_headers, after_provider_response",
-			);
-			await expect(session.compact()).rejects.toThrow(
-				"before_provider_request, before_provider_headers, after_provider_response",
-			);
-			expect(getAuth).not.toHaveBeenCalled();
-			expect(fetchMock).not.toHaveBeenCalled();
-			expect(sessionEvents).not.toContain("compaction_start");
-		} finally {
-			session.dispose();
-			modelRegistry.unregisterProvider(model.provider);
-		}
 	});
 
 	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {

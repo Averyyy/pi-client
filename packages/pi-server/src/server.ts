@@ -25,8 +25,7 @@ import {
 	type SimpleStreamOptions,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { getCompatProviderExecutionRoute, streamSimple } from "@earendil-works/pi-ai/compat";
-import { hashRemoteProviderExecution } from "@earendil-works/pi-ai/provider-execution-node";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
@@ -106,7 +105,6 @@ interface StreamRequestBody {
 	runId?: string;
 	eventCursor?: number;
 	runMode?: "main-durable" | "auxiliary-transient";
-	providerExecutionFingerprint?: string;
 	baseStaticContextHash?: string;
 	baseRevision?: number;
 	baseTreeHash?: string;
@@ -146,7 +144,6 @@ interface SessionTreeSwitchBody {
 interface SessionCompactBody {
 	protocolVersion: number;
 	sessionId: string;
-	providerExecutionFingerprint?: string;
 	model: Model<any>;
 	options?: SimpleStreamOptions;
 	settings?: CompactionSettings;
@@ -695,7 +692,6 @@ function hashStreamRequest(body: StreamRequestBody): string {
 		baseLeafId: body.baseLeafId,
 		model: body.model,
 		options: body.options,
-		providerExecutionFingerprint: body.providerExecutionFingerprint,
 		staticContext: body.staticContext,
 		ephemeralMessages: body.ephemeralMessages,
 		contextOverlay: body.contextOverlay,
@@ -730,7 +726,6 @@ function hashCompactRequest(body: SessionCompactBody): string {
 	const serialized = canonicalJsonStringify({
 		protocolVersion: body.protocolVersion,
 		sessionId: body.sessionId,
-		providerExecutionFingerprint: body.providerExecutionFingerprint,
 		model: body.model,
 		options: body.options,
 		settings: body.settings,
@@ -749,34 +744,6 @@ function hashCompactRequest(body: SessionCompactBody): string {
 		throw new Error("Failed to serialize pi-server compaction request");
 	}
 	return createHash("sha256").update(serialized).digest("hex");
-}
-
-function providerExecutionParityError(
-	model: Model<any> | undefined,
-	fingerprint: string | undefined,
-): string | undefined {
-	if (!model) return "model is required before provider execution parity can be verified";
-	if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(fingerprint)) {
-		return (
-			`providerExecutionFingerprint is required for ${model.provider}/${model.id}; ` +
-			"upgrade pi-client and pi-server together"
-		);
-	}
-	const route = getCompatProviderExecutionRoute(model);
-	if (route.kind !== "builtin_provider" && route.kind !== "builtin_api") {
-		return (
-			`pi-server cannot preserve provider execution parity for ${model.provider}/${model.id}: ` +
-			`server route is ${route.kind}; upgrade matching runtimes or use plain pi`
-		);
-	}
-	const expected = hashRemoteProviderExecution(model, route);
-	if (fingerprint !== expected) {
-		return (
-			`provider execution fingerprint mismatch for ${model.provider}/${model.id}; ` +
-			"pi-client/pi-server runtime versions or provider routes differ, so execution was rejected"
-		);
-	}
-	return undefined;
 }
 
 function createStreamErrorEvent(
@@ -2799,17 +2766,6 @@ async function handleSessionCompact(
 		return;
 	}
 	const requestHash = hashCompactRequest(body);
-	const parityError = providerExecutionParityError(body.model, body.providerExecutionFingerprint);
-	if (parityError) {
-		const response = createCompactFailureResponse(
-			{ sessionId: body.sessionId, operationId: body.operationId, requestHash },
-			409,
-			parityError,
-			"not_started",
-		);
-		sendJson(res, response.status, response.body);
-		return;
-	}
 	const action = await enqueueCompactSetup(runtime, async () => {
 		if (runtime.closing) return { kind: "closing" } as const;
 		await runtime.store.prune();
@@ -3402,11 +3358,6 @@ async function handleStream(
 		(typeof body.baseLeafId !== "string" || body.baseLeafId.length === 0)
 	) {
 		sendJson(res, 400, { error: "baseLeafId must be a non-empty string or null" });
-		return;
-	}
-	const parityError = providerExecutionParityError(body.model, body.providerExecutionFingerprint);
-	if (parityError) {
-		sendJson(res, 409, { error: parityError });
 		return;
 	}
 	const requestHash = hashStreamRequest(body);

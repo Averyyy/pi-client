@@ -18,7 +18,6 @@ import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { type PiServerHistorySnapshot, type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
-import { assertPiServerProviderExecution } from "./pi-server-provider-execution.ts";
 import { getPiServerRunStatePath } from "./pi-server-run-state.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
@@ -344,10 +343,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		(runMode: "main-durable" | "auxiliary-transient"): StreamFn =>
 		async (model, context, options) => {
 			const headerRunner = extensionRunnerRef.current;
-			const piServerExecution =
-				process.env.PI_SERVER_MODE === "true"
-					? assertPiServerProviderExecution(modelRuntime, model, headerRunner)
-					: undefined;
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -398,7 +393,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					sessionTree: piServerContext?.sessionTree,
 					ephemeralMessages: piServerContext?.ephemeralMessages,
 					contextOverlay: piServerContext?.contextOverlay,
-					providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
 					piServerRunStatePath: piServerSessionFile ? getPiServerRunStatePath(piServerSessionFile) : undefined,
 					onHistoryReconciled:
 						runMode === "main-durable" && activeAgentSession

@@ -25,14 +25,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type * as AiCompat from "@earendil-works/pi-ai/compat";
-import {
-	getCompatProviderExecutionRoute,
-	registerApiProvider,
-	registerFauxProvider,
-	resetApiProviders,
-} from "@earendil-works/pi-ai/compat";
-import { hashRemoteProviderExecution } from "@earendil-works/pi-ai/provider-execution-node";
+import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { canonicalJsonStringify, PI_SERVER_EMPTY_TREE_HASH } from "../src/pi-server-protocol.ts";
 import {
@@ -50,21 +43,6 @@ import {
 } from "../src/session-persistence.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 import { StreamRunCorruptionError, StreamRunPersistence } from "../src/stream-run-persistence.ts";
-
-vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
-	const actual = await importOriginal<typeof AiCompat>();
-	return {
-		...actual,
-		getCompatProviderExecutionRoute: vi.fn((model: Model<string>) =>
-			model.provider === "faux"
-				? {
-						kind: "builtin_api" as const,
-						id: model.api,
-					}
-				: actual.getCompatProviderExecutionRoute(model),
-		),
-	};
-});
 
 vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
 	const actual = await importOriginal<typeof AgentCore>();
@@ -159,19 +137,10 @@ function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
-function executionFingerprint(model: Model<Api>): string {
-	const route = getCompatProviderExecutionRoute(model);
-	if (route.kind !== "builtin_provider" && route.kind !== "builtin_api") {
-		throw new Error(`Test model ${model.provider}/${model.id} has unsupported route ${route.kind}`);
-	}
-	return hashRemoteProviderExecution(model, route);
-}
-
 function compactRequestHash(body: Record<string, unknown>): string {
 	const serialized = canonicalJsonStringify({
 		protocolVersion: body.protocolVersion,
 		sessionId: body.sessionId,
-		providerExecutionFingerprint: body.providerExecutionFingerprint,
 		model: body.model,
 		options: body.options,
 		settings: body.settings,
@@ -389,7 +358,6 @@ describe("pi-server HTTP", () => {
 			body: JSON.stringify({
 				sessionId,
 				runId,
-				providerExecutionFingerprint: executionFingerprint(model),
 				baseStaticContextHash: session.staticContextHash,
 				baseRevision: session.revision,
 				baseTreeHash: session.treeHash,
@@ -413,7 +381,6 @@ describe("pi-server HTTP", () => {
 			protocolVersion: 2,
 			sessionId,
 			operationId,
-			providerExecutionFingerprint: executionFingerprint(model),
 			baseStaticContextHash: session.staticContextHash,
 			baseTreeHash: session.treeHash,
 			baseEntryCount: session.entries.length,
@@ -1680,117 +1647,6 @@ describe("pi-server HTTP", () => {
 		expect(getSession("other-capacity-race")?.entries).toHaveLength(0);
 	});
 
-	it("rejects invalid compact execution fingerprints with not-started proof and no durable run", async () => {
-		const entries = [
-			{
-				type: "message" as const,
-				id: "u1",
-				parentId: null,
-				timestamp: "2026-01-01T00:00:00.000Z",
-				message: { role: "user" as const, content: "old", timestamp: 1000 },
-			},
-			{
-				type: "message" as const,
-				id: "u2",
-				parentId: "u1",
-				timestamp: "2026-01-01T00:00:01.000Z",
-				message: { role: "user" as const, content: "keep", timestamp: 2000 },
-			},
-		];
-		await fetch(`${baseUrl}/api/session/tree/sync`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer test-token",
-			},
-			body: JSON.stringify({ sessionId: "compact-provider-parity", entries, leafId: "u2" }),
-		});
-		const validFingerprint = executionFingerprint(compactTestModel);
-		const requests = [
-			createCompactRequest("compact-provider-parity", "compact-missing-fingerprint", compactTestModel, {
-				providerExecutionFingerprint: undefined,
-				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
-				preparation: { firstKeptEntryId: "u2" },
-			}),
-			createCompactRequest("compact-provider-parity", "compact-wrong-fingerprint", compactTestModel, {
-				providerExecutionFingerprint: "0".repeat(64),
-				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
-				preparation: { firstKeptEntryId: "u2" },
-			}),
-			createCompactRequest(
-				"compact-provider-parity",
-				"compact-model-mismatch",
-				{ ...compactTestModel, id: "different-model" },
-				{
-					providerExecutionFingerprint: validFingerprint,
-					settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
-					preparation: { firstKeptEntryId: "u2" },
-				},
-			),
-		];
-		const customRouteRequest = createCompactRequest(
-			"compact-provider-parity",
-			"compact-custom-route",
-			compactTestModel,
-			{
-				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
-				preparation: { firstKeptEntryId: "u2" },
-			},
-		);
-		const callCountBefore = vi.mocked(compactAgentCore).mock.calls.length;
-
-		for (const requestBody of requests) {
-			const response = await fetch(`${baseUrl}/api/session/compact`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: "Bearer test-token",
-				},
-				body: JSON.stringify(requestBody),
-			});
-			expect(response.status).toBe(409);
-			expect(await response.json()).toMatchObject({
-				protocolVersion: 2,
-				sessionId: "compact-provider-parity",
-				operationId: requestBody.operationId,
-				requestHash: compactRequestHash(requestBody),
-				status: "rejected",
-				operationDisposition: "not_started",
-			});
-		}
-
-		vi.mocked(getCompatProviderExecutionRoute).mockImplementationOnce(() => ({
-			kind: "custom_api",
-			id: compactTestModel.api,
-		}));
-		const customRoute = await fetch(`${baseUrl}/api/session/compact`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer test-token",
-			},
-			body: JSON.stringify(customRouteRequest),
-		});
-		expect(customRoute.status).toBe(409);
-		expect(await customRoute.json()).toMatchObject({
-			operationId: "compact-custom-route",
-			requestHash: compactRequestHash(customRouteRequest),
-			status: "rejected",
-			operationDisposition: "not_started",
-		});
-		expect(vi.mocked(compactAgentCore).mock.calls.length).toBe(callCountBefore);
-
-		for (const requestBody of [...requests, customRouteRequest]) {
-			const recovery = await fetch(
-				`${baseUrl}/api/session/compact-provider-parity/compactions/${String(
-					requestBody.operationId,
-				)}?requestHash=${compactRequestHash(requestBody)}`,
-				{ headers: { Authorization: "Bearer test-token" } },
-			);
-			expect(recovery.status).toBe(404);
-		}
-	});
-
 	it("returns one authoritative compact v2 entry and replays it for the same operation", async () => {
 		const entries = [
 			{
@@ -3044,7 +2900,6 @@ describe("pi-server HTTP", () => {
 				sessionId: "test-no-ctx",
 				baseStaticContextHash: "",
 				baseRevision: 0,
-				providerExecutionFingerprint: executionFingerprint(compactTestModel),
 				model: compactTestModel,
 				delta: [],
 			}),
@@ -3083,7 +2938,6 @@ describe("pi-server HTTP", () => {
 				baseTreeHash: heartbeatSession.treeHash,
 				baseEntryCount: heartbeatSession.entries.length,
 				baseLeafId: heartbeatSession.leafId,
-				providerExecutionFingerprint: executionFingerprint(heartbeatModel),
 				model: heartbeatModel,
 			}),
 		});
@@ -3311,7 +3165,6 @@ describe("pi-server HTTP", () => {
 			baseEntryCount: failedReplaySession.entries.length,
 			baseLeafId: failedReplaySession.leafId,
 			model: faux.models[0],
-			providerExecutionFingerprint: executionFingerprint(faux.models[0]),
 			options: { apiKey: "TOP_SECRET_TOKEN" },
 		};
 		const first = await fetch(`${baseUrl}/api/stream`, {
@@ -3500,7 +3353,6 @@ describe("pi-server HTTP", () => {
 				baseEntryCount: boundSession.entries.length,
 				baseLeafId: boundSession.leafId,
 				model: faux.models[0],
-				providerExecutionFingerprint: executionFingerprint(faux.models[0]),
 				options: { temperature: 0.75 },
 			}),
 		});
@@ -3520,18 +3372,14 @@ describe("pi-server HTTP", () => {
 		expect(faux.state.callCount).toBe(1);
 	});
 
-	it("binds a run id to the provider execution fingerprint but not the event cursor", async () => {
+	it("does not bind run replay identity to the event cursor", async () => {
 		const faux = registerFauxProvider();
-		faux.setResponses([fauxAssistantMessage("fingerprinted"), fauxAssistantMessage("must not run")]);
-		await initStreamSession("provider-fingerprint-binding");
-		const fingerprint = executionFingerprint(faux.models[0]);
-		const first = await postStream("provider-fingerprint-binding", "fingerprinted-run", faux.models[0], {
-			providerExecutionFingerprint: fingerprint,
-		});
+		faux.setResponses([fauxAssistantMessage("replayable"), fauxAssistantMessage("must not run")]);
+		await initStreamSession("event-cursor-binding");
+		const first = await postStream("event-cursor-binding", "replayable-run", faux.models[0]);
 		const firstEvents = await first.text();
-		const replay = await postStream("provider-fingerprint-binding", "fingerprinted-run", faux.models[0], {
+		const replay = await postStream("event-cursor-binding", "replayable-run", faux.models[0], {
 			eventCursor: 1,
-			providerExecutionFingerprint: fingerprint,
 		});
 		expect(replay.status).toBe(200);
 		expect((await replay.text()).split("\n").filter((line) => line.startsWith("data: "))).toEqual(
@@ -3540,78 +3388,6 @@ describe("pi-server HTTP", () => {
 				.filter((line) => line.startsWith("data: "))
 				.slice(1),
 		);
-
-		const conflict = await postStream("provider-fingerprint-binding", "fingerprinted-run", faux.models[0], {
-			providerExecutionFingerprint: "b".repeat(64),
-		});
-		expect(conflict.status).toBe(409);
-		expect(faux.state.callCount).toBe(1);
-	});
-
-	it("rejects missing, mismatched, model-mismatched, and custom stream execution routes before durable begin", async () => {
-		const faux = registerFauxProvider();
-		faux.setResponses([fauxAssistantMessage("valid execution")]);
-		const sessionId = "stream-provider-parity";
-		await initStreamSession(sessionId);
-		const session = getSession(sessionId);
-		if (!session) throw new Error("Provider parity session was not initialized");
-		const validFingerprint = hashRemoteProviderExecution(faux.models[0], {
-			kind: "builtin_api",
-			id: faux.models[0].api,
-		});
-		const post = (runId: string, model: Model<any>, providerExecutionFingerprint?: string) =>
-			fetch(`${baseUrl}/api/stream`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: "Bearer test-token",
-				},
-				body: JSON.stringify({
-					sessionId,
-					runId,
-					baseStaticContextHash: session.staticContextHash,
-					baseRevision: session.revision,
-					baseTreeHash: session.treeHash,
-					baseEntryCount: session.entries.length,
-					baseLeafId: session.leafId,
-					model,
-					providerExecutionFingerprint,
-				}),
-			});
-
-		const missing = await post("missing-fingerprint", faux.models[0]);
-		expect(missing.status).toBe(409);
-		const mismatched = await post("mismatched-fingerprint", faux.models[0], "0".repeat(64));
-		expect(mismatched.status).toBe(409);
-		const modelMismatched = await post(
-			"model-mismatched-fingerprint",
-			{ ...faux.models[0], id: `${faux.models[0].id}-different` },
-			validFingerprint,
-		);
-		expect(modelMismatched.status).toBe(409);
-		vi.mocked(getCompatProviderExecutionRoute).mockImplementationOnce(() => ({
-			kind: "custom_api",
-			id: faux.models[0].api,
-		}));
-		const customRoute = await post("custom-route", faux.models[0], validFingerprint);
-		expect(customRoute.status).toBe(409);
-		expect(faux.state.callCount).toBe(0);
-
-		for (const runId of [
-			"missing-fingerprint",
-			"mismatched-fingerprint",
-			"model-mismatched-fingerprint",
-			"custom-route",
-		]) {
-			const status = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}`, {
-				headers: { Authorization: "Bearer test-token" },
-			});
-			expect(status.status).toBe(404);
-		}
-
-		const valid = await post("valid-fingerprint", faux.models[0], validFingerprint);
-		expect(valid.status).toBe(200);
-		await valid.text();
 		expect(faux.state.callCount).toBe(1);
 	});
 
@@ -3666,7 +3442,6 @@ describe("pi-server HTTP", () => {
 				body: JSON.stringify({
 					sessionId,
 					runId: `${sessionId}-run`,
-					providerExecutionFingerprint: executionFingerprint(faux.models[0]),
 					baseStaticContextHash: "",
 					baseRevision: 0,
 					baseTreeHash: treeHash,

@@ -29,7 +29,6 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
-	Api,
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
@@ -118,10 +117,6 @@ import {
 	syncPiServerTree,
 } from "./pi-server-client.ts";
 import { getPiServerCompactStatePath, readPiServerPendingCompact } from "./pi-server-compact-state.ts";
-import {
-	assertPiServerProviderExecution,
-	type PiServerProviderExecutionPreflight,
-} from "./pi-server-provider-execution.ts";
 import { getPiServerRunStatePath, readPiServerPendingRun } from "./pi-server-run-state.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -701,10 +696,6 @@ export class AgentSession {
 		);
 		if (!result) return undefined;
 		return this._applyPiServerCompactionResult(result, reason, willRetry);
-	}
-
-	private _assertPiServerProviderExecution(model: Model<Api>): PiServerProviderExecutionPreflight {
-		return assertPiServerProviderExecution(this._modelRuntime, model, this._extensionRunner);
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -1562,9 +1553,6 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		if (isPiServerMode() && this.model) {
-			this._assertPiServerProviderExecution(this.model);
-		}
 		const piServerLease = this._acquirePiServerOperationLease();
 		this._resetValidationHintState();
 		this._isAgentRunActive = true;
@@ -1779,9 +1767,6 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			if (isPiServerMode()) {
-				this._assertPiServerProviderExecution(this.model);
-			}
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
 				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
@@ -2456,8 +2441,6 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
-		const piServerExecution =
-			isPiServerMode() && this.model ? this._assertPiServerProviderExecution(this.model) : undefined;
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -2556,7 +2539,6 @@ export class AgentSession {
 						extensionCompaction,
 						retry: this.settingsManager.getRetrySettings(),
 						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
 						piServerCompactStatePath: getPiServerCompactStatePath(sessionFile),
 						signal: this._compactionAbortController.signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
@@ -2729,9 +2711,6 @@ export class AgentSession {
 		// but must not retry: the assistant answer already completed and agent.continue() cannot
 		// continue from an assistant message.
 		if (sameModel && isContextOverflow(assistantMessage, contextWindow)) {
-			if (isPiServerMode() && this.model) {
-				this._assertPiServerProviderExecution(this.model);
-			}
 			const willRetry = assistantMessage.stopReason !== "stop";
 
 			if (!willRetry) {
@@ -2794,9 +2773,6 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			if (isPiServerMode() && this.model) {
-				this._assertPiServerProviderExecution(this.model);
-			}
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -2813,7 +2789,6 @@ export class AgentSession {
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		const model = this.model;
-		const piServerExecution = isPiServerMode() && model ? this._assertPiServerProviderExecution(model) : undefined;
 		let started = false;
 		let piServerLease: { path: string | undefined; acquired: boolean; owner: symbol | undefined } = {
 			path: undefined,
@@ -2909,7 +2884,6 @@ export class AgentSession {
 						preparation: preparationOptions ?? { firstKeptEntryId: preparation.firstKeptEntryId },
 						extensionCompaction,
 						sessionTree: { entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						providerExecutionFingerprint: piServerExecution?.providerExecutionFingerprint,
 						piServerCompactStatePath: getPiServerCompactStatePath(sessionFile),
 						signal,
 						reasoning: toProviderReasoning(this.thinkingLevel),
@@ -3094,9 +3068,6 @@ export class AgentSession {
 
 		const settings = this.settingsManager.getCompactionSettings();
 		const markerParentId = this.sessionManager.getLeafId();
-		if (isPiServerMode() && this.model) {
-			this._assertPiServerProviderExecution(this.model);
-		}
 		const markerId = this._appendIntraTurnCompactionMarker();
 		const preparationOptions: CompactionPreparationOptions = { firstKeptEntryId: markerId };
 		const branchWithMarker = this.sessionManager.getBranch();
@@ -3812,9 +3783,6 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		if (isPiServerMode() && options.summarize && this.model) {
-			this._assertPiServerProviderExecution(this.model);
-		}
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target

@@ -258,7 +258,6 @@ function compactRequestHash(body: JsonObject): string {
 	const serialized = canonicalJsonStringify({
 		protocolVersion: body.protocolVersion,
 		sessionId: body.sessionId,
-		providerExecutionFingerprint: body.providerExecutionFingerprint,
 		model: body.model,
 		options: body.options,
 		settings: body.settings,
@@ -3779,7 +3778,7 @@ describe("pi-server-client", () => {
 									status: "rejected",
 									httpStatus: status,
 									operationDisposition: "not_started",
-									error: "provider execution fingerprint rejected before operation begin",
+									error: "compaction rejected before operation begin",
 								}),
 								{
 									status,
@@ -3810,7 +3809,7 @@ describe("pi-server-client", () => {
 					{ systemPrompt: "You are helpful.", messages: [] },
 					{ sessionId, sessionTree: { entries, leafId: "u2" } },
 				),
-			).rejects.toThrow("provider execution fingerprint rejected");
+			).rejects.toThrow("compaction rejected");
 			expect(readPiServerPendingCompact(getCompactStatePathForTest(sessionId))).toBeUndefined();
 
 			const result = await compactPiServer(
