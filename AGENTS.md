@@ -31,6 +31,7 @@
 - Keep hot-path message/context transforms single-pass in shared code such as `convertToLlm()` and `buildSessionContext()`. Benchmark before keeping perf changes, and revert candidates that only move cost or improve one path while measurably regressing the common path.
 - Validation-aware tool-loop hints belong in transient next-turn context, not persisted session history: record edit/write paths and failed bash output from finalized tool results, inject one hidden `pi:validation-hint` before the next provider request, and de-dupe old hints each turn.
 - Keep TUI transcript rendering separate from model context projection: rebuild chat from the full active branch, render persisted compaction entries only once, and clear the working indicator only after `agent_settled`, restoring it after transient compaction or retry indicators while the session is still streaming.
+- When replaying OpenAI Responses history after a tool changes representation, keep `call_id` as the tool-call/output pairing key and omit the optional item `id` unless its prefix matches the serialized item type: `fc_*` for `function_call`, `ctc_*` for `custom_tool_call`.
 
 ## pi-client / pi-server Request Sync
 

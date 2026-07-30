@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed OpenAI Responses history replay when a tool changes between function and grammar/custom representations, preventing stale `fc_*` or `ctc_*` item IDs from making resumed sessions unrecoverable.
+
 ## [0.82.1] - 2026-07-25
 
 ### Added
