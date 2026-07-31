@@ -59,7 +59,8 @@ export type PiServerCompactAcknowledgementResolution =
 	| "server_ack"
 	| "server_missing_after_tree_applied"
 	| "server_missing_after_terminal_failure"
-	| "server_rejected_not_started";
+	| "server_rejected_not_started"
+	| "server_authoritative_missing";
 
 interface PiServerAcknowledgedCompactState extends PiServerCompactStateBase {
 	kind: "ack";
@@ -168,7 +169,8 @@ function parsePayload(payload: string, lineNumber: number): PiServerCompactState
 			value.resolution !== "server_ack" &&
 			value.resolution !== "server_missing_after_tree_applied" &&
 			value.resolution !== "server_missing_after_terminal_failure" &&
-			value.resolution !== "server_rejected_not_started"
+			value.resolution !== "server_rejected_not_started" &&
+			value.resolution !== "server_authoritative_missing"
 		) {
 			throw new Error(`pi-server compact state acknowledgement resolution is invalid at line ${lineNumber}`);
 		}

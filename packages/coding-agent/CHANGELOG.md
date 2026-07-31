@@ -14,9 +14,7 @@
 - Bounded streamed command output in memory while durably spooling the exact full output to a private temporary file when truncation is required.
 - Fixed interrupted tool execution recovery to journal exact results, fail closed on unknown external side effects, and provide explicit `tool-effects` resolution commands without re-executing tools.
 - Bounded long-running tool-effect journals with atomic integrity checkpoints that retain every unresolved effect and reject new side effects before unresolved count or byte limits are exceeded.
-- Preserved durable pending pi-server runs when their server journal is missing, failing closed with recovery instructions instead of automatically invoking the provider again.
-- Recovered pending pi-server runs from matching authoritative server journals after local tree or server identity changes, reconciling server history without resubmitting the provider request.
-- Recovered pending pi-server compactions from matching authoritative operation journals after local tree or server identity changes, without resubmitting the summarizer.
+- Made pending pi-server recovery server-authoritative: matching run and compaction journals replay after local identity drift, while missing journals reconcile server history, retire stale local markers, and retry with a fresh durable operation instead of permanently failing the session.
 - Bounded session-selector trash subprocesses so a stalled external trash command cannot freeze the interactive terminal.
 - Made local session-tree replacement atomic and applied authoritative compaction entries as durable idempotent deltas, avoiding full-history rewrites on long sessions.
 

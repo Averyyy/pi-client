@@ -29,10 +29,15 @@ export interface PiServerPendingRunState extends PiServerRunStateBase {
 interface PiServerAcknowledgedRunState extends PiServerRunStateBase {
 	kind: "ack";
 	runId: string;
-	resolution: "server_ack";
+	resolution: PiServerRunAcknowledgementResolution;
 }
 
 type PiServerRunStateRecord = PiServerPendingRunState | PiServerAcknowledgedRunState;
+
+export type PiServerRunAcknowledgementResolution =
+	| "server_ack"
+	| "server_authoritative_missing"
+	| "server_authoritative_rebind";
 
 interface PiServerRunStateEnvelope {
 	payload: string;
@@ -167,7 +172,11 @@ function parseRecord(payload: string, lineNumber: number): PiServerRunStateRecor
 	assertNonNegativeSafeInteger(value.timestamp, `pi-server run state line ${lineNumber}.timestamp`);
 	if (value.kind === "ack") {
 		assertIdentifier(value.runId, `pi-server run state line ${lineNumber}.runId`);
-		if (value.resolution !== "server_ack") {
+		if (
+			value.resolution !== "server_ack" &&
+			value.resolution !== "server_authoritative_missing" &&
+			value.resolution !== "server_authoritative_rebind"
+		) {
 			throw new Error(`pi-server run state acknowledgement resolution is invalid at line ${lineNumber}`);
 		}
 		return {
@@ -368,6 +377,7 @@ export function acknowledgePiServerPendingRun(
 	runId: string,
 	timestamp = Date.now(),
 	lease?: PiServerRunStateLease,
+	resolution: PiServerRunAcknowledgementResolution = "server_ack",
 ): void {
 	withRunStateLease(path, lease, () => {
 		const state = parseRunStateFile(path);
@@ -382,7 +392,7 @@ export function acknowledgePiServerPendingRun(
 			sequence: state.nextSequence,
 			timestamp,
 			runId,
-			resolution: "server_ack",
+			resolution,
 		});
 	});
 }

@@ -1293,7 +1293,7 @@ describe("AgentSession pi-server sync", () => {
 		},
 	);
 
-	it("fails closed at the last valid pi-server leaf when a 524 run is missing from recovery", async () => {
+	it("reconciles and replaces a 524 run missing from the authoritative server journal", async () => {
 		const tempDir = join(tmpdir(), `pi-stream-524-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -1307,6 +1307,11 @@ describe("AgentSession pi-server sync", () => {
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 		let streamCount = 0;
+		const serverEntries: SessionTreeEntry[] = [];
+		let serverLeafId: string | null = null;
+		let serverSessionId = "";
+		let serverStaticContextHash = "";
+		const terminalRuns = new Map<string, TestTerminalRun>();
 
 		try {
 			process.env.PI_SERVER_MODE = "true";
@@ -1321,13 +1326,19 @@ describe("AgentSession pi-server sync", () => {
 						if (streamCount === 1) {
 							return new Response("Cloudflare timeout", { status: 524, statusText: "A timeout occurred" });
 						}
+						const diagnostics = registerTestTerminalRun(body, terminalRuns, "completed");
 						return new Response(
 							[
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
 								'data: {"type":"text_end","contentIndex":0}\n\n',
-								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+								`data: ${JSON.stringify({
+									type: "done",
+									reason: "stop",
+									usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+									diagnostics,
+								})}\n\n`,
 							].join(""),
 							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
 						);
@@ -1338,8 +1349,48 @@ describe("AgentSession pi-server sync", () => {
 							headers: { "Content-Type": "application/json" },
 						});
 					}
-
-					return makeSessionResponse(body);
+					if (url.endsWith("/api/session/run/ack")) {
+						return makeTestRunAcknowledgement(body, terminalRuns);
+					}
+					if (url.includes("/history")) {
+						return new Response(
+							JSON.stringify({
+								protocolVersion: 2,
+								sessionId: serverSessionId,
+								staticContextHash: serverStaticContextHash,
+								treeHash: hashPiServerSessionEntries(serverEntries),
+								messageCount: serverEntries.filter((entry) => entry.type === "message").length,
+								entryCount: serverEntries.length,
+								leafId: serverLeafId,
+								revision: serverEntries.length,
+								entries: serverEntries,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+					if (url.endsWith("/api/session/init")) {
+						serverSessionId = body.sessionId as string;
+						serverStaticContextHash = body.staticContextHash as string;
+					}
+					if (url.endsWith("/api/session/tree/append") || url.endsWith("/api/session/tree/sync")) {
+						const incoming = body.entries as SessionTreeEntry[];
+						const existingIds = new Set(serverEntries.map((entry) => entry.id));
+						for (const entry of incoming) {
+							if (!existingIds.has(entry.id)) {
+								serverEntries.push(entry);
+								existingIds.add(entry.id);
+							}
+						}
+						serverLeafId = (body.leafId as string | null | undefined) ?? null;
+					}
+					return makeSessionResponse(body, {
+						staticContextHash: serverStaticContextHash,
+						treeHash: hashPiServerSessionEntries(serverEntries),
+						messageCount: serverEntries.filter((entry) => entry.type === "message").length,
+						entryCount: serverEntries.length,
+						leafId: serverLeafId,
+						revision: serverEntries.length,
+					});
 				}),
 			);
 
@@ -1365,22 +1416,19 @@ describe("AgentSession pi-server sync", () => {
 				session.dispose();
 			}
 
-			expect(streamCount).toBe(1);
+			expect(streamCount).toBe(2);
 			expect(events).toEqual([]);
 			const streamBodies = capturedRequests
 				.filter((request) => request.url.endsWith("/api/stream"))
 				.map((request) => request.body);
-			expect(streamBodies).toHaveLength(1);
+			expect(streamBodies).toHaveLength(2);
+			expect(streamBodies[1]?.runId).not.toBe(streamBodies[0]?.runId);
 			const activeMessages = sessionManager.buildSessionContext().messages;
-			expect(activeMessages.map((message) => message.role)).toEqual(["user"]);
-			expect(
-				activeMessages.some(
-					(message) =>
-						message.role === "assistant" &&
-						message.stopReason === "error" &&
-						message.errorMessage?.includes("524"),
-				),
-			).toBe(false);
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			const lastActiveMessage = activeMessages.at(-1);
+			expect(lastActiveMessage?.role === "assistant" ? lastActiveMessage.content : undefined).toEqual([
+				{ type: "text", text: "recovered" },
+			]);
 			const errorEntries = sessionManager
 				.getEntries()
 				.filter(
@@ -1390,8 +1438,7 @@ describe("AgentSession pi-server sync", () => {
 						entry.message.stopReason === "error" &&
 						entry.message.errorMessage?.includes("524"),
 				);
-			expect(errorEntries).toHaveLength(1);
-			expect(sessionManager.getBranch().map((entry) => entry.id)).not.toContain(errorEntries[0]?.id);
+			expect(errorEntries).toHaveLength(0);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

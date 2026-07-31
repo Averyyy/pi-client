@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +11,11 @@ import {
 	resetAllSessionTracking,
 	streamPiServer,
 } from "../src/core/pi-server-client.ts";
-import { hashPiServerSessionEntries, PI_SERVER_EMPTY_TREE_HASH } from "../src/core/pi-server-protocol.ts";
+import {
+	canonicalJsonStringify,
+	hashPiServerSessionEntries,
+	PI_SERVER_EMPTY_TREE_HASH,
+} from "../src/core/pi-server-protocol.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -47,6 +52,20 @@ function parseBody(init?: RequestInit): JsonObject {
 		throw new Error("Expected JSON object request body");
 	}
 	return parsed as JsonObject;
+}
+
+function streamRequestMac(body: JsonObject): string {
+	const { runId: _runId, eventCursor: _eventCursor, ...identity } = body;
+	const serialized = canonicalJsonStringify(identity);
+	if (serialized === undefined) throw new Error("Expected serializable stream request identity");
+	return createHash("sha256").update(serialized).digest("hex");
+}
+
+function eventStream(events: JsonObject[]): Response {
+	return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
 }
 
 function sessionResponse(
@@ -128,6 +147,28 @@ describe("pi-server client no-progress detection", () => {
 				}
 				if (path === "/api/stream") {
 					streamPosts++;
+					if (streamPosts > 1) {
+						return eventStream([
+							{ type: "start" },
+							{
+								type: "done",
+								reason: "stop",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+								diagnostics: [
+									{
+										type: "pi_server_run",
+										timestamp: 123,
+										details: {
+											sessionId,
+											runId: body.runId,
+											requestMac: streamRequestMac(body),
+											restartUnknown: false,
+										},
+									},
+								],
+							},
+						]);
+					}
 					return zeroByteEventStream(() => {
 						cancelled = true;
 					});
@@ -137,6 +178,22 @@ describe("pi-server client no-progress detection", () => {
 						status: 404,
 						headers: { "content-type": "application/json" },
 					});
+				}
+				if (path === `/api/session/${sessionId}/history`) {
+					return new Response(
+						JSON.stringify({
+							protocolVersion: 2,
+							sessionId,
+							staticContextHash,
+							treeHash: hashPiServerSessionEntries(entries),
+							messageCount: entries.length,
+							entryCount: entries.length,
+							leafId: "u1",
+							revision: 1,
+							entries,
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					);
 				}
 				throw new Error(`Unexpected request: ${path} ${JSON.stringify(body)}`);
 			}),
@@ -151,10 +208,9 @@ describe("pi-server client no-progress detection", () => {
 		await vi.advanceTimersByTimeAsync(51);
 
 		const result = await resultPromise;
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("pi-server response made no progress for 50ms");
-		expect(result.errorMessage).toContain("no longer has durable journal");
-		expect(streamPosts).toBe(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(streamPosts).toBe(2);
 		expect(cancelled).toBe(true);
 	});
 

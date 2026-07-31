@@ -102,7 +102,7 @@ const PI_SERVER_RESPONSE_NO_PROGRESS_TIMEOUT_MS = 90_000;
 const PI_SERVER_ERROR_BODY_MAX_BYTES = 64 * 1024;
 const PI_SERVER_EVENT_STREAM_MAX_LINE_BYTES = 256 * 1024 * 1024;
 const TRANSIENT_PI_SERVER_RETRY_DELAYS_MS = [250, 750, 1500];
-const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([408, 425, 429, 502, 503, 504, 530]);
+const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([408, 425, 429, 502, 503, 504, 520, 521, 522, 523, 524, 525, 530]);
 
 export function hashStaticContext(ctx: Context): string {
 	return hashPiServerStaticContext(ctx);
@@ -1288,7 +1288,7 @@ function isRecoverableTreeDivergenceError(error: unknown): boolean {
 
 function isRecoverableMissingServerState(response: Response, errorBody: string): boolean {
 	if (response.status !== 400 && response.status !== 404) return false;
-	return /Session has no static context|session not found|parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(
+	return /Session has no static context|session not found|(?:stream )?run not found|parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(
 		errorBody,
 	);
 }
@@ -2018,6 +2018,14 @@ export async function compactPiServer(
 					}
 					return await persistAndCompletePiServerCompactTerminal(terminal, compactStatePath, signal);
 				}
+				if (isRecoverableMissingServerState(response, failure.matchText)) {
+					resetSessionTracking(sessionId);
+					await ensureSessionInit(sessionId, context, request);
+					await syncPiServerTreeWithRequest(sessionId, tree, request, options?.onHistoryReconciled);
+					lastInterruption = new Error(`Server compaction state was rebuilt (${failure.details})`);
+					recoveryDeadline ??= Date.now() + recoveryWindowMs;
+					continue;
+				}
 				if (isRecoverablePiServerCompactResponse(response)) {
 					lastInterruption = new Error(`Server compaction failed (${failure.details})`);
 					recoveryDeadline ??= Date.now() + recoveryWindowMs;
@@ -2201,6 +2209,13 @@ export async function recoverPendingPiServerCompaction(
 ): Promise<PiServerCompactionResult | undefined> {
 	const pending = readPiServerPendingCompact(compactStatePath);
 	if (!pending) return undefined;
+	if (pending.sessionId !== sessionId) {
+		acknowledgePiServerPendingCompact(compactStatePath, pending.operationId, "server_authoritative_missing");
+		return undefined;
+	}
+	if (pending.serverHash !== hashPiServerIdentity(getServerUrl())) {
+		resetSessionTracking(sessionId);
+	}
 	let baseTree = getPendingPiServerCompactBase(pending, sessionId, tree);
 	const locallyApplied =
 		pending.observation?.kind === "applied" && baseTree
@@ -2287,10 +2302,14 @@ export async function recoverPendingPiServerCompaction(
 						pending.observation,
 					);
 				}
-				throw new Error(
-					`Pending pi-server compaction ${pending.operationId} is missing from the durable server journal; ` +
-						"the local marker was retained and automatic provider resubmission is disabled",
-				);
+				const snapshot = await fetchPiServerHistory(sessionId, request);
+				if (snapshot) {
+					await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+				} else {
+					resetSessionTracking(sessionId);
+				}
+				acknowledgePiServerPendingCompact(compactStatePath, pending.operationId, "server_authoritative_missing");
+				return undefined;
 			}
 			if (!isRecoverablePiServerCompactResponse(response)) {
 				throw new Error(`Pending server compaction recovery failed (${failure.details})`);
@@ -2508,16 +2527,6 @@ function pendingPiServerRunBaseMatches(
 		pending.baseEntryCount !== tree.entries.length ||
 		hashLocalTreePrefix(sessionId, tree.entries, pending.baseEntryCount) !== pending.baseTreeHash ||
 		pending.baseLeafId !== tree.leafId
-	);
-}
-
-function missingDurablePiServerRunError(runId: string, cause?: string): Error {
-	const prefix = cause ? `${cause}; ` : "";
-	return new Error(
-		`${prefix}pi-server no longer has durable journal for pending run ${runId}. ` +
-			"The provider outcome is unknown and the pending marker was retained. Restore the server journal, " +
-			"or after independently verifying that the provider did not execute, start an explicit new session or fork; " +
-			"automatic provider resubmission is disabled.",
 	);
 }
 
@@ -2840,7 +2849,7 @@ export async function streamPiServer(
 				...getLinearTreeFromMessages(context.messages as Message[]),
 				replace: true,
 			};
-			const syncTree = tree;
+			let syncTree = tree;
 			if (runStatePath) {
 				attachRunStateLease();
 			}
@@ -2849,6 +2858,9 @@ export async function streamPiServer(
 				: sessionPendingRuns.get(sessionId);
 			unresolvedRunPending = pending !== undefined;
 			let treeSynced = false;
+			if (pending && pending.serverHash !== hashPiServerIdentity(getServerUrl())) {
+				resetSessionTracking(sessionId);
+			}
 			if (pending) {
 				const persistedTerminal = findPendingPiServerRunTerminal(syncTree.entries, pending);
 				if (persistedTerminal) {
@@ -2907,23 +2919,94 @@ export async function streamPiServer(
 			let recoveredPendingRun: PiServerRunRecoveryResult | undefined;
 			if (pending) {
 				if (pending.sessionId !== sessionId) {
-					throw new Error(
-						`Cannot recover pending pi-server run ${pending.runId}: durable marker belongs to another session`,
-					);
+					if (runStatePath) {
+						acknowledgePiServerPendingRun(
+							runStatePath,
+							pending.runId,
+							Date.now(),
+							runStateLease,
+							"server_authoritative_rebind",
+						);
+					} else {
+						sessionPendingRuns.delete(sessionId);
+					}
+					pending = undefined;
+					unresolvedRunPending = false;
+					await ensureSessionInit(sessionId, context, request);
 				}
+			}
+			if (pending) {
 				runId = pending.runId;
 				phase = "provider_stream";
 				recoveredPendingRun = await recoverPiServerRun(sessionId, runId, request, options?.signal);
 				if (recoveredPendingRun.status === "not_found") {
-					throw missingDurablePiServerRunError(pending.runId);
+					phase = "history_reconcile";
+					const snapshot = await fetchPiServerHistory(sessionId, request);
+					if (snapshot) {
+						syncTree = snapshot;
+						await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+						treeSynced = true;
+					} else {
+						resetSessionTracking(sessionId);
+					}
+					if (runStatePath) {
+						acknowledgePiServerPendingRun(
+							runStatePath,
+							pending.runId,
+							Date.now(),
+							runStateLease,
+							"server_authoritative_missing",
+						);
+					} else {
+						sessionPendingRuns.delete(sessionId);
+					}
+					pending = undefined;
+					unresolvedRunPending = false;
+					runId = randomUUID();
+					await ensureSessionInit(sessionId, context, request);
+					phase = "provider_stream";
 				} else {
 					if (
 						recoveredPendingRun.status !== "unavailable" &&
 						recoveredPendingRun.requestMac !== pending.requestHash
 					) {
-						throw new Error(
-							`Cannot recover pending pi-server run ${pending.runId}: durable server request identity did not match the client marker`,
-						);
+						phase = "history_reconcile";
+						const snapshot = await fetchPiServerHistory(sessionId, request);
+						if (snapshot) {
+							syncTree = snapshot;
+							await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+							treeSynced = true;
+						}
+						const authoritativeTree = snapshot ?? syncTree;
+						const pendingInput = {
+							serverHash: hashPiServerIdentity(getServerUrl()),
+							sessionId,
+							runId: pending.runId,
+							baseTreeHash: hashLocalTree(sessionId, authoritativeTree.entries),
+							baseEntryCount: authoritativeTree.entries.length,
+							baseLeafId: authoritativeTree.leafId,
+							requestHash: recoveredPendingRun.requestMac,
+						};
+						if (runStatePath) {
+							acknowledgePiServerPendingRun(
+								runStatePath,
+								pending.runId,
+								Date.now(),
+								runStateLease,
+								"server_authoritative_rebind",
+							);
+							pending = writePiServerPendingRun(runStatePath, pendingInput, runStateLease);
+						} else {
+							pending = {
+								version: 1,
+								kind: "run",
+								sequence: 0,
+								timestamp: Date.now(),
+								...pendingInput,
+							};
+							sessionPendingRuns.set(sessionId, pending);
+						}
+						phase = "provider_stream";
 					}
 					if (
 						recoveredPendingRun.status !== "unavailable" &&
@@ -2932,11 +3015,12 @@ export async function streamPiServer(
 						phase = "history_reconcile";
 						const snapshot = await fetchPiServerHistory(sessionId, request);
 						if (!snapshot) {
-							throw new Error(
-								`Cannot recover pending pi-server run ${pending.runId}: server journal exists but authoritative session history is missing`,
-							);
+							resetSessionTracking(sessionId);
+						} else {
+							syncTree = snapshot;
+							await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+							treeSynced = true;
 						}
-						await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
 						phase = "provider_stream";
 					}
 					resumedPendingRun = true;
@@ -2983,6 +3067,7 @@ export async function streamPiServer(
 							...pendingInput,
 						} satisfies PiServerPendingRunState);
 				if (!runStatePath) sessionPendingRuns.set(sessionId, newPending);
+				pending = newPending;
 				unresolvedRunPending = true;
 			}
 
@@ -3120,16 +3205,169 @@ export async function streamPiServer(
 					recoveredRun.status === "completed" ||
 					recoveredRun.status === "failed";
 				if (hasDurableRun && recoveredRun.requestMac !== requestHash) {
-					await settleStreamFailure(
-						new Error("pi-server recovered run request identity did not match the pending provider request"),
-						false,
-					);
-					return;
+					phase = "history_reconcile";
+					const snapshot = await fetchPiServerHistory(sessionId, request);
+					if (snapshot) {
+						syncTree = snapshot;
+						await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+						treeSynced = true;
+					} else {
+						resetSessionTracking(sessionId);
+						treeSynced = false;
+					}
+					const authoritativeTree = snapshot ?? syncTree;
+					const reboundPendingInput = {
+						serverHash: hashPiServerIdentity(getServerUrl()),
+						sessionId,
+						runId,
+						baseTreeHash: hashLocalTree(sessionId, authoritativeTree.entries),
+						baseEntryCount: authoritativeTree.entries.length,
+						baseLeafId: authoritativeTree.leafId,
+						requestHash: recoveredRun.requestMac,
+					};
+					if (runStatePath) {
+						acknowledgePiServerPendingRun(
+							runStatePath,
+							runId,
+							Date.now(),
+							runStateLease,
+							"server_authoritative_rebind",
+						);
+						pending = writePiServerPendingRun(runStatePath, reboundPendingInput, runStateLease);
+					} else {
+						pending = {
+							version: 1,
+							kind: "run",
+							sequence: 0,
+							timestamp: Date.now(),
+							...reboundPendingInput,
+						};
+						sessionPendingRuns.set(sessionId, pending);
+					}
+					requestHash = recoveredRun.requestMac;
+					phase = "provider_stream";
 				}
 				if (recoveredRun.status === "not_found") {
-					const failureMessage = interruption instanceof Error ? interruption.message : String(interruption);
-					await settleStreamFailure(missingDurablePiServerRunError(runId, failureMessage), false);
-					return;
+					phase = "history_reconcile";
+					const snapshot = await fetchPiServerHistory(sessionId, request);
+					if (snapshot) {
+						syncTree = snapshot;
+						await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+						treeSynced = true;
+					} else {
+						resetSessionTracking(sessionId);
+						treeSynced = false;
+					}
+					if (runStatePath) {
+						acknowledgePiServerPendingRun(
+							runStatePath,
+							runId,
+							Date.now(),
+							runStateLease,
+							"server_authoritative_missing",
+						);
+					} else {
+						sessionPendingRuns.delete(sessionId);
+					}
+					pending = undefined;
+					unresolvedRunPending = false;
+					runId = randomUUID();
+					await ensureSessionInit(sessionId, context, request);
+					if (!treeSynced) {
+						phase = "tree_sync";
+						await syncPiServerTreeWithRequest(sessionId, syncTree, request, options?.onHistoryReconciled);
+						treeSynced = true;
+					}
+					baseTreeHash = hashLocalTree(sessionId, syncTree.entries);
+					baseEntryCount = syncTree.entries.length;
+					baseLeafId = syncTree.leafId;
+					baseStaticContextHash = sessionStaticContextHashes.get(sessionId) ?? hashStaticContext(context);
+					baseRevision = sessionTreeRevisions.get(sessionId) ?? 0;
+					requestIdentity = buildRequestIdentity(
+						baseTreeHash,
+						baseEntryCount,
+						baseLeafId,
+						baseStaticContextHash,
+						baseRevision,
+					);
+					requestHash = hashPiServerStreamRequest(requestIdentity);
+					const replacementPendingInput = {
+						serverHash: hashPiServerIdentity(getServerUrl()),
+						sessionId,
+						runId,
+						baseTreeHash,
+						baseEntryCount,
+						baseLeafId,
+						requestHash,
+					};
+					pending = runStatePath
+						? writePiServerPendingRun(runStatePath, replacementPendingInput, runStateLease)
+						: {
+								version: 1,
+								kind: "run",
+								sequence: 0,
+								timestamp: Date.now(),
+								...replacementPendingInput,
+							};
+					if (!runStatePath) sessionPendingRuns.set(sessionId, pending);
+					unresolvedRunPending = true;
+					partial.content = [];
+					partial.stopReason = "stop";
+					partial.errorMessage = undefined;
+					partial.diagnostics = undefined;
+					partial.usage = {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					};
+					partial.timestamp = Date.now();
+					receivedProxyEventCount = 0;
+					reconnectAttempt = 0;
+					recoveryDeadline = undefined;
+					phase = "provider_stream";
+					try {
+						const replacementResponse = await postStream(0);
+						if (replacementResponse.ok) {
+							activeResponse = replacementResponse;
+							activeEventCursor = 0;
+						} else {
+							const failure = await readPiServerFailure(replacementResponse);
+							const retryable =
+								isTransientPiServerResponse(replacementResponse, failure.bodyText) ||
+								isRecoverableMissingServerState(replacementResponse, failure.matchText);
+							if (!retryable) {
+								await settleStreamFailure(
+									new PiServerHttpResponseError(
+										`pi-server replacement run failed: ${failure.details}`,
+										replacementResponse.status,
+										false,
+									),
+									false,
+								);
+								return;
+							}
+							interruption = new PiServerHttpResponseError(
+								`pi-server replacement run failed: ${failure.details}`,
+								replacementResponse.status,
+								true,
+							);
+							activeResponse = undefined;
+							recoveryDeadline = Date.now() + recoveryWindowMs;
+						}
+					} catch (error) {
+						if (isAbortError(error, options?.signal)) throw error;
+						if (!isRetryablePiServerInterruption(error)) {
+							await settleStreamFailure(error, false);
+							return;
+						}
+						interruption = error;
+						activeResponse = undefined;
+						recoveryDeadline = Date.now() + recoveryWindowMs;
+					}
+					continue;
 				}
 				if (recoveredRun.status === "unavailable") {
 					const failureMessage = interruption instanceof Error ? interruption.message : String(interruption);
@@ -3167,7 +3405,10 @@ export async function streamPiServer(
 					const reconnectResponse = await getRunEvents(eventCursor);
 					if (!reconnectResponse.ok) {
 						const failure = await readPiServerFailure(reconnectResponse);
-						if (!isTransientPiServerResponse(reconnectResponse, failure.bodyText)) {
+						if (
+							!isTransientPiServerResponse(reconnectResponse, failure.bodyText) &&
+							!isRecoverableMissingServerState(reconnectResponse, failure.matchText)
+						) {
 							await settleStreamFailure(new Error(`pi-server reconnect failed: ${failure.details}`), false);
 							return;
 						}

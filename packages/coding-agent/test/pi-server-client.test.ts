@@ -974,7 +974,7 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[0].body.entries).toEqual(entries);
 	});
 
-	it("does not mark tree sync successful after an HTML proxy failure", async () => {
+	it("retries an HTML Cloudflare 520 tree sync before marking it successful", async () => {
 		const capturedPaths: string[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
 		const entries = baseTree().slice(0, 2);
@@ -1001,29 +1001,13 @@ describe("pi-server-client", () => {
 			}),
 		);
 
-		let error: unknown;
-		try {
-			await syncPiServerTree("html-tree-failure", context, { entries, leafId: "a1", replace: true });
-		} catch (caught) {
-			error = caught;
-		}
-
-		expect(error).toBeInstanceOf(Error);
-		const message = (error as Error).message;
-		expect(message).toContain("Session tree sync failed");
-		expect(message).toContain("520");
-		expect(message).toContain("server error");
-		expect(message).toContain("content-type: text/html; charset=utf-8");
-		expect(message).toContain("body excerpt: <html>Cloudflare 520</html>");
-		expect(message).not.toContain("Unexpected token");
-
 		await syncPiServerTree("html-tree-failure", context, { entries, leafId: "a1", replace: true });
 
 		expect(treeSyncAttempts).toBe(2);
 		expect(capturedPaths).toEqual(["/api/session/init", "/api/session/tree/sync", "/api/session/tree/sync"]);
 	});
 
-	it("does not mark tree append successful after a proxy failure", async () => {
+	it("retries a Cloudflare 520 tree append before marking it successful", async () => {
 		const capturedRequests: { path: string; body: JsonObject }[] = [];
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
 		const entries = baseTree().slice(0, 2);
@@ -1055,9 +1039,7 @@ describe("pi-server-client", () => {
 		await syncPiServerTree("append-proxy-failure", context, { entries, leafId: "a1" });
 		capturedRequests.length = 0;
 		failAppends = true;
-		await expect(
-			syncPiServerTree("append-proxy-failure", context, { entries: [...entries, nextEntry], leafId: "u2" }),
-		).rejects.toThrow("Session tree append failed");
+		await syncPiServerTree("append-proxy-failure", context, { entries: [...entries, nextEntry], leafId: "u2" });
 		await syncPiServerTree("append-proxy-failure", context, { entries: [...entries, nextEntry], leafId: "u2" });
 
 		const appendRequests = capturedRequests.filter((request) => request.path === "/api/session/tree/append");
@@ -1700,7 +1682,7 @@ describe("pi-server-client", () => {
 		expect(replayRequests).toBe(0);
 	});
 
-	it("does not resubmit an ambiguously missing run after the first provider request may have arrived", async () => {
+	it("reconciles and resubmits when an interrupted run is absent from the authoritative server", async () => {
 		const entries = baseTree().slice(0, 1);
 		const streamBodies: JsonObject[] = [];
 		let statusRequests = 0;
@@ -1733,9 +1715,50 @@ describe("pi-server-client", () => {
 						headers: { "Content-Type": "application/json" },
 					});
 				}
+				if (path === "/api/session/ambiguous-not-found/history") {
+					return new Response(
+						JSON.stringify({
+							protocolVersion: 2,
+							sessionId: "ambiguous-not-found",
+							staticContextHash: hashStaticContext({
+								systemPrompt: "You are helpful.",
+								messages: [textMessage("one", 1000)],
+							}),
+							treeHash: hashEntries(entries),
+							messageCount: 1,
+							entryCount: entries.length,
+							leafId: "u1",
+							revision: 1,
+							entries,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
 				if (path === "/api/stream") {
 					streamBodies.push(body);
-					throw new Error("socket closed after the provider request may have arrived");
+					if (streamBodies.length === 1) {
+						throw new Error("socket closed after the provider request may have arrived");
+					}
+					return makeMockResponse([
+						{ type: "start" },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+							diagnostics: [
+								{
+									type: "pi_server_run",
+									timestamp: 123,
+									details: {
+										sessionId: "ambiguous-not-found",
+										runId: body.runId,
+										requestMac: getStreamRequestMac(body),
+										restartUnknown: false,
+									},
+								},
+							],
+						},
+					]);
 				}
 				return makeSessionResponse(body, { leafId: body.leafId, entryCount: 1 });
 			}),
@@ -1752,13 +1775,11 @@ describe("pi-server-client", () => {
 		);
 		const result = await stream.result();
 
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("provider outcome is unknown");
-		expect(result.errorMessage).toContain("pending marker was retained");
-		expect(result.errorMessage).toContain("automatic provider resubmission is disabled");
-		expect(result.diagnostics?.[0]?.details?.runUnresolved).toBe(true);
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
 		expect(statusRequests).toBe(1);
-		expect(streamBodies).toHaveLength(1);
+		expect(streamBodies).toHaveLength(2);
+		expect(streamBodies[1]?.runId).not.toBe(streamBodies[0]?.runId);
 		expect(eventRequests).toBe(0);
 	});
 
@@ -2439,7 +2460,7 @@ describe("pi-server-client", () => {
 		}
 	});
 
-	it("fails closed when a durable pending run is missing instead of submitting a second provider run", async () => {
+	it("reconciles and submits a replacement when the authoritative server no longer has a pending run", async () => {
 		const tempDirectory = mkdtempSync(join(tmpdir(), "pi-server-client-run-not-found-"));
 		const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
 		const entries = baseTree().slice(0, 1);
@@ -2461,14 +2482,49 @@ describe("pi-server-client", () => {
 							headers: { "Content-Type": "application/json" },
 						});
 					}
+					if (path === "/api/session/pending-not-found/history") {
+						return new Response(
+							JSON.stringify({
+								protocolVersion: 2,
+								sessionId: "pending-not-found",
+								staticContextHash: hashStaticContext({
+									systemPrompt: "You are helpful.",
+									messages: [textMessage("one", 1000)],
+								}),
+								treeHash: hashEntries(entries),
+								messageCount: 1,
+								entryCount: entries.length,
+								leafId: "u1",
+								revision: 1,
+								entries,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
 					if (path === "/api/stream") {
 						streamBodies.push(body);
+						const diagnostics =
+							streamBodies.length === 2
+								? [
+										{
+											type: "pi_server_run",
+											timestamp: 123,
+											details: {
+												sessionId: "pending-not-found",
+												runId: body.runId,
+												requestMac: getStreamRequestMac(body),
+												restartUnknown: false,
+											},
+										},
+									]
+								: undefined;
 						return makeMockResponse([
 							{ type: "start" },
 							{
 								type: "done",
 								reason: "stop",
 								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+								diagnostics,
 							},
 						]);
 					}
@@ -2511,14 +2567,13 @@ describe("pi-server-client", () => {
 			const newPending = readPiServerPendingRun(runStatePath);
 
 			expect(statusRunIds).toEqual([oldPending?.runId]);
-			expect(streamBodies).toHaveLength(1);
-			expect(replacementResult.stopReason).toBe("error");
-			expect(replacementResult.errorMessage).toContain("provider outcome is unknown");
-			expect(replacementResult.errorMessage).toContain("pending marker was retained");
-			expect(replacementResult.errorMessage).toContain("automatic provider resubmission is disabled");
-			expect(replacementResult.diagnostics?.[0]?.details?.runUnresolved).toBe(true);
-			expect(newPending).toEqual(oldPending);
+			expect(streamBodies).toHaveLength(2);
+			expect(streamBodies[1]?.runId).not.toBe(oldPending?.runId);
+			expect(replacementResult.errorMessage).toBeUndefined();
+			expect(replacementResult.stopReason).toBe("stop");
+			expect(newPending?.runId).toBe(streamBodies[1]?.runId);
 		} finally {
+			resetAllSessionTracking();
 			rmSync(tempDirectory, { recursive: true, force: true });
 		}
 	});
@@ -2854,6 +2909,7 @@ describe("pi-server-client", () => {
 			});
 			const result = await resumedStream.result();
 
+			expect(result.errorMessage).toBeUndefined();
 			expect(result.stopReason).toBe("stop");
 			expect(streamPosts).toBe(0);
 			expect(statusRequests).toBe(1);
@@ -2867,7 +2923,7 @@ describe("pi-server-client", () => {
 		}
 	});
 
-	it("refuses a durable pending run when the current server has no matching journal", async () => {
+	it("uses authoritative history and continues when the configured server has no matching journal", async () => {
 		const tempDirectory = mkdtempSync(join(tmpdir(), "pi-server-client-run-server-mismatch-"));
 		const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
 		const entries = baseTree().slice(0, 1);
@@ -2889,14 +2945,49 @@ describe("pi-server-client", () => {
 							headers: { "Content-Type": "application/json" },
 						});
 					}
+					if (path === "/api/session/durable-mismatch/history") {
+						return new Response(
+							JSON.stringify({
+								protocolVersion: 2,
+								sessionId: "durable-mismatch",
+								staticContextHash: hashStaticContext({
+									systemPrompt: "You are helpful.",
+									messages: [textMessage("one", 1000)],
+								}),
+								treeHash: hashEntries(entries),
+								messageCount: 1,
+								entryCount: entries.length,
+								leafId: "u1",
+								revision: 1,
+								entries,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
 					if (path === "/api/stream") {
 						streamPosts++;
+						const configuredPort = new URL(url).port;
 						return makeMockResponse([
 							{ type: "start" },
 							{
 								type: "done",
 								reason: "stop",
 								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+								diagnostics:
+									configuredPort === "4218"
+										? [
+												{
+													type: "pi_server_run",
+													timestamp: 123,
+													details: {
+														sessionId: "durable-mismatch",
+														runId: body.runId,
+														requestMac: getStreamRequestMac(body),
+														restartUnknown: false,
+													},
+												},
+											]
+										: undefined,
 							},
 						]);
 					}
@@ -2923,7 +3014,6 @@ describe("pi-server-client", () => {
 			await initialStream.result();
 			expect(streamPosts).toBe(1);
 
-			resetAllSessionTracking();
 			streamPosts = 0;
 			process.env.PI_SERVER_URL = "http://127.0.0.1:4218";
 			const resumedStream = await streamPiServer(testModel, context, {
@@ -2937,9 +3027,8 @@ describe("pi-server-client", () => {
 			});
 			const result = await resumedStream.result();
 
-			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toContain("pi-server no longer has durable journal");
-			expect(streamPosts).toBe(0);
+			expect(result.stopReason).toBe("stop");
+			expect(streamPosts).toBe(1);
 			expect(statusRequests).toBe(1);
 		} finally {
 			resetAllSessionTracking();
@@ -4059,7 +4148,7 @@ describe("pi-server-client", () => {
 		expect(acknowledgementPosts).toBe(1);
 	});
 
-	it("retains an unobserved compact marker and fails closed when the server journal is missing", async () => {
+	it("reconciles and replaces an unobserved compact when the authoritative journal is missing", async () => {
 		const entries = baseTree();
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
 		const sessionId = "compact-unobserved-missing";
@@ -4085,6 +4174,22 @@ describe("pi-server-client", () => {
 						headers: { "Content-Type": "application/json" },
 					});
 				}
+				if (path === `/api/session/${sessionId}/history`) {
+					return new Response(
+						JSON.stringify({
+							protocolVersion: 2,
+							sessionId,
+							staticContextHash: hashStaticContext(context),
+							treeHash: hashEntries(entries),
+							messageCount: 3,
+							entryCount: entries.length,
+							leafId: "u2",
+							revision: 1,
+							entries,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
 				return makeSessionResponse(body, { leafId: body.leafId, entryCount: entries.length });
 			}),
 		);
@@ -4097,15 +4202,14 @@ describe("pi-server-client", () => {
 		expect(readPiServerPendingCompact(statePath)?.observation).toBeUndefined();
 
 		resetAllSessionTracking();
-		await expect(
-			compactPiServerRaw(testModel, context, {
-				sessionId,
-				sessionTree: { entries, leafId: "u2" },
-				piServerCompactStatePath: statePath,
-			}),
-		).rejects.toThrow("automatic provider resubmission is disabled");
-		expect(readPiServerPendingCompact(statePath)?.operationId).toBe(result.operationId);
-		expect(compactPosts).toBe(1);
+		const replacement = await compactPiServerRaw(testModel, context, {
+			sessionId,
+			sessionTree: { entries, leafId: "u2" },
+			piServerCompactStatePath: statePath,
+		});
+		expect(replacement.operationId).not.toBe(result.operationId);
+		expect(readPiServerPendingCompact(statePath)?.operationId).toBe(replacement.operationId);
+		expect(compactPosts).toBe(2);
 		expect(recoveryGets).toBe(1);
 	});
 
@@ -4295,7 +4399,7 @@ describe("pi-server-client", () => {
 		expect(syncedEntries.map((entry) => entry.parentId)).toEqual(entries.map((entry) => entry.parentId));
 	});
 
-	it("fails closed without rebuilding server state after an uncertain compact submission returns 404", async () => {
+	it("rebuilds missing server state and retries the same compact operation after a 404", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const entries = baseTree();
 		let compactCount = 0;
@@ -4308,13 +4412,28 @@ describe("pi-server-client", () => {
 
 				if (url.endsWith("/api/session/compact")) {
 					compactCount++;
-					return new Response(JSON.stringify({ error: "session not found" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json" },
-					});
+					if (compactCount === 1) {
+						return new Response(JSON.stringify({ error: "session not found" }), {
+							status: 404,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response(
+						compactResponse(body, entries, compactionEntry("c-rebuilt", "u2", "rebuilt summary", "u2")),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
 				}
 
-				return makeSessionResponse(body, { leafId: body.leafId, entryCount: 3 });
+				if (url.endsWith("/api/session/tree/append") || url.endsWith("/api/session/tree/sync")) {
+					return makeSessionResponse(body, {
+						treeHash: hashEntries(entries),
+						leafId: "u2",
+						entryCount: entries.length,
+						messageCount: 3,
+						revision: 1,
+					});
+				}
+				return makeSessionResponse(body);
 			}),
 		);
 
@@ -4322,16 +4441,21 @@ describe("pi-server-client", () => {
 		await syncPiServerTree("compact-restart", context, { entries, leafId: "u2" });
 		capturedBodies.length = 0;
 
-		await expect(
-			compactPiServer(testModel, context, {
-				sessionId: "compact-restart",
-				apiKey: "sk-client",
-				sessionTree: { entries, leafId: "u2" },
-			}),
-		).rejects.toThrow("session not found");
+		const result = await compactPiServer(testModel, context, {
+			sessionId: "compact-restart",
+			apiKey: "sk-client",
+			sessionTree: { entries, leafId: "u2" },
+		});
 
-		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/compact"]);
-		expect(compactCount).toBe(1);
+		expect(result.compaction.summary).toBe("rebuilt summary");
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/compact",
+			"/api/session/init",
+			"/api/session/tree/append",
+			"/api/session/compact",
+		]);
+		expect(compactCount).toBe(2);
 		expect(capturedBodies[0].body.operationId).toEqual(expect.any(String));
+		expect(capturedBodies[3].body.operationId).toBe(capturedBodies[0].body.operationId);
 	});
 });
