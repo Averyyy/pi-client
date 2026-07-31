@@ -35,6 +35,7 @@
 
 ## pi-client / pi-server Request Sync
 
+- Treat ordinary `/api/stream` calls as stateless provider proxy requests: send the exact projected `context.messages` as `contextOverlay`; do not synchronize the durable session tree before or after provider calls. Full tree synchronization is reserved for operations that actually require tree state, such as server-side compaction.
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
 - If the server has messages the client does not have, the server may send those messages or the full server history back to the client. Client receive size is not constrained by the proxy POST-body limit.
 - If client and server history diverge, server history is authoritative. Reconcile the client to the server history and refresh the UI/session state instead of uploading the divergent client history.

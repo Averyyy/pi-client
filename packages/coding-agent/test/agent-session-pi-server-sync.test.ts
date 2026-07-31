@@ -38,7 +38,7 @@ describe("AgentSession pi-server sync", () => {
 		delete process.env.PI_CLIENT_MAX_REQUEST_KB;
 	});
 
-	it("syncs the session tree to pi-server after explicit tree navigation without uploading flat messages", async () => {
+	it("keeps explicit tree navigation local until the next provider request", async () => {
 		const harness = await createHarness({ responses: ["answer one", "answer two"] });
 		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
 
@@ -95,18 +95,13 @@ describe("AgentSession pi-server sync", () => {
 
 			const result = await harness.session.navigateTree(userTwoEntry!.id, { summarize: false });
 			expect(result.editorText).toBe("question two");
-
-			const syncRequest = capturedRequests.find((request) => request.url.endsWith("/api/session/tree/sync"));
-			expect(syncRequest).toBeDefined();
-			expect(syncRequest!.body.leafId).toBe(harness.sessionManager.getLeafId());
-			expect(syncRequest!.body).not.toHaveProperty("messages");
-			expect(syncRequest!.body.entries).toEqual(harness.sessionManager.getEntries());
+			expect(capturedRequests).toEqual([]);
 		} finally {
 			harness.cleanup();
 		}
 	});
 
-	it("bootstraps an existing non-pi-client session tree before streaming", async () => {
+	it("streams projected context from an existing non-pi-client session without bootstrapping its tree", async () => {
 		const tempDir = join(tmpdir(), `pi-existing-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -185,26 +180,24 @@ describe("AgentSession pi-server sync", () => {
 				session.dispose();
 			}
 
-			const treeSync = capturedRequests.find((request) => request.url.endsWith("/api/session/tree/sync"));
-			expect(treeSync).toBeDefined();
-			expect(treeSync!.body).not.toHaveProperty("messages");
-			const entries = treeSync!.body.entries as Array<{
-				id: string;
-				type: string;
-				message?: { role: string; content: unknown };
+			expect(legacyUserId).toBeTruthy();
+			expect(legacyAssistantId).toBeTruthy();
+			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
+			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
+			const contextOverlay = streamRequest?.body.contextOverlay as Array<{
+				role: string;
+				content: unknown;
 			}>;
-			expect(entries.some((entry) => entry.id === legacyUserId)).toBe(true);
-			expect(entries.some((entry) => entry.id === legacyAssistantId)).toBe(true);
+			expect(contextOverlay.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
 			expect(
-				entries.some(
-					(entry) =>
-						entry.type === "message" &&
-						Array.isArray(entry.message?.content) &&
-						entry.message.content.some((content) => content.type === "text" && content.text === "fresh question"),
+				contextOverlay.some(
+					(message) =>
+						Array.isArray(message.content) &&
+						message.content.some((content) => content.type === "text" && content.text === "fresh question"),
 				),
 			).toBe(true);
-			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
 			expect(streamRequest?.body).not.toHaveProperty("messages");
+			expect(streamRequest?.body).not.toHaveProperty("entries");
 			expect(streamRequest?.body).not.toHaveProperty("delta");
 		} finally {
 			if (existsSync(tempDir)) {
@@ -213,7 +206,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("retries a retryable pi-server stream error after resyncing the active tree", async () => {
+	it("retries a retryable pi-server stream error without synchronizing the durable tree", async () => {
 		const tempDir = join(tmpdir(), `pi-stream-error-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -291,11 +284,7 @@ describe("AgentSession pi-server sync", () => {
 			}
 
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
-			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual([
-				"/api/session/tree/sync",
-				"/api/session/tree/append",
-				"/api/session/tree/append",
-			]);
+			expect(treeRequests).toEqual([]);
 			expect(streamCount).toBe(2);
 			expect(events).toEqual(["start:1", "end:success=true"]);
 			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
@@ -564,10 +553,17 @@ describe("AgentSession pi-server sync", () => {
 				session.dispose();
 			}
 
-			const treeSync = capturedRequests.find((request) => request.url.endsWith("/api/session/tree/sync"));
-			expect(treeSync).toBeDefined();
-			const syncedEntries = treeSync!.body.entries as Array<{ id: string }>;
-			expect(syncedEntries.some((entry) => entry.id === oldErrorId)).toBe(true);
+			expect(oldErrorId).toBeTruthy();
+			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
+			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
+			const contextOverlay = streamRequest?.body.contextOverlay as Array<{
+				role: string;
+				stopReason?: string;
+				errorMessage?: string;
+			}>;
+			expect(
+				contextOverlay.some((message) => message.stopReason === "error" && message.errorMessage === "previous 524"),
+			).toBe(false);
 			const activeMessages = sessionManager.buildSessionContext().messages;
 			expect(activeMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
 			expect(
@@ -585,7 +581,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("chunks the first tree bootstrap for a long session created outside pi-client", async () => {
+	it("chunks projected provider context for a long session without uploading its tree", async () => {
 		const tempDir = join(tmpdir(), `pi-long-legacy-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -667,15 +663,18 @@ describe("AgentSession pi-server sync", () => {
 								{ status: 200, headers: { "Content-Type": "application/json" } },
 							);
 						}
+						if (target === "/api/stream") {
+							return new Response(
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+							);
+						}
 						return new Response(
-							JSON.stringify({
-								sessionId: body.sessionId,
-								leafId: body.leafId,
-								staticContextHash: "hash-long-legacy",
-								entryCount: 61,
-								target,
-							}),
-							{ status: 200, headers: { "Content-Type": "application/json" } },
+							JSON.stringify({ sessionId: body.sessionId, staticContextHash: "hash-long-legacy" }),
+							{
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							},
 						);
 					}
 
@@ -711,11 +710,8 @@ describe("AgentSession pi-server sync", () => {
 			const chunkTargets = capturedRequests
 				.filter((request) => request.url.endsWith("/api/request/chunk"))
 				.map((request) => request.body.target);
-			expect(chunkTargets).toContain("/api/session/tree/sync");
-			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
-			expect(streamRequest?.body).not.toHaveProperty("messages");
-			expect(streamRequest?.body).not.toHaveProperty("entries");
-			expect(streamRequest?.body).not.toHaveProperty("delta");
+			expect(chunkTargets).toContain("/api/stream");
+			expect(chunkTargets).not.toContain("/api/session/tree/sync");
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
@@ -800,7 +796,7 @@ describe("AgentSession pi-server sync", () => {
 			}
 
 			const treeRequests = capturedRequests.filter((request) => request.url.includes("/api/session/tree/"));
-			expect(treeRequests.map((request) => new URL(request.url).pathname)).toEqual(["/api/session/tree/sync"]);
+			expect(treeRequests).toEqual([]);
 			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
 			const leaf = sessionManager.getLeafEntry();
 			expect(leaf?.type).toBe("message");
@@ -812,7 +808,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("passes the active abort signal to post-stream pi-server tree sync", async () => {
+	it("passes the active abort signal to the pi-server provider stream", async () => {
 		const tempDir = join(tmpdir(), `pi-post-stream-sync-signal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -822,7 +818,7 @@ describe("AgentSession pi-server sync", () => {
 		expect(model).toBeDefined();
 		const modelRuntime = await createTestModelRuntime(model!.provider);
 		const sessionManager = SessionManager.inMemory(cwd);
-		const treeSignals: Array<AbortSignal | null> = [];
+		const streamSignals: Array<AbortSignal | null> = [];
 
 		try {
 			process.env.PI_SERVER_MODE = "true";
@@ -830,8 +826,8 @@ describe("AgentSession pi-server sync", () => {
 				"fetch",
 				vi.fn(async (url: string, init?: RequestInit) => {
 					const body = parseJsonObject((init?.body as string | undefined) ?? "");
-					if (url.includes("/api/session/tree/")) {
-						treeSignals.push(init?.signal ?? null);
+					if (url.endsWith("/api/stream")) {
+						streamSignals.push(init?.signal ?? null);
 					}
 
 					if (url.endsWith("/api/stream")) {
@@ -875,8 +871,8 @@ describe("AgentSession pi-server sync", () => {
 				session.dispose();
 			}
 
-			expect(treeSignals.length).toBeGreaterThanOrEqual(2);
-			expect(treeSignals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+			expect(streamSignals).toHaveLength(1);
+			expect(streamSignals[0]).toBeInstanceOf(AbortSignal);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
@@ -884,7 +880,7 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
-	it("does not retry the LLM after post-stream pi-server tree append fails", async () => {
+	it("does not perform a post-stream pi-server tree append", async () => {
 		const tempDir = join(tmpdir(), `pi-post-stream-append-fail-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const cwd = join(tempDir, "project");
 		const agentDir = join(tempDir, "agent");
@@ -969,6 +965,7 @@ describe("AgentSession pi-server sync", () => {
 			expect(streamCount).toBe(1);
 			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
 			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
 			const syncErrorEntries = sessionManager
 				.getEntries()
 				.filter(
@@ -977,7 +974,7 @@ describe("AgentSession pi-server sync", () => {
 						entry.message.role === "assistant" &&
 						entry.message.errorMessage?.includes("Session tree append failed"),
 				);
-			expect(syncErrorEntries).toHaveLength(1);
+			expect(syncErrorEntries).toHaveLength(0);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

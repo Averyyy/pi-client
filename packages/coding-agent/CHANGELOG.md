@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
+- Fixed pi-server provider requests to send only the projected, compaction-aware LLM context instead of synchronizing the full durable session tree.
 
 ## [0.82.1] - 2026-07-25
 

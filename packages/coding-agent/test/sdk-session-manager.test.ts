@@ -65,18 +65,13 @@ describe("createAgentSession session manager defaults", () => {
 		session.dispose();
 	});
 
-	it("keeps transient pi-server context out of the durable session tree", () => {
-		const sessionManager = SessionManager.inMemory(cwd);
+	it("sends only the projected pi-server provider context", () => {
 		const durableMessage: Message = { role: "user", content: "durable", timestamp: 1000 };
 		const ephemeralMessage: Message = { role: "user", content: "hint", timestamp: 2000 };
-		sessionManager.appendMessage(durableMessage);
 
-		const sync = buildPiServerContextSync(sessionManager, [durableMessage, ephemeralMessage]);
+		const sync = buildPiServerContextSync([durableMessage, ephemeralMessage]);
 
-		expect(sync.sessionTree.entries).toEqual(sessionManager.getEntries());
-		expect(sync.sessionTree.replace).toBeUndefined();
-		expect(sync.ephemeralMessages).toEqual([ephemeralMessage]);
-		expect(sync.contextOverlay).toBeUndefined();
+		expect(sync.contextOverlay).toEqual([durableMessage, ephemeralMessage]);
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {

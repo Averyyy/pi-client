@@ -100,12 +100,7 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
-import {
-	compactPiServer,
-	type PiServerCompactionResult,
-	type PiServerHistorySnapshot,
-	syncPiServerTree,
-} from "./pi-server-client.ts";
+import { compactPiServer, type PiServerCompactionResult, type PiServerHistorySnapshot } from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type {
@@ -812,7 +807,7 @@ export class AgentSession {
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
+	private _handleAgentEvent = async (event: AgentEvent, _signal: AbortSignal): Promise<void> => {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -880,19 +875,6 @@ export class AgentSession {
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
-				}
-
-				if (isPiServerMode() && !this._isTerminalAssistantFailure(assistantMsg)) {
-					await syncPiServerTree(
-						this.sessionId,
-						{
-							systemPrompt: this.systemPrompt,
-							messages: this.agent.state.messages as Message[],
-							tools: this.agent.state.tools,
-						},
-						{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-						{ signal, onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot) },
-					);
 				}
 			}
 		}
@@ -3665,18 +3647,6 @@ export class AgentSession {
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			if (isPiServerMode()) {
-				await syncPiServerTree(
-					this.sessionId,
-					{
-						systemPrompt: this.systemPrompt,
-						messages: this.agent.state.messages as Message[],
-						tools: this.agent.state.tools,
-					},
-					{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
-					{ onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot) },
-				);
-			}
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

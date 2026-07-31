@@ -909,6 +909,16 @@ describe("pi-server-client", () => {
 							},
 						);
 					}
+					if (body.target === "/api/stream") {
+						return makeMockResponse([
+							{ type: "start" },
+							{
+								type: "done",
+								reason: "stop",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+							},
+						]);
+					}
 					return new Response(JSON.stringify({ sessionId: "chunk-timeout", leafId: "u1", entryCount: 1 }), {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
@@ -949,10 +959,58 @@ describe("pi-server-client", () => {
 		const chunkTargets = capturedBodies
 			.filter((request) => request.url.endsWith("/api/request/chunk"))
 			.map((request) => request.body.target);
-		expect(chunkTargets).toContain("/api/session/tree/sync");
-		const streamBody = capturedBodies.find((request) => request.url.endsWith("/api/stream"))?.body;
-		expect((streamBody?.options as { timeoutMs?: number } | undefined)?.timeoutMs).toBe(1);
+		expect(chunkTargets).toContain("/api/stream");
+		expect(chunkTargets).not.toContain("/api/session/tree/sync");
 		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
+	});
+
+	it("streams only compacted provider context without synchronizing durable history", async () => {
+		const capturedBodies: { url: string; body: JsonObject }[] = [];
+		const entries = [
+			messageEntry("u1", null, textMessage("old request", 1000)),
+			messageEntry("a1", "u1", assistantMessage("old response", 2000)),
+			compactionEntry("c1", "a1", "old exchange summary", "a1"),
+			messageEntry("u2", "c1", textMessage("current request", 3000)),
+		];
+		const projectedMessages = [textMessage("old exchange summary", 2000), textMessage("current request", 3000)];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+						},
+					]);
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, staticContextHash: "hash" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: projectedMessages },
+			{ sessionId: "compacted-provider-context", sessionTree: { entries, leafId: "u2" } },
+		);
+		for await (const _event of stream) {
+			// Drain the provider stream.
+		}
+
+		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
+			"/api/session/init",
+			"/api/stream",
+		]);
+		expect(capturedBodies[1].body.contextOverlay).toEqual(projectedMessages);
+		expect(capturedBodies[1].body).not.toHaveProperty("entries");
 	});
 
 	it("reports HTML stream proxy failures with response details", async () => {
@@ -1056,7 +1114,6 @@ describe("pi-server-client", () => {
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
 			"/api/stream",
 			"/api/session/init",
-			"/api/session/tree/sync",
 			"/api/stream",
 		]);
 		expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);

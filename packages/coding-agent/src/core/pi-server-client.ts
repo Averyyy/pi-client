@@ -793,21 +793,16 @@ export async function streamPiServer(
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
-			const tree = options?.sessionTree ?? {
-				...getLinearTreeFromMessages(context.messages as Message[]),
-				replace: true,
-			};
-			const syncTree = tree;
-			phase = "tree_sync";
-			await syncPiServerTreeWithRequest(sessionId, context, syncTree, request, options?.onHistoryReconciled);
 
 			const makeBody = () => ({
 				sessionId,
 				runId,
 				model,
 				options: serializeOptions(options),
-				ephemeralMessages: options?.ephemeralMessages,
-				contextOverlay: options?.contextOverlay,
+				contextOverlay: options?.contextOverlay ?? [
+					...(context.messages as Message[]),
+					...(options?.ephemeralMessages ?? []),
+				],
 			});
 			phase = "provider_stream";
 			let response = await request.postJson("/api/stream", makeBody());
@@ -817,7 +812,6 @@ export async function streamPiServer(
 				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.matchText)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);
-					await syncPiServerTreeWithRequest(sessionId, context, syncTree, request, options?.onHistoryReconciled);
 					response = await request.postJson("/api/stream", makeBody());
 					if (response.ok) {
 						failure = { details: "", matchText: "" };
