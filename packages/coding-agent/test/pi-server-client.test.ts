@@ -2689,95 +2689,230 @@ describe("pi-server-client", () => {
 		}
 	});
 
-	it.each(["tree", "server"] as const)(
-		"refuses a durable pending run after a %s identity mismatch without posting another stream",
-		async (mismatch) => {
-			const tempDirectory = mkdtempSync(join(tmpdir(), `pi-server-client-run-${mismatch}-mismatch-`));
-			const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
-			const entries = baseTree().slice(0, 1);
-			let streamPosts = 0;
-			let statusRequests = 0;
-			const originalServerUrl = process.env.PI_SERVER_URL;
+	it("recovers a durable pending run from authoritative server history after a local tree mismatch", async () => {
+		const tempDirectory = mkdtempSync(join(tmpdir(), "pi-server-client-run-tree-mismatch-"));
+		const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
+		const entries = baseTree().slice(0, 1);
+		const changedEntries = [...entries, messageEntry("u2", "u1", textMessage("changed tree", 2000))];
+		let streamPosts = 0;
+		let statusRequests = 0;
+		let historyRequests = 0;
+		let eventRequests = 0;
+		let reconciledEntries: SessionTreeEntry[] | undefined;
 
-			try {
-				process.env.PI_SERVER_URL = "http://127.0.0.1:4217";
-				vi.stubGlobal(
-					"fetch",
-					vi.fn(async (url: string, init?: RequestInit) => {
-						const path = new URL(url).pathname;
-						const body = parseJsonObject((init?.body as string | undefined) ?? "");
-						if (path.startsWith("/api/session/durable-mismatch/runs/")) {
-							statusRequests++;
-							throw new Error("Run status must not be queried for a mismatched durable marker");
-						}
-						if (path === "/api/stream") {
-							streamPosts++;
-							return makeMockResponse([
-								{ type: "start" },
-								{
-									type: "done",
-									reason: "stop",
-									usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
-								},
-							]);
-						}
-						return makeSessionResponse(body, {
-							treeHash: hashEntries(entries),
-							leafId: "u1",
-							entryCount: 1,
-							messageCount: 1,
-							revision: 1,
+		try {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const path = new URL(url).pathname;
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					if (path.startsWith("/api/session/durable-tree-mismatch/runs/") && path.endsWith("/events")) {
+						eventRequests++;
+						const pending = readPiServerPendingRun(runStatePath);
+						if (!pending) throw new Error("Expected durable pending run");
+						return makeMockResponse([
+							{ type: "start" },
+							{
+								type: "done",
+								reason: "stop",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+								diagnostics: [
+									{
+										type: "pi_server_run",
+										timestamp: 123,
+										details: {
+											sessionId: pending.sessionId,
+											runId: pending.runId,
+											requestMac: pending.requestHash,
+											restartUnknown: false,
+										},
+									},
+								],
+							},
+						]);
+					}
+					if (path.startsWith("/api/session/durable-tree-mismatch/runs/")) {
+						statusRequests++;
+						const pending = readPiServerPendingRun(runStatePath);
+						if (!pending) throw new Error("Expected durable pending run");
+						return makeRunStatusResponse(pending.sessionId, pending.runId, pending.requestHash, "completed", 2);
+					}
+					if (path === "/api/session/durable-tree-mismatch/history") {
+						historyRequests++;
+						return new Response(
+							JSON.stringify({
+								protocolVersion: 2,
+								sessionId: "durable-tree-mismatch",
+								staticContextHash: hashStaticContext({
+									systemPrompt: "You are helpful.",
+									messages: [textMessage("one", 1000)],
+								}),
+								treeHash: hashEntries(entries),
+								messageCount: 1,
+								entryCount: entries.length,
+								leafId: "u1",
+								revision: 1,
+								entries,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+					if (path === "/api/stream") {
+						streamPosts++;
+						const requestMac = getStreamRequestMac(body);
+						return makeMockResponse([
+							{ type: "start" },
+							{
+								type: "done",
+								reason: "stop",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+								diagnostics: [
+									{
+										type: "pi_server_run",
+										timestamp: 123,
+										details: {
+											sessionId: body.sessionId,
+											runId: body.runId,
+											requestMac,
+											restartUnknown: false,
+										},
+									},
+								],
+							},
+						]);
+					}
+					return makeSessionResponse(body, {
+						treeHash: hashEntries(entries),
+						leafId: "u1",
+						entryCount: 1,
+						messageCount: 1,
+						revision: 1,
+					});
+				}),
+			);
+
+			const context: Context = {
+				systemPrompt: "You are helpful.",
+				messages: [textMessage("one", 1000)],
+			};
+			const initialStream = await streamPiServer(testModel, context, {
+				sessionId: "durable-tree-mismatch",
+				sessionTree: { entries, leafId: "u1" },
+				temperature: 0.25,
+				piServerRunStatePath: runStatePath,
+			});
+			await initialStream.result();
+			expect(streamPosts).toBe(1);
+
+			resetAllSessionTracking();
+			streamPosts = 0;
+			const resumedStream = await streamPiServer(testModel, context, {
+				sessionId: "durable-tree-mismatch",
+				sessionTree: { entries: changedEntries, leafId: "u2" },
+				temperature: 0.25,
+				piServerRunStatePath: runStatePath,
+				onHistoryReconciled: (snapshot) => {
+					reconciledEntries = snapshot.entries;
+				},
+			});
+			const result = await resumedStream.result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(streamPosts).toBe(0);
+			expect(statusRequests).toBe(1);
+			expect(historyRequests).toBe(1);
+			expect(eventRequests).toBe(1);
+			expect(reconciledEntries).toEqual(entries);
+		} finally {
+			resetAllSessionTracking();
+			rmSync(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a durable pending run when the current server has no matching journal", async () => {
+		const tempDirectory = mkdtempSync(join(tmpdir(), "pi-server-client-run-server-mismatch-"));
+		const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
+		const entries = baseTree().slice(0, 1);
+		let streamPosts = 0;
+		let statusRequests = 0;
+		const originalServerUrl = process.env.PI_SERVER_URL;
+
+		try {
+			process.env.PI_SERVER_URL = "http://127.0.0.1:4217";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const path = new URL(url).pathname;
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					if (path.startsWith("/api/session/durable-mismatch/runs/")) {
+						statusRequests++;
+						return new Response(JSON.stringify({ error: "stream run not found" }), {
+							status: 404,
+							headers: { "Content-Type": "application/json" },
 						});
-					}),
-				);
+					}
+					if (path === "/api/stream") {
+						streamPosts++;
+						return makeMockResponse([
+							{ type: "start" },
+							{
+								type: "done",
+								reason: "stop",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+							},
+						]);
+					}
+					return makeSessionResponse(body, {
+						treeHash: hashEntries(entries),
+						leafId: "u1",
+						entryCount: 1,
+						messageCount: 1,
+						revision: 1,
+					});
+				}),
+			);
 
-				const context: Context = {
-					systemPrompt: "You are helpful.",
-					messages: [textMessage("one", 1000)],
-				};
-				const initialStream = await streamPiServer(testModel, context, {
-					sessionId: "durable-mismatch",
-					sessionTree: { entries, leafId: "u1" },
-					temperature: 0.25,
-					piServerRunStatePath: runStatePath,
-				});
-				await initialStream.result();
-				expect(streamPosts).toBe(1);
+			const context: Context = {
+				systemPrompt: "You are helpful.",
+				messages: [textMessage("one", 1000)],
+			};
+			const initialStream = await streamPiServer(testModel, context, {
+				sessionId: "durable-mismatch",
+				sessionTree: { entries, leafId: "u1" },
+				temperature: 0.25,
+				piServerRunStatePath: runStatePath,
+			});
+			await initialStream.result();
+			expect(streamPosts).toBe(1);
 
-				resetAllSessionTracking();
-				streamPosts = 0;
-				if (mismatch === "server") {
-					process.env.PI_SERVER_URL = "http://127.0.0.1:4218";
-				}
-				const changedEntries =
-					mismatch === "tree"
-						? [...entries, messageEntry("u2", "u1", textMessage("changed tree", 2000))]
-						: entries;
-				const resumedStream = await streamPiServer(testModel, context, {
-					sessionId: "durable-mismatch",
-					sessionTree: {
-						entries: changedEntries,
-						leafId: mismatch === "tree" ? "u2" : "u1",
-					},
-					temperature: 0.25,
-					piServerRunStatePath: runStatePath,
-				});
-				const result = await resumedStream.result();
+			resetAllSessionTracking();
+			streamPosts = 0;
+			process.env.PI_SERVER_URL = "http://127.0.0.1:4218";
+			const resumedStream = await streamPiServer(testModel, context, {
+				sessionId: "durable-mismatch",
+				sessionTree: {
+					entries,
+					leafId: "u1",
+				},
+				temperature: 0.25,
+				piServerRunStatePath: runStatePath,
+			});
+			const result = await resumedStream.result();
 
-				expect(result.stopReason).toBe("error");
-				expect(result.errorMessage).toContain("server, tree, or provider request identity changed");
-				expect(streamPosts).toBe(0);
-				expect(statusRequests).toBe(0);
-			} finally {
-				if (originalServerUrl === undefined) {
-					delete process.env.PI_SERVER_URL;
-				} else {
-					process.env.PI_SERVER_URL = originalServerUrl;
-				}
-				rmSync(tempDirectory, { recursive: true, force: true });
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("pi-server no longer has durable journal");
+			expect(streamPosts).toBe(0);
+			expect(statusRequests).toBe(1);
+		} finally {
+			resetAllSessionTracking();
+			if (originalServerUrl === undefined) {
+				delete process.env.PI_SERVER_URL;
+			} else {
+				process.env.PI_SERVER_URL = originalServerUrl;
 			}
-		},
-	);
+			rmSync(tempDirectory, { recursive: true, force: true });
+		}
+	});
 
 	it("cancels the server run with an independent signal when the caller aborts", async () => {
 		const entries = baseTree().slice(0, 1);

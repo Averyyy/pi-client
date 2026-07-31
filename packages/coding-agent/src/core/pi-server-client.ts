@@ -2474,23 +2474,19 @@ function findPendingPiServerRunTerminal(
 	return undefined;
 }
 
-function assertPendingPiServerRunMatches(
+function pendingPiServerRunBaseMatches(
 	pending: PiServerPendingRunState,
 	serverHash: string,
 	sessionId: string,
 	tree: PiServerTreeSnapshot,
-): void {
-	if (
+): boolean {
+	return !(
 		pending.serverHash !== serverHash ||
 		pending.sessionId !== sessionId ||
 		pending.baseEntryCount > tree.entries.length ||
 		hashLocalTreePrefix(sessionId, tree.entries, pending.baseEntryCount) !== pending.baseTreeHash ||
 		pending.baseLeafId !== tree.leafId
-	) {
-		throw new Error(
-			`Cannot safely resume pending pi-server run ${pending.runId}: server, tree, or provider request identity changed`,
-		);
-	}
+	);
 }
 
 function missingDurablePiServerRunError(runId: string, cause?: string): Error {
@@ -2886,13 +2882,39 @@ export async function streamPiServer(
 			let resumedPendingRun = false;
 			let recoveredPendingRun: PiServerRunRecoveryResult | undefined;
 			if (pending) {
-				assertPendingPiServerRunMatches(pending, hashPiServerIdentity(getServerUrl()), sessionId, syncTree);
+				if (pending.sessionId !== sessionId) {
+					throw new Error(
+						`Cannot recover pending pi-server run ${pending.runId}: durable marker belongs to another session`,
+					);
+				}
 				runId = pending.runId;
 				phase = "provider_stream";
 				recoveredPendingRun = await recoverPiServerRun(sessionId, runId, request, options?.signal);
 				if (recoveredPendingRun.status === "not_found") {
 					throw missingDurablePiServerRunError(pending.runId);
 				} else {
+					if (
+						recoveredPendingRun.status !== "unavailable" &&
+						recoveredPendingRun.requestMac !== pending.requestHash
+					) {
+						throw new Error(
+							`Cannot recover pending pi-server run ${pending.runId}: durable server request identity did not match the client marker`,
+						);
+					}
+					if (
+						recoveredPendingRun.status !== "unavailable" &&
+						!pendingPiServerRunBaseMatches(pending, hashPiServerIdentity(getServerUrl()), sessionId, syncTree)
+					) {
+						phase = "history_reconcile";
+						const snapshot = await fetchPiServerHistory(sessionId, request);
+						if (!snapshot) {
+							throw new Error(
+								`Cannot recover pending pi-server run ${pending.runId}: server journal exists but authoritative session history is missing`,
+							);
+						}
+						await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+						phase = "provider_stream";
+					}
 					resumedPendingRun = true;
 					runSubmissionStarted = true;
 					requestHash = pending.requestHash;
