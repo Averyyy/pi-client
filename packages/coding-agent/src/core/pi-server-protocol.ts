@@ -2,29 +2,9 @@ import { createHash } from "node:crypto";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Tool } from "@earendil-works/pi-ai";
 
-export const PI_SERVER_PROTOCOL_VERSION = 2;
-
 export interface PiServerStaticContext {
 	systemPrompt?: string;
 	tools?: Tool[];
-}
-
-export function canonicalJsonStringify(value: unknown): string | undefined {
-	if (Array.isArray(value)) {
-		return `[${Array.from(value, (item) => canonicalJsonStringify(item) ?? "null").join(",")}]`;
-	}
-	if (value !== null && typeof value === "object") {
-		const record = value as Record<string, unknown>;
-		const properties: string[] = [];
-		for (const key of Object.keys(record).sort()) {
-			const serialized = canonicalJsonStringify(record[key]);
-			if (serialized !== undefined) {
-				properties.push(`${JSON.stringify(key)}:${serialized}`);
-			}
-		}
-		return `{${properties.join(",")}}`;
-	}
-	return JSON.stringify(value);
 }
 
 export function hashPiServerStaticContext(context: PiServerStaticContext | undefined): string {
@@ -35,14 +15,9 @@ export function hashPiServerStaticContext(context: PiServerStaticContext | undef
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
-			constrainedSampling: tool.constrainedSampling,
 		})),
 	};
-	const serialized = canonicalJsonStringify(canonical);
-	if (serialized === undefined) {
-		throw new Error("Failed to serialize pi-server static context");
-	}
-	return createHash("sha256").update(serialized).digest("hex");
+	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 export const PI_SERVER_EMPTY_TREE_HASH = createHash("sha256").update("pi-tree-v1").digest("hex");

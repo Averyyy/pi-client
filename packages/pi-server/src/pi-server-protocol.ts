@@ -7,50 +7,6 @@ export interface PiServerStaticContext {
 	tools?: Tool[];
 }
 
-export interface PiServerSessionIdentity {
-	staticContextHash: string;
-	treeHash: string;
-	entryCount: number;
-	leafId: string | null;
-	revision: number;
-}
-
-export interface PiServerStreamBaseIdentity {
-	baseStaticContextHash: string;
-	baseTreeHash: string;
-	baseEntryCount: number;
-	baseLeafId: string | null;
-	baseRevision: number;
-}
-
-export function matchesPiServerStreamBase(base: PiServerStreamBaseIdentity, session: PiServerSessionIdentity): boolean {
-	return (
-		base.baseStaticContextHash === session.staticContextHash &&
-		base.baseTreeHash === session.treeHash &&
-		base.baseEntryCount === session.entryCount &&
-		base.baseLeafId === session.leafId &&
-		base.baseRevision === session.revision
-	);
-}
-
-export function canonicalJsonStringify(value: unknown): string | undefined {
-	if (Array.isArray(value)) {
-		return `[${Array.from(value, (item) => canonicalJsonStringify(item) ?? "null").join(",")}]`;
-	}
-	if (value !== null && typeof value === "object") {
-		const record = value as Record<string, unknown>;
-		const properties: string[] = [];
-		for (const key of Object.keys(record).sort()) {
-			const serialized = canonicalJsonStringify(record[key]);
-			if (serialized !== undefined) {
-				properties.push(`${JSON.stringify(key)}:${serialized}`);
-			}
-		}
-		return `{${properties.join(",")}}`;
-	}
-	return JSON.stringify(value);
-}
-
 export function hashPiServerStaticContext(context: PiServerStaticContext | undefined): string {
 	if (!context) return "";
 	const canonical = {
@@ -59,14 +15,9 @@ export function hashPiServerStaticContext(context: PiServerStaticContext | undef
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
-			constrainedSampling: tool.constrainedSampling,
 		})),
 	};
-	const serialized = canonicalJsonStringify(canonical);
-	if (serialized === undefined) {
-		throw new Error("Failed to serialize pi-server static context");
-	}
-	return createHash("sha256").update(serialized).digest("hex");
+	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 export const PI_SERVER_EMPTY_TREE_HASH = createHash("sha256").update("pi-tree-v1").digest("hex");

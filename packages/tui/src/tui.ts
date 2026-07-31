@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
-import type { Terminal, TerminalWriteResult } from "./terminal.ts";
+import type { Terminal } from "./terminal.ts";
 import {
 	isOsc11BackgroundColorResponse,
 	parseOsc11BackgroundColor,
@@ -19,10 +19,6 @@ import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } fro
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
-const SYNCHRONIZED_OUTPUT_BEGIN = "\x1b[?2026h";
-const SYNCHRONIZED_OUTPUT_END = "\x1b[?2026l";
-const PENDING_TERMINAL_WRITE_MAX_COUNT = 256;
-const PENDING_TERMINAL_WRITE_MAX_BYTES = 64 * 1024;
 
 interface KittyImageHeader {
 	ids: number[];
@@ -309,11 +305,6 @@ export class TUI extends Container {
 	public onDebug?: () => void;
 	private renderRequested = false;
 	private renderTimer: NodeJS.Timeout | undefined;
-	private outputBackpressured = false;
-	private removeDrainListener?: () => void;
-	private pendingTerminalWrites: string[] = [];
-	private pendingTerminalWriteBytes = 0;
-	private forceRenderRequested = false;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
 	private cursorRow = 0; // Logical cursor row (end of rendered content)
@@ -356,7 +347,7 @@ export class TUI extends Container {
 		if (this.showHardwareCursor === enabled) return;
 		this.showHardwareCursor = enabled;
 		if (!enabled) {
-			this.observeTerminalWrite(this.terminal.hideCursor());
+			this.terminal.hideCursor();
 		}
 		this.requestRender();
 	}
@@ -514,7 +505,7 @@ export class TUI extends Container {
 		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
-		this.observeTerminalWrite(this.terminal.hideCursor());
+		this.terminal.hideCursor();
 		this.requestRender();
 
 		// Return handle for controlling this overlay
@@ -530,7 +521,7 @@ export class TUI extends Container {
 						const topVisible = this.getTopmostVisibleOverlay();
 						this.setFocus(topVisible?.component ?? entry.preFocus);
 					}
-					if (this.overlayStack.length === 0) this.observeTerminalWrite(this.terminal.hideCursor());
+					if (this.overlayStack.length === 0) this.terminal.hideCursor();
 					this.requestRender();
 				}
 			},
@@ -608,7 +599,7 @@ export class TUI extends Container {
 			const topVisible = this.getTopmostVisibleOverlay();
 			this.setFocus(topVisible?.component ?? overlay.preFocus);
 		}
-		if (this.overlayStack.length === 0) this.observeTerminalWrite(this.terminal.hideCursor());
+		if (this.overlayStack.length === 0) this.terminal.hideCursor();
 		this.requestRender();
 	}
 
@@ -649,9 +640,9 @@ export class TUI extends Container {
 			(data) => this.handleInput(data),
 			() => this.requestRender(),
 		);
-		this.observeTerminalWrite(this.terminal.hideCursor());
+		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
-			this.writeTerminal("\x1b[?2031h");
+			this.terminal.write("\x1b[?2031h");
 		}
 		this.queryCellSize();
 		this.requestRender();
@@ -681,7 +672,7 @@ export class TUI extends Container {
 		}
 		this.terminalColorSchemeNotificationsEnabled = enabled;
 		if (!this.stopped) {
-			this.writeTerminal(enabled ? "\x1b[?2031h" : "\x1b[?2031l");
+			this.terminal.write(enabled ? "\x1b[?2031h" : "\x1b[?2031l");
 		}
 	}
 
@@ -692,54 +683,52 @@ export class TUI extends Container {
 		}
 		// Query terminal for cell size in pixels: CSI 16 t
 		// Response format: CSI 6 ; height ; width t
-		this.writeTerminal("\x1b[16t");
+		this.terminal.write("\x1b[16t");
 	}
 
 	stop(): void {
 		this.stopped = true;
-		this.renderRequested = false;
-		this.removeDrainListener?.();
-		this.removeDrainListener = undefined;
-		this.outputBackpressured = false;
-		this.pendingTerminalWrites = [];
-		this.pendingTerminalWriteBytes = 0;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
 		}
-		let cleanup = SYNCHRONIZED_OUTPUT_END;
-		if (this.terminalColorSchemeNotificationsEnabled) cleanup += "\x1b[?2031l";
+		if (this.terminalColorSchemeNotificationsEnabled) {
+			this.terminal.write("\x1b[?2031l");
+		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
 			// Overwrite the inverted cursor with a normal space to clear the artifact
-			cleanup += " ";
+			this.terminal.write(" ");
 			const targetRow = this.previousLines.length; // Line after the last content
 			const lineDiff = targetRow - this.hardwareCursorRow;
 			if (lineDiff > 0) {
-				cleanup += `\x1b[${lineDiff}B`;
+				this.terminal.write(`\x1b[${lineDiff}B`);
 			} else if (lineDiff < 0) {
-				cleanup += `\x1b[${-lineDiff}A`;
+				this.terminal.write(`\x1b[${-lineDiff}A`);
 			}
-			cleanup += "\r\n";
+			this.terminal.write("\r\n");
 		}
-		cleanup += "\x1b[?25h";
-		try {
-			this.terminal.write(cleanup);
-		} finally {
-			this.terminal.stop();
-		}
+
+		this.terminal.showCursor();
+		this.terminal.stop();
 	}
 
 	requestRender(force = false): void {
 		if (force) {
-			this.forceRenderRequested = true;
+			this.previousLines = [];
+			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
+			this.previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
+			this.cursorRow = 0;
+			this.hardwareCursorRow = 0;
+			this.maxLinesRendered = 0;
+			this.previousViewportTop = 0;
 			if (this.renderTimer) {
 				clearTimeout(this.renderTimer);
 				this.renderTimer = undefined;
 			}
 			this.renderRequested = true;
 			process.nextTick(() => {
-				if (this.stopped || this.outputBackpressured || !this.renderRequested) {
+				if (this.stopped || !this.renderRequested) {
 					return;
 				}
 				this.renderRequested = false;
@@ -754,14 +743,14 @@ export class TUI extends Container {
 	}
 
 	private scheduleRender(): void {
-		if (this.stopped || this.outputBackpressured || this.renderTimer || !this.renderRequested) {
+		if (this.stopped || this.renderTimer || !this.renderRequested) {
 			return;
 		}
 		const elapsed = performance.now() - this.lastRenderAt;
 		const delay = Math.max(0, TUI.MIN_RENDER_INTERVAL_MS - elapsed);
 		this.renderTimer = setTimeout(() => {
 			this.renderTimer = undefined;
-			if (this.stopped || this.outputBackpressured || !this.renderRequested) {
+			if (this.stopped || !this.renderRequested) {
 				return;
 			}
 			this.renderRequested = false;
@@ -771,80 +760,6 @@ export class TUI extends Container {
 				this.scheduleRender();
 			}
 		}, delay);
-	}
-
-	private writeTerminal(data: string): boolean {
-		if (this.outputBackpressured) {
-			this.enqueuePendingTerminalWrite(data);
-			return false;
-		}
-		let accepted: boolean;
-		try {
-			accepted = this.terminal.write(data) !== false;
-		} catch (error) {
-			try {
-				this.terminal.write(SYNCHRONIZED_OUTPUT_END);
-			} catch {
-				// Best effort only: the terminal write path is already failing.
-			}
-			throw error;
-		}
-		if (!accepted) {
-			this.pauseForOutputDrain();
-		}
-		return accepted;
-	}
-
-	private enqueuePendingTerminalWrite(data: string): void {
-		const dataBytes = Buffer.byteLength(data, "utf8");
-		const nextCount = this.pendingTerminalWrites.length + 1;
-		const nextBytes = this.pendingTerminalWriteBytes + dataBytes;
-		if (nextCount > PENDING_TERMINAL_WRITE_MAX_COUNT || nextBytes > PENDING_TERMINAL_WRITE_MAX_BYTES) {
-			throw new Error(
-				`TUI pending terminal output capacity exceeded: writes=${nextCount}/${PENDING_TERMINAL_WRITE_MAX_COUNT}, bytes=${nextBytes}/${PENDING_TERMINAL_WRITE_MAX_BYTES}`,
-			);
-		}
-		this.pendingTerminalWrites.push(data);
-		this.pendingTerminalWriteBytes = nextBytes;
-	}
-
-	private takePendingTerminalWrites(): string {
-		if (this.pendingTerminalWrites.length === 0) return "";
-		const pending = this.pendingTerminalWrites.join("");
-		this.pendingTerminalWrites = [];
-		this.pendingTerminalWriteBytes = 0;
-		return pending;
-	}
-
-	private observeTerminalWrite(result: TerminalWriteResult): void {
-		if (result === false) {
-			this.pauseForOutputDrain();
-		}
-	}
-
-	private pauseForOutputDrain(): void {
-		if (this.outputBackpressured) return;
-		if (!this.terminal.onDrain) {
-			try {
-				this.terminal.write(SYNCHRONIZED_OUTPUT_END);
-			} catch {
-				// Best effort only: the terminal contract is invalid.
-			}
-			throw new Error("Terminal.write() returned false, but the terminal does not implement onDrain()");
-		}
-		this.outputBackpressured = true;
-		this.removeDrainListener = this.terminal.onDrain(() => {
-			this.removeDrainListener?.();
-			this.removeDrainListener = undefined;
-			this.outputBackpressured = false;
-			const pending = this.takePendingTerminalWrites();
-			if (pending && !this.writeTerminal(pending)) {
-				return;
-			}
-			if (!this.stopped && this.renderRequested) {
-				this.scheduleRender();
-			}
-		});
 	}
 
 	private handleInput(data: string): void {
@@ -1372,7 +1287,7 @@ export class TUI extends Container {
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
 			this.fullRedrawCount += 1;
-			let buffer = SYNCHRONIZED_OUTPUT_BEGIN;
+			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
 				buffer += this.deleteKittyImages(this.previousKittyImageIds);
 				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
@@ -1394,13 +1309,10 @@ export class TUI extends Container {
 				}
 				buffer += line;
 			}
-			const contentCursorRow = Math.max(0, newLines.length - 1);
-			const cursorOutput = this.buildHardwareCursorOutput(cursorPos, newLines.length, contentCursorRow);
-			buffer += cursorOutput.buffer;
-			buffer += SYNCHRONIZED_OUTPUT_END;
-			this.writeTerminal(buffer);
-			this.cursorRow = contentCursorRow;
-			this.hardwareCursorRow = cursorOutput.row;
+			buffer += "\x1b[?2026l"; // End synchronized output
+			this.terminal.write(buffer);
+			this.cursorRow = Math.max(0, newLines.length - 1);
+			this.hardwareCursorRow = this.cursorRow;
 			// Reset max lines when clearing, otherwise track growth
 			if (clear) {
 				this.maxLinesRendered = newLines.length;
@@ -1409,6 +1321,7 @@ export class TUI extends Container {
 			}
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
+			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
@@ -1423,13 +1336,6 @@ export class TUI extends Container {
 			fs.mkdirSync(path.dirname(logPath), { recursive: true });
 			fs.appendFileSync(logPath, msg);
 		};
-
-		if (this.forceRenderRequested) {
-			logRedraw("forced render");
-			fullRender(true);
-			this.forceRenderRequested = false;
-			return;
-		}
 
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
@@ -1494,9 +1400,7 @@ export class TUI extends Container {
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
-			const cursorOutput = this.buildHardwareCursorOutput(cursorPos, newLines.length, this.hardwareCursorRow);
-			this.writeTerminal(SYNCHRONIZED_OUTPUT_BEGIN + cursorOutput.buffer + SYNCHRONIZED_OUTPUT_END);
-			this.hardwareCursorRow = cursorOutput.row;
+			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
 			return;
@@ -1504,9 +1408,8 @@ export class TUI extends Container {
 
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
-			let contentHardwareCursorRow = this.hardwareCursorRow;
-			let buffer = SYNCHRONIZED_OUTPUT_BEGIN;
 			if (this.previousLines.length > newLines.length) {
+				let buffer = "\x1b[?2026h";
 				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
@@ -1538,14 +1441,12 @@ export class TUI extends Container {
 				if (moveBack > 0) {
 					buffer += `\x1b[${moveBack}A`;
 				}
+				buffer += "\x1b[?2026l";
+				this.terminal.write(buffer);
 				this.cursorRow = targetRow;
-				contentHardwareCursorRow = targetRow;
+				this.hardwareCursorRow = targetRow;
 			}
-			const cursorOutput = this.buildHardwareCursorOutput(cursorPos, newLines.length, contentHardwareCursorRow);
-			buffer += cursorOutput.buffer;
-			buffer += SYNCHRONIZED_OUTPUT_END;
-			this.writeTerminal(buffer);
-			this.hardwareCursorRow = cursorOutput.row;
+			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
@@ -1564,7 +1465,7 @@ export class TUI extends Container {
 
 		// Render from first changed line to end
 		// Build buffer with all updates wrapped in synchronized output
-		let buffer = SYNCHRONIZED_OUTPUT_BEGIN;
+		let buffer = "\x1b[?2026h"; // Begin synchronized output
 		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
@@ -1671,9 +1572,7 @@ export class TUI extends Container {
 			buffer += `\x1b[${extraLines}A`;
 		}
 
-		const cursorOutput = this.buildHardwareCursorOutput(cursorPos, newLines.length, finalCursorRow);
-		buffer += cursorOutput.buffer;
-		buffer += SYNCHRONIZED_OUTPUT_END;
+		buffer += "\x1b[?2026l"; // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = "/tmp/tui";
@@ -1705,16 +1604,19 @@ export class TUI extends Container {
 		}
 
 		// Write entire buffer at once
-		this.writeTerminal(buffer);
+		this.terminal.write(buffer);
 
 		// Track cursor position for next render
 		// cursorRow tracks end of content (for viewport calculation)
 		// hardwareCursorRow tracks actual terminal cursor position (for movement)
 		this.cursorRow = Math.max(0, newLines.length - 1);
-		this.hardwareCursorRow = cursorOutput.row;
+		this.hardwareCursorRow = finalCursorRow;
 		// Track terminal's working area (grows but doesn't shrink unless cleared)
 		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
 		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
+
+		// Position hardware cursor for IME
+		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
@@ -1722,13 +1624,15 @@ export class TUI extends Container {
 		this.previousHeight = height;
 	}
 
-	private buildHardwareCursorOutput(
-		cursorPos: { row: number; col: number } | null,
-		totalLines: number,
-		currentRow: number,
-	): { buffer: string; row: number } {
+	/**
+	 * Position the hardware cursor for IME candidate window.
+	 * @param cursorPos The cursor position extracted from rendered output, or null
+	 * @param totalLines Total number of rendered lines
+	 */
+	private positionHardwareCursor(cursorPos: { row: number; col: number } | null, totalLines: number): void {
 		if (!cursorPos || totalLines <= 0) {
-			return { buffer: "\x1b[?25l", row: currentRow };
+			this.terminal.hideCursor();
+			return;
 		}
 
 		// Clamp cursor position to valid range
@@ -1736,7 +1640,7 @@ export class TUI extends Container {
 		const targetCol = Math.max(0, cursorPos.col);
 
 		// Move cursor from current position to target
-		const rowDelta = targetRow - currentRow;
+		const rowDelta = targetRow - this.hardwareCursorRow;
 		let buffer = "";
 		if (rowDelta > 0) {
 			buffer += `\x1b[${rowDelta}B`; // Move down
@@ -1745,8 +1649,17 @@ export class TUI extends Container {
 		}
 		// Move to absolute column (1-indexed)
 		buffer += `\x1b[${targetCol + 1}G`;
-		buffer += this.showHardwareCursor ? "\x1b[?25h" : "\x1b[?25l";
-		return { buffer, row: targetRow };
+
+		if (buffer) {
+			this.terminal.write(buffer);
+		}
+
+		this.hardwareCursorRow = targetRow;
+		if (this.showHardwareCursor) {
+			this.terminal.showCursor();
+		} else {
+			this.terminal.hideCursor();
+		}
 	}
 
 	/**
@@ -1773,7 +1686,7 @@ export class TUI extends Container {
 			}, timeoutMs);
 			this.pendingOsc11BackgroundQueries.push(query);
 			this.pendingOsc11BackgroundReplies += 1;
-			this.writeTerminal("\x1b]11;?\x07");
+			this.terminal.write("\x1b]11;?\x07");
 		});
 	}
 
@@ -1800,7 +1713,7 @@ export class TUI extends Container {
 
 			unsubscribe = this.onTerminalColorSchemeChange(settle);
 			timer = setTimeout(() => settle(undefined), timeoutMs);
-			this.writeTerminal("\x1b[?996n");
+			this.terminal.write("\x1b[?996n");
 		});
 	}
 }

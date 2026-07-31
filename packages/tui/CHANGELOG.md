@@ -1,15 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### Changed
-
-- Terminal output methods may now report their writable acceptance state; existing `void` implementations remain compatible, while terminals that return `false` must implement `onDrain()` so TUI rendering can resume safely.
-
-### Fixed
-
-- Fixed long streaming sessions ignoring stdout backpressure by bounding queued rendering and direct writes, preserving committed cursor state across deferred forced redraws, and resetting synchronized output during shutdown, termination signals, and fatal render errors.
-
 ## [0.82.1] - 2026-07-25
 
 ## [0.82.0] - 2026-07-24

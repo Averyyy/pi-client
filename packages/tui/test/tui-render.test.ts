@@ -26,9 +26,9 @@ class TestComponent implements Component {
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
 
-	override write(data: string): boolean {
+	override write(data: string): void {
 		this.writes.push(data);
-		return super.write(data);
+		super.write(data);
 	}
 
 	getWrites(): string {

@@ -2,9 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { PI_SERVER_EMPTY_TREE_HASH } from "../src/pi-server-protocol.ts";
 import { createPiServer, type ServerConfig } from "../src/server.ts";
 import {
 	appendMessages,
@@ -22,19 +20,6 @@ interface ServerResponse {
 	error?: string;
 	deleted?: string;
 }
-
-const streamModel: Model<"openai-completions"> = {
-	id: "test-model",
-	api: "openai-completions",
-	provider: "opencode-go",
-	baseUrl: "https://example.com",
-	name: "Test",
-	reasoning: false,
-	input: ["text"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 1000,
-	maxTokens: 100,
-};
 
 describe("pi-server integration", () => {
 	let server: Server;
@@ -133,9 +118,18 @@ describe("pi-server integration", () => {
 			},
 			body: JSON.stringify({
 				sessionId: "no-ctx-stream",
-				baseStaticContextHash: "",
-				baseRevision: 0,
-				model: streamModel,
+				model: {
+					id: "test-model",
+					api: "openai-completions",
+					provider: "opencode-go",
+					baseUrl: "https://example.com",
+					name: "Test",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 			}),
 		});
@@ -153,12 +147,18 @@ describe("pi-server integration", () => {
 			},
 			body: JSON.stringify({
 				sessionId: "inline-ctx-stream",
-				baseStaticContextHash: "",
-				baseRevision: 0,
-				baseTreeHash: PI_SERVER_EMPTY_TREE_HASH,
-				baseEntryCount: 0,
-				baseLeafId: null,
-				model: streamModel,
+				model: {
+					id: "test-model",
+					api: "openai-completions",
+					provider: "opencode-go",
+					baseUrl: "https://example.com",
+					name: "Test",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
 				delta: [{ role: "user", content: "hello", timestamp: 1000 }],
 				staticContext: {
 					systemPrompt: "You are helpful.",

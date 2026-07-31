@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, openSync, rmSync, writeSync } from "node:fs";
+import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
@@ -52,7 +52,7 @@ export class OutputAccumulator {
 	private finished = false;
 
 	private tempFilePath: string | undefined;
-	private tempFileHandle: number | undefined;
+	private tempFileStream: WriteStream | undefined;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -69,9 +69,9 @@ export class OutputAccumulator {
 		this.totalRawBytes += data.length;
 		this.appendDecodedText(this.decoder.decode(data, { stream: true }));
 
-		if (this.tempFileHandle !== undefined || this.shouldUseTempFile()) {
+		if (this.tempFileStream || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.writeTempFile(data);
+			this.tempFileStream?.write(data);
 		} else if (data.length > 0) {
 			this.rawChunks.push(data);
 		}
@@ -119,17 +119,26 @@ export class OutputAccumulator {
 	}
 
 	async closeTempFile(): Promise<void> {
-		if (this.tempFileHandle === undefined) {
+		if (!this.tempFileStream) {
 			return;
 		}
 
-		const handle = this.tempFileHandle;
-		this.tempFileHandle = undefined;
-		try {
-			fsyncSync(handle);
-		} finally {
-			closeSync(handle);
-		}
+		const stream = this.tempFileStream;
+		this.tempFileStream = undefined;
+
+		await new Promise<void>((resolve, reject) => {
+			const onError = (error: Error) => {
+				stream.off("finish", onFinish);
+				reject(error);
+			};
+			const onFinish = () => {
+				stream.off("error", onError);
+				resolve();
+			};
+			stream.once("error", onError);
+			stream.once("finish", onFinish);
+			stream.end();
+		});
 	}
 
 	getLastLineBytes(): number {
@@ -200,41 +209,14 @@ export class OutputAccumulator {
 	}
 
 	private ensureTempFile(): void {
-		if (this.tempFileHandle !== undefined) {
+		if (this.tempFilePath) {
 			return;
 		}
-		if (this.tempFilePath) {
-			throw new Error("Cannot reopen a closed output accumulator temp file");
+		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
+		this.tempFileStream = createWriteStream(this.tempFilePath);
+		for (const chunk of this.rawChunks) {
+			this.tempFileStream.write(chunk);
 		}
-		const path = defaultTempFilePath(this.tempFilePrefix);
-		const handle = openSync(path, "wx", 0o600);
-		try {
-			for (const chunk of this.rawChunks) {
-				this.writeAll(handle, chunk);
-			}
-		} catch (error) {
-			closeSync(handle);
-			rmSync(path, { force: true });
-			throw error;
-		}
-		this.tempFilePath = path;
-		this.tempFileHandle = handle;
 		this.rawChunks = [];
-	}
-
-	private writeTempFile(data: Buffer): void {
-		if (this.tempFileHandle === undefined || data.length === 0) return;
-		this.writeAll(this.tempFileHandle, data);
-	}
-
-	private writeAll(handle: number, data: Buffer): void {
-		let offset = 0;
-		while (offset < data.length) {
-			const written = writeSync(handle, data, offset, data.length - offset);
-			if (written === 0) {
-				throw new Error("Output spool write made no progress");
-			}
-			offset += written;
-		}
 	}
 }

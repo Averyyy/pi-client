@@ -153,14 +153,12 @@ describe("InteractiveMode.renderSessionEntries", () => {
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(true);
 
-		const toolResult = createToolResultMessage("FINAL_RESULT");
 		await handleEvent.call(fakeThis, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_ID,
 			toolName: TOOL_NAME,
 			result: { content: [{ type: "text", text: "FINAL_RESULT" }], details: undefined },
 			isError: false,
-			toolResult,
 		});
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(false);

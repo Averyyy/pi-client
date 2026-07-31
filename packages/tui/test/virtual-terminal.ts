@@ -47,13 +47,8 @@ export class VirtualTerminal implements Terminal {
 		this.resizeHandler = undefined;
 	}
 
-	write(data: string): boolean {
+	write(data: string): void {
 		this.xterm.write(data);
-		return true;
-	}
-
-	onDrain(_listener: () => void): () => void {
-		return () => {};
 	}
 
 	get columns(): number {
@@ -69,7 +64,7 @@ export class VirtualTerminal implements Terminal {
 		return true;
 	}
 
-	moveBy(lines: number): boolean {
+	moveBy(lines: number): void {
 		if (lines > 0) {
 			// Move down
 			this.xterm.write(`\x1b[${lines}B`);
@@ -78,43 +73,34 @@ export class VirtualTerminal implements Terminal {
 			this.xterm.write(`\x1b[${-lines}A`);
 		}
 		// lines === 0: no movement
-		return true;
 	}
 
-	hideCursor(): boolean {
+	hideCursor(): void {
 		this.xterm.write("\x1b[?25l");
-		return true;
 	}
 
-	showCursor(): boolean {
+	showCursor(): void {
 		this.xterm.write("\x1b[?25h");
-		return true;
 	}
 
-	clearLine(): boolean {
+	clearLine(): void {
 		this.xterm.write("\x1b[K");
-		return true;
 	}
 
-	clearFromCursor(): boolean {
+	clearFromCursor(): void {
 		this.xterm.write("\x1b[J");
-		return true;
 	}
 
-	clearScreen(): boolean {
+	clearScreen(): void {
 		this.xterm.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
-		return true;
 	}
 
-	setTitle(title: string): boolean {
+	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title
 		this.xterm.write(`\x1b]0;${title}\x07`);
-		return true;
 	}
 
-	setProgress(_active: boolean): boolean {
-		return true;
-	}
+	setProgress(_active: boolean): void {}
 
 	// Test-specific methods not in Terminal interface
 

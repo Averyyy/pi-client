@@ -1,21 +1,11 @@
-import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
-import {
-	acquirePiServerRunStateLease,
-	getPiServerRunStatePath,
-	releasePiServerRunStateLease,
-} from "../src/core/pi-server-run-state.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
-import {
-	deleteSessionFile,
-	getSessionDeletionPaths,
-	SessionSelectorComponent,
-} from "../src/modes/interactive/components/session-selector.ts";
+import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 type Deferred<T> = {
@@ -137,100 +127,6 @@ describe("session selector path/delete interactions", () => {
 		list.handleInput(CTRL_BACKSPACE);
 
 		expect(confirmationChanges).toEqual([]);
-	});
-
-	it("enumerates the session, recovery journals, and complete pi-server lock database family", () => {
-		const sessionPath = join("sessions", "session.jsonl");
-		const runStatePath = `${sessionPath}.pi-server-runs.jsonl`;
-		const lockPath = `${runStatePath}.lock.sqlite`;
-		expect(getSessionDeletionPaths(sessionPath)).toEqual([
-			sessionPath,
-			`${sessionPath}.tool-effects.jsonl`,
-			runStatePath,
-			lockPath,
-			`${lockPath}-journal`,
-			`${lockPath}-wal`,
-			`${lockPath}-shm`,
-		]);
-	});
-
-	it("deletes the session and recovery sidecars under an exclusive pi-server lease", async () => {
-		const directory = mkdtempSync(join(tmpdir(), "pi-session-delete-"));
-		tempDirs.push(directory);
-		const sessionPath = join(directory, "session.jsonl");
-		const toolEffectPath = `${sessionPath}.tool-effects.jsonl`;
-		const runStatePath = getPiServerRunStatePath(sessionPath);
-		writeFileSync(sessionPath, "session\n");
-		writeFileSync(toolEffectPath, "tool effect\n");
-		writeFileSync(runStatePath, "run state\n");
-		const lease = acquirePiServerRunStateLease(runStatePath);
-		releasePiServerRunStateLease(lease);
-
-		const result = await deleteSessionFile(sessionPath);
-
-		expect(result.ok).toBe(true);
-		expect(getSessionDeletionPaths(sessionPath).every((path) => !existsSync(path))).toBe(true);
-	});
-
-	it("bounds the trash subprocess and falls back to unlink after a timeout", async () => {
-		const directory = mkdtempSync(join(tmpdir(), "pi-session-delete-timeout-"));
-		tempDirs.push(directory);
-		const sessionPath = join(directory, "session.jsonl");
-		writeFileSync(sessionPath, "session\n");
-		const observedOptions: SpawnSyncOptionsWithStringEncoding[] = [];
-		const timeoutError = Object.assign(new Error("spawnSync trash ETIMEDOUT"), { code: "ETIMEDOUT" });
-		const timedOutResult: SpawnSyncReturns<string> = {
-			pid: 123,
-			output: [null, "", ""],
-			stdout: "",
-			stderr: "",
-			status: null,
-			signal: "SIGKILL",
-			error: timeoutError,
-		};
-
-		const result = await deleteSessionFile(sessionPath, {
-			trashTimeoutMs: 25,
-			spawnTrash: (_command, _args, options) => {
-				observedOptions.push(options);
-				return timedOutResult;
-			},
-		});
-
-		expect(result).toEqual({ ok: true, method: "unlink" });
-		expect(observedOptions.length).toBeGreaterThanOrEqual(1);
-		for (const options of observedOptions) {
-			expect(options).toMatchObject({
-				timeout: 25,
-				killSignal: "SIGKILL",
-				windowsHide: true,
-				maxBuffer: 64 * 1024,
-			});
-		}
-		expect(existsSync(sessionPath)).toBe(false);
-	});
-
-	it("fails without deleting data when another process owns the pi-server session lease", async () => {
-		const directory = mkdtempSync(join(tmpdir(), "pi-session-delete-locked-"));
-		tempDirs.push(directory);
-		const sessionPath = join(directory, "session.jsonl");
-		const toolEffectPath = `${sessionPath}.tool-effects.jsonl`;
-		const runStatePath = getPiServerRunStatePath(sessionPath);
-		writeFileSync(sessionPath, "session\n");
-		writeFileSync(toolEffectPath, "tool effect\n");
-		writeFileSync(runStatePath, "run state\n");
-		const lease = acquirePiServerRunStateLease(runStatePath);
-		try {
-			const result = await deleteSessionFile(sessionPath);
-
-			expect(result.ok).toBe(false);
-			expect(result.error).toContain("another process owns the session");
-			expect(existsSync(sessionPath)).toBe(true);
-			expect(existsSync(toolEffectPath)).toBe(true);
-			expect(existsSync(runStatePath)).toBe(true);
-		} finally {
-			releasePiServerRunStateLease(lease);
-		}
 	});
 
 	it("enters confirmation mode on Ctrl+D even with a non-empty search query", async () => {

@@ -1,8 +1,6 @@
-import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
@@ -10,15 +8,8 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { hashPiServerCompactRequest } from "../src/core/pi-server-client.ts";
-import {
-	canonicalJsonStringify,
-	hashPiServerSessionEntries,
-	PI_SERVER_EMPTY_TREE_HASH,
-	PI_SERVER_PROTOCOL_VERSION,
-} from "../src/core/pi-server-protocol.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
@@ -29,10 +20,8 @@ describe("createAgentSession stream options", () => {
 	let tempDir: string;
 	let cwd: string;
 	let agentDir: string;
-	let previousPiServerMode: string | undefined;
 
 	beforeEach(() => {
-		previousPiServerMode = process.env.PI_SERVER_MODE;
 		tempDir = mkdtempSync(join(tmpdir(), "pi-sdk-stream-options-"));
 		cwd = join(tempDir, "project");
 		agentDir = join(tempDir, "agent");
@@ -41,13 +30,6 @@ describe("createAgentSession stream options", () => {
 	});
 
 	afterEach(() => {
-		vi.restoreAllMocks();
-		vi.unstubAllGlobals();
-		if (previousPiServerMode === undefined) {
-			delete process.env.PI_SERVER_MODE;
-		} else {
-			process.env.PI_SERVER_MODE = previousPiServerMode;
-		}
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -69,10 +51,11 @@ describe("createAgentSession stream options", () => {
 		};
 	}
 
-	function createDoneMessage(api: Api, text = "ok"): AssistantMessage {
-		return {
+	function createDoneStream(api: Api) {
+		const stream = createAssistantMessageEventStream();
+		const message: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "text", text }],
+			content: [{ type: "text", text: "ok" }],
 			api,
 			provider: "capture-provider",
 			model: "capture-model",
@@ -87,11 +70,6 @@ describe("createAgentSession stream options", () => {
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
-	}
-
-	function createDoneStream(api: Api) {
-		const stream = createAssistantMessageEventStream();
-		const message = createDoneMessage(api);
 		stream.end(message);
 		return stream;
 	}
@@ -190,223 +168,6 @@ describe("createAgentSession stream options", () => {
 
 		expect(options?.maxRetries).toBe(2);
 		expect(options?.maxRetryDelayMs).toBe(3000);
-	});
-
-	it("uses a later main stream replacement for native auxiliary compaction", async () => {
-		delete process.env.PI_SERVER_MODE;
-		const model = createModel("openai-completions");
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
-		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
-		let registeredProviderCalls = 0;
-		modelRegistry.registerProvider(model.provider, {
-			api: model.api,
-			streamSimple: () => {
-				registeredProviderCalls++;
-				return createDoneStream(model.api);
-			},
-		});
-		const sessionManager = SessionManager.inMemory(cwd);
-		const settingsManager = SettingsManager.inMemory({ compaction: { keepRecentTokens: 1 } });
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			model,
-			modelRuntime: getModelRuntime(modelRegistry),
-			settingsManager,
-			sessionManager,
-		});
-		const now = Date.now();
-		sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: "message to compact" }],
-			timestamp: now - 1000,
-		});
-		const assistant = createDoneMessage(model.api, "assistant response to compact");
-		assistant.timestamp = now - 500;
-		assistant.usage = {
-			input: 100,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 100,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		};
-		sessionManager.appendMessage(assistant);
-		session.agent.state.messages = sessionManager.buildSessionContext().messages;
-		let replacementCalls = 0;
-		session.agent.streamFunction = (requestModel) => {
-			replacementCalls++;
-			const stream = createAssistantMessageEventStream();
-			stream.end(createDoneMessage(requestModel.api, "summary from replacement stream"));
-			return stream;
-		};
-
-		try {
-			const result = await session.compact();
-
-			expect(result?.summary).toContain("summary from replacement stream");
-			expect(replacementCalls).toBe(1);
-			expect(registeredProviderCalls).toBe(0);
-		} finally {
-			session.dispose();
-			modelRegistry.unregisterProvider(model.provider);
-		}
-	});
-
-	it("allows a custom provider executor and applies the credential-scoped baseUrl to pi-server", async () => {
-		const model = createModel("openai-completions");
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
-		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
-		modelRegistry.registerProvider(model.provider, {
-			api: model.api,
-			baseUrl: model.baseUrl,
-			streamSimple: () => createDoneStream(model.api),
-			models: [
-				{
-					id: model.id,
-					name: model.name,
-					reasoning: model.reasoning,
-					input: model.input,
-					cost: model.cost,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-				},
-			],
-		});
-		const modelRuntime = getModelRuntime(modelRegistry);
-		vi.spyOn(modelRuntime, "getAuth").mockResolvedValue({
-			auth: {
-				apiKey: "credential-api-key",
-				baseUrl: "https://credential-endpoint.invalid/v1",
-			},
-		});
-		let requestModel: Record<string, unknown> | undefined;
-		let serverEntries: SessionTreeEntry[] = [];
-		let serverLeafId: string | null = null;
-		let serverStaticContextHash = "";
-		let revision = 0;
-		let streamRunId = "";
-		let streamRequestMac = "";
-
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string, init?: RequestInit) => {
-				const body = JSON.parse((init?.body as string | undefined) ?? "{}") as Record<string, unknown>;
-				if (url.endsWith("/api/stream")) {
-					requestModel = body.model as Record<string, unknown>;
-					streamRunId = body.runId as string;
-					const { eventCursor: _eventCursor, runId: _runId, ...requestIdentity } = body;
-					const serializedIdentity = canonicalJsonStringify(requestIdentity);
-					if (serializedIdentity === undefined) throw new Error("Failed to serialize mock stream identity");
-					streamRequestMac = createHash("sha256").update(serializedIdentity).digest("hex");
-					return new Response(
-						`data: ${JSON.stringify({
-							type: "done",
-							reason: "stop",
-							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
-							diagnostics: [
-								{
-									type: "pi_server_run",
-									timestamp: Date.now(),
-									details: {
-										sessionId: body.sessionId,
-										runId: streamRunId,
-										requestMac: streamRequestMac,
-									},
-								},
-							],
-						})}\n\n`,
-						{ status: 200, headers: { "Content-Type": "text/event-stream" } },
-					);
-				}
-				if (url.endsWith("/api/session/run/ack")) {
-					return new Response(
-						JSON.stringify({
-							acknowledged: true,
-							sessionId: body.sessionId,
-							runId: streamRunId,
-							requestMac: streamRequestMac,
-							status: "completed",
-							acknowledgedAt: Date.now(),
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-				if (url.endsWith("/api/session/compact")) {
-					const requestHash = hashPiServerCompactRequest(
-						body as unknown as Parameters<typeof hashPiServerCompactRequest>[0],
-					);
-					return new Response(
-						JSON.stringify({
-							protocolVersion: PI_SERVER_PROTOCOL_VERSION,
-							sessionId: body.sessionId,
-							operationId: body.operationId,
-							requestHash,
-							status: "rejected",
-							httpStatus: 400,
-							operationDisposition: "not_started",
-							error: "stop after compact request capture",
-						}),
-						{ status: 400, headers: { "Content-Type": "application/json" } },
-					);
-				}
-				if (url.endsWith("/api/session/init")) {
-					serverStaticContextHash = body.staticContextHash as string;
-				}
-				if (url.endsWith("/api/session/tree/append") || url.endsWith("/api/session/tree/sync")) {
-					const entries = body.entries as SessionTreeEntry[] | undefined;
-					serverEntries = url.endsWith("/append") ? [...serverEntries, ...(entries ?? [])] : (entries ?? []);
-					serverLeafId = (body.leafId as string | null | undefined) ?? null;
-					revision++;
-				}
-				return new Response(
-					JSON.stringify({
-						protocolVersion: PI_SERVER_PROTOCOL_VERSION,
-						sessionId: body.sessionId,
-						staticContextHash: serverStaticContextHash,
-						staticContextRequired: false,
-						treeHash:
-							serverEntries.length > 0 ? hashPiServerSessionEntries(serverEntries) : PI_SERVER_EMPTY_TREE_HASH,
-						messageCount: 0,
-						entryCount: serverEntries.length,
-						leafId: serverLeafId,
-						revision,
-					}),
-					{ status: 200, headers: { "Content-Type": "application/json" } },
-				);
-			}),
-		);
-		process.env.PI_SERVER_MODE = "true";
-		const sessionManager = SessionManager.create(cwd, join(tempDir, "sessions"));
-		sessionManager.appendMessage({ role: "user", content: "first persisted turn", timestamp: Date.now() - 4 });
-		sessionManager.appendMessage(createDoneMessage(model.api, "first persisted answer"));
-		sessionManager.appendMessage({ role: "user", content: "second persisted turn", timestamp: Date.now() - 2 });
-		sessionManager.appendMessage(createDoneMessage(model.api, "second persisted answer"));
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			model,
-			modelRuntime,
-			settingsManager: SettingsManager.inMemory({ compaction: { keepRecentTokens: 1 } }),
-			sessionManager,
-		});
-
-		try {
-			await session.prompt("capture provider request");
-			await session.agent.waitForIdle();
-			await expect(session.compact()).rejects.toThrow("stop after compact request capture");
-		} finally {
-			session.dispose();
-			modelRegistry.unregisterProvider(model.provider);
-		}
-
-		expect(requestModel).toMatchObject({
-			id: model.id,
-			baseUrl: "https://credential-endpoint.invalid/v1",
-		});
-		expect(model.baseUrl).toBe("https://capture.invalid/v1");
 	});
 
 	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {

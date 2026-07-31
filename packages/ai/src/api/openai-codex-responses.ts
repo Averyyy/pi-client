@@ -465,7 +465,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, httpTimeoutMs, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -646,21 +646,14 @@ async function processStream(
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
-	idleTimeoutMs: number | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(
-		mapCodexEvents(parseSSE(response, options?.signal, idleTimeoutMs)),
-		output,
-		stream,
-		model,
-		{
-			serviceTier: options?.serviceTier,
-			grammarToolInputProperties,
-			resolveServiceTier: resolveCodexServiceTier,
-			applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-		},
-	);
+	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal)), output, stream, model, {
+		serviceTier: options?.serviceTier,
+		grammarToolInputProperties,
+		resolveServiceTier: resolveCodexServiceTier,
+		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+	});
 }
 
 class CodexApiError extends Error {
@@ -754,17 +747,12 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 // SSE Parsing
 // ============================================================================
 
-async function* parseSSE(
-	response: Response,
-	signal?: AbortSignal,
-	idleTimeoutMs?: number,
-): AsyncGenerator<Record<string, unknown>> {
+async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
-	let idleDeadlineMs = idleTimeoutMs !== undefined && idleTimeoutMs > 0 ? Date.now() + idleTimeoutMs : undefined;
 	const onAbort = () => {
 		void reader.cancel().catch(() => {});
 	};
@@ -775,50 +763,11 @@ async function* parseSSE(
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			const remainingIdleMs = idleDeadlineMs === undefined ? undefined : Math.max(0, idleDeadlineMs - Date.now());
-			if (remainingIdleMs === 0) {
-				const error = new Error(`Codex SSE idle timeout after ${idleTimeoutMs}ms`);
-				void reader.cancel(error).catch(() => {});
-				throw error;
-			}
-			const { done, value } =
-				remainingIdleMs !== undefined
-					? await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
-							let settled = false;
-							const timeout = setTimeout(() => {
-								if (settled) return;
-								settled = true;
-								const error = new Error(`Codex SSE idle timeout after ${idleTimeoutMs}ms`);
-								void reader.cancel(error).catch(() => {});
-								reject(error);
-							}, remainingIdleMs);
-							void reader.read().then(
-								(result) => {
-									if (settled) return;
-									settled = true;
-									clearTimeout(timeout);
-									resolve(result);
-								},
-								(cause) => {
-									if (settled) return;
-									settled = true;
-									clearTimeout(timeout);
-									reject(cause);
-								},
-							);
-						})
-					: await reader.read();
+			const { done, value } = await reader.read();
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
 			if (done) break;
-			if (value.byteLength === 0) {
-				await new Promise<void>((resolve) => setTimeout(resolve, 0));
-				continue;
-			}
-			if (idleTimeoutMs !== undefined && idleTimeoutMs > 0) {
-				idleDeadlineMs = Date.now() + idleTimeoutMs;
-			}
 			buffer += decoder.decode(value, { stream: true });
 
 			let idx = buffer.indexOf("\n\n");

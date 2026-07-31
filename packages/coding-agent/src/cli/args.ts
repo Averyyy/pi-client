@@ -232,8 +232,7 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  ${APP_NAME} tool-effects <action>     Inspect or explicitly resolve an interrupted tool effect
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/tool-effects
+  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)

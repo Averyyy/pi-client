@@ -6,7 +6,7 @@ import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } fro
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type {
 	FauxModelDefinition,
@@ -73,8 +73,6 @@ export interface HarnessOptions {
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
-	sessionManager?: SessionManager;
-	auxiliaryStreamFunction?: StreamFn;
 }
 
 export interface Harness {
@@ -112,7 +110,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
+	const sessionManager = SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -182,30 +180,20 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const resourceLoader =
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
-	let session: AgentSession;
-	try {
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settingsManager,
-			cwd: options.sessionManager ? sessionManager.getCwd() : tempDir,
-			modelRuntime: getModelRuntime(modelRegistry),
-			auxiliaryStreamFunction: options.auxiliaryStreamFunction,
-			resourceLoader,
-			baseToolsOverride: toolMap,
-			initialActiveToolNames: options.initialActiveToolNames,
-			allowedToolNames: options.allowedToolNames,
-			excludedToolNames: options.excludedToolNames,
-			extensionRunnerRef,
-			autoSessionName: options.autoSessionName ?? false,
-		});
-	} catch (error) {
-		fauxProvider.unregister();
-		if (existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true });
-		}
-		throw error;
-	}
+	const session = new AgentSession({
+		agent,
+		sessionManager,
+		settingsManager,
+		cwd: tempDir,
+		modelRuntime: getModelRuntime(modelRegistry),
+		resourceLoader,
+		baseToolsOverride: toolMap,
+		initialActiveToolNames: options.initialActiveToolNames,
+		allowedToolNames: options.allowedToolNames,
+		excludedToolNames: options.excludedToolNames,
+		extensionRunnerRef,
+		autoSessionName: options.autoSessionName ?? false,
+	});
 
 	const events: AgentSessionEvent[] = [];
 	session.subscribe((event) => {

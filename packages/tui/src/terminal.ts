@@ -11,10 +11,6 @@ const cjsRequire = createRequire(import.meta.url);
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
-const TERMINAL_SYNCHRONIZED_OUTPUT_END_SEQUENCE = "\x1b[?2026l";
-const TERMINAL_EMERGENCY_RESET_SEQUENCE = `${TERMINAL_SYNCHRONIZED_OUTPUT_END_SEQUENCE}\x1b[?25h`;
-const TERMINAL_PENDING_OUTPUT_MAX_WRITES = 256;
-const TERMINAL_PENDING_OUTPUT_MAX_BYTES = 64 * 1024;
 const APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
@@ -50,20 +46,6 @@ export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boole
 	return data;
 }
 
-export function reraiseSignalIfUnowned(remainingListenerCount: number, reraise: () => void): void {
-	if (remainingListenerCount === 0) {
-		reraise();
-	}
-}
-
-// biome-ignore lint/suspicious/noConfusingVoidType: void keeps existing Terminal implementations source-compatible.
-export type TerminalWriteResult = boolean | void;
-type CoalescedTerminalControl = "cursor" | "keyboard" | "progress" | "title";
-type PendingTerminalOutput = {
-	data: string;
-	control?: CoalescedTerminalControl;
-};
-
 /**
  * Minimal terminal interface for TUI
  */
@@ -82,18 +64,8 @@ export interface Terminal {
 	 */
 	drainInput(maxMs?: number, idleMs?: number): Promise<void>;
 
-	/**
-	 * Write output to the terminal. A false result means the data was accepted
-	 * but the writable is applying backpressure; callers must wait for drain
-	 * before writing more.
-	 */
-	write(data: string): TerminalWriteResult;
-
-	/**
-	 * Subscribe to output drain. A terminal that can return false from write()
-	 * must implement this method.
-	 */
-	onDrain?(listener: () => void): () => void;
+	// Write output to terminal
+	write(data: string): void;
 
 	// Get terminal dimensions
 	get columns(): number;
@@ -103,22 +75,22 @@ export interface Terminal {
 	get kittyProtocolActive(): boolean;
 
 	// Cursor positioning (relative to current position)
-	moveBy(lines: number): TerminalWriteResult; // Move cursor up (negative) or down (positive) by N lines
+	moveBy(lines: number): void; // Move cursor up (negative) or down (positive) by N lines
 
 	// Cursor visibility
-	hideCursor(): TerminalWriteResult; // Hide the cursor
-	showCursor(): TerminalWriteResult; // Show the cursor
+	hideCursor(): void; // Hide the cursor
+	showCursor(): void; // Show the cursor
 
 	// Clear operations
-	clearLine(): TerminalWriteResult; // Clear current line
-	clearFromCursor(): TerminalWriteResult; // Clear from cursor to end of screen
-	clearScreen(): TerminalWriteResult; // Clear entire screen and move cursor to (0,0)
+	clearLine(): void; // Clear current line
+	clearFromCursor(): void; // Clear from cursor to end of screen
+	clearScreen(): void; // Clear entire screen and move cursor to (0,0)
 
 	// Title operations
-	setTitle(title: string): TerminalWriteResult; // Set terminal window title
+	setTitle(title: string): void; // Set terminal window title
 
 	// Progress indicator (OSC 9;4)
-	setProgress(active: boolean): TerminalWriteResult;
+	setProgress(active: boolean): void;
 }
 
 /**
@@ -136,13 +108,6 @@ export class ProcessTerminal implements Terminal {
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
-	private stdoutBackpressured = false;
-	private stdoutDrainHandler?: () => void;
-	private drainListeners = new Set<() => void>();
-	private pendingOutput: PendingTerminalOutput[] = [];
-	private pendingOutputBytes = 0;
-	private emergencyExitHandler?: () => void;
-	private emergencySignalHandlers = new Map<NodeJS.Signals, () => void>();
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -169,7 +134,6 @@ export class ProcessTerminal implements Terminal {
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
-		this.installEmergencyResetHandlers();
 
 		// Save previous state and enable raw mode
 		this.wasRaw = process.stdin.isRaw || false;
@@ -180,7 +144,7 @@ export class ProcessTerminal implements Terminal {
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
-		this.write("\x1b[?2004h");
+		process.stdout.write("\x1b[?2004h");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.resizeHandler);
@@ -258,7 +222,7 @@ export class ProcessTerminal implements Terminal {
 		process.stdin.on("data", this.stdinDataHandler!);
 		this.keyboardProtocolPushed = true;
 		this.clearKeyboardProtocolNegotiationBuffer();
-		this.write(KITTY_KEYBOARD_PROTOCOL_QUERY);
+		process.stdout.write(KITTY_KEYBOARD_PROTOCOL_QUERY);
 	}
 
 	private handleKeyboardProtocolNegotiationSequence(
@@ -355,17 +319,13 @@ export class ProcessTerminal implements Terminal {
 
 	private enableModifyOtherKeys(): void {
 		if (this._kittyProtocolActive || this._modifyOtherKeysActive) return;
-		this.writeCoalescedControl("keyboard", "\x1b[>4;2m");
+		process.stdout.write("\x1b[>4;2m");
 		this._modifyOtherKeysActive = true;
 	}
 
-	private disableModifyOtherKeys(forceWrite = false): void {
+	private disableModifyOtherKeys(): void {
 		if (!this._modifyOtherKeysActive) return;
-		if (forceWrite) {
-			this.write("\x1b[>4;0m");
-		} else {
-			this.writeCoalescedControl("keyboard", "\x1b[>4;0m");
-		}
+		process.stdout.write("\x1b[>4;0m");
 		this._modifyOtherKeysActive = false;
 	}
 
@@ -411,12 +371,12 @@ export class ProcessTerminal implements Terminal {
 		if (shouldDisableKittyProtocol) {
 			// Disable Kitty keyboard protocol first so any late key releases
 			// do not generate new Kitty escape sequences.
-			this.write("\x1b[<u");
+			process.stdout.write("\x1b[<u");
 			this.keyboardProtocolPushed = false;
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
-		this.disableModifyOtherKeys(true);
+		this.disableModifyOtherKeys();
 
 		const previousHandler = this.inputHandler;
 		this.inputHandler = undefined;
@@ -444,30 +404,24 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
-		this.clearProgressInterval();
+		if (this.clearProgressInterval()) {
+			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+		}
+
+		// Disable bracketed paste mode
+		process.stdout.write("\x1b[?2004l");
+
 		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
 		this.clearKeyboardProtocolNegotiationBuffer();
-		let cleanup =
-			this.takePendingOutput() +
-			TERMINAL_SYNCHRONIZED_OUTPUT_END_SEQUENCE +
-			TERMINAL_PROGRESS_CLEAR_SEQUENCE +
-			"\x1b[?2004l";
+
+		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (shouldDisableKittyProtocol) {
-			cleanup += "\x1b[<u";
+			process.stdout.write("\x1b[<u");
 			this.keyboardProtocolPushed = false;
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
-		if (this._modifyOtherKeysActive) {
-			cleanup += "\x1b[>4;0m";
-			this._modifyOtherKeysActive = false;
-		}
-		cleanup += "\x1b[?25h";
-		try {
-			this.writeToStdout(cleanup);
-		} catch {
-			this.writeEmergencyReset();
-		}
+		this.disableModifyOtherKeys();
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {
@@ -495,21 +449,10 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.wasRaw);
 		}
-
-		this.removeEmergencyResetHandlers();
-		this.clearOutputDrainState();
 	}
 
-	write(data: string): boolean {
-		if (this.stdoutBackpressured) {
-			this.enqueuePendingOutput(data);
-			return false;
-		}
-		return this.writeToStdout(data);
-	}
-
-	private writeToStdout(data: string): boolean {
-		const accepted = process.stdout.write(data);
+	write(data: string): void {
+		process.stdout.write(data);
 		if (this.writeLogPath) {
 			try {
 				fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });
@@ -517,17 +460,6 @@ export class ProcessTerminal implements Terminal {
 				// Ignore logging errors
 			}
 		}
-		if (!accepted) {
-			this.markOutputBackpressured();
-		}
-		return accepted;
-	}
-
-	onDrain(listener: () => void): () => void {
-		this.drainListeners.add(listener);
-		return () => {
-			this.drainListeners.delete(listener);
-		};
 	}
 
 	get columns(): number {
@@ -538,176 +470,62 @@ export class ProcessTerminal implements Terminal {
 		return process.stdout.rows || Number(process.env.LINES) || 24;
 	}
 
-	moveBy(lines: number): boolean {
+	moveBy(lines: number): void {
 		if (lines > 0) {
 			// Move down
-			return this.write(`\x1b[${lines}B`);
+			process.stdout.write(`\x1b[${lines}B`);
 		} else if (lines < 0) {
 			// Move up
-			return this.write(`\x1b[${-lines}A`);
+			process.stdout.write(`\x1b[${-lines}A`);
 		}
 		// lines === 0: no movement
-		return true;
 	}
 
-	hideCursor(): boolean {
-		return this.writeCoalescedControl("cursor", "\x1b[?25l");
+	hideCursor(): void {
+		process.stdout.write("\x1b[?25l");
 	}
 
-	showCursor(): boolean {
-		return this.writeCoalescedControl("cursor", "\x1b[?25h");
+	showCursor(): void {
+		process.stdout.write("\x1b[?25h");
 	}
 
-	clearLine(): boolean {
-		return this.write("\x1b[K");
+	clearLine(): void {
+		process.stdout.write("\x1b[K");
 	}
 
-	clearFromCursor(): boolean {
-		return this.write("\x1b[J");
+	clearFromCursor(): void {
+		process.stdout.write("\x1b[J");
 	}
 
-	clearScreen(): boolean {
-		return this.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
+	clearScreen(): void {
+		process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
 	}
 
-	setTitle(title: string): boolean {
+	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title
-		return this.writeCoalescedControl("title", `\x1b]0;${title}\x07`);
+		process.stdout.write(`\x1b]0;${title}\x07`);
 	}
 
-	setProgress(active: boolean): boolean {
-		let accepted: boolean;
+	setProgress(active: boolean): void {
 		if (active) {
 			// OSC 9;4;3 - indeterminate progress
-			accepted = this.writeCoalescedControl("progress", TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+			process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 			if (!this.progressInterval) {
 				this.progressInterval = setInterval(() => {
-					this.writeCoalescedControl("progress", TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+					process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 				}, TERMINAL_PROGRESS_KEEPALIVE_MS);
 			}
 		} else {
 			this.clearProgressInterval();
 			// OSC 9;4;0 - clear progress
-			accepted = this.writeCoalescedControl("progress", TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
-		return accepted;
 	}
 
-	private clearProgressInterval(): void {
-		if (!this.progressInterval) return;
+	private clearProgressInterval(): boolean {
+		if (!this.progressInterval) return false;
 		clearInterval(this.progressInterval);
 		this.progressInterval = undefined;
-	}
-
-	private writeCoalescedControl(kind: CoalescedTerminalControl, data: string): boolean {
-		if (!this.stdoutBackpressured) {
-			return this.write(data);
-		}
-		this.enqueuePendingOutput(data, kind);
-		return false;
-	}
-
-	private enqueuePendingOutput(data: string, control?: CoalescedTerminalControl): void {
-		const existingIndex =
-			control === undefined ? -1 : this.pendingOutput.findIndex((pending) => pending.control === control);
-		const existing = existingIndex === -1 ? undefined : this.pendingOutput[existingIndex];
-		const dataBytes = Buffer.byteLength(data, "utf8");
-		const nextBytes = this.pendingOutputBytes - (existing ? Buffer.byteLength(existing.data, "utf8") : 0) + dataBytes;
-		const nextWrites = this.pendingOutput.length + (existing ? 0 : 1);
-		if (nextWrites > TERMINAL_PENDING_OUTPUT_MAX_WRITES || nextBytes > TERMINAL_PENDING_OUTPUT_MAX_BYTES) {
-			throw new Error(
-				`Terminal pending output capacity exceeded: writes=${nextWrites}/${TERMINAL_PENDING_OUTPUT_MAX_WRITES}, bytes=${nextBytes}/${TERMINAL_PENDING_OUTPUT_MAX_BYTES}`,
-			);
-		}
-		if (existingIndex !== -1) {
-			this.pendingOutput.splice(existingIndex, 1);
-		}
-		this.pendingOutput.push(control === undefined ? { data } : { data, control });
-		this.pendingOutputBytes = nextBytes;
-	}
-
-	private takePendingOutput(): string {
-		if (this.pendingOutput.length === 0) return "";
-		const pending = this.pendingOutput.map((output) => output.data).join("");
-		this.pendingOutput = [];
-		this.pendingOutputBytes = 0;
-		return pending;
-	}
-
-	private markOutputBackpressured(): void {
-		if (this.stdoutBackpressured) return;
-		this.stdoutBackpressured = true;
-		this.stdoutDrainHandler = () => {
-			this.stdoutDrainHandler = undefined;
-			this.stdoutBackpressured = false;
-			const pending = this.takePendingOutput();
-			if (pending && !this.writeToStdout(pending)) {
-				return;
-			}
-			for (const listener of [...this.drainListeners]) {
-				listener();
-			}
-		};
-		process.stdout.once("drain", this.stdoutDrainHandler);
-	}
-
-	private clearOutputDrainState(): void {
-		if (this.stdoutDrainHandler) {
-			process.stdout.removeListener("drain", this.stdoutDrainHandler);
-			this.stdoutDrainHandler = undefined;
-		}
-		this.stdoutBackpressured = false;
-		this.pendingOutput = [];
-		this.pendingOutputBytes = 0;
-		this.drainListeners.clear();
-	}
-
-	private installEmergencyResetHandlers(): void {
-		if (this.emergencyExitHandler) return;
-		this.emergencyExitHandler = () => {
-			this.writeEmergencyReset();
-		};
-		process.once("exit", this.emergencyExitHandler);
-		const signals: NodeJS.Signals[] =
-			process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGHUP", "SIGINT", "SIGTERM"];
-		for (const signal of signals) {
-			const handler = () => {
-				this.writeEmergencyReset();
-				this.removeEmergencyResetHandlers();
-				reraiseSignalIfUnowned(process.listenerCount(signal), () => {
-					process.kill(process.pid, signal);
-				});
-			};
-			this.emergencySignalHandlers.set(signal, handler);
-			process.prependOnceListener(signal, handler);
-		}
-	}
-
-	private removeEmergencyResetHandlers(): void {
-		if (this.emergencyExitHandler) {
-			process.removeListener("exit", this.emergencyExitHandler);
-			this.emergencyExitHandler = undefined;
-		}
-		for (const [signal, handler] of this.emergencySignalHandlers) {
-			process.removeListener(signal, handler);
-		}
-		this.emergencySignalHandlers.clear();
-	}
-
-	private writeEmergencyReset(): void {
-		try {
-			const fd = process.stdout.fd;
-			if (Number.isInteger(fd) && fd >= 0) {
-				fs.writeSync(fd, TERMINAL_EMERGENCY_RESET_SEQUENCE);
-				return;
-			}
-		} catch {
-			// Best effort only: the output descriptor may already be closed.
-		}
-		try {
-			process.stdout.write(TERMINAL_EMERGENCY_RESET_SEQUENCE);
-		} catch {
-			// Best effort only during process termination.
-		}
+		return true;
 	}
 }

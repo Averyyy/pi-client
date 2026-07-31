@@ -219,53 +219,6 @@ describe("constrained tool sampling", () => {
 		});
 	});
 
-	it("omits custom item IDs when a grammar-constrained tool becomes a function tool", () => {
-		const context: Context = {
-			messages: [
-				{
-					role: "assistant",
-					api: "openai-responses",
-					provider: "openai",
-					model: "gpt-test",
-					content: [
-						{
-							type: "toolCall",
-							id: "call_1|ctc_existing",
-							name: "sample_tool",
-							arguments: { payload: "abc" },
-						},
-					],
-					usage: makeUsage(),
-					stopReason: "toolUse",
-					timestamp: Date.now(),
-				},
-				{
-					role: "toolResult",
-					toolCallId: "call_1|ctc_existing",
-					toolName: "sample_tool",
-					content: [{ type: "text", text: "done" }],
-					isError: false,
-					timestamp: Date.now(),
-				},
-			],
-		};
-
-		const messages = convertResponsesMessages(makeModel(), context, new Set(["openai"]));
-
-		expect(messages).toContainEqual({
-			type: "function_call",
-			id: undefined,
-			call_id: "call_1",
-			name: "sample_tool",
-			arguments: '{"payload":"abc"}',
-		});
-		expect(messages).toContainEqual({
-			type: "function_call_output",
-			call_id: "call_1",
-			output: "done",
-		});
-	});
-
 	it("keeps grammar input JSON deltas append-only", () => {
 		const buffer = { input: "", started: false, closed: false };
 		const first = appendGrammarToolInputJsonDelta(buffer, "payload", 'a"', false);

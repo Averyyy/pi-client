@@ -1,16 +1,11 @@
 import type {
 	appendFileSync,
-	closeSync,
 	existsSync,
-	fsyncSync,
 	mkdirSync,
-	openSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
-	statSync,
-	truncateSync,
 	writeFileSync,
 } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,36 +14,24 @@ import { clearAllSessions, replaceSessionTree } from "../src/session-store.ts";
 
 const fsMock = vi.hoisted(() => ({
 	appendFileSync: vi.fn<typeof appendFileSync>(),
-	closeSync: vi.fn<typeof closeSync>(),
 	existsSync: vi.fn<typeof existsSync>(),
-	fsyncSync: vi.fn<typeof fsyncSync>(),
 	mkdirSync: vi.fn<typeof mkdirSync>(),
-	openSync: vi.fn<typeof openSync>(),
 	readdirSync: vi.fn<typeof readdirSync>(),
 	readFileSync: vi.fn<typeof readFileSync>(),
 	renameSync: vi.fn<typeof renameSync>(),
 	rmSync: vi.fn<typeof rmSync>(),
-	statSync: vi.fn<typeof statSync>(),
-	truncateSync: vi.fn<typeof truncateSync>(),
 	writeFileSync: vi.fn<typeof writeFileSync>(),
-	writeSync: vi.fn<(fd: number, buffer: Uint8Array, offset?: number, length?: number) => number>(),
 }));
 
 vi.mock("node:fs", () => ({
 	appendFileSync: fsMock.appendFileSync,
-	closeSync: fsMock.closeSync,
 	existsSync: fsMock.existsSync,
-	fsyncSync: fsMock.fsyncSync,
 	mkdirSync: fsMock.mkdirSync,
-	openSync: fsMock.openSync,
 	readdirSync: fsMock.readdirSync,
 	readFileSync: fsMock.readFileSync,
 	renameSync: fsMock.renameSync,
 	rmSync: fsMock.rmSync,
-	statSync: fsMock.statSync,
-	truncateSync: fsMock.truncateSync,
 	writeFileSync: fsMock.writeFileSync,
-	writeSync: fsMock.writeSync,
 }));
 
 const originalPlatform = process.platform;
@@ -63,9 +46,9 @@ function errno(code: string): NodeJS.ErrnoException {
 	return error;
 }
 
-function persistedSession(sessionId: string) {
+function persistedSession() {
 	return replaceSessionTree(
-		sessionId,
+		"persist-retry",
 		[
 			{
 				type: "message",
@@ -83,9 +66,6 @@ describe("session-persistence rename retry", () => {
 	beforeEach(() => {
 		clearAllSessions();
 		vi.clearAllMocks();
-		fsMock.existsSync.mockImplementation((path) => String(path) === "/" || String(path) === "\\");
-		fsMock.openSync.mockReturnValue(42);
-		fsMock.writeSync.mockImplementation((_fd, buffer, offset = 0, length) => length ?? buffer.byteLength - offset);
 		setPlatform(originalPlatform);
 	});
 
@@ -102,10 +82,10 @@ describe("session-persistence rename retry", () => {
 			})
 			.mockImplementationOnce(() => undefined);
 
-		savePersistedSession("/sessions", persistedSession("persist-retry-windows"));
+		savePersistedSession("/sessions", persistedSession());
 
-		expect(fsMock.renameSync).toHaveBeenCalledTimes(4);
-		expect(fsMock.rmSync).not.toHaveBeenCalled();
+		expect(fsMock.renameSync).toHaveBeenCalledTimes(2);
+		expect(fsMock.rmSync.mock.calls.every(([path]) => String(path).endsWith(".wal"))).toBe(true);
 	});
 
 	it("does not retry EPERM outside Windows", () => {
@@ -117,7 +97,7 @@ describe("session-persistence rename retry", () => {
 
 		let thrown: unknown;
 		try {
-			savePersistedSession("/sessions", persistedSession("persist-retry-linux"));
+			savePersistedSession("/sessions", persistedSession());
 		} catch (caught) {
 			thrown = caught;
 		}
@@ -136,7 +116,7 @@ describe("session-persistence rename retry", () => {
 
 		let thrown: unknown;
 		try {
-			savePersistedSession("/sessions", persistedSession("persist-retry-eacces"));
+			savePersistedSession("/sessions", persistedSession());
 		} catch (caught) {
 			thrown = caught;
 		}
@@ -144,16 +124,5 @@ describe("session-persistence rename retry", () => {
 		expect(thrown).toBe(error);
 		expect(fsMock.renameSync).toHaveBeenCalledTimes(1);
 		expect(fsMock.rmSync).toHaveBeenCalledTimes(1);
-	});
-
-	it("fsyncs each replacement and its containing directory outside Windows", () => {
-		setPlatform("linux");
-
-		savePersistedSession("/sessions", persistedSession("persist-fsync-linux"));
-
-		const directoryOpens = fsMock.openSync.mock.calls.filter(([, flags]) => flags === "r");
-		expect(fsMock.renameSync).toHaveBeenCalledTimes(3);
-		expect(directoryOpens).toHaveLength(4);
-		expect(fsMock.fsyncSync).toHaveBeenCalledTimes(7);
 	});
 });

@@ -206,42 +206,6 @@ describe("buildSessionContext", () => {
 			expect(ctx.thinkingLevel).toBe("high");
 			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user"]);
 		});
-
-		it("uses retainedTail as the authoritative compacted tail without replaying kept entries", () => {
-			const retainedMessage = { role: "user" as const, content: "retained split-turn tail", timestamp: 5000 };
-			const entries: SessionEntry[] = [
-				msg("1", null, "user", "old"),
-				msg("2", "1", "assistant", "old response"),
-				msg("3", "2", "user", "legacy kept entry"),
-				{
-					...compaction("4", "3", "Authoritative summary", "3"),
-					retainedTail: [retainedMessage],
-				},
-				msg("5", "4", "assistant", "after compaction"),
-			];
-
-			expect(buildContextEntries(entries).map((entry) => entry.id)).toEqual(["4", "5"]);
-			const ctx = buildSessionContext(entries);
-			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user", "assistant"]);
-			expect(ctx.messages[1]).toEqual(retainedMessage);
-		});
-
-		it("preserves an empty retainedTail as authoritative", () => {
-			const entries: SessionEntry[] = [
-				msg("1", null, "user", "old"),
-				msg("2", "1", "assistant", "old response"),
-				{
-					...compaction("3", "2", "Summary only", "1"),
-					retainedTail: [],
-				},
-				msg("4", "3", "user", "after"),
-			];
-
-			expect(buildContextEntries(entries).map((entry) => entry.id)).toEqual(["3", "4"]);
-			const ctx = buildSessionContext(entries);
-			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user"]);
-			expect((ctx.messages[1] as { content: string }).content).toBe("after");
-		});
 	});
 
 	describe("with branches", () => {

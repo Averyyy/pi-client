@@ -1,4 +1,4 @@
-import { type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import * as os from "node:os";
@@ -14,14 +14,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
-import {
-	acquirePiServerRunStateLease,
-	getPiServerRunStatePath,
-	type PiServerRunStateLease,
-	releasePiServerRunStateLease,
-} from "../../../core/pi-server-run-state.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
-import { getToolEffectJournalPath } from "../../../core/tool-effect-journal.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -646,134 +639,44 @@ class SessionList implements Component, Focusable {
 
 type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
-interface SessionDeletionPathGroups {
-	dataPaths: string[];
-	lockPaths: string[];
-}
-
-function getSessionDeletionPathGroups(sessionPath: string): SessionDeletionPathGroups {
-	const toolEffectJournalPath = getToolEffectJournalPath(sessionPath);
-	const piServerRunStatePath = getPiServerRunStatePath(sessionPath);
-	const piServerLockPath = `${piServerRunStatePath}.lock.sqlite`;
-	return {
-		dataPaths: [sessionPath, toolEffectJournalPath, piServerRunStatePath],
-		lockPaths: [
-			piServerLockPath,
-			`${piServerLockPath}-journal`,
-			`${piServerLockPath}-wal`,
-			`${piServerLockPath}-shm`,
-		],
-	};
-}
-
-export function getSessionDeletionPaths(sessionPath: string): string[] {
-	const paths = getSessionDeletionPathGroups(sessionPath);
-	return [...paths.dataPaths, ...paths.lockPaths];
-}
-
-interface RemoveSessionPathsResult {
-	ok: boolean;
-	method: "trash" | "unlink";
-	error?: string;
-}
-
-export interface SessionDeletionOptions {
-	trashTimeoutMs?: number;
-	spawnTrash?: (
-		command: string,
-		args: string[],
-		options: SpawnSyncOptionsWithStringEncoding,
-	) => SpawnSyncReturns<string>;
-}
-
-const DEFAULT_TRASH_TIMEOUT_MS = 10_000;
-
-async function removeSessionPaths(paths: string[], options: SessionDeletionOptions): Promise<RemoveSessionPathsResult> {
-	const existingPaths = [...new Set(paths)].filter((path) => existsSync(path));
-	if (existingPaths.length === 0) {
-		return { ok: true, method: "trash" };
-	}
-
-	const trashArgs = existingPaths.some((path) => path.startsWith("-")) ? ["--", ...existingPaths] : existingPaths;
-	const trashTimeoutMs = options.trashTimeoutMs ?? DEFAULT_TRASH_TIMEOUT_MS;
-	if (!Number.isSafeInteger(trashTimeoutMs) || trashTimeoutMs <= 0) {
-		throw new Error("trashTimeoutMs must be a positive safe integer");
-	}
-	const trashResult = (options.spawnTrash ?? spawnSync)("trash", trashArgs, {
-		encoding: "utf-8",
-		timeout: trashTimeoutMs,
-		killSignal: "SIGKILL",
-		windowsHide: true,
-		maxBuffer: 64 * 1024,
-	});
-	if (trashResult.status === 0 && existingPaths.every((path) => !existsSync(path))) {
-		return { ok: true, method: "trash" };
-	}
-
-	const errors: string[] = [];
-	for (const path of existingPaths) {
-		if (!existsSync(path)) continue;
-		try {
-			await unlink(path);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-			const message = error instanceof Error ? error.message : String(error);
-			errors.push(`${path}: ${message}`);
-		}
-	}
-	if (errors.length === 0) {
-		return { ok: true, method: "unlink" };
-	}
-
-	const trashErrors: string[] = [];
-	if (trashResult.error) {
-		trashErrors.push(trashResult.error.message);
-	}
-	const stderr = trashResult.stderr?.trim();
-	if (stderr) {
-		trashErrors.push(stderr.split("\n")[0] ?? stderr);
-	}
-	const trashErrorHint = trashErrors.length > 0 ? ` (trash: ${trashErrors.join(" | ").slice(0, 200)})` : "";
-	return {
-		ok: false,
-		method: "unlink",
-		error: `${errors.join("; ")}${trashErrorHint}`,
-	};
-}
-
 /**
- * Delete a session and its recovery sidecars, trying the `trash` CLI first, then falling back to unlink.
- * Windows cannot unlink an open SQLite database, so the lock database family is removed immediately after release.
+ * Delete a session file, trying the `trash` CLI first, then falling back to unlink
  */
-export async function deleteSessionFile(
+async function deleteSessionFile(
 	sessionPath: string,
-	options: SessionDeletionOptions = {},
 ): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
-	const paths = getSessionDeletionPathGroups(sessionPath);
-	let lease: PiServerRunStateLease;
-	try {
-		lease = acquirePiServerRunStateLease(getPiServerRunStatePath(sessionPath));
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return { ok: false, method: "unlink", error: message };
+	// Try `trash` first (if installed)
+	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+
+	const getTrashErrorHint = (): string | null => {
+		const parts: string[] = [];
+		if (trashResult.error) {
+			parts.push(trashResult.error.message);
+		}
+		const stderr = trashResult.stderr?.trim();
+		if (stderr) {
+			parts.push(stderr.split("\n")[0] ?? stderr);
+		}
+		if (parts.length === 0) return null;
+		return `trash: ${parts.join(" · ").slice(0, 200)}`;
+	};
+
+	// If trash reports success, or the file is gone afterwards, treat it as successful
+	if (trashResult.status === 0 || !existsSync(sessionPath)) {
+		return { ok: true, method: "trash" };
 	}
 
-	let dataResult: RemoveSessionPathsResult;
+	// Fallback to permanent deletion
 	try {
-		dataResult = await removeSessionPaths(paths.dataPaths, options);
-	} finally {
-		releasePiServerRunStateLease(lease);
+		await unlink(sessionPath);
+		return { ok: true, method: "unlink" };
+	} catch (err) {
+		const unlinkError = err instanceof Error ? err.message : String(err);
+		const trashErrorHint = getTrashErrorHint();
+		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
+		return { ok: false, method: "unlink", error };
 	}
-	const lockResult = await removeSessionPaths(paths.lockPaths, options);
-	const method = dataResult.method === "unlink" || lockResult.method === "unlink" ? "unlink" : "trash";
-	if (dataResult.ok && lockResult.ok) {
-		return { ok: true, method };
-	}
-	return {
-		ok: false,
-		method,
-		error: [dataResult.error, lockResult.error].filter((error): error is string => error !== undefined).join("; "),
-	};
 }
 
 /**

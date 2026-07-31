@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -11,7 +11,6 @@ import {
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
-import { beginSessionToolEffect, ToolEffectUnknownOutcomeError } from "../../src/core/tool-effect-journal.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -342,36 +341,6 @@ describe("AgentSessionRuntime characterization", () => {
 						: undefined,
 			})),
 		).toEqual(beforeMessages);
-	});
-
-	it("blocks runtime fork before extension hooks when the source has an unknown tool outcome", async () => {
-		let beforeForkCalls = 0;
-		const { runtime } = await createRuntimeForTest((pi) => {
-			pi.on("session_before_fork", () => {
-				beforeForkCalls++;
-			});
-		});
-		const manager = runtime.session.sessionManager;
-		manager.appendMessage({ role: "user", content: [{ type: "text", text: "perform effect" }], timestamp: 1 });
-		const assistantEntryId = manager.appendMessage(
-			fauxAssistantMessage([{ ...fauxToolCall("external_write", { value: "unknown" }), id: "call-unknown-fork" }], {
-				stopReason: "toolUse",
-				timestamp: 2,
-			}),
-		);
-		manager.flushSessionFile();
-		const intent = beginSessionToolEffect(manager, {
-			toolCallId: "call-unknown-fork",
-			toolName: "external_write",
-			args: { value: "unknown" },
-		});
-		if (!intent) throw new Error("Expected a durable tool effect intent");
-
-		await expect(runtime.fork(assistantEntryId, { position: "at" })).rejects.toBeInstanceOf(
-			ToolEffectUnknownOutcomeError,
-		);
-		expect(beforeForkCalls).toBe(0);
-		expect(runtime.session.sessionManager.getEntry(assistantEntryId)).toBeDefined();
 	});
 
 	it("duplicates the current active branch in-memory when forking at the current position", async () => {

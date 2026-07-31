@@ -1,8 +1,7 @@
 import assert from "node:assert";
-import { EventEmitter } from "node:events";
 import { describe, it, mock } from "node:test";
 import { setKittyProtocolActive } from "../src/keys.ts";
-import { normalizeAppleTerminalInput, ProcessTerminal, reraiseSignalIfUnowned } from "../src/terminal.ts";
+import { normalizeAppleTerminalInput, ProcessTerminal } from "../src/terminal.ts";
 
 describe("normalizeAppleTerminalInput", () => {
 	it("rewrites Apple Terminal Return to CSI-u Shift+Enter when Shift is pressed", () => {
@@ -105,7 +104,7 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 			assert.equal(harness.writes.includes("\x1b[>4;0m"), false);
 
 			harness.cleanup();
-			assert.equal(harness.writes.join("").match(/\x1b\[<u/g)?.length, 1);
+			assert.equal(harness.writes.filter((write) => write === "\x1b[<u").length, 1);
 			assert.equal(harness.writes.includes("\x1b[>4;0m"), false);
 		} finally {
 			harness.cleanup();
@@ -122,7 +121,7 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;2m").length, 1);
 
 			harness.cleanup();
-			assert.equal(harness.writes.join("").match(/\x1b\[>4;0m/g)?.length, 1);
+			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;0m").length, 1);
 		} finally {
 			harness.cleanup();
 		}
@@ -229,154 +228,6 @@ describe("ProcessTerminal dimensions", () => {
 			} else {
 				process.env.LINES = previousLines;
 			}
-		}
-	});
-});
-
-describe("ProcessTerminal output backpressure", () => {
-	it("exposes drain and coalesces direct terminal state while blocked", () => {
-		const terminal = new ProcessTerminal();
-		const writes: string[] = [];
-		const previousWrite = process.stdout.write;
-		let firstWrite = true;
-		process.stdout.write = ((chunk: string | Uint8Array) => {
-			writes.push(String(chunk));
-			if (firstWrite) {
-				firstWrite = false;
-				return false;
-			}
-			return true;
-		}) as typeof process.stdout.write;
-
-		try {
-			assert.strictEqual(terminal.write("frame"), false);
-			let drains = 0;
-			const removeDrain = terminal.onDrain(() => {
-				drains += 1;
-			});
-
-			assert.strictEqual(terminal.setTitle("old"), false);
-			assert.strictEqual(terminal.setTitle("latest"), false);
-			assert.strictEqual(terminal.write("raw-after-backpressure"), false);
-			(terminal as unknown as { enableModifyOtherKeys(): void }).enableModifyOtherKeys();
-			assert.strictEqual(terminal.hideCursor(), false);
-			assert.strictEqual(terminal.setProgress(true), false);
-			assert.deepStrictEqual(writes, ["frame"]);
-
-			process.stdout.emit("drain");
-
-			assert.strictEqual(drains, 1);
-			assert.strictEqual(writes.length, 2);
-			assert.ok(writes[1]?.includes("\x1b]0;latest\x07"));
-			assert.ok(!writes[1]?.includes("\x1b]0;old\x07"));
-			assert.ok(writes[1]?.includes("raw-after-backpressure"));
-			assert.ok(writes[1]?.includes("\x1b[>4;2m"), "keyboard state must not be overwritten by cursor state");
-			assert.ok(writes[1]?.includes("\x1b[?25l"), "cursor state must not be overwritten by keyboard state");
-			assert.ok(writes[1]?.includes("\x1b]9;4;3\x07"));
-			removeDrain();
-		} finally {
-			terminal.stop();
-			process.stdout.write = previousWrite;
-			setKittyProtocolActive(false);
-		}
-	});
-
-	it("fails explicitly instead of growing pending raw output without a bound", () => {
-		const terminal = new ProcessTerminal();
-		const writes: string[] = [];
-		const previousWrite = process.stdout.write;
-		process.stdout.write = ((chunk: string | Uint8Array) => {
-			writes.push(String(chunk));
-			return false;
-		}) as typeof process.stdout.write;
-
-		try {
-			assert.strictEqual(terminal.write("frame"), false);
-			for (let index = 0; index < 256; index++) {
-				assert.strictEqual(terminal.write("x"), false);
-			}
-			assert.throws(() => terminal.write("overflow"), /Terminal pending output capacity exceeded/);
-			assert.deepStrictEqual(writes, ["frame"]);
-		} finally {
-			terminal.stop();
-			process.stdout.write = previousWrite;
-		}
-	});
-
-	it("observes a pre-existing once signal owner before deciding whether to re-raise", () => {
-		const emitter = new EventEmitter();
-		const calls: string[] = [];
-		emitter.once("signal", () => {
-			calls.push("application");
-		});
-		emitter.prependOnceListener("signal", () => {
-			calls.push("terminal");
-			reraiseSignalIfUnowned(emitter.listenerCount("signal"), () => {
-				calls.push("reraise");
-			});
-		});
-
-		emitter.emit("signal");
-		assert.deepStrictEqual(calls, ["terminal", "application"]);
-	});
-
-	it("re-raises an unowned signal after the reset listener is removed", () => {
-		const emitter = new EventEmitter();
-		let reraises = 0;
-		emitter.prependOnceListener("signal", () => {
-			reraiseSignalIfUnowned(emitter.listenerCount("signal"), () => {
-				reraises += 1;
-			});
-		});
-
-		emitter.emit("signal");
-		assert.strictEqual(reraises, 1, "an unowned signal must recover the default exit behavior");
-	});
-
-	it("prepends emergency reset handlers ahead of pre-existing once handlers", () => {
-		const terminal = new ProcessTerminal();
-		const applicationHandler = () => {};
-		process.once("SIGTERM", applicationHandler);
-		try {
-			(terminal as unknown as { installEmergencyResetHandlers(): void }).installEmergencyResetHandlers();
-			const terminalHandler = (
-				terminal as unknown as { emergencySignalHandlers: Map<NodeJS.Signals, () => void> }
-			).emergencySignalHandlers.get("SIGTERM");
-			assert.ok(terminalHandler);
-			const listeners = process.listeners("SIGTERM");
-			assert.ok(listeners.indexOf(terminalHandler) < listeners.indexOf(applicationHandler));
-		} finally {
-			(terminal as unknown as { removeEmergencyResetHandlers(): void }).removeEmergencyResetHandlers();
-			process.removeListener("SIGTERM", applicationHandler);
-		}
-	});
-
-	it("writes one complete terminal reset when stopped under backpressure", () => {
-		const terminal = new ProcessTerminal();
-		const writes: string[] = [];
-		const previousWrite = process.stdout.write;
-		process.stdout.write = ((chunk: string | Uint8Array) => {
-			writes.push(String(chunk));
-			return false;
-		}) as typeof process.stdout.write;
-
-		try {
-			assert.strictEqual(terminal.write("frame"), false);
-			(terminal as unknown as { enableModifyOtherKeys(): void }).enableModifyOtherKeys();
-			terminal.setProgress(true);
-			terminal.stop();
-
-			assert.strictEqual(writes.length, 2);
-			const cleanup = writes[1] ?? "";
-			assert.ok(cleanup.includes("\x1b[?2026l"));
-			assert.ok(cleanup.includes("\x1b]9;4;0;\x07"));
-			assert.ok(cleanup.includes("\x1b[?2004l"));
-			assert.ok(cleanup.includes("\x1b[>4;0m"));
-			assert.ok(cleanup.includes("\x1b[?25h"));
-		} finally {
-			terminal.stop();
-			process.stdout.write = previousWrite;
-			setKittyProtocolActive(false);
 		}
 	});
 });

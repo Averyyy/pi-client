@@ -14,7 +14,6 @@ import { resetSessionTracking } from "./pi-server-client.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
-import { recoverToolEffects } from "./tool-effect-journal.ts";
 
 /**
  * Result returned by runtime creation.
@@ -265,10 +264,6 @@ export class AgentSessionRuntime {
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
-		const recovery = recoverToolEffects(this.session.sessionManager);
-		if (recovery.recoveredToolCallIds.length > 0) {
-			this.session.agent.state.messages = this.session.sessionManager.buildSessionContext().messages;
-		}
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
 		if (beforeResult.cancelled) {

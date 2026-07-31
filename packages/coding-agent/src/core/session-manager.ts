@@ -2,26 +2,21 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
+	appendFileSync,
 	closeSync,
 	createReadStream,
 	existsSync,
-	constants as fsConstants,
-	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
-	renameSync,
 	statSync,
-	unlinkSync,
-	writeSync,
+	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { basename, dirname, join, resolve } from "path";
+import { join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
-import { isDeepStrictEqual } from "util";
-import { serialize as serializeV8 } from "v8";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
@@ -31,7 +26,6 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-import { appendPiServerTreeHash, hashPiServerTreeEntry, PI_SERVER_EMPTY_TREE_HASH } from "./pi-server-protocol.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -77,8 +71,6 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
-	/** Authoritative messages retained inside a split turn. Presence, including [], replaces legacy entry retention. */
-	retainedTail?: AgentMessage[];
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 	/** Usage from the LLM call(s) that generated this summary, if available */
@@ -177,101 +169,6 @@ export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
-}
-
-export interface CompactionAppendBase {
-	baseEntryCount: number;
-	baseLeafId: string | null;
-	baseTreeHash: string;
-}
-
-export type SessionAtomicRewriteStage =
-	| "after_temp_open"
-	| "after_temp_write"
-	| "after_temp_fsync"
-	| "after_replace"
-	| "after_directory_fsync";
-
-export type SessionCompactionAppendStage = "after_append" | "after_fsync";
-
-export interface SessionManagerPersistenceTestHooks {
-	onAtomicRewriteStage?: (stage: SessionAtomicRewriteStage) => void;
-	onAppendStage?: (stage: SessionCompactionAppendStage) => void;
-	onCompactionAppendStage?: (stage: SessionCompactionAppendStage) => void;
-	beforeRenameAttempt?: (attempt: number) => void;
-	simulateWindowsRenameRetries?: boolean;
-}
-
-let sessionManagerPersistenceTestHooks: SessionManagerPersistenceTestHooks | undefined;
-
-export function setSessionManagerPersistenceTestHooks(hooks: SessionManagerPersistenceTestHooks | undefined): void {
-	sessionManagerPersistenceTestHooks = hooks;
-}
-
-export interface SessionManagerCapacityLimits {
-	maxEntries: number;
-	maxLogicalBytes: number;
-	maxFileBytes: number;
-}
-
-export const DEFAULT_SESSION_MANAGER_CAPACITY_LIMITS = Object.freeze({
-	maxEntries: 250_000,
-	maxLogicalBytes: 256 * 1024 * 1024,
-});
-
-export const ENV_SESSION_MAX_ENTRIES = "PI_SESSION_MAX_ENTRIES";
-export const ENV_SESSION_MAX_LOGICAL_BYTES = "PI_SESSION_MAX_LOGICAL_BYTES";
-export const ENV_SESSION_MAX_FILE_BYTES = "PI_SESSION_MAX_FILE_BYTES";
-
-export type SessionManagerCapacityResource = "entries" | "logical_bytes" | "file_bytes";
-
-export class SessionManagerCapacityError extends Error {
-	readonly code = "PI_SESSION_CAPACITY_EXCEEDED";
-	readonly retryable = false as const;
-	readonly resource: SessionManagerCapacityResource;
-	readonly sessionId: string;
-	readonly path: string | undefined;
-	readonly current: number;
-	readonly requested: number;
-	readonly limit: number;
-
-	constructor(input: {
-		resource: SessionManagerCapacityResource;
-		sessionId: string;
-		path?: string;
-		current: number;
-		requested: number;
-		limit: number;
-	}) {
-		super(
-			`Session capacity exceeded: resource=${input.resource}, session=${input.sessionId}, path=${input.path ?? "<memory>"}, requested=${input.requested}, limit=${input.limit}`,
-		);
-		this.name = "SessionManagerCapacityError";
-		this.resource = input.resource;
-		this.sessionId = input.sessionId;
-		this.path = input.path;
-		this.current = input.current;
-		this.requested = input.requested;
-		this.limit = input.limit;
-	}
-}
-
-let sessionManagerCapacityOverrides: Partial<SessionManagerCapacityLimits> = {};
-
-export function configureSessionManagerCapacityLimits(
-	overrides: Partial<SessionManagerCapacityLimits>,
-): SessionManagerCapacityLimits {
-	for (const [name, value] of Object.entries(overrides)) {
-		if (!Number.isSafeInteger(value) || (value ?? 0) <= 0) {
-			throw new RangeError(`${name} must be a positive safe integer`);
-		}
-	}
-	sessionManagerCapacityOverrides = { ...sessionManagerCapacityOverrides, ...overrides };
-	return getSessionManagerCapacityLimits();
-}
-
-export function resetSessionManagerCapacityLimits(): void {
-	sessionManagerCapacityOverrides = {};
 }
 
 export interface SessionInfo {
@@ -434,37 +331,6 @@ function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntr
 	return index;
 }
 
-function validateSessionTreeShape(entries: readonly SessionEntry[]): Map<string, SessionEntry> {
-	const index = new Map<string, SessionEntry>();
-	for (const entry of entries) {
-		if (index.has(entry.id)) throw new Error(`Duplicate session entry id ${entry.id}`);
-		index.set(entry.id, entry);
-	}
-	for (const entry of entries) {
-		if (entry.parentId !== null && !index.has(entry.parentId)) {
-			throw new Error(`Parent entry ${entry.parentId} does not exist`);
-		}
-	}
-	const visitState = new Map<string, "visiting" | "visited">();
-	for (const entry of entries) {
-		if (visitState.get(entry.id) === "visited") continue;
-		const path: SessionEntry[] = [];
-		let current: SessionEntry | undefined = entry;
-		while (current) {
-			const state = visitState.get(current.id);
-			if (state === "visiting") {
-				throw new Error(`Session tree contains a parent cycle at entry ${current.id}`);
-			}
-			if (state === "visited") break;
-			visitState.set(current.id, "visiting");
-			path.push(current);
-			current = current.parentId === null ? undefined : index.get(current.parentId);
-		}
-		for (const pathEntry of path) visitState.set(pathEntry.id, "visited");
-	}
-	return index;
-}
-
 function buildSessionPath(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -485,12 +351,7 @@ function buildSessionPath(
 
 	const path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
-	const seen = new Set<string>();
 	while (current) {
-		if (seen.has(current.id)) {
-			throw new Error(`Session tree contains a parent cycle at entry ${current.id}`);
-		}
-		seen.add(current.id);
 		path.push(current);
 		current = current.parentId ? index.get(current.parentId) : undefined;
 	}
@@ -541,10 +402,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
 	}
 	if (entry.type === "compaction") {
-		return [
-			createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
-			...(entry.retainedTail ?? []),
-		];
+		return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
 	}
 	return [];
 }
@@ -581,10 +439,6 @@ export function buildContextEntries(
 	}
 
 	const contextEntries: SessionEntry[] = [compaction];
-	if (compaction.retainedTail !== undefined) {
-		contextEntries.push(...path.slice(compactionIdx + 1));
-		return contextEntries;
-	}
 	let foundFirstKept = false;
 	for (let i = 0; i < compactionIdx; i++) {
 		const entry = path[i];
@@ -638,251 +492,6 @@ const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
 /** Bound synchronous header discovery while allowing large cwd and custom metadata fields. */
 const MAX_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
-const SESSION_FILE_ENVELOPE_OVERHEAD_BYTES = 1024 * 1024;
-const WINDOWS_SESSION_RENAME_RETRIES = 4;
-const MAX_WINDOWS_SESSION_RENAME_DELAY_MS = 80;
-
-function readPositiveSafeIntegerEnvironment(name: string): number | undefined {
-	const raw = process.env[name];
-	if (raw === undefined) return undefined;
-	if (!/^[1-9][0-9]*$/u.test(raw)) {
-		throw new Error(`${name} must be a positive safe integer`);
-	}
-	const value = Number(raw);
-	if (!Number.isSafeInteger(value)) {
-		throw new Error(`${name} must be a positive safe integer`);
-	}
-	return value;
-}
-
-export function getSessionManagerCapacityLimits(): SessionManagerCapacityLimits {
-	const maxEntries =
-		sessionManagerCapacityOverrides.maxEntries ??
-		readPositiveSafeIntegerEnvironment(ENV_SESSION_MAX_ENTRIES) ??
-		DEFAULT_SESSION_MANAGER_CAPACITY_LIMITS.maxEntries;
-	const maxLogicalBytes =
-		sessionManagerCapacityOverrides.maxLogicalBytes ??
-		readPositiveSafeIntegerEnvironment(ENV_SESSION_MAX_LOGICAL_BYTES) ??
-		DEFAULT_SESSION_MANAGER_CAPACITY_LIMITS.maxLogicalBytes;
-	const derivedMaxFileBytes = maxLogicalBytes + maxEntries + SESSION_FILE_ENVELOPE_OVERHEAD_BYTES;
-	if (!Number.isSafeInteger(derivedMaxFileBytes)) {
-		throw new Error("Session capacity limits are too large to derive a safe session file limit");
-	}
-	const maxFileBytes =
-		sessionManagerCapacityOverrides.maxFileBytes ??
-		readPositiveSafeIntegerEnvironment(ENV_SESSION_MAX_FILE_BYTES) ??
-		derivedMaxFileBytes;
-	return { maxEntries, maxLogicalBytes, maxFileBytes };
-}
-
-function sessionCapacityError(
-	resource: SessionManagerCapacityResource,
-	sessionId: string,
-	path: string | undefined,
-	current: number,
-	requested: number,
-	limit: number,
-): SessionManagerCapacityError {
-	return new SessionManagerCapacityError({ resource, sessionId, path, current, requested, limit });
-}
-
-function serializeEntryJson(entry: FileEntry): string {
-	const serialized = JSON.stringify(entry);
-	if (serialized === undefined) {
-		throw new Error(`Session entry ${entry.type} could not be serialized`);
-	}
-	return serialized;
-}
-
-function measureSessionEntryLogicalBytes(entry: SessionEntry): number {
-	try {
-		return Buffer.byteLength(serializeEntryJson(entry), "utf8");
-	} catch (error) {
-		if (entry.type !== "custom") throw error;
-		// Native in-memory custom entries intentionally support cyclic structured
-		// data. They have no JSON representation, so account their exact V8
-		// structured-clone bytes; all transportable entries retain JSON byte parity.
-		return serializeV8(entry).byteLength;
-	}
-}
-
-function measureSessionEntriesLogicalBytes(entries: readonly SessionEntry[]): number {
-	let logicalBytes = 0;
-	for (const entry of entries) logicalBytes += measureSessionEntryLogicalBytes(entry);
-	return logicalBytes;
-}
-
-/**
- * Measure durable tree content as the UTF-8 bytes of each independently
- * serialized session entry. File headers and JSONL newlines are envelope bytes.
- */
-export function calculateSessionManagerLogicalBytes(entries: readonly SessionEntry[]): number {
-	return measureSessionEntriesLogicalBytes(entries);
-}
-
-function assertSessionTreeCapacity(
-	sessionId: string,
-	path: string | undefined,
-	currentEntryCount: number,
-	currentLogicalBytes: number,
-	nextEntryCount: number,
-	nextLogicalBytes: number,
-): void {
-	const limits = getSessionManagerCapacityLimits();
-	if (nextEntryCount > limits.maxEntries) {
-		throw sessionCapacityError("entries", sessionId, path, currentEntryCount, nextEntryCount, limits.maxEntries);
-	}
-	if (nextLogicalBytes > limits.maxLogicalBytes) {
-		throw sessionCapacityError(
-			"logical_bytes",
-			sessionId,
-			path,
-			currentLogicalBytes,
-			nextLogicalBytes,
-			limits.maxLogicalBytes,
-		);
-	}
-}
-
-function measureSessionFileBytes(entries: readonly FileEntry[]): number {
-	let fileBytes = 0;
-	for (const entry of entries) {
-		fileBytes += Buffer.byteLength(serializeEntryJson(entry), "utf8") + 1;
-	}
-	return fileBytes;
-}
-
-function assertSessionFileSize(sessionId: string, path: string, current: number, requested: number): void {
-	const limit = getSessionManagerCapacityLimits().maxFileBytes;
-	if (requested > limit) {
-		throw sessionCapacityError("file_bytes", sessionId, path, current, requested, limit);
-	}
-}
-
-function getFilesystemErrorCode(error: unknown): string | undefined {
-	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
-	return typeof error.code === "string" ? error.code : undefined;
-}
-
-function waitForWindowsSessionRenameRetry(attempt: number): void {
-	const delay = Math.min(2 ** attempt * 5, MAX_WINDOWS_SESSION_RENAME_DELAY_MS);
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
-}
-
-function replaceSessionFile(tempPath: string, targetPath: string): void {
-	for (let attempt = 0; ; attempt++) {
-		try {
-			sessionManagerPersistenceTestHooks?.beforeRenameAttempt?.(attempt);
-			renameSync(tempPath, targetPath);
-			return;
-		} catch (error) {
-			const useWindowsRetries =
-				process.platform === "win32" || sessionManagerPersistenceTestHooks?.simulateWindowsRenameRetries === true;
-			if (
-				!useWindowsRetries ||
-				getFilesystemErrorCode(error) !== "EPERM" ||
-				attempt >= WINDOWS_SESSION_RENAME_RETRIES
-			) {
-				throw error;
-			}
-			waitForWindowsSessionRenameRetry(attempt);
-		}
-	}
-}
-
-function fsyncSessionDirectory(targetPath: string): void {
-	if (process.platform === "win32") {
-		// libuv cannot open a Windows directory for fsync. Re-open the replaced
-		// file and fsync it after rename so the replacement reaches stable storage.
-		const handle = openSync(targetPath, "r+");
-		try {
-			fsyncSync(handle);
-		} finally {
-			closeSync(handle);
-		}
-		return;
-	}
-	const handle = openSync(dirname(targetPath), "r");
-	try {
-		fsyncSync(handle);
-	} finally {
-		closeSync(handle);
-	}
-}
-
-function serializeFileEntry(entry: FileEntry): Buffer {
-	return Buffer.from(`${serializeEntryJson(entry)}\n`);
-}
-
-function writeBufferFully(handle: number, buffer: Buffer): void {
-	let written = 0;
-	while (written < buffer.byteLength) {
-		const bytesWritten = writeSync(handle, buffer, written, buffer.byteLength - written);
-		if (bytesWritten === 0) {
-			throw new Error("Session file write made no progress");
-		}
-		written += bytesWritten;
-	}
-}
-
-function writeSessionFileAtomically(targetPath: string, entries: readonly FileEntry[]): void {
-	const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
-	const currentBytes = existsSync(targetPath) ? statSync(targetPath).size : 0;
-	assertSessionFileSize(header?.id ?? "<unresolved>", targetPath, currentBytes, measureSessionFileBytes(entries));
-	const tempPath = join(dirname(targetPath), `.${basename(targetPath)}.rewrite-${process.pid}-${randomUUID()}.tmp`);
-	let tempHandle: number | undefined;
-	let replaced = false;
-	let primaryError: unknown;
-	const cleanupErrors: unknown[] = [];
-	try {
-		tempHandle = openSync(tempPath, "wx", 0o600);
-		sessionManagerPersistenceTestHooks?.onAtomicRewriteStage?.("after_temp_open");
-		for (const entry of entries) {
-			writeBufferFully(tempHandle, serializeFileEntry(entry));
-		}
-		sessionManagerPersistenceTestHooks?.onAtomicRewriteStage?.("after_temp_write");
-		fsyncSync(tempHandle);
-		sessionManagerPersistenceTestHooks?.onAtomicRewriteStage?.("after_temp_fsync");
-		closeSync(tempHandle);
-		tempHandle = undefined;
-
-		replaceSessionFile(tempPath, targetPath);
-		replaced = true;
-		sessionManagerPersistenceTestHooks?.onAtomicRewriteStage?.("after_replace");
-		fsyncSessionDirectory(targetPath);
-		sessionManagerPersistenceTestHooks?.onAtomicRewriteStage?.("after_directory_fsync");
-	} catch (error) {
-		primaryError = error;
-	} finally {
-		if (tempHandle !== undefined) {
-			try {
-				closeSync(tempHandle);
-			} catch (error) {
-				cleanupErrors.push(error);
-			}
-		}
-		if (!replaced && existsSync(tempPath)) {
-			try {
-				unlinkSync(tempPath);
-			} catch (error) {
-				cleanupErrors.push(error);
-			}
-		}
-	}
-	if (primaryError !== undefined && cleanupErrors.length === 0) {
-		throw primaryError;
-	}
-	if (primaryError !== undefined || cleanupErrors.length > 0) {
-		throw new AggregateError(
-			primaryError === undefined ? cleanupErrors : [primaryError, ...cleanupErrors],
-			`Failed to atomically rewrite session file ${targetPath}`,
-		);
-	}
-}
-
-function persistedEntriesEqual(left: SessionEntry, right: SessionEntry): boolean {
-	return isDeepStrictEqual(JSON.parse(JSON.stringify(left)) as unknown, JSON.parse(JSON.stringify(right)) as unknown);
-}
 
 class SessionHeaderScanLimitError extends Error {
 	constructor(filePath: string) {
@@ -891,24 +500,13 @@ class SessionHeaderScanLimitError extends Error {
 	}
 }
 
-export class SessionFileCorruptionError extends Error {
-	readonly path: string;
-	readonly line: number;
-
-	constructor(filePath: string, line: number, cause?: unknown) {
-		super(`Malformed session JSONL at ${filePath}:${line}`, { cause });
-		this.name = "SessionFileCorruptionError";
-		this.path = filePath;
-		this.line = line;
-	}
-}
-
-function parseSessionEntryLineStrict(line: string, filePath: string, lineNumber: number): FileEntry | null {
+function parseSessionEntryLine(line: string): FileEntry | null {
 	if (!line.trim()) return null;
 	try {
 		return JSON.parse(line) as FileEntry;
-	} catch (error) {
-		throw new SessionFileCorruptionError(filePath, lineNumber, error);
+	} catch {
+		// Skip malformed lines
+		return null;
 	}
 }
 
@@ -916,18 +514,13 @@ function parseSessionEntryLineStrict(line: string, filePath: string, lineNumber:
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
-	const fileBytes = statSync(resolvedFilePath).size;
-	assertSessionFileSize("<unresolved>", resolvedFilePath, 0, fileBytes);
 
 	const entries: FileEntry[] = [];
-	let treeEntryCount = 0;
-	let treeLogicalBytes = 0;
 	const fd = openSync(resolvedFilePath, "r");
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
 		let pending = "";
-		let lineNumber = 1;
 
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
@@ -937,52 +530,17 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLineStrict(
-					pending.slice(lineStart, newlineIndex),
-					resolvedFilePath,
-					lineNumber,
-				);
-				if (entry) {
-					if (entry.type !== "session") {
-						const nextLogicalBytes = treeLogicalBytes + measureSessionEntryLogicalBytes(entry);
-						assertSessionTreeCapacity(
-							entries[0]?.type === "session" ? entries[0].id : "<unresolved>",
-							resolvedFilePath,
-							treeEntryCount,
-							treeLogicalBytes,
-							treeEntryCount + 1,
-							nextLogicalBytes,
-						);
-						treeEntryCount++;
-						treeLogicalBytes = nextLogicalBytes;
-					}
-					entries.push(entry);
-				}
+				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
+				if (entry) entries.push(entry);
 				lineStart = newlineIndex + 1;
-				lineNumber++;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
 			pending = pending.slice(lineStart);
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLineStrict(pending, resolvedFilePath, lineNumber);
-		if (finalEntry) {
-			if (finalEntry.type !== "session") {
-				const nextLogicalBytes = treeLogicalBytes + measureSessionEntryLogicalBytes(finalEntry);
-				assertSessionTreeCapacity(
-					entries[0]?.type === "session" ? entries[0].id : "<unresolved>",
-					resolvedFilePath,
-					treeEntryCount,
-					treeLogicalBytes,
-					treeEntryCount + 1,
-					nextLogicalBytes,
-				);
-				treeEntryCount++;
-				treeLogicalBytes = nextLogicalBytes;
-			}
-			entries.push(finalEntry);
-		}
+		const finalEntry = parseSessionEntryLine(pending);
+		if (finalEntry) entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
 	}
@@ -999,38 +557,31 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 
 /**
  * Inspect a physical line while searching for the first parsed session entry.
- * Blank lines are skipped; malformed JSON fails closed.
+ * Blank and malformed lines are skipped to match loadEntriesFromFile().
  * Returns undefined to keep scanning, null for a parsed non-header entry, or the header.
  */
-function parseSessionHeaderCandidate(
-	line: string,
-	filePath: string,
-	lineNumber: number,
-): SessionHeader | null | undefined {
+function parseSessionHeaderCandidate(line: string): SessionHeader | null | undefined {
 	if (!line.trim()) return undefined;
-	const entry = parseSessionEntryLineStrict(line, filePath, lineNumber);
+	const entry = parseSessionEntryLine(line);
 	if (!entry) return undefined;
 	if (entry.type !== "session" || typeof (entry as { id?: unknown }).id !== "string") return null;
 	return entry;
 }
 
 function readSessionHeader(filePath: string): SessionHeader | null {
-	const fileBytes = statSync(filePath).size;
-	assertSessionFileSize("<unresolved>", filePath, 0, fileBytes);
 	const fd = openSync(filePath, "r");
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_HEADER_READ_BUFFER_SIZE);
 		const lineChunks: string[] = [];
 		let scannedBytes = 0;
-		let lineNumber = 1;
 
 		while (scannedBytes < MAX_SESSION_HEADER_SCAN_BYTES) {
 			const readLength = Math.min(buffer.length, MAX_SESSION_HEADER_SCAN_BYTES - scannedBytes);
 			const bytesRead = readSync(fd, buffer, 0, readLength, null);
 			if (bytesRead === 0) {
 				lineChunks.push(decoder.end());
-				return parseSessionHeaderCandidate(lineChunks.join(""), filePath, lineNumber) ?? null;
+				return parseSessionHeaderCandidate(lineChunks.join("")) ?? null;
 			}
 			scannedBytes += bytesRead;
 
@@ -1039,11 +590,10 @@ function readSessionHeader(filePath: string): SessionHeader | null {
 			let newlineIndex = chunk.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
 				lineChunks.push(chunk.slice(lineStart, newlineIndex));
-				const header = parseSessionHeaderCandidate(lineChunks.join(""), filePath, lineNumber);
+				const header = parseSessionHeaderCandidate(lineChunks.join(""));
 				if (header !== undefined) return header;
 				lineChunks.length = 0;
 				lineStart = newlineIndex + 1;
-				lineNumber++;
 				newlineIndex = chunk.indexOf("\n", lineStart);
 			}
 			lineChunks.push(chunk.slice(lineStart));
@@ -1054,7 +604,7 @@ function readSessionHeader(filePath: string): SessionHeader | null {
 		const probe = Buffer.allocUnsafe(1);
 		if (readSync(fd, probe, 0, probe.length, null) === 0) {
 			lineChunks.push(decoder.end());
-			return parseSessionHeaderCandidate(lineChunks.join(""), filePath, lineNumber) ?? null;
+			return parseSessionHeaderCandidate(lineChunks.join("")) ?? null;
 		}
 		throw new SessionHeaderScanLimitError(filePath);
 	} finally {
@@ -1065,9 +615,9 @@ function readSessionHeader(filePath: string): SessionHeader | null {
 function readSessionHeaderForDiscovery(filePath: string): SessionHeader | null {
 	try {
 		return readSessionHeader(filePath);
-	} catch (error) {
-		if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError) throw error;
-		// Discovery remains best-effort for transient filesystem failures.
+	} catch {
+		// Discovery is best-effort: unreadable or oversized files are not sessions,
+		// and one corrupt file must not prevent other sessions from being found.
 		return null;
 	}
 }
@@ -1099,8 +649,7 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
 		return files[0]?.path || null;
-	} catch (error) {
-		if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError) throw error;
+	} catch {
 		// Directory access and stat races make recent-session discovery unavailable.
 		return null;
 	}
@@ -1138,16 +687,12 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	try {
 		const stats = await stat(filePath);
-		assertSessionFileSize("<unresolved>", filePath, 0, stats.size);
 		let header: SessionHeader | null = null;
 		let messageCount = 0;
 		let firstMessage = "";
 		const allMessages: string[] = [];
 		let name: string | undefined;
 		let lastActivityTime: number | undefined;
-		let treeEntryCount = 0;
-		let treeLogicalBytes = 0;
-		let lineNumber = 0;
 
 		const rl = createInterface({
 			input: createReadStream(filePath, { encoding: "utf8" }),
@@ -1155,27 +700,13 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		});
 
 		for await (const line of rl) {
-			lineNumber++;
-			const entry = parseSessionEntryLineStrict(line, filePath, lineNumber);
+			const entry = parseSessionEntryLine(line);
 			if (!entry) continue;
 
 			if (!header) {
 				if (entry.type !== "session") return null;
 				header = entry;
 				continue;
-			}
-			if (entry.type !== "session") {
-				const nextLogicalBytes = treeLogicalBytes + measureSessionEntryLogicalBytes(entry);
-				assertSessionTreeCapacity(
-					header.id,
-					filePath,
-					treeEntryCount,
-					treeLogicalBytes,
-					treeEntryCount + 1,
-					nextLogicalBytes,
-				);
-				treeEntryCount++;
-				treeLogicalBytes = nextLogicalBytes;
 			}
 
 			// Extract session name (use latest, including explicit clears)
@@ -1228,8 +759,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.join(" "),
 		};
-	} catch (error) {
-		if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError) throw error;
+	} catch {
 		return null;
 	}
 }
@@ -1256,9 +786,7 @@ async function buildSessionInfosWithConcurrency(
 			.then((info) => {
 				results[index] = info;
 			})
-			.catch((error: unknown) => {
-				if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError)
-					throw error;
+			.catch(() => {
 				results[index] = null;
 			})
 			.finally(() => {
@@ -1273,12 +801,7 @@ async function buildSessionInfosWithConcurrency(
 			startNext();
 		}
 		if (inFlight.size > 0) {
-			try {
-				await Promise.race(inFlight);
-			} catch (error) {
-				await Promise.allSettled([...inFlight]);
-				throw error;
-			}
+			await Promise.race(inFlight);
 		}
 	}
 
@@ -1311,8 +834,7 @@ async function listSessionsFromDir(
 				sessions.push(info);
 			}
 		}
-	} catch (error) {
-		if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError) throw error;
+	} catch {
 		// Return empty list on error
 	}
 
@@ -1342,11 +864,6 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
-	private treeEntryCount = 0;
-	private treeLogicalBytes = 0;
-	private treeHash: string | undefined = PI_SERVER_EMPTY_TREE_HASH;
-	private treeHashError: unknown;
-	private appendPersistenceFailure: unknown;
 
 	private constructor(
 		cwd: string,
@@ -1376,60 +893,37 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
-		const resolvedSessionFile = resolvePath(sessionFile);
-		if (existsSync(resolvedSessionFile)) {
-			const nextFileEntries = structuredClone(preloadedFileEntries ?? loadEntriesFromFile(resolvedSessionFile));
+		this.sessionFile = resolvePath(sessionFile);
+		if (existsSync(this.sessionFile)) {
+			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
-			if (nextFileEntries.length === 0) {
-				if (statSync(resolvedSessionFile).size > 0) {
-					throw new Error(`Session file is not a valid pi session: ${resolvedSessionFile}`);
+			if (this.fileEntries.length === 0) {
+				const explicitPath = this.sessionFile;
+				if (statSync(explicitPath).size > 0) {
+					throw new Error(`Session file is not a valid pi session: ${explicitPath}`);
 				}
-				const nextSessionId = createSessionId();
-				const header: SessionHeader = {
-					type: "session",
-					version: CURRENT_SESSION_VERSION,
-					id: nextSessionId,
-					timestamp: new Date().toISOString(),
-					cwd: this.cwd,
-				};
-				writeSessionFileAtomically(resolvedSessionFile, [header]);
-				this.sessionId = nextSessionId;
-				this.sessionFile = resolvedSessionFile;
-				this.fileEntries = [header];
-				this._buildIndex();
-				this.appendPersistenceFailure = undefined;
+				this.newSession();
+				this.sessionFile = explicitPath;
+				this._rewriteFile();
 				this.flushed = true;
 				return;
 			}
 
-			const header = nextFileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			const nextSessionId = header?.id ?? createSessionId();
-			const migrated = migrateToCurrentVersion(nextFileEntries);
-			const treeEntries = nextFileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-			validateSessionTreeShape(treeEntries);
-			assertSessionTreeCapacity(
-				nextSessionId,
-				resolvedSessionFile,
-				0,
-				0,
-				treeEntries.length,
-				measureSessionEntriesLogicalBytes(treeEntries),
-			);
-			if (migrated) {
-				writeSessionFileAtomically(resolvedSessionFile, nextFileEntries);
+			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
+			this.sessionId = header?.id ?? createSessionId();
+
+			if (migrateToCurrentVersion(this.fileEntries)) {
+				this._rewriteFile();
 			}
 
-			this.sessionId = nextSessionId;
-			this.sessionFile = resolvedSessionFile;
-			this.fileEntries = nextFileEntries;
 			this._buildIndex();
-			this.appendPersistenceFailure = undefined;
 			this.flushed = true;
 		} else {
+			const explicitPath = this.sessionFile;
 			this.newSession();
-			this.sessionFile = resolvedSessionFile; // preserve explicit path from --session flag
+			this.sessionFile = explicitPath; // preserve explicit path from --session flag
 		}
 	}
 
@@ -1452,11 +946,6 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
-		this.treeEntryCount = 0;
-		this.treeLogicalBytes = 0;
-		this.treeHash = PI_SERVER_EMPTY_TREE_HASH;
-		this.treeHashError = undefined;
-		this.appendPersistenceFailure = undefined;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -1467,25 +956,14 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
-		const entries = this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		validateSessionTreeShape(entries);
-		const logicalBytes = measureSessionEntriesLogicalBytes(entries);
-		assertSessionTreeCapacity(this.sessionId, this.sessionFile, 0, 0, entries.length, logicalBytes);
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
-		this.treeEntryCount = 0;
-		this.treeLogicalBytes = 0;
-		this.treeHash = PI_SERVER_EMPTY_TREE_HASH;
-		this.treeHashError = undefined;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
-			this.treeEntryCount++;
-			this.treeLogicalBytes += measureSessionEntryLogicalBytes(entry);
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
-			this._updateTreeHash(entry);
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1498,32 +976,15 @@ export class SessionManager {
 		}
 	}
 
-	private _updateTreeHash(entry: SessionEntry): void {
-		if (this.treeHash === undefined) return;
-		try {
-			this.treeHash = appendPiServerTreeHash(this.treeHash, hashPiServerTreeEntry(entry));
-		} catch (error) {
-			this.treeHash = undefined;
-			this.treeHashError = error;
-		}
-	}
-
-	private _rewriteFile(entries: readonly FileEntry[] = this.fileEntries): void {
+	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		if (this.appendPersistenceFailure !== undefined) {
-			throw new Error("Session persistence has an indeterminate prior failure; reopen the session before retrying", {
-				cause: this.appendPersistenceFailure,
-			});
-		}
+		const fd = openSync(this.sessionFile, "w");
 		try {
-			writeSessionFileAtomically(this.sessionFile, entries);
-		} catch (error) {
-			this.appendPersistenceFailure = error;
-			const details = error instanceof Error ? error.message : String(error);
-			throw new Error(
-				`Session file rewrite may have replaced ${this.sessionFile} without a durable in-memory commit; reopen the session before retrying: ${details}`,
-				{ cause: error },
-			);
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
 		}
 	}
 
@@ -1551,134 +1012,40 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	/**
-	 * Durably flush the persisted session file before an external acknowledgement.
-	 * In-memory sessions and sessions without a materialized file have nothing to flush.
-	 */
-	flushSessionFile(): void {
-		if (!this.persist || !this.sessionFile || !existsSync(this.sessionFile)) return;
-		const handle = openSync(this.sessionFile, "r+");
-		try {
-			fsyncSync(handle);
-		} finally {
-			closeSync(handle);
-		}
-	}
-
-	private _appendMaterializedEntry(entry: SessionEntry): void {
-		if (!this.sessionFile) throw new Error("Cannot append without a session file");
-		const handle = openSync(this.sessionFile, fsConstants.O_WRONLY | fsConstants.O_APPEND);
-		let appendError: unknown;
-		try {
-			writeBufferFully(handle, serializeFileEntry(entry));
-			sessionManagerPersistenceTestHooks?.onAppendStage?.("after_append");
-			fsyncSync(handle);
-			sessionManagerPersistenceTestHooks?.onAppendStage?.("after_fsync");
-		} catch (error) {
-			appendError = error;
-		}
-		try {
-			closeSync(handle);
-		} catch (error) {
-			appendError =
-				appendError === undefined
-					? error
-					: new AggregateError([appendError, error], `Failed to close session file ${this.sessionFile}`);
-		}
-		if (appendError !== undefined) {
-			this.appendPersistenceFailure = appendError;
-			throw new Error(
-				`Session entry ${entry.id} may have reached disk but was not committed in memory; reopen the session before retrying`,
-				{ cause: appendError },
-			);
-		}
-	}
-
-	private _persistBeforeCommit(entry: SessionEntry, nextFileEntries: readonly FileEntry[]): boolean {
-		if (!this.persist || !this.sessionFile) return this.flushed;
-		const hasAssistant = nextFileEntries.some((candidate) => {
-			return candidate.type === "message" && candidate.message.role === "assistant";
-		});
-		if (!hasAssistant) {
-			if (this.flushed) this._appendMaterializedEntry(entry);
-			return this.flushed;
-		}
-		if (this.flushed) {
-			this._appendMaterializedEntry(entry);
-			return true;
-		}
-		try {
-			writeSessionFileAtomically(this.sessionFile, nextFileEntries);
-		} catch (error) {
-			this.appendPersistenceFailure = error;
-			throw new Error(
-				`Session entry ${entry.id} persistence failed before the in-memory commit; reopen the session before retrying`,
-				{ cause: error },
-			);
-		}
-		return true;
-	}
-
-	private _preflightPersistEntry(entry: SessionEntry): void {
+	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
-		const entryBytes = serializeFileEntry(entry).byteLength;
-		if (!this.flushed) {
-			assertSessionFileSize(
-				this.sessionId,
-				this.sessionFile,
-				existsSync(this.sessionFile) ? statSync(this.sessionFile).size : 0,
-				measureSessionFileBytes([...this.fileEntries, entry]),
-			);
+
+		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		if (!hasAssistant) {
+			if (this.flushed) {
+				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			} else {
+				// Mark as not flushed so when assistant arrives, all entries get written
+				this.flushed = false;
+			}
 			return;
 		}
-		const currentBytes = existsSync(this.sessionFile) ? statSync(this.sessionFile).size : 0;
-		assertSessionFileSize(this.sessionId, this.sessionFile, currentBytes, currentBytes + entryBytes);
-	}
 
-	private _preflightAppendEntry(entry: SessionEntry): number {
-		const nextLogicalBytes = this.treeLogicalBytes + measureSessionEntryLogicalBytes(entry);
-		assertSessionTreeCapacity(
-			this.sessionId,
-			this.sessionFile,
-			this.treeEntryCount,
-			this.treeLogicalBytes,
-			this.treeEntryCount + 1,
-			nextLogicalBytes,
-		);
-		this._preflightPersistEntry(entry);
-		return nextLogicalBytes;
+		if (!this.flushed) {
+			const fd = openSync(this.sessionFile, "wx");
+			try {
+				for (const e of this.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				}
+			} finally {
+				closeSync(fd);
+			}
+			this.flushed = true;
+		} else {
+			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
-		if (this.appendPersistenceFailure !== undefined) {
-			throw new Error(
-				"Session append persistence has an indeterminate prior failure; reopen the session before retrying",
-				{
-					cause: this.appendPersistenceFailure,
-				},
-			);
-		}
-		const nextLogicalBytes = this._preflightAppendEntry(entry);
-		const nextFileEntries = [...this.fileEntries, entry];
-		let nextTreeHash = this.treeHash;
-		let nextTreeHashError = this.treeHashError;
-		if (nextTreeHash !== undefined) {
-			try {
-				nextTreeHash = appendPiServerTreeHash(nextTreeHash, hashPiServerTreeEntry(entry));
-			} catch (error) {
-				nextTreeHash = undefined;
-				nextTreeHashError = error;
-			}
-		}
-		const nextFlushed = this._persistBeforeCommit(entry, nextFileEntries);
 		this.fileEntries.push(entry);
-		this.treeEntryCount++;
-		this.treeLogicalBytes = nextLogicalBytes;
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this.treeHash = nextTreeHash;
-		this.treeHashError = nextTreeHashError;
-		this.flushed = nextFlushed;
+		this._persist(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1721,19 +1088,9 @@ export class SessionManager {
 			parentId = entry.id;
 			return entry;
 		});
-		const nextFileEntries: FileEntry[] = [...retainedEntries, ...messageEntries];
-		const nextTreeEntries = nextFileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		assertSessionTreeCapacity(
-			this.sessionId,
-			this.sessionFile,
-			this.treeEntryCount,
-			this.treeLogicalBytes,
-			nextTreeEntries.length,
-			measureSessionEntriesLogicalBytes(nextTreeEntries),
-		);
-		this._rewriteFile(nextFileEntries);
-		this.fileEntries = nextFileEntries;
+		this.fileEntries = [...retainedEntries, ...messageEntries];
 		this._buildIndex();
+		this._rewriteFile();
 		this.flushed = this.persist;
 	}
 
@@ -1742,185 +1099,27 @@ export class SessionManager {
 		if (!header) {
 			throw new Error("Session header is missing");
 		}
-		const savedEntries = structuredClone(entries);
-		const nextEntryById = validateSessionTreeShape(savedEntries);
-		if (leafId !== null && !nextEntryById.has(leafId)) {
+		const ids = new Set<string>();
+		for (const entry of entries) {
+			if (ids.has(entry.id)) {
+				throw new Error(`Duplicate session entry id ${entry.id}`);
+			}
+			ids.add(entry.id);
+		}
+		for (const entry of entries) {
+			if (entry.parentId !== null && !ids.has(entry.parentId)) {
+				throw new Error(`Parent entry ${entry.parentId} does not exist`);
+			}
+		}
+		if (leafId !== null && !ids.has(leafId)) {
 			throw new Error(`Leaf entry ${leafId} does not exist`);
 		}
 
-		const nextLogicalBytes = measureSessionEntriesLogicalBytes(savedEntries);
-		assertSessionTreeCapacity(
-			this.sessionId,
-			this.sessionFile,
-			this.treeEntryCount,
-			this.treeLogicalBytes,
-			savedEntries.length,
-			nextLogicalBytes,
-		);
-		const nextFileEntries: FileEntry[] = [header, ...savedEntries];
-		this._rewriteFile(nextFileEntries);
-		this.fileEntries = nextFileEntries;
+		this.fileEntries = [header, ...entries.map((entry) => ({ ...entry }))];
 		this._buildIndex();
 		this.leafId = leafId;
+		this._rewriteFile();
 		this.flushed = this.persist;
-	}
-
-	/**
-	 * Durably append one authoritative compaction entry without rewriting the
-	 * existing session history. The caller must provide the exact local base
-	 * identity used by the compaction request.
-	 *
-	 * Re-applying the exact already-durable entry is an idempotent no-op. Any
-	 * other base, leaf, parent, or entry-id divergence fails closed.
-	 */
-	appendCompactionEntry<T = unknown>(entry: CompactionEntry<T>, base: CompactionAppendBase): string {
-		if (
-			!Number.isSafeInteger(base.baseEntryCount) ||
-			base.baseEntryCount < 0 ||
-			(base.baseLeafId !== null && (typeof base.baseLeafId !== "string" || base.baseLeafId.length === 0)) ||
-			typeof base.baseTreeHash !== "string" ||
-			!/^[a-f0-9]{64}$/u.test(base.baseTreeHash)
-		) {
-			throw new Error("Compaction append base identity is invalid");
-		}
-		if (
-			entry.type !== "compaction" ||
-			typeof entry.id !== "string" ||
-			entry.id.length === 0 ||
-			typeof entry.timestamp !== "string" ||
-			entry.timestamp.length === 0 ||
-			typeof entry.summary !== "string" ||
-			typeof entry.firstKeptEntryId !== "string" ||
-			entry.firstKeptEntryId.length === 0 ||
-			!Number.isFinite(entry.tokensBefore) ||
-			entry.tokensBefore < 0 ||
-			(entry.retainedTail !== undefined && !Array.isArray(entry.retainedTail))
-		) {
-			throw new Error("Compaction entry is invalid");
-		}
-		let entryHash: string;
-		try {
-			entryHash = hashPiServerTreeEntry(entry);
-		} catch (error) {
-			throw new Error(`Compaction entry ${entry.id} is not serializable`, { cause: error });
-		}
-		const currentTreeHash = this.treeHash;
-		if (currentTreeHash === undefined) {
-			throw new Error("Cannot validate compaction base because the local tree contains a non-serializable entry", {
-				cause: this.treeHashError,
-			});
-		}
-
-		const currentEntryCount = this.treeEntryCount;
-		if (currentEntryCount === base.baseEntryCount + 1) {
-			const existing = this.fileEntries.at(-1);
-			if (
-				existing?.type === "compaction" &&
-				existing.id === entry.id &&
-				this.leafId === entry.id &&
-				currentTreeHash === appendPiServerTreeHash(base.baseTreeHash, entryHash) &&
-				persistedEntriesEqual(existing, entry)
-			) {
-				if (this.persist && (!this.sessionFile || !this.flushed || !existsSync(this.sessionFile))) {
-					throw new Error("Cannot verify an already-applied compaction without its materialized session file");
-				}
-				this.flushSessionFile();
-				return entry.id;
-			}
-			throw new Error(
-				`Compaction entry ${entry.id} cannot be replayed because the local tree has a divergent entry after the requested base`,
-			);
-		}
-		if (currentEntryCount !== base.baseEntryCount) {
-			throw new Error(
-				`Compaction append base entry count mismatch: expected ${base.baseEntryCount}, current ${currentEntryCount}`,
-			);
-		}
-		if (currentTreeHash !== base.baseTreeHash) {
-			throw new Error(`Compaction append base tree hash mismatch`);
-		}
-		if (this.leafId !== base.baseLeafId) {
-			throw new Error(
-				`Compaction append base leaf mismatch: expected ${String(base.baseLeafId)}, current ${String(this.leafId)}`,
-			);
-		}
-		if (entry.parentId !== base.baseLeafId) {
-			throw new Error(
-				`Compaction entry parent mismatch: expected ${String(base.baseLeafId)}, received ${String(entry.parentId)}`,
-			);
-		}
-		if (base.baseLeafId !== null && !this.byId.has(base.baseLeafId)) {
-			throw new Error(`Compaction append base leaf ${base.baseLeafId} does not exist`);
-		}
-		if (!this.byId.has(entry.firstKeptEntryId)) {
-			throw new Error(`Compaction first-kept entry ${entry.firstKeptEntryId} does not exist`);
-		}
-		if (this.byId.has(entry.id)) {
-			throw new Error(`Compaction entry id ${entry.id} already exists`);
-		}
-		if (this.appendPersistenceFailure !== undefined) {
-			throw new Error(
-				"Compaction append persistence has an indeterminate prior failure; reopen the session before retrying",
-				{ cause: this.appendPersistenceFailure },
-			);
-		}
-
-		const savedEntry: CompactionEntry<T> = { ...entry };
-		const nextLogicalBytes = this.treeLogicalBytes + measureSessionEntryLogicalBytes(savedEntry);
-		assertSessionTreeCapacity(
-			this.sessionId,
-			this.sessionFile,
-			this.treeEntryCount,
-			this.treeLogicalBytes,
-			this.treeEntryCount + 1,
-			nextLogicalBytes,
-		);
-		const serializedEntry = serializeFileEntry(savedEntry);
-		if (this.persist) {
-			if (!this.sessionFile || !this.flushed || !existsSync(this.sessionFile)) {
-				throw new Error("Cannot durably append compaction before the session file is materialized");
-			}
-			const currentFileBytes = statSync(this.sessionFile).size;
-			assertSessionFileSize(
-				this.sessionId,
-				this.sessionFile,
-				currentFileBytes,
-				currentFileBytes + serializedEntry.byteLength,
-			);
-			const handle = openSync(this.sessionFile, fsConstants.O_WRONLY | fsConstants.O_APPEND);
-			let appendError: unknown;
-			try {
-				writeBufferFully(handle, serializedEntry);
-				sessionManagerPersistenceTestHooks?.onCompactionAppendStage?.("after_append");
-				fsyncSync(handle);
-				sessionManagerPersistenceTestHooks?.onCompactionAppendStage?.("after_fsync");
-			} catch (error) {
-				appendError = error;
-			}
-			try {
-				closeSync(handle);
-			} catch (error) {
-				appendError =
-					appendError === undefined
-						? error
-						: new AggregateError([appendError, error], `Failed to close session file ${this.sessionFile}`);
-			}
-			if (appendError !== undefined) {
-				this.appendPersistenceFailure = appendError;
-				throw new Error(
-					`Compaction entry ${entry.id} may have reached disk but was not committed in memory; reopen the session before retrying`,
-					{ cause: appendError },
-				);
-			}
-		}
-
-		this.fileEntries.push(savedEntry);
-		this.treeEntryCount++;
-		this.treeLogicalBytes = nextLogicalBytes;
-		this.byId.set(savedEntry.id, savedEntry);
-		this.leafId = savedEntry.id;
-		this.treeHash = appendPiServerTreeHash(currentTreeHash, entryHash);
-		return savedEntry.id;
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
@@ -1958,7 +1157,6 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		usage?: Usage,
-		retainedTail?: AgentMessage[],
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1968,7 +1166,6 @@ export class SessionManager {
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
-			retainedTail,
 			details,
 			usage,
 			fromHook,
@@ -2247,6 +1444,7 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -2308,55 +1506,65 @@ export class SessionManager {
 			}
 		}
 
+		if (this.persist) {
+			// Build label entries
+			const lastEntryId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
+			let parentId = lastEntryId;
+			const labelEntries: LabelEntry[] = [];
+			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
+				const labelEntry: LabelEntry = {
+					type: "label",
+					id: generateId(new Set(pathEntryIds)),
+					parentId,
+					timestamp: labelTimestamp,
+					targetId,
+					label,
+				};
+				pathEntryIds.add(labelEntry.id);
+				labelEntries.push(labelEntry);
+				parentId = labelEntry.id;
+			}
+
+			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this.sessionId = newSessionId;
+			this.sessionFile = newSessionFile;
+			this._buildIndex();
+
+			// Only write the file now if it contains an assistant message.
+			// Otherwise defer to _persist(), which creates the file on the
+			// first assistant response, matching the newSession() contract
+			// and avoiding the duplicate-header bug when _persist()'s
+			// no-assistant guard later resets flushed to false.
+			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+			if (hasAssistant) {
+				this._rewriteFile();
+				this.flushed = true;
+			} else {
+				this.flushed = false;
+			}
+
+			return newSessionFile;
+		}
+
+		// In-memory mode: replace current session with the path + labels
 		const labelEntries: LabelEntry[] = [];
-		const labelEntryIds = new Set(pathEntryIds);
 		let parentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
 		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 			const labelEntry: LabelEntry = {
 				type: "label",
-				id: generateId(labelEntryIds),
+				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
 				parentId,
 				timestamp: labelTimestamp,
 				targetId,
 				label,
 			};
-			labelEntryIds.add(labelEntry.id);
 			labelEntries.push(labelEntry);
 			parentId = labelEntry.id;
 		}
-
-		const nextTreeEntries = [...pathWithoutLabels, ...labelEntries];
-		const nextFileEntries: FileEntry[] = [header, ...nextTreeEntries];
-		assertSessionTreeCapacity(
-			newSessionId,
-			this.persist ? newSessionFile : undefined,
-			this.treeEntryCount,
-			this.treeLogicalBytes,
-			nextTreeEntries.length,
-			measureSessionEntriesLogicalBytes(nextTreeEntries),
-		);
-		const hasAssistant = nextFileEntries.some((entry) => {
-			return entry.type === "message" && entry.message.role === "assistant";
-		});
-		if (this.persist) {
-			assertSessionFileSize(
-				newSessionId,
-				newSessionFile,
-				existsSync(newSessionFile) ? statSync(newSessionFile).size : 0,
-				measureSessionFileBytes(nextFileEntries),
-			);
-			if (hasAssistant) {
-				writeSessionFileAtomically(newSessionFile, nextFileEntries);
-			}
-		}
-
-		this.fileEntries = nextFileEntries;
+		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this.sessionId = newSessionId;
-		if (this.persist) this.sessionFile = newSessionFile;
 		this._buildIndex();
-		this.appendPersistenceFailure = undefined;
-		this.flushed = this.persist && hasAssistant;
-		return this.persist ? newSessionFile : undefined;
+		return undefined;
 	}
 
 	/**
@@ -2442,6 +1650,11 @@ export class SessionManager {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
 
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+
 		// Create new session file with new ID but forked content
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
@@ -2449,7 +1662,6 @@ export class SessionManager {
 		const newSessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDirPath(resolvedTargetCwd);
 		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
 
 		// Write new header pointing to source as parent, with updated cwd
@@ -2461,24 +1673,14 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		const migratedSourceEntries = structuredClone(sourceEntries);
-		migrateToCurrentVersion(migratedSourceEntries);
-		const copiedEntries = migratedSourceEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		assertSessionTreeCapacity(
-			newSessionId,
-			newSessionFile,
-			0,
-			0,
-			copiedEntries.length,
-			measureSessionEntriesLogicalBytes(copiedEntries),
-		);
-		const nextFileEntries: FileEntry[] = [newHeader, ...copiedEntries];
-		assertSessionFileSize(newSessionId, newSessionFile, 0, measureSessionFileBytes(nextFileEntries));
+		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
 
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
+		// Copy all non-header entries from source
+		for (const entry of sourceEntries) {
+			if (entry.type !== "session") {
+				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+			}
 		}
-		writeSessionFileAtomically(newSessionFile, nextFileEntries);
 
 		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
 	}
@@ -2559,8 +1761,7 @@ export class SessionManager {
 
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
-		} catch (error) {
-			if (error instanceof SessionManagerCapacityError || error instanceof SessionFileCorruptionError) throw error;
+		} catch {
 			return [];
 		}
 	}
