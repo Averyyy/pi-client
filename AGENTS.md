@@ -46,6 +46,7 @@
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Chunk envelopes must include `requestId`, `chunkIndex`, `totalChunks`, and a `sha256` of the encoded chunk string. Identical duplicate chunks are acknowledgement-only no-ops; checksum mismatches or divergent duplicate indexes fail in `request-chunks`.
 - Chunk upload may run with bounded parallelism, but chunk ack bodies must echo `requestId`, `chunkIndex`, and `totalChunks`; otherwise the client treats the response as the final target response.
+- Keep the legacy Base64 request-chunk pending budget at 1 GiB. It counts encoded chunk strings, so the previous 64 MiB budget rejected session-tree append bodies above roughly 48 MiB of raw JSON before the target request could run.
 - Keep request-chunk pending state bounded with TTL/byte cleanup and keep a short completed-request tombstone so retrying the completing chunk can return the original target body.
 - Static context hashes must be real fixed-size digests over canonical `{systemPrompt, tools:[name,description,parameters]}` data, never the raw prompt/tools string.
 - Transient provider context such as validation hints or extension overlays must travel as `ephemeralMessages`/`contextOverlay` on `/api/stream`; it must not be converted into durable pending tree entries or trigger full-tree sync.
