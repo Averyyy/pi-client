@@ -692,7 +692,10 @@ export class AgentSession {
 			this.sessionId,
 			{ entries: this.sessionManager.getEntries(), leafId: this.sessionManager.getLeafId() },
 			compactStatePath,
-			{ signal },
+			{
+				signal,
+				onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
+			},
 		);
 		if (!result) return undefined;
 		return this._applyPiServerCompactionResult(result, reason, willRetry);

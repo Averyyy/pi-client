@@ -2693,11 +2693,29 @@ describe("pi-server-client", () => {
 		const tempDirectory = mkdtempSync(join(tmpdir(), "pi-server-client-run-tree-mismatch-"));
 		const runStatePath = join(tempDirectory, "session.pi-server-runs.jsonl");
 		const entries = baseTree().slice(0, 1);
-		const changedEntries = [...entries, messageEntry("u2", "u1", textMessage("changed tree", 2000))];
+		const changedEntries = [
+			...entries,
+			messageEntry("a2", "u1", {
+				...assistantMessage("changed tree", 2000),
+				diagnostics: [
+					{
+						type: "pi_server_run",
+						timestamp: 123,
+						details: {
+							sessionId: "durable-tree-mismatch",
+							runId: "locally-corrupted-run-id",
+							requestMac: "f".repeat(64),
+							restartUnknown: false,
+						},
+					},
+				],
+			}),
+		];
 		let streamPosts = 0;
 		let statusRequests = 0;
 		let historyRequests = 0;
 		let eventRequests = 0;
+		let initRequests = 0;
 		let reconciledEntries: SessionTreeEntry[] | undefined;
 
 		try {
@@ -2781,6 +2799,7 @@ describe("pi-server-client", () => {
 							},
 						]);
 					}
+					if (path === "/api/session/init") initRequests++;
 					return makeSessionResponse(body, {
 						treeHash: hashEntries(entries),
 						leafId: "u1",
@@ -2803,6 +2822,24 @@ describe("pi-server-client", () => {
 			});
 			await initialStream.result();
 			expect(streamPosts).toBe(1);
+			const pending = readPiServerPendingRun(runStatePath);
+			if (!pending) throw new Error("Expected durable pending run");
+			const changedAssistant = changedEntries[1];
+			if (changedAssistant?.type !== "message" || changedAssistant.message.role !== "assistant") {
+				throw new Error("Expected changed assistant entry");
+			}
+			changedAssistant.message.diagnostics = [
+				{
+					type: "pi_server_run",
+					timestamp: 123,
+					details: {
+						sessionId: pending.sessionId,
+						runId: pending.runId,
+						requestMac: "f".repeat(64),
+						restartUnknown: false,
+					},
+				},
+			];
 
 			resetAllSessionTracking();
 			streamPosts = 0;
@@ -2822,6 +2859,7 @@ describe("pi-server-client", () => {
 			expect(statusRequests).toBe(1);
 			expect(historyRequests).toBe(1);
 			expect(eventRequests).toBe(1);
+			expect(initRequests).toBe(1);
 			expect(reconciledEntries).toEqual(entries);
 		} finally {
 			resetAllSessionTracking();
@@ -4071,11 +4109,16 @@ describe("pi-server-client", () => {
 		expect(recoveryGets).toBe(1);
 	});
 
-	it("rejects a tampered locally applied compact before contacting the server", async () => {
+	it("recovers a locally divergent applied compact from authoritative server history", async () => {
 		const entries = baseTree();
 		const context: Context = { systemPrompt: "You are helpful.", messages: [] };
 		const sessionId = "compact-applied-tamper";
 		let recoveryGets = 0;
+		let historyGets = 0;
+		let compactRequestBody: JsonObject | undefined;
+		let authoritativeEntries: SessionTreeEntry[] | undefined;
+		let authoritativeLeafId: string | null | undefined;
+		let reconciledEntries: SessionTreeEntry[] | undefined;
 
 		vi.stubGlobal(
 			"fetch",
@@ -4083,12 +4126,40 @@ describe("pi-server-client", () => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				const path = new URL(url).pathname;
 				if (path === "/api/session/compact") {
+					compactRequestBody = body;
 					return new Response(compactResponse(body, entries, compactionEntry("c-tamper", "u2", "summary", "u2")), {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
 					});
 				}
-				if (path.includes("/compactions/")) recoveryGets++;
+				if (path.includes("/compactions/")) {
+					recoveryGets++;
+					if (!compactRequestBody) throw new Error("Expected original compact request body");
+					return new Response(
+						compactResponse(compactRequestBody, entries, compactionEntry("c-tamper", "u2", "summary", "u2")),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (path === `/api/session/${sessionId}/history`) {
+					historyGets++;
+					if (!authoritativeEntries || authoritativeLeafId === undefined) {
+						throw new Error("Expected authoritative compact result");
+					}
+					return new Response(
+						JSON.stringify({
+							protocolVersion: 2,
+							sessionId,
+							staticContextHash: hashStaticContext(context),
+							treeHash: hashEntries(authoritativeEntries),
+							messageCount: 2,
+							entryCount: authoritativeEntries.length,
+							leafId: authoritativeLeafId,
+							revision: 1,
+							entries: authoritativeEntries,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
 				return makeSessionResponse(body, { leafId: body.leafId, entryCount: entries.length });
 			}),
 		);
@@ -4098,20 +4169,26 @@ describe("pi-server-client", () => {
 			sessionTree: { entries, leafId: "u2" },
 		});
 		recordPiServerCompactionApplied(result);
+		authoritativeEntries = result.entries;
+		authoritativeLeafId = result.leafId;
 		const tamperedEntry = { ...result.compactionEntry, summary: "tampered summary" };
 
 		resetAllSessionTracking();
-		await expect(
-			compactPiServerRaw(testModel, context, {
-				sessionId,
-				sessionTree: {
-					entries: [...entries, tamperedEntry],
-					leafId: tamperedEntry.id,
-				},
-				piServerCompactStatePath: getCompactStatePathForTest(sessionId),
-			}),
-		).rejects.toThrow("local applied tree does not match its durable observation");
-		expect(recoveryGets).toBe(0);
+		const recovered = await compactPiServerRaw(testModel, context, {
+			sessionId,
+			sessionTree: {
+				entries: [...entries, tamperedEntry],
+				leafId: tamperedEntry.id,
+			},
+			piServerCompactStatePath: getCompactStatePathForTest(sessionId),
+			onHistoryReconciled: (snapshot) => {
+				reconciledEntries = snapshot.entries;
+			},
+		});
+		expect(recovered.compactionEntry).toEqual(result.compactionEntry);
+		expect(recoveryGets).toBe(1);
+		expect(historyGets).toBe(1);
+		expect(reconciledEntries).toEqual(result.entries);
 	});
 
 	it("reconciles server history before compact instead of full-syncing over a different tree", async () => {

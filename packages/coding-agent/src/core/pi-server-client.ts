@@ -1881,6 +1881,7 @@ export async function compactPiServer(
 	const recovered = await recoverPendingPiServerCompaction(sessionId, tree, compactStatePath, {
 		signal,
 		recoveryWindowMs,
+		onHistoryReconciled: options?.onHistoryReconciled,
 	});
 	if (recovered) return recovered;
 	const operationId = randomUUID();
@@ -2110,45 +2111,33 @@ export async function compactPiServer(
 	}
 }
 
-function assertPendingPiServerCompactMatches(
+function getPendingPiServerCompactBase(
 	pending: PiServerPendingCompactState,
 	sessionId: string,
 	tree: PiServerTreeSnapshot,
-): PiServerTreeSnapshot {
-	if (
-		pending.serverHash !== hashPiServerIdentity(getServerUrl()) ||
-		pending.sessionId !== sessionId ||
-		pending.baseEntryCount > tree.entries.length
-	) {
+): PiServerTreeSnapshot | undefined {
+	if (pending.sessionId !== sessionId) {
 		throw new Error(
-			`Cannot safely resume pending pi-server compaction ${pending.operationId}: server, session, or tree identity changed`,
+			`Cannot recover pending pi-server compaction ${pending.operationId}: durable marker belongs to another session`,
 		);
 	}
+	if (pending.baseEntryCount > tree.entries.length) return undefined;
 	const baseEntries = tree.entries.slice(0, pending.baseEntryCount);
 	if (
 		hashEntries(baseEntries) !== pending.baseTreeHash ||
 		(pending.baseLeafId !== null && !baseEntries.some((entry) => entry.id === pending.baseLeafId))
 	) {
-		throw new Error(
-			`Cannot safely resume pending pi-server compaction ${pending.operationId}: local base tree no longer matches its durable marker`,
-		);
-	}
-	if (!pending.observation || pending.observation.kind === "terminal") {
-		if (tree.entries.length !== pending.baseEntryCount || tree.leafId !== pending.baseLeafId) {
-			throw new Error(
-				`Cannot safely resume pending pi-server compaction ${pending.operationId}: local tree changed before a committed compaction was observed`,
-			);
-		}
+		return undefined;
 	}
 	return { entries: baseEntries, leafId: pending.baseLeafId };
 }
 
-function recoverLocallyAppliedPiServerCompaction(
+function tryRecoverLocallyAppliedPiServerCompaction(
 	pending: PiServerPendingCompactState,
 	tree: PiServerTreeSnapshot,
 	baseTree: PiServerTreeSnapshot,
 	compactStatePath: string,
-): PiServerCompactionResult {
+): PiServerCompactionResult | undefined {
 	const applied = pending.observation;
 	if (!applied || applied.kind !== "applied") {
 		throw new Error("Pending pi-server compaction does not contain a durable local apply observation");
@@ -2164,9 +2153,7 @@ function recoverLocallyAppliedPiServerCompaction(
 		hashEntries(tree.entries) !== applied.updatedTreeHash ||
 		applied.updatedRevision !== pending.baseRevision + 1
 	) {
-		throw new Error(
-			`Cannot safely resume pending pi-server compaction ${pending.operationId}: local applied tree does not match its durable observation`,
-		);
+		return undefined;
 	}
 	return normalizePiServerCompactionResult(
 		{
@@ -2206,15 +2193,25 @@ export async function recoverPendingPiServerCompaction(
 	sessionId: string,
 	tree: PiServerTreeSnapshot,
 	compactStatePath: string,
-	options?: { signal?: AbortSignal; recoveryWindowMs?: number },
+	options?: {
+		signal?: AbortSignal;
+		recoveryWindowMs?: number;
+		onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
+	},
 ): Promise<PiServerCompactionResult | undefined> {
 	const pending = readPiServerPendingCompact(compactStatePath);
 	if (!pending) return undefined;
-	const baseTree = assertPendingPiServerCompactMatches(pending, sessionId, tree);
+	let baseTree = getPendingPiServerCompactBase(pending, sessionId, tree);
 	const locallyApplied =
-		pending.observation?.kind === "applied"
-			? recoverLocallyAppliedPiServerCompaction(pending, tree, baseTree, compactStatePath)
+		pending.observation?.kind === "applied" && baseTree
+			? tryRecoverLocallyAppliedPiServerCompaction(pending, tree, baseTree, compactStatePath)
 			: undefined;
+	const localIdentityMatches =
+		pending.serverHash === hashPiServerIdentity(getServerUrl()) &&
+		baseTree !== undefined &&
+		(pending.observation?.kind === "applied"
+			? locallyApplied !== undefined
+			: tree.entries.length === pending.baseEntryCount && tree.leafId === pending.baseLeafId);
 	if (pending.observation?.kind === "terminal" && pending.observation.operationDisposition === "not_started") {
 		return await persistAndCompletePiServerCompactTerminal(
 			{
@@ -2307,6 +2304,26 @@ export async function recoverPendingPiServerCompaction(
 				response,
 				"Pending server compaction recovery failed",
 			);
+			if (!localIdentityMatches) {
+				const snapshot = await fetchPiServerHistory(sessionId, request);
+				if (!snapshot) {
+					throw new PiServerCompactProtocolError(
+						`Pending server compaction recovery failed (operation journal exists but authoritative session history is missing)`,
+					);
+				}
+				baseTree = getPendingPiServerCompactBase(pending, sessionId, snapshot);
+				if (!baseTree) {
+					throw new PiServerCompactProtocolError(
+						`Pending server compaction recovery failed (authoritative history did not contain the operation base tree)`,
+					);
+				}
+				await applyPiServerHistory(sessionId, snapshot, options?.onHistoryReconciled);
+			}
+			if (!baseTree) {
+				throw new PiServerCompactProtocolError(
+					`Pending server compaction recovery failed (local operation base tree was unavailable)`,
+				);
+			}
 			const result = normalizePiServerCompactionResult(
 				responseResult,
 				sessionId,
@@ -2464,10 +2481,15 @@ function findPendingPiServerRunTerminal(
 		const entry = entries[index];
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const message = entry.message as AssistantMessage;
-		const diagnostic = getPiServerRunDiagnostic(message);
+		let diagnostic: PiServerRunDiagnostic | undefined;
+		try {
+			diagnostic = getPiServerRunDiagnostic(message);
+		} catch {
+			continue;
+		}
 		if (!diagnostic || diagnostic.runId !== pending.runId) continue;
 		if (diagnostic.sessionId !== pending.sessionId || diagnostic.requestMac !== pending.requestHash) {
-			throw new Error("Cannot recover pi-server run: persisted terminal diagnostic did not match pending state");
+			continue;
 		}
 		return message;
 	}
@@ -2483,7 +2505,7 @@ function pendingPiServerRunBaseMatches(
 	return !(
 		pending.serverHash !== serverHash ||
 		pending.sessionId !== sessionId ||
-		pending.baseEntryCount > tree.entries.length ||
+		pending.baseEntryCount !== tree.entries.length ||
 		hashLocalTreePrefix(sessionId, tree.entries, pending.baseEntryCount) !== pending.baseTreeHash ||
 		pending.baseLeafId !== tree.leafId
 	);
@@ -2814,7 +2836,6 @@ export async function streamPiServer(
 
 		try {
 			const request = createPiServerRequest(options?.signal);
-			await ensureSessionInit(sessionId, context, request);
 			const tree = options?.sessionTree ?? {
 				...getLinearTreeFromMessages(context.messages as Message[]),
 				replace: true,
@@ -2841,6 +2862,9 @@ export async function streamPiServer(
 					pending = undefined;
 					unresolvedRunPending = false;
 				}
+			}
+			if (!pending) {
+				await ensureSessionInit(sessionId, context, request);
 			}
 
 			const buildRequestIdentity = (
