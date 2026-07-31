@@ -113,7 +113,7 @@
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
-- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files.
+- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files. Pass the loader through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
 - Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
 - Keep automatic session naming disabled in general faux-session harnesses; enable it only in tests that explicitly cover the extra first-turn provider request.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
@@ -246,8 +246,10 @@ Attribution:
 
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
 - Cross-platform tests for platform-specific behavior must set the simulated platform explicitly when asserting the opposite platform, instead of relying on the host OS.
+- Keep home-shortened image fallback text in the documented `~/...` form on every platform; OSC 8 `file://` links must still target the original absolute path.
 - On Windows with WSL or Git Bash, harness file names must split both path separators, and cwd tests should use a marker file instead of asserting shell `$PWD`, which may be translated to a POSIX path.
 - If hydration removes a retired direct-OpenAI model used only by API-key-gated e2e tests, update those tests to an explicit current catalog model; do not restore a removed stale-model fallback.
+- If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.
 - After upstream merges, strict `tsgo --noEmit` may require explicit guards before reading optional results in upstream-added tests; use a clear error assertion rather than a non-null fallback.
 
 ## User Override

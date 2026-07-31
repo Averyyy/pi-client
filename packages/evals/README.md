@@ -2,8 +2,12 @@
 
 Behavioral evaluations for Pi using `vitest-evals`.
 
-The Pi harness in `src/pi-harness.ts` is built on `createHarness` from `vitest-evals/harness`. It drives a real
-`createAgentSession` in a temporary workspace and reports the final assistant message, transcript, and token usage.
+`src/pi-harness.ts` adapts Pi's `AgentSession` directly to `vitest-evals`. Each run uses isolated temporary project and
+agent directories that are removed afterward. Judge harnesses are configured separately from the application harness.
+
+Eval cases supply either one prompt or a JSON-safe sequence of prompt and reload steps. The harness executes that input
+and normalizes the resulting session without defining scenario-specific behavior. Suites can configure a typed output
+selector over the final response and `AgentSession` state.
 
 ## Running
 

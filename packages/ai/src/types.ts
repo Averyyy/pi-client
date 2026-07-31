@@ -105,6 +105,7 @@ export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 /** Provider-scoped environment overrides. Values take precedence over process.env. */
 export type ProviderEnv = Record<string, string>;
 export type ProviderHeaders = Record<string, string | null>;
+export type FetchFunction = typeof globalThis.fetch;
 export type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
 
 export interface ProviderResponse {
@@ -117,6 +118,12 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/**
+	 * Optional fetch implementation for provider HTTP requests.
+	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.
+	 * This does not affect WebSocket transports.
+	 */
+	fetch?: FetchFunction;
 	/**
 	 * Preferred transport for providers that support multiple transports.
 	 * Providers that do not support this option ignore it.
@@ -248,6 +255,8 @@ export interface ProviderImages {
 export interface ImagesOptions {
 	signal?: AbortSignal;
 	apiKey?: string;
+	/** Optional fetch implementation for provider HTTP requests. Defaults to `globalThis.fetch`. */
+	fetch?: FetchFunction;
 	/**
 	 * Provider-scoped environment values. These take precedence over process.env for
 	 * provider configuration such as endpoint placeholders and proxy variables.
@@ -379,7 +388,7 @@ export interface Usage {
 	};
 }
 
-export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
 
 export interface UserMessage {
 	role: "user";
@@ -399,6 +408,7 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	rawStopReason?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 

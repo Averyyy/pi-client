@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.83.0] - 2026-07-29
+
+### Fixed
+
+- Fixed long image fallback paths overflowing narrow terminals, shortened home-directory paths, and made absolute paths clickable when terminal hyperlinks are available ([#7262](https://github.com/earendil-works/pi/pull/7262)).
+
 ## [0.82.1] - 2026-07-25
 
 ## [0.82.0] - 2026-07-24

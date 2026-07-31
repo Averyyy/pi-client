@@ -1,9 +1,11 @@
 import { expect } from "vitest";
 import { describeEval } from "vitest-evals";
-import { piCodingAgentHarness } from "./pi-harness.ts";
+import { createPiCodingAgentHarness } from "./pi-harness.ts";
 
-describeEval("general knowledge", { harness: piCodingAgentHarness }, (it) => {
-	it("knows the capital of France", async ({ run }) => {
+const piCodingAgentHarness = createPiCodingAgentHarness({ noTools: "all" });
+
+describeEval("Pi Coding Agent smoke", { harness: piCodingAgentHarness }, (it) => {
+	it("runs a basic prompt end to end", async ({ run }) => {
 		const result = await run("What's the capital of France? Respond with only the city name.");
 
 		expect(result.output.trim()).toBe("Paris");
