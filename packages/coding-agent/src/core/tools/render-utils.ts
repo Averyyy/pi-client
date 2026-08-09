@@ -9,9 +9,11 @@ import { sanitizeBinaryOutput } from "../../utils/shell.ts";
 
 export function shortenPath(path: unknown): string {
 	if (typeof path !== "string") return "";
-	const home = os.homedir();
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
+	const normalizedPath = path.replaceAll("\\", "/");
+	const normalizedHome = os.homedir().replaceAll("\\", "/").replace(/\/+$/, "");
+	if (normalizedPath === normalizedHome) return "~";
+	if (normalizedPath.startsWith(`${normalizedHome}/`)) {
+		return `~/${normalizedPath.slice(normalizedHome.length + 1)}`;
 	}
 	return path;
 }

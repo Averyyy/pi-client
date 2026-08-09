@@ -46,8 +46,9 @@ export type ProxyAssistantMessageEvent =
 	| { type: "toolcall_end"; contentIndex: number }
 	| {
 			type: "done";
-			reason: Extract<StopReason, "stop" | "length" | "toolUse">;
+			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;
 			usage: AssistantMessage["usage"];
+			deferred?: AssistantMessage["deferred"];
 	  }
 	| {
 			type: "error";
@@ -59,6 +60,7 @@ export type ProxyAssistantMessageEvent =
 type ProxySerializableStreamOptions = Pick<
 	SimpleStreamOptions,
 	| "temperature"
+	| "samplingParams"
 	| "maxTokens"
 	| "reasoning"
 	| "cacheRetention"
@@ -101,6 +103,7 @@ export interface ProxyStreamOptions extends ProxySerializableStreamOptions {
 function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializableStreamOptions {
 	return {
 		temperature: options.temperature,
+		samplingParams: options.samplingParams,
 		maxTokens: options.maxTokens,
 		reasoning: options.reasoning,
 		cacheRetention: options.cacheRetention,
@@ -350,6 +353,7 @@ function processProxyEvent(
 		case "done":
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
+			partial.deferred = proxyEvent.deferred;
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 
 		case "error":

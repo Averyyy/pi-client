@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -42,7 +42,7 @@ describe("createAgentSession session manager defaults", () => {
 		const sessionFile = session.sessionManager.getSessionFile();
 
 		expect(sessionDir).toBe(expectedSessionDir);
-		expect(sessionFile?.startsWith(`${expectedSessionDir}/`)).toBe(true);
+		expect(sessionFile?.startsWith(`${expectedSessionDir}${sep}`)).toBe(true);
 
 		session.dispose();
 	});
@@ -80,6 +80,7 @@ describe("createAgentSession session manager defaults", () => {
 
 		const sessionCwd = join(tempDir, "session-project");
 		mkdirSync(sessionCwd, { recursive: true });
+		writeFileSync(join(sessionCwd, ".pi-sdk-cwd-marker"), "marker");
 		const sessionManager = SessionManager.inMemory(sessionCwd);
 		const { session } = await createAgentSession({
 			agentDir,
@@ -88,17 +89,19 @@ describe("createAgentSession session manager defaults", () => {
 		});
 
 		expect(session.sessionManager).toBe(sessionManager);
-		expect(session.systemPrompt).toContain(`Current working directory: ${sessionCwd}`);
+		expect(session.systemPrompt).toContain(`Current working directory: ${sessionCwd.replaceAll("\\", "/")}`);
 
 		const bashTool = session.agent.state.tools.find((tool) => tool.name === "bash");
 		expect(bashTool).toBeTruthy();
-		const result = await bashTool!.execute("test", { command: "pwd" });
+		const result = await bashTool!.execute("test", {
+			command: "test -f .pi-sdk-cwd-marker && printf 'cwd marker found'",
+		});
 		const output = result.content
 			.filter((item): item is { type: "text"; text: string } => item.type === "text")
 			.map((item) => item.text)
 			.join("");
 
-		expect(realpathSync(output.trim())).toBe(realpathSync(sessionCwd));
+		expect(output).toContain("cwd marker found");
 
 		session.dispose();
 	});
@@ -115,7 +118,7 @@ describe("createAgentSession session manager defaults", () => {
 		});
 		expect(session.sessionFile).toBeTruthy();
 		expect(session.systemPrompt).toContain(
-			"Inspect PI_* environment variables for current model and session details.",
+			"You can inspect PI_* environment variables for current model and session details.",
 		);
 
 		const bashTool = session.agent.state.tools.find((tool) => tool.name === "bash");

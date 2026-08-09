@@ -11,11 +11,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxLoaderPath = resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -74,7 +75,7 @@ async function runCli(
 
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderPath, cliPath, ...resolvedArgs], {
+		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...resolvedArgs], {
 			cwd: dirs.projectDir,
 			env: {
 				...process.env,

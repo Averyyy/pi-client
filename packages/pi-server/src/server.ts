@@ -3,11 +3,11 @@ import { createRequire } from "node:module";
 import {
 	type CompactionPreparationOptions,
 	type CompactionSettings,
-	type CompactResult,
-	compact,
+	compactLegacy,
 	DEFAULT_COMPACTION_SETTINGS,
+	type LegacyCompactResult,
 	type ProxyAssistantMessageEvent,
-	prepareCompaction,
+	prepareLegacyCompaction,
 	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -286,7 +286,7 @@ function sessionTreePatchResponseBody(
 	};
 }
 
-type PreparedCompaction = Parameters<typeof compact>[0];
+type PreparedCompaction = Parameters<typeof compactLegacy>[0];
 
 interface PreparedSessionCompact {
 	session: SessionState;
@@ -296,7 +296,7 @@ interface PreparedSessionCompact {
 
 interface SessionCompactSuccessBody {
 	success: true;
-	compaction: CompactResult;
+	compaction: LegacyCompactResult;
 	compactionEntry: SessionTreeEntry;
 	sessionId: string;
 	staticContextHash: string;
@@ -456,7 +456,11 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 	}
 
 	const entries = getSessionBranch(session);
-	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS, body.preparation);
+	const preparationResult = prepareLegacyCompaction(
+		entries,
+		body.settings ?? DEFAULT_COMPACTION_SETTINGS,
+		body.preparation,
+	);
 	if (!preparationResult.ok) {
 		return { status: 400, body: { error: preparationResult.error.message } };
 	}
@@ -477,7 +481,7 @@ async function completeSessionCompact(
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 ): Promise<SessionCompactHttpResponse> {
-	const result = await compact(
+	const result = await compactLegacy(
 		prepared.preparation,
 		createRequestModels(body.model, prepared.options),
 		body.model,
@@ -492,22 +496,14 @@ async function completeSessionCompact(
 	const baseTreeHash = prepared.session.treeHash;
 	const baseEntryCount = prepared.session.entries.length;
 	const compaction = result.value;
-	const firstKeptEntryId = compaction.firstKeptEntryId;
-	if (!firstKeptEntryId) {
-		return { status: 500, body: { error: "Compaction result is missing firstKeptEntryId" } };
-	}
-	const normalizedCompaction = { ...compaction, firstKeptEntryId };
-	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(
-		body.sessionId,
-		normalizedCompaction,
-	);
+	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, compaction);
 	persistSession(config, updatedSession);
 	if (!body.fullResponse && body.baseTreeHash === baseTreeHash) {
 		return {
 			status: 200,
 			body: {
 				success: true,
-				compaction: normalizedCompaction satisfies CompactResult,
+				compaction: compaction satisfies LegacyCompactResult,
 				compactionEntry,
 				...sessionResponseBody(updatedSession),
 				staticContext: updatedSession.staticContext,
@@ -525,7 +521,7 @@ async function completeSessionCompact(
 		status: 200,
 		body: {
 			success: true,
-			compaction: normalizedCompaction satisfies CompactResult,
+			compaction: compaction satisfies LegacyCompactResult,
 			compactionEntry,
 			...sessionResponseBody(updatedSession),
 			staticContext: updatedSession.staticContext,
@@ -1018,7 +1014,12 @@ function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent 
 		case "toolcall_end":
 			return { type: "toolcall_end", contentIndex: event.contentIndex };
 		case "done":
-			return { type: "done", reason: event.reason, usage: event.message.usage };
+			return {
+				type: "done",
+				reason: event.reason,
+				usage: event.message.usage,
+				deferred: event.message.deferred,
+			};
 		case "error":
 			return {
 				type: "error",

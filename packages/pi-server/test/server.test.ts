@@ -4,7 +4,7 @@ import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as AgentCore from "@earendil-works/pi-agent-core";
-import { compact as compactAgentCore } from "@earendil-works/pi-agent-core";
+import { compactLegacy as compactAgentCore } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import { registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,12 +15,13 @@ vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
 	const actual = await importOriginal<typeof AgentCore>();
 	return {
 		...actual,
-		compact: vi.fn(async () => ({
+		compactLegacy: vi.fn(async () => ({
 			ok: true,
 			value: {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		})),
 	};
@@ -547,6 +548,7 @@ describe("pi-server HTTP", () => {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		});
 
@@ -639,6 +641,7 @@ describe("pi-server HTTP", () => {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		});
 
@@ -1059,6 +1062,63 @@ describe("pi-server HTTP", () => {
 		expect(runBody.status).toBe("completed");
 		expect(runBody.message?.role).toBe("assistant");
 		expect(runBody.message?.content).toEqual([{ type: "text", text: "journaled" }]);
+	});
+
+	it("preserves deferred response handles in proxied done events", async () => {
+		const faux = registerFauxProvider();
+		faux.setResponses([
+			{
+				role: "assistant",
+				content: [],
+				api: faux.models[0].api,
+				provider: faux.models[0].provider,
+				model: faux.models[0].id,
+				usage: {
+					input: 1,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "deferred",
+				deferred: {
+					provider: faux.models[0].provider,
+					modelId: faux.models[0].id,
+					api: faux.models[0].api,
+					id: "deferred-response-1",
+				},
+				timestamp: 1000,
+			},
+		]);
+
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-deferred",
+				staticContext: { systemPrompt: "Deferred test" },
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-deferred",
+				model: faux.models[0],
+			}),
+		});
+
+		const eventStream = await res.text();
+		expect(eventStream).toContain('"reason":"deferred"');
+		expect(eventStream).toContain('"id":"deferred-response-1"');
 	});
 
 	it("returns 404 for unknown routes with auth", async () => {

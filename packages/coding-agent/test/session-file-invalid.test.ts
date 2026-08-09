@@ -2,11 +2,12 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxLoaderPath = resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -24,7 +25,7 @@ function createTempDir(): string {
 async function runCli(args: string[], cwd: string, agentDir: string): Promise<{ code: number | null; stderr: string }> {
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderPath, cliPath, ...args], {
+		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...args], {
 			cwd,
 			env: {
 				...process.env,

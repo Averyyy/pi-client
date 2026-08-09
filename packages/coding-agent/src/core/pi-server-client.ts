@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type {
 	CompactionPreparationOptions,
-	CompactResult,
+	LegacyCompactResult,
 	ProxyAssistantMessageEvent,
 	SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
@@ -123,7 +123,7 @@ export interface PiServerTreeSnapshot {
 }
 
 export interface PiServerCompactionResult {
-	compaction: CompactResult;
+	compaction: LegacyCompactResult;
 	compactionEntry: SessionTreeEntry;
 	entries: SessionTreeEntry[];
 	leafId: string | null;
@@ -873,6 +873,7 @@ export async function streamPiServer(
 							case "stop":
 							case "length":
 							case "toolUse":
+							case "deferred":
 								stream.push({
 									type: "done",
 									reason: recoveredRun.message.stopReason,
@@ -992,6 +993,7 @@ function processProxyEvent(
 		case "done":
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
+			partial.deferred = proxyEvent.deferred;
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 		case "error":
 			partial.stopReason = proxyEvent.reason;

@@ -21,8 +21,12 @@ async function runExternalEditor(fixtureFlag?: "--fail" | "--empty"): Promise<{
 	const testDirectory = mkdtempSync(join(tmpdir(), "pi-external-editor-test-"));
 	const capturePath = join(testDirectory, "capture.json");
 	try {
+		const command = [process.execPath, editorFixturePath, capturePath, fixtureFlag]
+			.filter((value): value is string => value !== undefined)
+			.map((value) => (process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : value))
+			.join(" ");
 		const result = await editInExternalEditor({
-			command: `${process.execPath} ${editorFixturePath} ${capturePath}${fixtureFlag ? ` ${fixtureFlag}` : ""}`,
+			command,
 			content: "original",
 		});
 		const capture = JSON.parse(readFileSync(capturePath, "utf-8")) as EditorCapture;

@@ -59,6 +59,7 @@
 
 ## pi-client / pi-server Compact and Resilience
 
+- Keep the pi-client/pi-server `firstKeptEntryId` session-tree adapter explicit through `buildLegacySessionContext()`, `prepareLegacyCompaction()`, and `compactLegacy()`; do not pass that durable wire format into Harness v2 APIs that require `seq` and embedded `retainedTail` entries.
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
 - Prefer delta responses for server-side compact/history when the client supplies a matching base tree hash or entry offset; keep full history/tree responses as the mismatch fallback.
@@ -109,7 +110,9 @@
 - On Windows with Node 26, `spawnSync("npm.cmd", ...)` can fail with `EINVAL`; release scripts that spawn npm must invoke npm's CLI through `process.execPath` instead.
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - Never run `npm run build` or `npm test` unless requested by the user.
-- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
+- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root:
+  - Vitest: `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/specific.test.ts`
+  - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
@@ -122,6 +125,7 @@
 ## Dependency and Install Security
 
 - Treat npm dep and lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
+- When updating `undici`, you MUST read its changelog/release notes for the target version and evaluate whether any changes may affect functionality before applying the update.
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
 - If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
 - If `packages/coding-agent/npm-shrinkwrap.json` needs regen, run `node scripts/generate-coding-agent-shrinkwrap.mjs` (verify with `--check` or `npm run check`). New deps with lifecycle scripts require review and an explicit allowlist entry in that script; never add one silently.
@@ -238,15 +242,17 @@ Attribution:
 
    The release script bumps all package versions, updates changelogs, regenerates release artifacts, runs `npm run check`, commits `Release vX.Y.Z`, tags `vX.Y.Z`, adds fresh `## [Unreleased]` changelog sections, commits `Add [Unreleased] section for next cycle`, then pushes `main` and the tag. Do not rerun the release script after a tag was pushed.
 
-4. **CI publishes npm packages**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required.
+4. **CI verifies and announces the npm release**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required. After publishing, `announce-pi-dev-release` verifies every public workspace package resolves at the exact release version and that its npm tarball is available, then writes the verified release marker to R2. `pi.dev/api/latest-version` reads that marker; it must never announce a release from npm before this job succeeds.
 
-5. **If CI publish fails**: inspect the failed `publish-npm` job. The publish helper is idempotent and skips package versions already present on npm, so rerun the tag workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
+5. **If CI publish or announcement fails**: inspect the failed job. The publish helper is idempotent and skips package versions already present on npm; the announcement job rechecks availability before updating the R2 marker. Rerun the failed job or workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
 
 ## Upstream Sync
 
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
 - Cross-platform tests for platform-specific behavior must set the simulated platform explicitly when asserting the opposite platform, instead of relying on the host OS.
+- Real Unix-domain socket integration tests must use an explicit non-Windows `runIf` guard, matching `packages/client`; keep option-validation and transport-neutral tests enabled on Windows.
 - Keep home-shortened image fallback text in the documented `~/...` form on every platform; OSC 8 `file://` links must still target the original absolute path.
+- Normalize both Windows and POSIX separators before comparing resource paths with the home directory; render matched paths in the documented `~/...` form and do not shorten sibling prefixes.
 - On Windows with WSL or Git Bash, harness file names must split both path separators, and cwd tests should use a marker file instead of asserting shell `$PWD`, which may be translated to a POSIX path.
 - If hydration removes a retired direct-OpenAI model used only by API-key-gated e2e tests, update those tests to an explicit current catalog model; do not restore a removed stale-model fallback.
 - If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.

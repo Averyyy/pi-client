@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { buildSessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import { buildLegacySessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
 import {
 	appendPiServerTreeHash,
@@ -178,7 +178,7 @@ export function getSessionBranch(session: SessionState): SessionTreeEntry[] {
 
 function deriveActiveMessages(session: SessionState): Message[] {
 	const branch = getSessionBranch(session);
-	return convertToLlm(buildSessionContext(branch).messages);
+	return convertToLlm(buildLegacySessionContext(branch).messages);
 }
 
 function refreshActiveMessages(session: SessionState): void {
