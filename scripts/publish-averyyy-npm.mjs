@@ -10,7 +10,16 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const versionPattern = /^\d+\.\d+\.\d+-piclient\.\d+$/;
 
-const buildWorkspaces = ["packages/tui", "packages/ai", "packages/agent", "packages/coding-agent", "packages/pi-server"];
+const buildWorkspaces = [
+	"packages/tui",
+	"packages/telemetry",
+	"packages/ai",
+	"packages/agent",
+	"packages/protocol",
+	"packages/client",
+	"packages/coding-agent",
+	"packages/pi-server",
+];
 
 const packageDefs = [
 	{
@@ -74,6 +83,12 @@ if (!versionPattern.test(version)) {
 	throw new Error(`Expected version like 0.80.3-piclient.4, got ${version}`);
 }
 
+validateBuildWorkspaceOrder();
+if (args.selfTest) {
+	console.log("publish-averyyy-npm self-test ok");
+	process.exit(0);
+}
+
 console.log(`Publishing @averyyy Pi packages at ${version}${args.dryRun ? " (dry run)" : ""}`);
 
 if (!args.skipBuild) {
@@ -120,6 +135,7 @@ function parseArgs(argv) {
 	const parsed = {
 		dryRun: false,
 		provenance: false,
+		selfTest: false,
 		skipBuild: false,
 		version: undefined,
 	};
@@ -130,6 +146,8 @@ function parseArgs(argv) {
 			parsed.dryRun = true;
 		} else if (arg === "--provenance") {
 			parsed.provenance = true;
+		} else if (arg === "--self-test") {
+			parsed.selfTest = true;
 		} else if (arg === "--skip-build") {
 			parsed.skipBuild = true;
 		} else if (arg === "--version") {
@@ -144,7 +162,8 @@ Options:
   --version <version>  Release version, e.g. 0.80.3-piclient.4
   --dry-run            Validate package contents without publishing
   --skip-build         Reuse existing dist output
-  --provenance         Pass --provenance to npm publish`);
+  --provenance         Pass --provenance to npm publish
+  --self-test          Validate the local workspace build order`);
 			process.exit(0);
 		} else {
 			throw new Error(`Unknown argument: ${arg}`);
@@ -204,6 +223,45 @@ function writeJson(path, value) {
 function setDependency(pkg, name, version) {
 	pkg.dependencies = pkg.dependencies ?? {};
 	pkg.dependencies[name] = version;
+}
+
+function validateBuildWorkspaceOrder() {
+	const lock = readJson(join(repoRoot, "package-lock.json"));
+	const localWorkspaceByName = new Map();
+	for (const [workspace, metadata] of Object.entries(lock.packages ?? {})) {
+		if (
+			!workspace.startsWith("packages/") ||
+			workspace.includes("/node_modules/") ||
+			!metadata ||
+			typeof metadata !== "object" ||
+			typeof metadata.name !== "string"
+		) {
+			continue;
+		}
+		localWorkspaceByName.set(metadata.name, workspace);
+	}
+
+	const buildPosition = new Map(buildWorkspaces.map((workspace, index) => [workspace, index]));
+	for (const definition of packageDefs) {
+		if (definition.requiredFiles.some((file) => file.startsWith("dist/")) && !buildPosition.has(definition.source)) {
+			throw new Error(`${definition.source} produces published dist files but is missing from buildWorkspaces`);
+		}
+	}
+
+	for (const [position, workspace] of buildWorkspaces.entries()) {
+		const manifest = readJson(join(repoRoot, workspace, "package.json"));
+		for (const dependencyName of Object.keys(manifest.dependencies ?? {})) {
+			const dependencyWorkspace = localWorkspaceByName.get(dependencyName);
+			if (!dependencyWorkspace) continue;
+			const dependencyPosition = buildPosition.get(dependencyWorkspace);
+			if (dependencyPosition === undefined) {
+				throw new Error(`${workspace} depends on ${dependencyWorkspace}, which is missing from buildWorkspaces`);
+			}
+			if (dependencyPosition >= position) {
+				throw new Error(`${dependencyWorkspace} must be built before ${workspace}`);
+			}
+		}
+	}
 }
 
 function preparePackage(tempRoot, def, version) {
