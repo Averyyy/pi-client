@@ -90,6 +90,7 @@
 - `pi-client web` depends on the standalone `@averyyy/pi-tau-codex` Pi extension. The wrapper should check shared Pi agent settings and print a `请安装` install command when the extension is missing, rather than bundling the web UI or adding a pi-client runtime dependency.
 - If `pi-client web` is interactive and the Tau Codex extension is missing, prompt `y/N` and install it via `pi-client install npm:@averyyy/pi-tau-codex`; non-TTY should only print the install command and exit.
 - Bind Tau to localhost by default for `pi-client web` (`TAU_HOST=127.0.0.1`); users can set `TAU_HOST=0.0.0.0` when they intentionally want LAN/mobile access.
+- Session resume hints must use `pi-client` when `PI_SERVER_MODE=true`; keep `pi` for local coding-agent sessions.
 - When publishing the standalone client package, publish `packages/pi-client` as `@averyyy/pi-client` and keep its runtime dependencies as registry versions, not workspace `file:` links.
 - `@jmfederico/pi-web` peers use stable upstream semver ranges, so `@averyyy/*@0.80.3-piclient.N` aliases can trigger non-fatal npm peer override warnings when upstream Pi is already installed globally. For documented/manual fork installs and npm-global updater paths, use `--legacy-peer-deps`; do not install upstream stable peers to silence the warning.
 

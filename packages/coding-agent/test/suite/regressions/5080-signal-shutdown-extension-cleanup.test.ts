@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import chalk from "chalk";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { APP_NAME } from "../../../src/config.ts";
 import type { SessionManager } from "../../../src/core/session-manager.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 
@@ -33,6 +32,7 @@ type InteractiveModePrototypeWithShutdown = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown;
 const tempDirs: string[] = [];
 const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+const originalPiServerMode = process.env.PI_SERVER_MODE;
 
 class ProcessExitError extends Error {}
 
@@ -102,6 +102,11 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		restoreStdoutIsTTY();
+		if (originalPiServerMode === undefined) {
+			delete process.env.PI_SERVER_MODE;
+		} else {
+			process.env.PI_SERVER_MODE = originalPiServerMode;
+		}
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -132,7 +137,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 	});
 
-	test("interactive quit prints a resume hint for persisted sessions", async () => {
+	test("interactive pi-client quit prints a pi-client resume hint for persisted sessions", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
@@ -140,6 +145,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 			.spyOn(process.stdout, "write")
 			.mockImplementation((() => true) as typeof process.stdout.write);
 		setStdoutIsTTY(true);
+		process.env.PI_SERVER_MODE = "true";
 		const order: string[] = [];
 		const context = createContext(order, createSessionManager({ sessionFile: createTempFile() }));
 
@@ -147,7 +153,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 		expect(stdoutWrite).toHaveBeenCalledWith(
-			`${chalk.dim("To resume this session:")} ${APP_NAME} --session test-session\n`,
+			`${chalk.dim("To resume this session:")} pi-client --session test-session\n`,
 		);
 	});
 
