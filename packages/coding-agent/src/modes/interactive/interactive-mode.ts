@@ -178,6 +178,8 @@ interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
 
+const TRANSCRIPT_LAZY_LOAD_BATCH_SIZE = 20;
+
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
@@ -396,6 +398,11 @@ export class InteractiveMode {
 	private chatContainer: Container;
 	private documentContainer: Container;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
+	private transcriptLazyEntries: SessionEntry[] = [];
+	private loadedTranscriptEntryIds = new Set<string>();
+	private transcriptWindowInitialized = false;
+	private transcriptLatestCompactionId: string | undefined;
+	private loadingEarlierTranscript = false;
 	private fullscreenLayoutRoot: Component | undefined;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
@@ -875,6 +882,7 @@ export class InteractiveMode {
 			follow: "end",
 			primary: true,
 			overscroll: "chain",
+			onScroll: (scrollTop) => this.handleTranscriptScroll(scrollTop),
 			scrollbar: this.settingsManager.getFullscreenScrollbar(),
 			scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
 		});
@@ -2831,6 +2839,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onAction("app.session.loadEarlier", () => this.loadEarlierTranscript());
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -3712,9 +3721,86 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Text(text, 1, 0));
 	}
 
+	private getTranscriptEntriesForRender(reset = false): SessionEntry[] {
+		const branch = this.sessionManager.getBranch();
+		const contextEntries = this.sessionManager.buildContextEntries();
+		let latestCompactionId: string | undefined;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry?.type === "compaction") {
+				latestCompactionId = entry.id;
+				break;
+			}
+		}
+
+		if (reset || (this.transcriptWindowInitialized && this.transcriptLatestCompactionId !== latestCompactionId)) {
+			this.loadedTranscriptEntryIds.clear();
+		}
+		this.transcriptWindowInitialized = true;
+		this.transcriptLatestCompactionId = latestCompactionId;
+
+		const contextEntryIds = new Set(contextEntries.map((entry) => entry.id));
+		const earlierEntries = branch.filter((entry) => !contextEntryIds.has(entry.id));
+		const loadedEntries = earlierEntries.filter((entry) => this.loadedTranscriptEntryIds.has(entry.id));
+		this.transcriptLazyEntries = earlierEntries.filter((entry) => !this.loadedTranscriptEntryIds.has(entry.id));
+		return [...loadedEntries, ...contextEntries];
+	}
+
+	private renderTranscriptEntries(
+		entries: SessionEntry[],
+		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+	): void {
+		if (this.transcriptLazyEntries.length > 0) {
+			const count = this.transcriptLazyEntries.length.toLocaleString();
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"dim",
+						`${count} earlier transcript entries hidden (${keyText("app.session.loadEarlier")} to load)`,
+					),
+					1,
+					0,
+				),
+			);
+			this.chatContainer.addChild(new Spacer(1));
+		}
+		this.renderSessionEntries(entries, options);
+	}
+
+	private handleTranscriptScroll(scrollTop: number): void {
+		if (scrollTop === 0) {
+			this.loadEarlierTranscript();
+		}
+	}
+
+	private loadEarlierTranscript(): void {
+		if (this.loadingEarlierTranscript || this.session.isStreaming || this.transcriptLazyEntries.length === 0) {
+			return;
+		}
+
+		this.loadingEarlierTranscript = true;
+		try {
+			const firstLoadedIndex = Math.max(0, this.transcriptLazyEntries.length - TRANSCRIPT_LAZY_LOAD_BATCH_SIZE);
+			const entriesToLoad = this.transcriptLazyEntries.slice(firstLoadedIndex);
+			for (const entry of entriesToLoad) {
+				this.loadedTranscriptEntryIds.add(entry.id);
+			}
+			this.rebuildChatFromMessages();
+			const remaining = this.transcriptLazyEntries.length;
+			this.showStatus(
+				remaining > 0
+					? `Loaded ${entriesToLoad.length} earlier transcript entries (${remaining} remaining)`
+					: "Loaded the beginning of the transcript",
+			);
+			this.ui.requestRender();
+		} finally {
+			this.loadingEarlierTranscript = false;
+		}
+	}
+
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.getBranch();
-		this.renderSessionEntries(entries, {
+		const entries = this.getTranscriptEntriesForRender(true);
+		this.renderTranscriptEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
 		});
@@ -3765,7 +3851,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.getBranch());
+		this.renderTranscriptEntries(this.getTranscriptEntriesForRender());
 	}
 
 	// =========================================================================

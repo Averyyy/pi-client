@@ -51,30 +51,74 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
 
-	test("renders the full active branch instead of the compacted model context", () => {
-		const branch = [
-			{ type: "message", id: "old" },
-			{ type: "compaction", id: "compact" },
-		];
+	test("renders the latest compaction context and defers older branch entries", () => {
+		const branch = [{ type: "message", id: "old" } as const, { type: "compaction", id: "compact" } as const];
+		const contextEntries = [branch[1]];
+		const getTranscriptEntriesForRender = Reflect.get(InteractiveMode.prototype, "getTranscriptEntriesForRender") as (
+			this: object,
+			reset?: boolean,
+		) => unknown[];
 		const fakeThis = {
-			chatContainer: { clear: vi.fn() },
 			sessionManager: {
 				getBranch: vi.fn().mockReturnValue(branch),
-				buildContextEntries: vi.fn(),
+				buildContextEntries: vi.fn().mockReturnValue(contextEntries),
 			},
 			renderSessionEntries: vi.fn(),
+			loadedTranscriptEntryIds: new Set<string>(),
+			transcriptWindowInitialized: false,
+			transcriptLatestCompactionId: undefined as string | undefined,
+			transcriptLazyEntries: [] as typeof branch,
+			getTranscriptEntriesForRender,
 		};
 
-		const rebuildChatFromMessages = Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages") as (
+		const renderedEntries = getTranscriptEntriesForRender.call(fakeThis);
+
+		expect(fakeThis.sessionManager.getBranch).toHaveBeenCalledTimes(1);
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledTimes(1);
+		expect(renderedEntries).toEqual(contextEntries);
+		expect(fakeThis.transcriptLazyEntries).toEqual([branch[0]]);
+	});
+
+	test("loads older transcript entries in bounded batches", () => {
+		const branch = Array.from({ length: 25 }, (_, index) => ({
+			type: "message" as const,
+			id: `old-${index}`,
+		}));
+		const contextEntries = [{ type: "compaction" as const, id: "latest" }];
+		const fakeThis = {
+			sessionManager: {
+				getBranch: vi.fn().mockReturnValue(branch),
+				buildContextEntries: vi.fn().mockReturnValue(contextEntries),
+			},
+			loadedTranscriptEntryIds: new Set<string>(),
+			transcriptWindowInitialized: false,
+			transcriptLatestCompactionId: undefined as string | undefined,
+			transcriptLazyEntries: [] as typeof branch,
+			loadingEarlierTranscript: false,
+			session: { isStreaming: false },
+			rebuildChatFromMessages: vi.fn(() => {
+				getTranscriptEntriesForRender.call(fakeThis);
+			}),
+			showStatus: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		const getTranscriptEntriesForRender = Reflect.get(InteractiveMode.prototype, "getTranscriptEntriesForRender") as (
+			this: typeof fakeThis,
+			reset?: boolean,
+		) => unknown[];
+		const loadEarlierTranscript = Reflect.get(InteractiveMode.prototype, "loadEarlierTranscript") as (
 			this: typeof fakeThis,
 		) => void;
 
-		rebuildChatFromMessages.call(fakeThis);
+		getTranscriptEntriesForRender.call(fakeThis, true);
+		loadEarlierTranscript.call(fakeThis);
 
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
-		expect(fakeThis.sessionManager.getBranch).toHaveBeenCalledTimes(1);
-		expect(fakeThis.sessionManager.buildContextEntries).not.toHaveBeenCalled();
-		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(branch);
+		expect(fakeThis.loadedTranscriptEntryIds.size).toBe(20);
+		expect(fakeThis.loadedTranscriptEntryIds.has("old-4")).toBe(false);
+		expect(fakeThis.loadedTranscriptEntryIds.has("old-5")).toBe(true);
+		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledTimes(1);
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Loaded 20 earlier transcript entries (5 remaining)");
 	});
 
 	test("keeps working active through agent_end and clears it at agent_settled", async () => {

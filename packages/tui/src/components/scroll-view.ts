@@ -6,6 +6,7 @@ export type ScrollViewScrollbar = "hidden" | "auto" | "always";
 export interface ScrollViewOptions {
 	axis?: "vertical";
 	follow?: "none" | "end";
+	onScroll?: (scrollTop: number) => void;
 	primary?: boolean;
 	overscroll?: "chain" | "contain";
 	scrollbar?: ScrollViewScrollbar;
@@ -16,6 +17,7 @@ export interface ScrollViewOptions {
 export class ScrollView extends Container {
 	private readonly child: Component;
 	private readonly followEnd: boolean;
+	private readonly onScroll?: (scrollTop: number) => void;
 	readonly primary: boolean;
 	readonly overscroll: "chain" | "contain";
 	readonly scrollbarStyle: (text: string) => string;
@@ -38,6 +40,7 @@ export class ScrollView extends Container {
 		this.child = component;
 		this.children.push(component);
 		this.followEnd = (options.follow ?? "none") === "end";
+		this.onScroll = options.onScroll;
 		this.followingEnd = this.followEnd;
 		this.primary = options.primary ?? false;
 		this.overscroll = options.overscroll ?? "chain";
@@ -104,6 +107,10 @@ export class ScrollView extends Container {
 		this.scrollbarHideTimer = undefined;
 	}
 
+	private notifyScroll(): void {
+		this.onScroll?.(this.currentScrollTop);
+	}
+
 	setScrollbarActive(active: boolean): void {
 		if (active === this.scrollbarActive) return;
 		this.scrollbarActive = active;
@@ -118,6 +125,7 @@ export class ScrollView extends Container {
 		this.currentScrollTop = next;
 		this.followingEnd = this.followEnd && next === maxScrollTop;
 		this.markScrollbarActivity();
+		this.notifyScroll();
 		this.requestRenderCallback?.();
 	}
 
@@ -132,7 +140,10 @@ export class ScrollView extends Container {
 		this.followingEnd = this.followEnd && next === maxScrollTop;
 		if (moved !== 0) {
 			this.markScrollbarActivity();
+			this.notifyScroll();
 			this.requestRenderCallback?.();
+		} else if (requested < 0 && start === 0) {
+			this.notifyScroll();
 		}
 		return requested - moved;
 	}
@@ -145,8 +156,9 @@ export class ScrollView extends Container {
 		this.followingEnd = this.followEnd && this.contentHeight <= this.currentViewportHeight;
 		if (changed) {
 			this.markScrollbarActivity();
-			this.requestRenderCallback?.();
 		}
+		this.notifyScroll();
+		if (changed) this.requestRenderCallback?.();
 	}
 
 	scrollToEnd(): void {

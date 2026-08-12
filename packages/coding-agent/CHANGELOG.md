@@ -6,6 +6,7 @@
 
 - Fixed pi-client shutdown resume hints to use `pi-client --session` instead of `pi --session`.
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
+- Fixed long compacted sessions blocking the terminal by rendering the latest compaction context first and lazy-loading earlier transcript entries in bounded batches.
 - Fixed pi-server provider requests to send only the projected, compaction-aware LLM context instead of synchronizing the full durable session tree.
 
 ## [0.84.1] - 2026-08-07

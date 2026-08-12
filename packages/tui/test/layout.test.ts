@@ -190,6 +190,22 @@ describe("viewport layout", () => {
 		assert.strictEqual(scrollView.isFollowingEnd, true);
 	});
 
+	it("notifies listeners when scrolling reaches or remains at the top", () => {
+		const positions: number[] = [];
+		const scrollView = new ScrollView(new Text("1\n2\n3\n4", 0, 0), {
+			follow: "end",
+			onScroll: (scrollTop) => positions.push(scrollTop),
+		});
+		renderLayoutFrame(scrollView, 10, 2, () => {});
+
+		scrollView.scrollBy(-1);
+		scrollView.scrollBy(-1);
+		scrollView.scrollBy(-1);
+		scrollView.scrollToStart();
+
+		assert.deepStrictEqual(positions, [1, 0, 0, 0]);
+	});
+
 	it("renders a transient proportional scrollbar without replacing cell content", async () => {
 		const sourceLines = ["abcd界", "abcde2", "abcde3", "abcde4", "abcde5", "abcde6", "abcde7", "abcde8"];
 		const contentBackground = "\x1b[42m";
