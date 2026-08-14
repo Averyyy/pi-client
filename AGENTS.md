@@ -6,6 +6,9 @@
 - No emojis in commits, issues, PR comments, or code
 - No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!")
 - Technical prose only, be direct
+- Use concise, clear, simple language. Define unavoidable jargon before using it.
+- Explain non-trivial designs and problems as: problem, concrete example or short trace, then solution. State why the solution is necessary and distinguish it from optional complexity.
+- Prefer concrete behavior and small illustrations over abstract summaries, dense terminology, or unexplained lists of changes.
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
@@ -38,6 +41,7 @@
 - Treat ordinary `/api/stream` calls as stateless provider proxy requests: send the exact projected `context.messages` as `contextOverlay`; do not synchronize the durable session tree before or after provider calls. Full tree synchronization is reserved for operations that actually require tree state, such as server-side compaction.
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
 - If the server has messages the client does not have, the server may send those messages or the full server history back to the client. Client receive size is not constrained by the proxy POST-body limit.
+- When `pi-server` converts provider events to proxy SSE, preserve the complete `toolCall` on `toolcall_end`; the client reconstructs the assistant event and durable tool metadata from that payload.
 - If client and server history diverge, server history is authoritative. Reconcile the client to the server history and refresh the UI/session state instead of uploading the divergent client history.
 - When `pi-server` reports an existing `treeHash` and `entryCount`, treat that as the server-known prefix. If the local tree extends that prefix, append only the new tail entries; do not full-sync just because in-memory entry-id tracking was reset by resume/import/process restart.
 - When `pi-server` reports the same full tree hash but a different `leafId`, switch the leaf with `/api/session/tree/switch`; do not resend entries.

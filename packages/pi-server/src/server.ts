@@ -1012,7 +1012,7 @@ function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent 
 		case "toolcall_delta":
 			return { type: "toolcall_delta", contentIndex: event.contentIndex, delta: event.delta };
 		case "toolcall_end":
-			return { type: "toolcall_end", contentIndex: event.contentIndex };
+			return { type: "toolcall_end", contentIndex: event.contentIndex, toolCall: event.toolCall };
 		case "done":
 			return {
 				type: "done",
