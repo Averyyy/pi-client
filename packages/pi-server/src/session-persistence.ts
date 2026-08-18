@@ -234,8 +234,17 @@ function applyPersistedWal(sessionStoreDir: string, session: PersistedSessionSta
 	let applied = 0;
 	for (const [index, line] of lines.entries()) {
 		if (!line) continue;
-		applyWalRecord(session, parseWalLine(line, filePath, index + 1));
-		applied++;
+		try {
+			applyWalRecord(session, parseWalLine(line, filePath, index + 1));
+			applied++;
+		} catch (error) {
+			// Tolerate torn tail line from crash: discard incomplete last record and continue startup
+			if (index === lines.length - 1 || (index === lines.length - 2 && !lines[lines.length - 1])) {
+				console.warn(`Discarding torn WAL tail line at ${filePath}:${index + 1}`);
+				break;
+			}
+			throw error;
+		}
 	}
 	return applied;
 }
@@ -246,17 +255,21 @@ export function loadPersistedSessions(sessionStoreDir: string): void {
 	for (const entry of entries) {
 		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
 		const filePath = join(sessionStoreDir, entry.name);
-		const persisted = parsePersistedSessionFile(readFileSync(filePath, "utf-8"), filePath);
-		const expectedFileName = sessionFileName(persisted.session.sessionId);
-		if (entry.name !== expectedFileName) {
-			throw new Error(`Persisted session file name does not match sessionId: ${filePath}`);
+		try {
+			const persisted = parsePersistedSessionFile(readFileSync(filePath, "utf-8"), filePath);
+			const expectedFileName = sessionFileName(persisted.session.sessionId);
+			if (entry.name !== expectedFileName) {
+				throw new Error(`Persisted session file name does not match sessionId: ${filePath}`);
+			}
+			const walRecords = applyPersistedWal(sessionStoreDir, persisted.session);
+			restoreSessionState(persisted.session);
+			persistedSessions.set(persistedSessionKey(sessionStoreDir, persisted.session.sessionId), {
+				entryCount: persisted.session.entries.length,
+				walRecords,
+			});
+		} catch (error) {
+			console.error(`Failed to load session from ${filePath}, skipping:`, error);
 		}
-		const walRecords = applyPersistedWal(sessionStoreDir, persisted.session);
-		restoreSessionState(persisted.session);
-		persistedSessions.set(persistedSessionKey(sessionStoreDir, persisted.session.sessionId), {
-			entryCount: persisted.session.entries.length,
-			walRecords,
-		});
 	}
 }
 

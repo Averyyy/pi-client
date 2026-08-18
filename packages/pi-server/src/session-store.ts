@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { buildLegacySessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
+import { PiServerError, PiServerErrorCode, type PiServerErrorCode as PiServerErrorCodeType } from "./error-codes.ts";
 import {
 	appendPiServerTreeHash,
 	buildPiServerTreePrefixHashes,
@@ -200,7 +201,11 @@ function appendTreeHashes(session: SessionState, entries: SessionTreeEntry[]): v
 function assertValidLeaf(entries: SessionTreeEntry[], leafId: string | null): void {
 	if (leafId === null) return;
 	if (!entries.some((entry) => entry.id === leafId)) {
-		throw new Error(`leafId ${leafId} does not exist in session tree`);
+		throw new PiServerError(
+			`leafId ${leafId} does not exist in session tree`,
+			PiServerErrorCode.LEAF_ID_NOT_FOUND,
+			{ leafId },
+		);
 	}
 }
 
@@ -233,19 +238,31 @@ export function appendSessionEntries(
 		const knownEntry = knownEntries.get(entry.id);
 		if (knownEntry) {
 			if (!isDeepStrictEqual(knownEntry, entry)) {
-				throw new Error(`entry ${entry.id} already exists`);
+				throw new PiServerError(
+					`entry ${entry.id} already exists`,
+					PiServerErrorCode.ENTRY_ALREADY_EXISTS,
+					{ entryId: entry.id },
+				);
 			}
 			continue;
 		}
 		if (entry.parentId !== null && !knownEntries.has(entry.parentId)) {
-			throw new Error(`parent entry ${entry.parentId} does not exist`);
+			throw new PiServerError(
+				`parent entry ${entry.parentId} does not exist`,
+				PiServerErrorCode.PARENT_ENTRY_NOT_FOUND,
+				{ parentId: entry.parentId },
+			);
 		}
 		const entryToAppend = { ...entry };
 		entriesToAppend.push(entryToAppend);
 		knownEntries.set(entryToAppend.id, entryToAppend);
 	}
 	if (leafId !== null && !knownEntries.has(leafId)) {
-		throw new Error(`leafId ${leafId} does not exist in session tree`);
+		throw new PiServerError(
+			`leafId ${leafId} does not exist in session tree`,
+			PiServerErrorCode.LEAF_ID_NOT_FOUND,
+			{ leafId },
+		);
 	}
 	if (entriesToAppend.length === 0 && session.leafId === leafId) {
 		return session;
@@ -340,23 +357,6 @@ export function replaceMessages(sessionId: string, messages: Message[]): Session
 	refreshActiveMessages(session);
 	session.persistenceChange = { kind: "snapshot" };
 	return session;
-}
-
-export function dropLastAssistantError(sessionId: string): boolean {
-	const session = getSession(sessionId);
-	if (!session) return false;
-	const leaf = session.leafId ? session.entries.find((entry) => entry.id === session.leafId) : undefined;
-	if (leaf?.type !== "message" || leaf.message.role !== "assistant" || leaf.message.stopReason !== "error") {
-		return false;
-	}
-	session.entries = session.entries.filter((entry) => entry.id !== leaf.id);
-	session.leafId = leaf.parentId;
-	refreshTreeHashes(session);
-	session.revision++;
-	session.updatedAt = Date.now();
-	refreshActiveMessages(session);
-	session.persistenceChange = { kind: "snapshot" };
-	return true;
 }
 
 export function deleteSession(sessionId: string): boolean {

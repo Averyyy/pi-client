@@ -77,9 +77,14 @@ export function hasTauCodexExtensionInstalled(env = process.env) {
 		"settings.json",
 	);
 	if (!existsSync(settingsPath)) return false;
-	const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-	const packages = Array.isArray(settings.packages) ? settings.packages : [];
-	return packages.some(packageSpecMatchesTauCodex);
+	try {
+		const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+		const packages = Array.isArray(settings.packages) ? settings.packages : [];
+		return packages.some(packageSpecMatchesTauCodex);
+	} catch (error) {
+		console.warn(`Failed to parse settings.json, treating as missing: ${error.message}`);
+		return false;
+	}
 }
 
 function packageSpecMatchesTauCodex(spec) {

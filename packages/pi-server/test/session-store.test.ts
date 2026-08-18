@@ -7,7 +7,6 @@ import {
 	appendSessionEntries,
 	clearAllSessions,
 	deleteSession,
-	dropLastAssistantError,
 	getActiveMessages,
 	getOrCreateSession,
 	getSession,
@@ -316,37 +315,6 @@ describe("session-store", () => {
 		const session = getSession("test-1")!;
 		expect(session.messages.length).toBe(1);
 		expect(session.messages[0].role).toBe("assistant");
-	});
-
-	it("drops the last assistant error only", () => {
-		const errorMessage = {
-			role: "assistant" as const,
-			content: [],
-			api: "openai-completions" as const,
-			provider: "opencode-go" as const,
-			model: "glm-5.1",
-			usage: {
-				input: 10,
-				output: 5,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 15,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error" as const,
-			errorMessage: "retryable",
-			timestamp: 2000,
-		};
-
-		replaceMessages("test-drop", [{ role: "user", content: "hello", timestamp: 1000 }, errorMessage]);
-		expect(dropLastAssistantError("test-drop")).toBe(true);
-		expect(getSession("test-drop")?.messages).toEqual([{ role: "user", content: "hello", timestamp: 1000 }]);
-		expect(dropLastAssistantError("test-drop")).toBe(false);
-	});
-
-	it("does not create a session when dropping a missing assistant error", () => {
-		expect(dropLastAssistantError("missing-drop")).toBe(false);
-		expect(getSession("missing-drop")).toBeUndefined();
 	});
 
 	it("deletes a session", () => {

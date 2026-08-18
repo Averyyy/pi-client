@@ -17,6 +17,11 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
+	isRecoverableMissingServerStateCode,
+	isRecoverableTreeDivergenceCode,
+	type PiServerErrorResponse,
+} from "@earendil-works/pi-server";
+import {
 	buildPiServerTreePrefixHashes,
 	hashPiServerSessionEntries,
 	hashPiServerStaticContext,
@@ -235,6 +240,18 @@ async function readPiServerFailure(response: Response): Promise<PiServerResponse
 async function readPiServerJson<T>(response: Response, errorPrefix: string): Promise<T> {
 	const bodyText = await response.text();
 	if (!response.ok) {
+		// Try to parse as PiServerErrorResponse for structured error
+		try {
+			const errorResponse: PiServerErrorResponse = JSON.parse(bodyText);
+			if (errorResponse.error) {
+				const error: any = new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
+				if (errorResponse.code) error.code = errorResponse.code;
+				if (errorResponse.details) error.details = errorResponse.details;
+				throw error;
+			}
+		} catch (parseError) {
+			// Fall through to generic error
+		}
 		throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
 	}
 	try {
@@ -530,12 +547,27 @@ function getKnownServerPrefixIds(sessionId: string, entries: SessionTreeEntry[])
 }
 
 function isRecoverableTreeDivergenceError(error: unknown): boolean {
+	// Check for PiServerErrorResponse with structured error code
+	if (error && typeof error === "object" && "code" in error) {
+		return isRecoverableTreeDivergenceCode((error as PiServerErrorResponse).code);
+	}
+	// Fallback to message matching for backward compatibility
 	const message = error instanceof Error ? error.message : String(error);
 	return /parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(message);
 }
 
 function isRecoverableMissingServerState(response: Response, errorBody: string): boolean {
 	if (response.status !== 400 && response.status !== 404) return false;
+	// Try to parse as PiServerErrorResponse
+	try {
+		const errorResponse: PiServerErrorResponse = JSON.parse(errorBody);
+		if (errorResponse.code) {
+			return isRecoverableMissingServerStateCode(errorResponse.code);
+		}
+	} catch {
+		// Fall through to message matching
+	}
+	// Fallback to message matching for backward compatibility
 	return /Session has no static context|session not found|parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(
 		errorBody,
 	);
@@ -752,12 +784,6 @@ export async function compactPiServer(
 		leafId: resultLeafId,
 		messages: result.messages ?? [],
 	};
-}
-
-export async function dropLastPiServerAssistantError(sessionId: string): Promise<void> {
-	const request = createPiServerRequest();
-	const response = await request.postJson("/api/session/drop-last-assistant-error", { sessionId });
-	await readPiServerJson<unknown>(response, "Dropping server assistant error failed");
 }
 
 export async function streamPiServer(
@@ -985,6 +1011,7 @@ function processProxyEvent(
 		case "toolcall_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
+				Object.assign(content, proxyEvent.toolCall);
 				delete (content as any).partialJson;
 				return { type: "toolcall_end", contentIndex: proxyEvent.contentIndex, toolCall: content, partial };
 			}

@@ -24,6 +24,7 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
+import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
@@ -32,7 +33,6 @@ import {
 	appendMessages,
 	appendSessionEntries,
 	deleteSession as deleteSessionFromStore,
-	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
 	getSessionBranch,
@@ -145,6 +145,7 @@ interface StreamRunRecord {
 const STREAM_HEARTBEAT = ": keep-alive\n\n";
 const JSON_HEARTBEAT = " \n";
 const STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
+const STREAM_RUN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const streamRuns = new Map<string, StreamRunRecord>();
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -160,6 +161,19 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	const data = JSON.stringify(body);
 	res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) });
 	res.end(data);
+}
+
+function sendError(
+	res: ServerResponse,
+	status: number,
+	message: string,
+	code?: PiServerErrorCode,
+	details?: Record<string, unknown>,
+): void {
+	const body: PiServerErrorResponse = { error: message };
+	if (code) body.code = code;
+	if (details) body.details = details;
+	sendJson(res, status, body);
 }
 
 function logRequestError(req: IncomingMessage, error: unknown): void {
@@ -218,6 +232,10 @@ function startStreamRun(sessionId: string, runId: string): StreamRunRecord {
 	};
 	run.status = "running";
 	run.updatedAt = now;
+	// Clear old events on retry to avoid interleaving
+	if (existing) {
+		run.events = [];
+	}
 	streamRuns.set(runKey(sessionId, runId), run);
 	return run;
 }
@@ -234,6 +252,8 @@ function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantM
 	run.message = message;
 	run.errorMessage = undefined;
 	run.updatedAt = Date.now();
+	// Discard events array to save memory; completed runs only need the final message
+	run.events = [];
 }
 
 function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): void {
@@ -241,6 +261,16 @@ function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): 
 	run.status = "failed";
 	run.errorMessage = errorMessage;
 	run.updatedAt = Date.now();
+	// Discard events array to save memory
+	run.events = [];
+}
+
+function cleanupExpiredStreamRuns(nowMs: number): void {
+	for (const [key, run] of streamRuns) {
+		if (nowMs - run.updatedAt > STREAM_RUN_TTL_MS) {
+			streamRuns.delete(key);
+		}
+	}
 }
 
 function sessionHistoryFullResponseBody(session: SessionState, baseMessageCount: number) {
@@ -319,7 +349,7 @@ interface SessionCompactSuccessBody {
 
 interface SessionCompactHttpResponse {
 	status: number;
-	body: { error: string } | SessionCompactSuccessBody;
+	body: PiServerErrorResponse | SessionCompactSuccessBody;
 }
 
 export function resolveStreamOptions(
@@ -417,29 +447,47 @@ function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, 
 
 function handleSessionTreeAppend(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!Array.isArray(body.entries)) {
-		sendJson(res, 400, { error: "entries is required" });
+		sendError(res, 400, "entries is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
-	if (body.staticContext) {
-		setStaticContext(body.sessionId, body.staticContext);
+	try {
+		if (body.staticContext) {
+			setStaticContext(body.sessionId, body.staticContext);
+		}
+		const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
+		persistSession(config, session);
+		sendJson(res, 200, sessionResponseBody(session));
+	} catch (error) {
+		if (error instanceof PiServerError) {
+			sendError(res, 400, error.message, error.code, error.details);
+		} else {
+			const message = error instanceof Error ? error.message : String(error);
+			sendError(res, 500, message);
+		}
 	}
-	const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
-	persistSession(config, session);
-	sendJson(res, 200, sessionResponseBody(session));
 }
 
 function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
-	const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
-	persistSession(config, session);
-	sendJson(res, 200, sessionResponseBody(session));
+	try {
+		const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
+		persistSession(config, session);
+		sendJson(res, 200, sessionResponseBody(session));
+	} catch (error) {
+		if (error instanceof PiServerError) {
+			sendError(res, 400, error.message, error.code, error.details);
+		} else {
+			const message = error instanceof Error ? error.message : String(error);
+			sendError(res, 500, message);
+		}
+	}
 }
 
 function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact | SessionCompactHttpResponse {
@@ -452,7 +500,7 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 
 	const session = getSession(body.sessionId);
 	if (!session) {
-		return { status: 404, body: { error: "session not found" } };
+		return { status: 404, body: { error: "session not found", code: PiServerErrorCode.SESSION_NOT_FOUND } };
 	}
 
 	const entries = getSessionBranch(session);
@@ -621,20 +669,6 @@ async function handleSessionCompact(
 	await handleSessionCompactJsonStream(config, body, prepared, res);
 }
 
-function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody, res: ServerResponse): void {
-	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
-		return;
-	}
-	const dropped = dropLastAssistantError(body.sessionId);
-	const session = getSession(body.sessionId);
-	if (session) {
-		persistSession(config, session);
-	}
-	const messageCount = session?.messages.length ?? 0;
-	sendJson(res, 200, { success: true, dropped, messageCount });
-}
-
 function handleSessionHistory(
 	sessionId: string,
 	from: number | undefined,
@@ -645,7 +679,7 @@ function handleSessionHistory(
 ): void {
 	const session = getSession(sessionId);
 	if (!session) {
-		sendJson(res, 404, { error: "session not found" });
+		sendError(res, 404, "session not found", PiServerErrorCode.SESSION_NOT_FOUND);
 		return;
 	}
 	const baseMessageCount = from ?? 0;
@@ -664,7 +698,7 @@ function handleSessionHistory(
 function handleSessionRun(sessionId: string, runId: string, res: ServerResponse): void {
 	const run = getStreamRun(sessionId, runId);
 	if (!run) {
-		sendJson(res, 404, { error: "run not found" });
+		sendError(res, 404, "run not found", PiServerErrorCode.RUN_NOT_FOUND);
 		return;
 	}
 	sendJson(res, 200, run);
@@ -684,13 +718,15 @@ export function buildStreamContext(
 
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!body.model) {
-		sendJson(res, 400, { error: "model is required" });
+		sendError(res, 400, "model is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
+
+	cleanupExpiredStreamRuns(Date.now());
 
 	const session = getOrCreateSession(body.sessionId);
 
@@ -700,7 +736,12 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	}
 
 	if (!session.staticContext && !body.staticContext) {
-		sendJson(res, 400, { error: "Session has no static context. Initialize with /api/session/init first." });
+		sendError(
+			res,
+			400,
+			"Session has no static context. Initialize with /api/session/init first.",
+			PiServerErrorCode.SESSION_NO_STATIC_CONTEXT,
+		);
 		return;
 	}
 
@@ -831,11 +872,6 @@ async function handlePostRequest(
 
 	if (pathname === "/api/session/tree/switch") {
 		handleSessionTreeSwitch(config, body as SessionTreeSwitchBody, res);
-		return true;
-	}
-
-	if (pathname === "/api/session/drop-last-assistant-error") {
-		handleDropLastAssistantError(config, body as SessionIdBody, res);
 		return true;
 	}
 
