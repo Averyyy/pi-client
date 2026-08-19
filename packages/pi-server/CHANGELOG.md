@@ -19,6 +19,11 @@
 
 ### Fixed
 
+- Recovered and truncated torn WAL tail records without hiding complete invalid records or allowing one corrupt session file to prevent server startup.
+- Preserved complete authoritative tool-call metadata through proxy streams and completed-run replay.
+- Bounded stream-run journals with TTL cleanup, final-message-only storage, same-run recovery, and session-delete cleanup.
+- Returned structured error codes for session/tree recovery and removed the obsolete assistant-error deletion endpoint.
+- Updated pi-server runtime dependencies to the current lockstep fork packages.
 - Used `--legacy-peer-deps` for npm-global fork updates so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 - Increased the pending chunk budget to 1 GiB so large session-tree appends do not fail at the previous 64 MiB Base64 limit.
 

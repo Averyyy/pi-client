@@ -151,6 +151,16 @@ describe("AgentSession retry", () => {
 		expect(created.session.isRetrying).toBe(false);
 	});
 
+	it.each(["Error: Provider failed, retrying...", "Upstream http/2 stream failed"])(
+		"retries transient provider failure: %s",
+		async (errorMessage) => {
+			const created = await createSession({ failCount: 1, errorMessage });
+			await created.session.prompt("Test");
+			expect(created.getCallCount()).toBe(2);
+			expect(created.session.isRetrying).toBe(false);
+		},
+	);
+
 	it("does not retry provider balance errors", async () => {
 		const created = await createSession({ failCount: 99, errorMessage: "401 Insufficient balance" });
 		const events: string[] = [];

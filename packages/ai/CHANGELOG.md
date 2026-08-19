@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed automatic retries for transient `Provider failed, retrying...` and upstream HTTP/2 stream failures.
 - Fixed OpenAI Responses history replay when a tool changes between function and grammar/custom representations, preventing stale `fc_*` or `ctc_*` item IDs from making resumed sessions unrecoverable.
 ## [0.84.2] - 2026-08-14
 

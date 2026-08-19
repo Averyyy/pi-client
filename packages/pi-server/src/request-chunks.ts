@@ -11,7 +11,6 @@ const ALLOWED_TARGETS = new Set([
 	"/api/session/tree/sync",
 	"/api/session/tree/append",
 	"/api/session/tree/switch",
-	"/api/session/drop-last-assistant-error",
 	"/api/session/compact",
 	"/api/stream",
 	"/api/receive",

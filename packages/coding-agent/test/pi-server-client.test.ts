@@ -154,6 +154,58 @@ describe("pi-server-client", () => {
 		expect(true).toBe(true);
 	});
 
+	it("preserves the authoritative toolCall namespace on toolcall_end", async () => {
+		const entries = baseTree().slice(0, 1);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				if (url.endsWith("/api/stream")) {
+					return makeMockResponse([
+						{ type: "start" },
+						{ type: "toolcall_start", contentIndex: 0, id: "call-1", toolName: "dynamic_tool" },
+						{ type: "toolcall_delta", contentIndex: 0, delta: '{"value":1}' },
+						{
+							type: "toolcall_end",
+							contentIndex: 0,
+							toolCall: {
+								type: "toolCall",
+								id: "call-1",
+								name: "dynamic_tool",
+								arguments: { value: 1 },
+								namespace: "functions_dyn",
+							},
+						},
+						{
+							type: "done",
+							reason: "toolUse",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+						},
+					]);
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "test", messages: [] },
+			{
+				sessionId: "toolcall-namespace",
+				sessionTree: { entries, leafId: "u1" },
+			},
+		);
+		const events: object[] = [];
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => (event as { type?: string }).type === "toolcall_end") as
+			| { toolCall?: { namespace?: string } }
+			| undefined;
+		expect(toolEnd?.toolCall?.namespace).toBe("functions_dyn");
+	});
+
 	it("includes tool parameters in the static context hash", () => {
 		const ctx1: Context = {
 			systemPrompt: "You are helpful.",
@@ -429,17 +481,20 @@ describe("pi-server-client", () => {
 				capturedBodies.push({ url, body });
 
 				if (new URL(url).pathname === "/api/session/tree-rebuild/history") {
-					return new Response(JSON.stringify({ error: "session not found" }), {
+					return new Response(JSON.stringify({ error: "session not found", code: "SESSION_NOT_FOUND" }), {
 						status: 404,
 						headers: { "Content-Type": "application/json" },
 					});
 				}
 
 				if (url.endsWith("/api/session/tree/append") && rejectNextAppend) {
-					return new Response(JSON.stringify({ error: "parent entry a1 does not exist" }), {
-						status: 400,
-						headers: { "Content-Type": "application/json" },
-					});
+					return new Response(
+						JSON.stringify({ error: "localized tree divergence", code: "PARENT_ENTRY_NOT_FOUND" }),
+						{
+							status: 400,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
 				}
 
 				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 3 }), {
@@ -492,7 +547,7 @@ describe("pi-server-client", () => {
 				}
 
 				if (url.endsWith("/api/session/tree/switch") && rejectSwitch) {
-					return new Response(JSON.stringify({ error: "leafId a1 does not exist in session tree" }), {
+					return new Response(JSON.stringify({ error: "localized leaf divergence", code: "LEAF_ID_NOT_FOUND" }), {
 						status: 400,
 						headers: { "Content-Type": "application/json" },
 					});
@@ -877,6 +932,98 @@ describe("pi-server-client", () => {
 		expect(capturedPaths.some((path) => path.startsWith("/api/session/stream-run-recovery/runs/"))).toBe(true);
 	});
 
+	it("waits for a running server run before recovering its final result", async () => {
+		const capturedPaths: string[] = [];
+		const entries = baseTree().slice(0, 1);
+		const recoveredMessage = assistantMessage("eventual recovery", 3000);
+		let runPolls = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				if (path.startsWith("/api/session/stream-run-poll/runs/")) {
+					runPolls++;
+					return new Response(
+						JSON.stringify(
+							runPolls === 1
+								? { runId: path.split("/").pop(), status: "running" }
+								: { runId: path.split("/").pop(), status: "completed", message: recoveredMessage },
+						),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url.endsWith("/api/stream")) {
+					const bodyStream = new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('data: {"type":"start"}\n\n'));
+							controller.close();
+						},
+					});
+					return new Response(bodyStream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "stream-run-poll", sessionTree: { entries, leafId: "u1" }, timeoutMs: 2000 },
+		);
+		const events: object[] = [];
+		for await (const event of stream) events.push(event);
+		expect(events.find((event) => (event as { type?: string }).type === "done")).toMatchObject({
+			message: recoveredMessage,
+		});
+		expect(runPolls).toBe(2);
+		expect(capturedPaths.filter((path) => path === "/api/stream")).toHaveLength(1);
+	});
+
+	it("does not mark run-recovery transport failures as provider-retryable", async () => {
+		const entries = baseTree().slice(0, 1);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				if (path.startsWith("/api/session/run-recovery-failure/runs/")) {
+					throw new Error("run recovery network failed");
+				}
+				if (url.endsWith("/api/stream")) {
+					return new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+				}
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "test", messages: [] },
+			{ sessionId: "run-recovery-failure", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) events.push(event);
+		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
+			| {
+					error?: {
+						errorMessage?: string;
+						diagnostics?: Array<{ details?: { phase?: unknown; retryable?: unknown } }>;
+					};
+			  }
+			| undefined;
+		expect(errorEvent?.error?.errorMessage).toContain("run recovery network failed");
+		expect(errorEvent?.error?.diagnostics?.[0]?.details).toMatchObject({
+			phase: "history_reconcile",
+			retryable: false,
+		});
+	});
+
 	it("does not count request chunk upload time against the LLM timeout", async () => {
 		process.env.PI_CLIENT_MAX_REQUEST_KB = "2";
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
@@ -1073,6 +1220,7 @@ describe("pi-server-client", () => {
 						return new Response(
 							JSON.stringify({
 								error: "Session has no static context. Initialize with /api/session/init first.",
+								code: "SESSION_NO_STATIC_CONTEXT",
 							}),
 							{ status: 400, headers: { "Content-Type": "application/json" } },
 						);
@@ -1435,7 +1583,7 @@ describe("pi-server-client", () => {
 				if (url.endsWith("/api/session/compact")) {
 					compactCount++;
 					if (compactCount === 1) {
-						return new Response(JSON.stringify({ error: "session not found" }), {
+						return new Response(JSON.stringify({ error: "session not found", code: "SESSION_NOT_FOUND" }), {
 							status: 404,
 							headers: { "Content-Type": "application/json" },
 						});

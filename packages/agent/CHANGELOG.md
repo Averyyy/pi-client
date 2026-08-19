@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed proxy replay of completed server runs to preserve the authoritative final assistant message.
+
 ## [0.84.2] - 2026-08-14
 
 ### Fixed

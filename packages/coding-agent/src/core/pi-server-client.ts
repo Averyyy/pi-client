@@ -17,11 +17,6 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
-	isRecoverableMissingServerStateCode,
-	isRecoverableTreeDivergenceCode,
-	type PiServerErrorResponse,
-} from "@earendil-works/pi-server";
-import {
 	buildPiServerTreePrefixHashes,
 	hashPiServerSessionEntries,
 	hashPiServerStaticContext,
@@ -66,6 +61,15 @@ const sessionHasTemporaryTree = new Set<string>();
 const RESPONSE_BODY_EXCERPT_CHARS = 500;
 const TRANSIENT_PI_SERVER_RETRY_DELAYS_MS = [250, 750, 1500];
 const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([502, 503, 504, 530]);
+const PI_SERVER_RUN_RECOVERY_POLL_MS = 250;
+const DEFAULT_PI_SERVER_RUN_RECOVERY_TIMEOUT_MS = 10 * 60 * 1000;
+
+class PiServerRunRecoveryTimeoutError extends Error {
+	constructor() {
+		super("pi-server run recovery timed out; the server may still be processing the request");
+		this.name = "PiServerRunRecoveryTimeoutError";
+	}
+}
 
 export function hashStaticContext(ctx: Context): string {
 	return hashPiServerStaticContext(ctx);
@@ -148,9 +152,27 @@ export interface PiServerStreamOptions extends SimpleStreamOptions {
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 }
 
+interface PiServerErrorResponse {
+	error: string;
+	code?: string;
+	details?: Record<string, unknown>;
+}
+
 interface PiServerResponseFailure {
 	details: string;
-	matchText: string;
+	code?: string;
+}
+
+class PiServerResponseError extends Error {
+	public readonly code?: string;
+	public readonly details?: Record<string, unknown>;
+
+	constructor(message: string, code?: string, details?: Record<string, unknown>) {
+		super(message);
+		this.name = "PiServerResponseError";
+		this.code = code;
+		this.details = details;
+	}
 }
 
 interface PiServerHistoryResponse extends Partial<PiServerHistorySnapshot> {
@@ -176,6 +198,55 @@ interface PiServerCompactionResponse extends Partial<PiServerCompactionResult> {
 interface ServerSentEvent {
 	event: string;
 	data: string;
+}
+
+class ServerSentEventParser {
+	private buffer = "";
+	private event = "message";
+	private dataLines: string[] = [];
+
+	feed(text: string): ServerSentEvent[] {
+		this.buffer += text;
+		const lines = this.buffer.split("\n");
+		this.buffer = lines.pop() ?? "";
+		return lines.flatMap((line) => this.consumeLine(line));
+	}
+
+	finish(): ServerSentEvent[] {
+		const events: ServerSentEvent[] = [];
+		if (this.buffer.length > 0) {
+			events.push(...this.consumeLine(this.buffer));
+			this.buffer = "";
+		}
+		const final = this.flush();
+		if (final) events.push(final);
+		return events;
+	}
+
+	private consumeLine(rawLine: string): ServerSentEvent[] {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (line === "") {
+			const event = this.flush();
+			return event ? [event] : [];
+		}
+		if (line.startsWith(":")) return [];
+		if (line.startsWith("event:")) {
+			this.event = getServerSentEventFieldValue(line, "event");
+			return [];
+		}
+		if (line.startsWith("data:")) {
+			this.dataLines.push(getServerSentEventFieldValue(line, "data"));
+		}
+		return [];
+	}
+
+	private flush(): ServerSentEvent | undefined {
+		if (this.dataLines.length === 0) return undefined;
+		const event = { event: this.event, data: this.dataLines.join("\n") };
+		this.event = "message";
+		this.dataLines = [];
+		return event;
+	}
 }
 
 interface PiServerRunResponse {
@@ -212,16 +283,24 @@ function getBodyExcerpt(text: string): string {
 	return excerpt.length < trimmed.length ? `${excerpt}...` : excerpt;
 }
 
-function getJsonErrorText(text: string): string | undefined {
+function getJsonErrorResponse(text: string): PiServerErrorResponse | undefined {
 	if (!text) return undefined;
 	try {
 		const parsed = JSON.parse(text) as unknown;
-		if (!isObject(parsed)) return undefined;
-		const error = parsed.error;
-		return typeof error === "string" && error.length > 0 ? error : undefined;
+		if (!isObject(parsed) || typeof parsed.error !== "string" || parsed.error.length === 0) return undefined;
+		const code = parsed.code;
+		return {
+			error: parsed.error,
+			code: typeof code === "string" ? code : undefined,
+			details: isObject(parsed.details) ? parsed.details : undefined,
+		};
 	} catch {
 		return undefined;
 	}
+}
+
+function getJsonErrorText(text: string): string | undefined {
+	return getJsonErrorResponse(text)?.error;
 }
 
 function formatResponseDetails(response: Response, bodyText: string): string {
@@ -231,26 +310,23 @@ function formatResponseDetails(response: Response, bodyText: string): string {
 
 async function readPiServerFailure(response: Response): Promise<PiServerResponseFailure> {
 	const bodyText = await response.text();
+	const errorResponse = getJsonErrorResponse(bodyText);
 	return {
 		details: formatResponseDetails(response, bodyText),
-		matchText: getJsonErrorText(bodyText) ?? bodyText,
+		code: errorResponse?.code,
 	};
 }
 
 async function readPiServerJson<T>(response: Response, errorPrefix: string): Promise<T> {
 	const bodyText = await response.text();
 	if (!response.ok) {
-		// Try to parse as PiServerErrorResponse for structured error
-		try {
-			const errorResponse: PiServerErrorResponse = JSON.parse(bodyText);
-			if (errorResponse.error) {
-				const error: any = new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
-				if (errorResponse.code) error.code = errorResponse.code;
-				if (errorResponse.details) error.details = errorResponse.details;
-				throw error;
-			}
-		} catch (parseError) {
-			// Fall through to generic error
+		const errorResponse = getJsonErrorResponse(bodyText);
+		if (errorResponse) {
+			throw new PiServerResponseError(
+				`${errorPrefix} (${formatResponseDetails(response, bodyText)})`,
+				errorResponse.code,
+				errorResponse.details,
+			);
 		}
 		throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
 	}
@@ -268,33 +344,8 @@ function getServerSentEventFieldValue(line: string, field: string): string {
 }
 
 function parseServerSentEvents(bodyText: string): ServerSentEvent[] {
-	const events: ServerSentEvent[] = [];
-	let event = "message";
-	let dataLines: string[] = [];
-
-	const flush = () => {
-		if (dataLines.length === 0) return;
-		events.push({ event, data: dataLines.join("\n") });
-		event = "message";
-		dataLines = [];
-	};
-
-	for (const line of bodyText.split(/\r?\n/)) {
-		if (line === "") {
-			flush();
-			continue;
-		}
-		if (line.startsWith(":")) continue;
-		if (line.startsWith("event:")) {
-			event = getServerSentEventFieldValue(line, "event");
-			continue;
-		}
-		if (line.startsWith("data:")) {
-			dataLines.push(getServerSentEventFieldValue(line, "data"));
-		}
-	}
-	flush();
-	return events;
+	const parser = new ServerSentEventParser();
+	return [...parser.feed(bodyText), ...parser.finish()];
 }
 
 function parseServerSentEventData(event: ServerSentEvent, errorPrefix: string): unknown {
@@ -385,6 +436,14 @@ async function postPiServerJsonWithTransientRetry<T>(
 			) {
 				await waitForPiServerRetry(attempt, request.options.signal);
 				continue;
+			}
+			const errorResponse = getJsonErrorResponse(bodyText);
+			if (errorResponse) {
+				throw new PiServerResponseError(
+					`${errorPrefix} (${formatResponseDetails(response, bodyText)})`,
+					errorResponse.code,
+					errorResponse.details,
+				);
 			}
 			throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)})`);
 		}
@@ -531,6 +590,21 @@ async function fetchPiServerRun(
 	return readPiServerJson<PiServerRunResponse>(response, "Session run recovery failed");
 }
 
+async function waitForPiServerRunCompletion(
+	sessionId: string,
+	runId: string,
+	request: ChunkRequest,
+	options: PiServerStreamOptions | undefined,
+): Promise<PiServerRunResponse | undefined> {
+	const deadline = Date.now() + DEFAULT_PI_SERVER_RUN_RECOVERY_TIMEOUT_MS;
+	for (;;) {
+		const run = await fetchPiServerRun(sessionId, runId, request);
+		if (!run || run.status !== "running") return run;
+		if (Date.now() >= deadline) throw new PiServerRunRecoveryTimeoutError();
+		await sleep(PI_SERVER_RUN_RECOVERY_POLL_MS, undefined, { signal: options?.signal });
+	}
+}
+
 function getKnownServerPrefixIds(sessionId: string, entries: SessionTreeEntry[]): Set<string> | undefined {
 	const entryCount = sessionTreeEntryCounts.get(sessionId);
 	const treeHash = sessionTreeHashes.get(sessionId);
@@ -546,31 +620,27 @@ function getKnownServerPrefixIds(sessionId: string, entries: SessionTreeEntry[])
 	return ids;
 }
 
-function isRecoverableTreeDivergenceError(error: unknown): boolean {
-	// Check for PiServerErrorResponse with structured error code
-	if (error && typeof error === "object" && "code" in error) {
-		return isRecoverableTreeDivergenceCode((error as PiServerErrorResponse).code);
-	}
-	// Fallback to message matching for backward compatibility
-	const message = error instanceof Error ? error.message : String(error);
-	return /parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(message);
+function isRecoverableTreeDivergenceCode(code: string | undefined): boolean {
+	return code === "PARENT_ENTRY_NOT_FOUND" || code === "LEAF_ID_NOT_FOUND" || code === "ENTRY_ALREADY_EXISTS";
 }
 
-function isRecoverableMissingServerState(response: Response, errorBody: string): boolean {
-	if (response.status !== 400 && response.status !== 404) return false;
-	// Try to parse as PiServerErrorResponse
-	try {
-		const errorResponse: PiServerErrorResponse = JSON.parse(errorBody);
-		if (errorResponse.code) {
-			return isRecoverableMissingServerStateCode(errorResponse.code);
-		}
-	} catch {
-		// Fall through to message matching
+function isRecoverableMissingServerStateCode(code: string | undefined): boolean {
+	return code === "SESSION_NOT_FOUND" || code === "SESSION_NO_STATIC_CONTEXT" || isRecoverableTreeDivergenceCode(code);
+}
+
+function isRecoverableTreeDivergenceError(error: unknown): boolean {
+	if (error instanceof PiServerResponseError) {
+		return isRecoverableTreeDivergenceCode(error.code);
 	}
-	// Fallback to message matching for backward compatibility
-	return /Session has no static context|session not found|parent entry .* does not exist|leafId .* does not exist|entry .* already exists/i.test(
-		errorBody,
-	);
+	if (error && typeof error === "object" && "code" in error) {
+		return isRecoverableTreeDivergenceCode((error as { code?: string }).code);
+	}
+	return false;
+}
+
+function isRecoverableMissingServerState(response: Response, errorCode?: string): boolean {
+	if (response.status !== 400 && response.status !== 404) return false;
+	return isRecoverableMissingServerStateCode(errorCode);
 }
 
 async function syncFullPiServerTree(
@@ -748,13 +818,13 @@ export async function compactPiServer(
 	let response = await request.postJson("/api/session/compact", makeBody());
 	if (!response.ok) {
 		let failure = await readPiServerFailure(response);
-		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.matchText)) {
+		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 			resetSessionTracking(sessionId);
 			await ensureSessionInit(sessionId, context, request);
 			await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
 			response = await request.postJson("/api/session/compact", makeBody());
 			if (response.ok) {
-				failure = { details: "", matchText: "" };
+				failure = { details: "", code: undefined };
 			} else {
 				failure = await readPiServerFailure(response);
 			}
@@ -835,12 +905,12 @@ export async function streamPiServer(
 
 			if (!response.ok) {
 				let failure = await readPiServerFailure(response);
-				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.matchText)) {
+				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);
 					response = await request.postJson("/api/stream", makeBody());
 					if (response.ok) {
-						failure = { details: "", matchText: "" };
+						failure = { details: "", code: undefined };
 					} else {
 						failure = await readPiServerFailure(response);
 					}
@@ -853,7 +923,21 @@ export async function streamPiServer(
 			await ensurePiServerEventStream(response);
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
-			let buffer = "";
+			const parser = new ServerSentEventParser();
+			let terminalReceived = false;
+
+			const consumeEvents = (events: ServerSentEvent[]): void => {
+				for (const serverEvent of events) {
+					const proxyEvent = parseServerSentEventData(
+						serverEvent,
+						"pi-server stream",
+					) as ProxyAssistantMessageEvent;
+					const event = processProxyEvent(proxyEvent, partial);
+					if (!event) continue;
+					if (event.type === "done" || event.type === "error") terminalReceived = true;
+					stream.push(event);
+				}
+			};
 
 			while (true) {
 				const { done, value } = await reader.read();
@@ -863,25 +947,16 @@ export async function streamPiServer(
 					throw new Error("Request aborted by user");
 				}
 
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-
-				for (const line of lines) {
-					if (line.startsWith("data: ")) {
-						const data = line.slice(6).trim();
-						if (!data) continue;
-						const proxyEvent = JSON.parse(data) as ProxyAssistantMessageEvent;
-						const event = processProxyEvent(proxyEvent, partial);
-						if (event) {
-							stream.push(event);
-						}
-					}
-				}
+				consumeEvents(parser.feed(decoder.decode(value, { stream: true })));
 			}
+			consumeEvents(parser.feed(decoder.decode()));
+			consumeEvents(parser.finish());
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request aborted by user");
+			}
+			if (!terminalReceived) {
+				throw new Error("pi-server stream ended before a terminal response event");
 			}
 
 			if (isEphemeralSession) {
@@ -890,10 +965,15 @@ export async function streamPiServer(
 
 			stream.end();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
+			let errorMessage = error instanceof Error ? error.message : String(error);
 			if (!options?.signal?.aborted && phase === "provider_stream") {
 				try {
-					const recoveredRun = await fetchPiServerRun(sessionId, runId, createPiServerRequest());
+					const recoveredRun = await waitForPiServerRunCompletion(
+						sessionId,
+						runId,
+						createPiServerRequest(options?.signal),
+						options,
+					);
 					if (recoveredRun?.status === "completed" && recoveredRun.message) {
 						switch (recoveredRun.message.stopReason) {
 							case "stop":
@@ -916,8 +996,12 @@ export async function streamPiServer(
 						stream.end();
 						return;
 					}
-				} catch {
-					// Keep the original stream error authoritative.
+					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
+						errorMessage = recoveredRun.errorMessage;
+					}
+				} catch (recoveryError) {
+					phase = "history_reconcile";
+					errorMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
 				}
 			}
 			const reason = options?.signal?.aborted ? "aborted" : "error";
@@ -1018,6 +1102,7 @@ function processProxyEvent(
 			return undefined;
 		}
 		case "done":
+			if (proxyEvent.message) return { type: "done", reason: proxyEvent.reason, message: proxyEvent.message };
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
 			partial.deferred = proxyEvent.deferred;

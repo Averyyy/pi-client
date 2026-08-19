@@ -49,6 +49,7 @@ export type ProxyAssistantMessageEvent =
 			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;
 			usage: AssistantMessage["usage"];
 			deferred?: AssistantMessage["deferred"];
+			message?: AssistantMessage;
 	  }
 	| {
 			type: "error";
@@ -352,6 +353,7 @@ function processProxyEvent(
 		}
 
 		case "done":
+			if (proxyEvent.message) return { type: "done", reason: proxyEvent.reason, message: proxyEvent.message };
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
 			partial.deferred = proxyEvent.deferred;

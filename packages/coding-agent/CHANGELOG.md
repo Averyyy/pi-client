@@ -8,6 +8,9 @@
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
 - Fixed long compacted sessions blocking the terminal by rendering the latest compaction context first and lazy-loading earlier transcript entries in bounded batches.
 - Fixed pi-server provider requests to send only the projected, compaction-aware LLM context instead of synchronizing the full durable session tree.
+- Fixed pi-server tree recovery to use structured error codes and preserve authoritative tool-call namespaces.
+- Fixed disconnected pi-server streams to recover the same run before allowing an outer provider retry, preventing duplicate concurrent provider requests.
+
 ## [0.84.2] - 2026-08-14
 
 ### New Features

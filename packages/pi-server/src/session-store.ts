@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { buildLegacySessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Message, Tool } from "@earendil-works/pi-ai";
-import { PiServerError, PiServerErrorCode, type PiServerErrorCode as PiServerErrorCodeType } from "./error-codes.ts";
+import { PiServerError, PiServerErrorCode } from "./error-codes.ts";
 import {
 	appendPiServerTreeHash,
 	buildPiServerTreePrefixHashes,
@@ -201,11 +201,9 @@ function appendTreeHashes(session: SessionState, entries: SessionTreeEntry[]): v
 function assertValidLeaf(entries: SessionTreeEntry[], leafId: string | null): void {
 	if (leafId === null) return;
 	if (!entries.some((entry) => entry.id === leafId)) {
-		throw new PiServerError(
-			`leafId ${leafId} does not exist in session tree`,
-			PiServerErrorCode.LEAF_ID_NOT_FOUND,
-			{ leafId },
-		);
+		throw new PiServerError(`leafId ${leafId} does not exist in session tree`, PiServerErrorCode.LEAF_ID_NOT_FOUND, {
+			leafId,
+		});
 	}
 }
 
@@ -238,11 +236,9 @@ export function appendSessionEntries(
 		const knownEntry = knownEntries.get(entry.id);
 		if (knownEntry) {
 			if (!isDeepStrictEqual(knownEntry, entry)) {
-				throw new PiServerError(
-					`entry ${entry.id} already exists`,
-					PiServerErrorCode.ENTRY_ALREADY_EXISTS,
-					{ entryId: entry.id },
-				);
+				throw new PiServerError(`entry ${entry.id} already exists`, PiServerErrorCode.ENTRY_ALREADY_EXISTS, {
+					entryId: entry.id,
+				});
 			}
 			continue;
 		}
@@ -258,11 +254,9 @@ export function appendSessionEntries(
 		knownEntries.set(entryToAppend.id, entryToAppend);
 	}
 	if (leafId !== null && !knownEntries.has(leafId)) {
-		throw new PiServerError(
-			`leafId ${leafId} does not exist in session tree`,
-			PiServerErrorCode.LEAF_ID_NOT_FOUND,
-			{ leafId },
-		);
+		throw new PiServerError(`leafId ${leafId} does not exist in session tree`, PiServerErrorCode.LEAF_ID_NOT_FOUND, {
+			leafId,
+		});
 	}
 	if (entriesToAppend.length === 0 && session.leafId === leafId) {
 		return session;
@@ -314,11 +308,6 @@ export function appendCompactionEntry(
 	return { session, entry };
 }
 
-export function getActiveMessages(sessionId: string): Message[] {
-	const session = getSession(sessionId);
-	return session ? [...session.messages] : [];
-}
-
 export function appendMessages(sessionId: string, delta: Message[]): SessionState {
 	const session = getOrCreateSession(sessionId);
 	const entries = delta.map((message) => {
@@ -332,13 +321,6 @@ export function appendMessages(sessionId: string, delta: Message[]): SessionStat
 	session.updatedAt = Date.now();
 	refreshActiveMessages(session);
 	markWalPersistenceChange(session, entries);
-	return session;
-}
-
-export function appendAssistantResponse(sessionId: string, message: Message): SessionState {
-	const session = getOrCreateSession(sessionId);
-	session.messages.push(message);
-	session.updatedAt = Date.now();
 	return session;
 }
 
