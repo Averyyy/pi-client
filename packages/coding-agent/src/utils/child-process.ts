@@ -12,6 +12,7 @@ import {
 } from "node:child_process";
 import type { Readable } from "node:stream";
 import crossSpawn from "cross-spawn";
+import { rewritePiCliSpawn } from "../core/pi-client-cli-adapter.ts";
 
 const EXIT_STDIO_GRACE_MS = 100;
 
@@ -22,7 +23,10 @@ export function spawnProcess(
 ): ChildProcessByStdio<null, Readable, Readable>;
 export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
 export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
-	return process.platform === "win32" ? crossSpawn(command, args, options) : nodeSpawn(command, args, options);
+	const invocation = rewritePiCliSpawn(command, args);
+	return process.platform === "win32"
+		? crossSpawn(invocation.command, invocation.args, options)
+		: nodeSpawn(invocation.command, invocation.args, options);
 }
 
 export function spawnProcessSync(
@@ -30,9 +34,10 @@ export function spawnProcessSync(
 	args: string[],
 	options: SpawnSyncOptionsWithStringEncoding,
 ): SpawnSyncReturns<string> {
+	const invocation = rewritePiCliSpawn(command, args);
 	return process.platform === "win32"
-		? crossSpawn.sync(command, args, options)
-		: nodeSpawnSync(command, args, options);
+		? crossSpawn.sync(invocation.command, invocation.args, options)
+		: nodeSpawnSync(invocation.command, invocation.args, options);
 }
 
 /**

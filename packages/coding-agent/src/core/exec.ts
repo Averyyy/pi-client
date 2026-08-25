@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { waitForChildProcess } from "../utils/child-process.ts";
+import { rewritePiCliSpawn } from "./pi-client-cli-adapter.ts";
 
 /**
  * Options for executing shell commands.
@@ -38,7 +39,8 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
-		const proc = spawn(command, args, {
+		const invocation = rewritePiCliSpawn(command, args);
+		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],

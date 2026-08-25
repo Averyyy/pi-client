@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
-
+import { getPiClientCliShimDir } from "../core/pi-client-cli-adapter.ts";
 export interface ShellConfig {
 	shell: string;
 	args: string[];
@@ -121,11 +121,14 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 
 export function getShellEnv(): NodeJS.ProcessEnv {
 	const binDir = getBinDir();
+	const shimDir = getPiClientCliShimDir();
 	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
 	const currentPath = process.env[pathKey] ?? "";
 	const pathEntries = currentPath.split(delimiter).filter(Boolean);
-	const hasBinDir = pathEntries.includes(binDir);
-	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
+	const prefix = [shimDir, binDir].filter(
+		(dir): dir is string => typeof dir === "string" && dir.length > 0 && !pathEntries.includes(dir),
+	);
+	const updatedPath = prefix.length > 0 ? [...prefix, ...pathEntries].join(delimiter) : currentPath;
 
 	return {
 		...process.env,

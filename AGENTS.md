@@ -76,7 +76,7 @@
 - If post-stream pi-server tree sync fails after a successful assistant response, do not auto-retry the LLM or call `agent.continue()` from that assistant leaf; detach the sync-error assistant from the active branch and let the next pi-server sync recover.
 - Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
 - To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
-
+- When `PI_SERVER_MODE` is set, the pi-client CLI adapter automatically installs a process-local PATH shim that redirects `pi` subprocess invocations to `pi-client`, and rewrites displayed command strings to show `pi-client` instead of `pi` for consistency.
 ## pi-client Web UI
 
 - `pi-client web` is the remote-backend Tau entrypoint. It should launch the forked coding-agent CLI with `PI_SERVER_MODE=true`, `PI_SERVER_URL`, and `TAU_MIRROR_PORT=1838`; Tau remains the browser mirror, not the backend selector.

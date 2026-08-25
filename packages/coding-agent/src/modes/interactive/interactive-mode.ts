@@ -82,6 +82,7 @@ import {
 	resolveModelScopeWithDiagnostics,
 } from "../../core/model-resolver.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
+import { getCliBinName } from "../../core/pi-client-cli-adapter.ts";
 import {
 	getPiClientUpdateMarkerPath,
 	PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE,
@@ -240,7 +241,7 @@ export function formatResumeCommand(sessionManager: SessionManager): string | un
 	const sessionFile = sessionManager.getSessionFile();
 	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
 
-	const args = [APP_NAME];
+	const args = [getCliBinName()];
 	if (!sessionManager.usesDefaultSessionDir()) {
 		args.push("--session-dir", quoteIfNeeded(sessionManager.getSessionDir()));
 	}

@@ -2,6 +2,7 @@
 
 ### Added
 
+- Added automatic `pi` → `pi-client` command rewriting when running in `PI_SERVER_MODE`. The adapter installs a process-local PATH shim for subprocess execution and rewrites displayed commands for consistency.
 - Initial `pi-client` package as a lightweight wrapper that exposes only the `pi-client` bin without `pi`.
 - Global install wrapper that launches the local forked coding-agent entrypoint while sharing the original `~/.pi/agent` configuration.
 - `pi-client update` command for updating the fork checkout and reinstalling both `pi-client` and `pi-server`.

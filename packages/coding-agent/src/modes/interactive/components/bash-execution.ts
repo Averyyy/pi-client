@@ -3,6 +3,7 @@
  */
 
 import { Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { rewritePiCliCommand } from "../../../core/pi-client-cli-adapter.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -31,7 +32,7 @@ export class BashExecutionComponent extends Container {
 
 	constructor(command: string, ui: TUI, excludeFromContext = false) {
 		super();
-		this.command = command;
+		this.command = rewritePiCliCommand(command);
 
 		// Use dim border for excluded-from-context commands (!! prefix)
 		const colorKey = excludeFromContext ? "dim" : "bashMode";

@@ -77,4 +77,12 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export {
+	getCliBinName,
+	getPiClientCliShimDir,
+	installPiClientCliAdapter,
+	isPiClientMode,
+	rewritePiCliCommand,
+	rewritePiCliSpawn,
+} from "./pi-client-cli-adapter.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

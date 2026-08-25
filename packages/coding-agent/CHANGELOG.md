@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 ### Fixed
 
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
