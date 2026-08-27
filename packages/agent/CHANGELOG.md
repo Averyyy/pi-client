@@ -2,9 +2,12 @@
 
 ## [Unreleased]
 
+## [0.84.3] - 2026-08-24
+
 ### Fixed
 
-- Fixed proxy replay of completed server runs to preserve the authoritative final assistant message.
+- Fixed single-object `edit` tool inputs failing validation by accepting them as one-edit arrays ([#7835](https://github.com/earendil-works/pi/issues/7835)).
+- Fixed root Markdown files such as `README.md` and `AGENTS.md` in skill directories being reported as broken skills unless they declare valid skill frontmatter ([#7805](https://github.com/earendil-works/pi/issues/7805)).
 
 ## [0.84.2] - 2026-08-14
 
@@ -103,9 +106,6 @@
 
 - Added `AgentToolResult.addedToolNames` propagation to `ToolResultMessage` so tools introduced by a result can be loaded from that transcript point onward ([#6474](https://github.com/earendil-works/pi-mono/pull/6474)).
 
-### Fixed
-
-- Fixed parallel tool scheduling so sequential tools act as source-order barriers instead of forcing the whole tool batch to run serially.
 ## [0.80.6] - 2026-07-09
 
 ### Added
