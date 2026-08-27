@@ -3207,14 +3207,9 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
-	private _isNonRetryableProviderLimitError(errorMessage: string): boolean {
-		return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient.?balance|balance.?insufficient|insufficient_quota|out of budget|quota exceeded|billing|payment required|402/i.test(
-			errorMessage,
-		);
-	}
-
 	/**
-	 * Check if an error is retryable (overloaded, rate limit, server errors).
+	 * Check if an error is retryable. Provider error text is retryable by default,
+	 * except usage/quota/balance limits and session or context failures.
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
@@ -3223,7 +3218,6 @@ export class AgentSession {
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
 		const piServerPhase = getPiServerFailurePhase(message);
 		if (piServerPhase && piServerPhase !== "provider_stream") return false;
-		if (message.errorMessage && this._isNonRetryableProviderLimitError(message.errorMessage)) return false;
 		return isRetryableAssistantError(message);
 	}
 

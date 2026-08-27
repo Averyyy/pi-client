@@ -57,12 +57,21 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
-	it("keeps provider limit errors non-retryable", () => {
-		expect(
-			isRetryableAssistantError(
-				fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 quota exceeded" }),
-			),
-		).toBe(false);
+	it.each(["429 Usage limit exceeded", "insufficient_quota", "401 Insufficient balance"])(
+		"keeps usage/quota/balance errors non-retryable: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
+	it("retries errors without usage text by default", () => {
+		for (const errorMessage of [
+			"invalid_api_key",
+			"Error: Upstream service temporarily unavailable. Please try again later.",
+			"Provider failed, please try again&#x20;",
+		]) {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		}
 	});
 
 	it("classifies assistant error messages", () => {
@@ -98,9 +107,9 @@ describe("retryAssistantCall", () => {
 		expect(onRetryScheduled).not.toHaveBeenCalled();
 	});
 
-	it("does not retry a non-retryable error (quota/billing)", async () => {
+	it("does not retry an error containing usage/quota", async () => {
 		const produce = vi.fn(async () =>
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient Usage quota" }),
 		);
 		const onRetryScheduled = vi.fn();
 		const onRetryFinished = vi.fn();

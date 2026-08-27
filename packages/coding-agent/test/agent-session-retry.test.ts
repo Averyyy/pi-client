@@ -151,8 +151,8 @@ describe("AgentSession retry", () => {
 		expect(created.session.isRetrying).toBe(false);
 	});
 
-	it("does not retry provider balance errors", async () => {
-		const created = await createSession({ failCount: 99, errorMessage: "401 Insufficient balance" });
+	it("does not retry usage errors", async () => {
+		const created = await createSession({ failCount: 99, errorMessage: "401 usage limit reached" });
 		const events: string[] = [];
 		created.session.subscribe((event) => {
 			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
