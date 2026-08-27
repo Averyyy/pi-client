@@ -93,7 +93,7 @@ export async function resolveApiKey(provider: string): Promise<string | undefine
 		if (!oauth) return undefined;
 		let credential = entry;
 		if (Date.now() >= credential.expires) {
-			credential = await oauth.refresh(credential);
+			credential = await oauth.refresh(credential, new AbortController().signal);
 			storage[provider] = credential;
 			saveAuthStorage(storage);
 		}
@@ -224,7 +224,9 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
 		getSystemPrompt: () => undefined,
+		getSystemPromptSource: () => undefined,
 		getAppendSystemPrompt: () => [],
+		getAppendSystemPromptSources: () => [],
 		extendResources: () => {},
 		reload: async () => {},
 	};

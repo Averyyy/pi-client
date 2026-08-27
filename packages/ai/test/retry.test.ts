@@ -12,6 +12,8 @@ const bunFetchSocketClosedMessage =
 const openAIResponsesEarlyEofMessage = "OpenAI Responses stream ended before a terminal response event";
 const wrappedDnsLookupError =
 	"The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.us-east-1.amazonaws.com)";
+const providerRetryingMessage = "Error: Provider failed, retrying...";
+const upstreamHttp2StreamFailedMessage = "Upstream http/2 stream failed";
 
 describe("provider retry classification", () => {
 	it("matches explicit provider retry guidance", () => {
@@ -38,6 +40,16 @@ describe("provider retry classification", () => {
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: bunFetchSocketClosedMessage }),
 			),
 		).toBe(true);
+	});
+
+	it("matches provider retry and upstream HTTP/2 stream failure wording", () => {
+		for (const errorMessage of [
+			"Error: exceeded request buffer limit while retrying upstream",
+			providerRetryingMessage,
+			upstreamHttp2StreamFailedMessage,
+		]) {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		}
 	});
 
 	it.each([
@@ -130,6 +142,22 @@ describe("retryAssistantCall", () => {
 		expect(onRetryScheduled).toHaveBeenCalledTimes(3);
 		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "terminated");
 	});
+
+	it.each([providerRetryingMessage, upstreamHttp2StreamFailedMessage])(
+		"retries %s until a later attempt succeeds",
+		async (errorMessage) => {
+			let attempts = 0;
+			const produce = vi.fn(async () => {
+				attempts++;
+				return attempts === 1
+					? fauxAssistantMessage("", { stopReason: "error", errorMessage })
+					: fauxAssistantMessage("recovered");
+			});
+			const result = await retryAssistantCall(produce, { enabled: true, maxRetries: 1, baseDelayMs: 0 }, undefined);
+			expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+			expect(produce).toHaveBeenCalledTimes(2);
+		},
+	);
 
 	it("stops retrying once a call succeeds", async () => {
 		let n = 0;

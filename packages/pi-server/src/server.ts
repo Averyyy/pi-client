@@ -3,11 +3,11 @@ import { createRequire } from "node:module";
 import {
 	type CompactionPreparationOptions,
 	type CompactionSettings,
-	type CompactResult,
-	compact,
+	compactLegacy,
 	DEFAULT_COMPACTION_SETTINGS,
+	type LegacyCompactResult,
 	type ProxyAssistantMessageEvent,
-	prepareCompaction,
+	prepareLegacyCompaction,
 	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -23,6 +23,7 @@ import {
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
+import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
@@ -32,7 +33,6 @@ import {
 	appendMessages,
 	appendSessionEntries,
 	deleteSession as deleteSessionFromStore,
-	dropLastAssistantError,
 	getOrCreateSession,
 	getSession,
 	getSessionBranch,
@@ -127,15 +127,10 @@ function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 	return models;
 }
 
-interface SessionIdBody {
-	sessionId: string;
-}
-
 interface StreamRunRecord {
 	sessionId: string;
 	runId: string;
 	status: "running" | "completed" | "failed";
-	events: ProxyAssistantMessageEvent[];
 	message?: AssistantMessage;
 	errorMessage?: string;
 	createdAt: number;
@@ -145,6 +140,7 @@ interface StreamRunRecord {
 const STREAM_HEARTBEAT = ": keep-alive\n\n";
 const JSON_HEARTBEAT = " \n";
 const STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
+const STREAM_RUN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const streamRuns = new Map<string, StreamRunRecord>();
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -162,6 +158,19 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(data);
 }
 
+function sendError(
+	res: ServerResponse,
+	status: number,
+	message: string,
+	code?: PiServerErrorCode,
+	details?: Record<string, unknown>,
+): void {
+	const body: PiServerErrorResponse = { error: message };
+	if (code) body.code = code;
+	if (details) body.details = details;
+	sendJson(res, status, body);
+}
+
 function logRequestError(req: IncomingMessage, error: unknown): void {
 	const message = error instanceof Error ? error.stack || error.message : String(error);
 	console.error(`${req.method ?? "UNKNOWN"} ${req.url ?? "/"} failed: ${message}`);
@@ -173,11 +182,6 @@ function authenticate(config: ServerConfig, req: IncomingMessage): boolean {
 	if (!header) return false;
 	const token = header.startsWith("Bearer ") ? header.slice(7) : header;
 	return token === config.authToken;
-}
-
-interface ResolvedStream {
-	model: Model<any>;
-	options: SimpleStreamOptions;
 }
 
 function sessionResponseBody(session: SessionState) {
@@ -206,26 +210,71 @@ function getStreamRun(sessionId: string, runId: string): StreamRunRecord | undef
 
 function startStreamRun(sessionId: string, runId: string): StreamRunRecord {
 	const existing = getStreamRun(sessionId, runId);
-	if (existing?.status === "completed" || existing?.status === "failed") return existing;
+	if (existing?.status === "completed") return existing;
 	const now = Date.now();
 	const run: StreamRunRecord = existing ?? {
 		sessionId,
 		runId,
 		status: "running",
-		events: [],
 		createdAt: now,
 		updatedAt: now,
 	};
+	if (existing) {
+		run.message = undefined;
+		run.errorMessage = undefined;
+	}
 	run.status = "running";
 	run.updatedAt = now;
 	streamRuns.set(runKey(sessionId, runId), run);
 	return run;
 }
 
-function recordStreamRunEvent(run: StreamRunRecord | undefined, event: ProxyAssistantMessageEvent): void {
-	if (!run) return;
-	run.events.push(event);
-	run.updatedAt = Date.now();
+function replayStreamRun(run: StreamRunRecord): ProxyAssistantMessageEvent[] {
+	if (!run.message) return [];
+	if (
+		run.message.stopReason !== "stop" &&
+		run.message.stopReason !== "length" &&
+		run.message.stopReason !== "toolUse" &&
+		run.message.stopReason !== "deferred"
+	) {
+		return [];
+	}
+	const events: ProxyAssistantMessageEvent[] = [{ type: "start" }];
+	for (const [contentIndex, content] of run.message.content.entries()) {
+		switch (content.type) {
+			case "text":
+				events.push(
+					{ type: "text_start", contentIndex },
+					{ type: "text_delta", contentIndex, delta: content.text },
+					{ type: "text_end", contentIndex, contentSignature: content.textSignature },
+				);
+				break;
+			case "thinking":
+				events.push(
+					{ type: "thinking_start", contentIndex },
+					{ type: "thinking_delta", contentIndex, delta: content.thinking },
+					{ type: "thinking_end", contentIndex, contentSignature: content.thinkingSignature },
+				);
+				break;
+			case "toolCall":
+				events.push(
+					{ type: "toolcall_start", contentIndex, id: content.id, toolName: content.name },
+					{ type: "toolcall_delta", contentIndex, delta: JSON.stringify(content.arguments) },
+					{ type: "toolcall_end", contentIndex, toolCall: content },
+				);
+				break;
+			default:
+				break;
+		}
+	}
+	events.push({
+		type: "done",
+		reason: run.message.stopReason,
+		usage: run.message.usage,
+		deferred: run.message.deferred,
+		message: run.message,
+	});
+	return events;
 }
 
 function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantMessage): void {
@@ -242,6 +291,45 @@ function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): 
 	run.errorMessage = errorMessage;
 	run.updatedAt = Date.now();
 }
+
+function touchStreamRun(run: StreamRunRecord | undefined): void {
+	if (run) run.updatedAt = Date.now();
+}
+
+function writeStreamEvent(res: ServerResponse, event: ProxyAssistantMessageEvent): void {
+	if (!res.writableEnded && !res.destroyed) {
+		res.write(encodeProxyEvent(event));
+	}
+}
+
+function writeStreamError(res: ServerResponse, message: string): void {
+	if (!res.writableEnded && !res.destroyed) {
+		res.write(encodeErrorEvent(message));
+	}
+}
+
+function endStreamResponse(res: ServerResponse): void {
+	if (!res.writableEnded && !res.destroyed) {
+		res.end();
+	}
+}
+
+function cleanupExpiredStreamRuns(nowMs: number): void {
+	for (const [key, run] of streamRuns) {
+		if (nowMs - run.updatedAt > STREAM_RUN_TTL_MS) {
+			streamRuns.delete(key);
+		}
+	}
+}
+
+function deleteStreamRunsForSession(sessionId: string): void {
+	for (const [key, run] of streamRuns) {
+		if (run.sessionId === sessionId) streamRuns.delete(key);
+	}
+}
+
+const streamRunCleanupTimer = setInterval(() => cleanupExpiredStreamRuns(Date.now()), STREAM_RUN_TTL_MS / 4);
+streamRunCleanupTimer.unref();
 
 function sessionHistoryFullResponseBody(session: SessionState, baseMessageCount: number) {
 	return {
@@ -286,7 +374,7 @@ function sessionTreePatchResponseBody(
 	};
 }
 
-type PreparedCompaction = Parameters<typeof compact>[0];
+type PreparedCompaction = Parameters<typeof compactLegacy>[0];
 
 interface PreparedSessionCompact {
 	session: SessionState;
@@ -296,7 +384,7 @@ interface PreparedSessionCompact {
 
 interface SessionCompactSuccessBody {
 	success: true;
-	compaction: CompactResult;
+	compaction: LegacyCompactResult;
 	compactionEntry: SessionTreeEntry;
 	sessionId: string;
 	staticContextHash: string;
@@ -319,20 +407,12 @@ interface SessionCompactSuccessBody {
 
 interface SessionCompactHttpResponse {
 	status: number;
-	body: { error: string } | SessionCompactSuccessBody;
-}
-
-export function resolveStreamOptions(
-	_config: ServerConfig,
-	model: Model<any>,
-	body: StreamRequestBody,
-): ResolvedStream {
-	return { model, options: { ...(body.options ?? {}) } };
+	body: PiServerErrorResponse | SessionCompactSuccessBody;
 }
 
 function handleSessionInit(config: ServerConfig, body: SessionInitBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (body.staticContext) {
@@ -351,11 +431,11 @@ function handleSessionUpdate(
 	res: ServerResponse,
 ): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!body.staticContext) {
-		sendJson(res, 400, { error: "staticContext is required for update" });
+		sendError(res, 400, "staticContext is required for update", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	setStaticContext(body.sessionId, body.staticContext);
@@ -366,11 +446,11 @@ function handleSessionUpdate(
 
 function handleSessionSync(config: ServerConfig, body: SessionSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!Array.isArray(body.messages)) {
-		sendJson(res, 400, { error: "messages is required" });
+		sendError(res, 400, "messages is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (body.staticContext) {
@@ -383,11 +463,11 @@ function handleSessionSync(config: ServerConfig, body: SessionSyncBody, res: Ser
 
 function handleSessionAppend(config: ServerConfig, body: SessionAppendBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!Array.isArray(body.messages)) {
-		sendJson(res, 400, { error: "messages is required" });
+		sendError(res, 400, "messages is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (body.staticContext) {
@@ -400,11 +480,11 @@ function handleSessionAppend(config: ServerConfig, body: SessionAppendBody, res:
 
 function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!Array.isArray(body.entries)) {
-		sendJson(res, 400, { error: "entries is required" });
+		sendError(res, 400, "entries is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (body.staticContext) {
@@ -417,29 +497,47 @@ function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, 
 
 function handleSessionTreeAppend(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!Array.isArray(body.entries)) {
-		sendJson(res, 400, { error: "entries is required" });
+		sendError(res, 400, "entries is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
-	if (body.staticContext) {
-		setStaticContext(body.sessionId, body.staticContext);
+	try {
+		if (body.staticContext) {
+			setStaticContext(body.sessionId, body.staticContext);
+		}
+		const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
+		persistSession(config, session);
+		sendJson(res, 200, sessionResponseBody(session));
+	} catch (error) {
+		if (error instanceof PiServerError) {
+			sendError(res, 400, error.message, error.code, error.details);
+		} else {
+			const message = error instanceof Error ? error.message : String(error);
+			sendError(res, 500, message, PiServerErrorCode.INTERNAL_ERROR);
+		}
 	}
-	const session = appendSessionEntries(body.sessionId, body.entries, body.leafId ?? null);
-	persistSession(config, session);
-	sendJson(res, 200, sessionResponseBody(session));
 }
 
 function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
-	const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
-	persistSession(config, session);
-	sendJson(res, 200, sessionResponseBody(session));
+	try {
+		const session = switchSessionLeaf(body.sessionId, body.leafId ?? null);
+		persistSession(config, session);
+		sendJson(res, 200, sessionResponseBody(session));
+	} catch (error) {
+		if (error instanceof PiServerError) {
+			sendError(res, 400, error.message, error.code, error.details);
+		} else {
+			const message = error instanceof Error ? error.message : String(error);
+			sendError(res, 500, message, PiServerErrorCode.INTERNAL_ERROR);
+		}
+	}
 }
 
 function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact | SessionCompactHttpResponse {
@@ -452,11 +550,15 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 
 	const session = getSession(body.sessionId);
 	if (!session) {
-		return { status: 404, body: { error: "session not found" } };
+		return { status: 404, body: { error: "session not found", code: PiServerErrorCode.SESSION_NOT_FOUND } };
 	}
 
 	const entries = getSessionBranch(session);
-	const preparationResult = prepareCompaction(entries, body.settings ?? DEFAULT_COMPACTION_SETTINGS, body.preparation);
+	const preparationResult = prepareLegacyCompaction(
+		entries,
+		body.settings ?? DEFAULT_COMPACTION_SETTINGS,
+		body.preparation,
+	);
 	if (!preparationResult.ok) {
 		return { status: 400, body: { error: preparationResult.error.message } };
 	}
@@ -477,7 +579,7 @@ async function completeSessionCompact(
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 ): Promise<SessionCompactHttpResponse> {
-	const result = await compact(
+	const result = await compactLegacy(
 		prepared.preparation,
 		createRequestModels(body.model, prepared.options),
 		body.model,
@@ -486,28 +588,20 @@ async function completeSessionCompact(
 		prepared.options.reasoning,
 	);
 	if (!result.ok) {
-		return { status: 500, body: { error: result.error.message } };
+		return { status: 500, body: { error: result.error.message, code: PiServerErrorCode.INTERNAL_ERROR } };
 	}
 
 	const baseTreeHash = prepared.session.treeHash;
 	const baseEntryCount = prepared.session.entries.length;
 	const compaction = result.value;
-	const firstKeptEntryId = compaction.firstKeptEntryId;
-	if (!firstKeptEntryId) {
-		return { status: 500, body: { error: "Compaction result is missing firstKeptEntryId" } };
-	}
-	const normalizedCompaction = { ...compaction, firstKeptEntryId };
-	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(
-		body.sessionId,
-		normalizedCompaction,
-	);
+	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, compaction);
 	persistSession(config, updatedSession);
 	if (!body.fullResponse && body.baseTreeHash === baseTreeHash) {
 		return {
 			status: 200,
 			body: {
 				success: true,
-				compaction: normalizedCompaction satisfies CompactResult,
+				compaction: compaction satisfies LegacyCompactResult,
 				compactionEntry,
 				...sessionResponseBody(updatedSession),
 				staticContext: updatedSession.staticContext,
@@ -525,7 +619,7 @@ async function completeSessionCompact(
 		status: 200,
 		body: {
 			success: true,
-			compaction: normalizedCompaction satisfies CompactResult,
+			compaction: compaction satisfies LegacyCompactResult,
 			compactionEntry,
 			...sessionResponseBody(updatedSession),
 			staticContext: updatedSession.staticContext,
@@ -625,20 +719,6 @@ async function handleSessionCompact(
 	await handleSessionCompactJsonStream(config, body, prepared, res);
 }
 
-function handleDropLastAssistantError(config: ServerConfig, body: SessionIdBody, res: ServerResponse): void {
-	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
-		return;
-	}
-	const dropped = dropLastAssistantError(body.sessionId);
-	const session = getSession(body.sessionId);
-	if (session) {
-		persistSession(config, session);
-	}
-	const messageCount = session?.messages.length ?? 0;
-	sendJson(res, 200, { success: true, dropped, messageCount });
-}
-
 function handleSessionHistory(
 	sessionId: string,
 	from: number | undefined,
@@ -649,7 +729,7 @@ function handleSessionHistory(
 ): void {
 	const session = getSession(sessionId);
 	if (!session) {
-		sendJson(res, 404, { error: "session not found" });
+		sendError(res, 404, "session not found", PiServerErrorCode.SESSION_NOT_FOUND);
 		return;
 	}
 	const baseMessageCount = from ?? 0;
@@ -668,7 +748,7 @@ function handleSessionHistory(
 function handleSessionRun(sessionId: string, runId: string, res: ServerResponse): void {
 	const run = getStreamRun(sessionId, runId);
 	if (!run) {
-		sendJson(res, 404, { error: "run not found" });
+		sendError(res, 404, "run not found", PiServerErrorCode.RUN_NOT_FOUND);
 		return;
 	}
 	sendJson(res, 200, run);
@@ -688,13 +768,15 @@ export function buildStreamContext(
 
 function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
 	if (!body.sessionId) {
-		sendJson(res, 400, { error: "sessionId is required" });
+		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!body.model) {
-		sendJson(res, 400, { error: "model is required" });
+		sendError(res, 400, "model is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
+
+	cleanupExpiredStreamRuns(Date.now());
 
 	const session = getOrCreateSession(body.sessionId);
 
@@ -704,23 +786,48 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	}
 
 	if (!session.staticContext && !body.staticContext) {
-		sendJson(res, 400, { error: "Session has no static context. Initialize with /api/session/init first." });
+		sendError(
+			res,
+			400,
+			"Session has no static context. Initialize with /api/session/init first.",
+			PiServerErrorCode.SESSION_NO_STATIC_CONTEXT,
+		);
 		return;
 	}
 
 	if (body.ephemeralMessages !== undefined && !Array.isArray(body.ephemeralMessages)) {
-		sendJson(res, 400, { error: "ephemeralMessages must be an array" });
+		sendError(res, 400, "ephemeralMessages must be an array", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
 	if (body.contextOverlay !== undefined && !Array.isArray(body.contextOverlay)) {
-		sendJson(res, 400, { error: "contextOverlay must be an array" });
+		sendError(res, 400, "contextOverlay must be an array", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
 
 	const context = buildStreamContext(session, body);
 	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 
-	const { model: resolvedModel, options: streamOptions } = resolveStreamOptions(config, body.model, body);
+	const resolvedModel = body.model;
+	const streamOptions: SimpleStreamOptions = { ...(body.options ?? {}) };
+
+	if (existingRun?.status === "completed") {
+		res.writeHead(200, {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+		});
+		res.flushHeaders();
+		res.write(STREAM_HEARTBEAT);
+		for (const event of replayStreamRun(existingRun)) {
+			writeStreamEvent(res, event);
+		}
+		endStreamResponse(res);
+		return;
+	}
+	if (existingRun?.status === "running") {
+		sendError(res, 409, "A stream with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
+		return;
+	}
 
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
@@ -730,18 +837,11 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	res.flushHeaders();
 	res.write(STREAM_HEARTBEAT);
 
-	if (existingRun?.status === "completed") {
-		for (const event of existingRun.events) {
-			res.write(encodeProxyEvent(event));
-		}
-		res.end();
-		return;
-	}
-
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
 
 	const heartbeat = setInterval(() => {
-		if (!res.writableEnded) {
+		touchStreamRun(run);
+		if (!res.writableEnded && !res.destroyed) {
 			res.write(STREAM_HEARTBEAT);
 		}
 	}, STREAM_HEARTBEAT_INTERVAL_MS);
@@ -754,8 +854,8 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		clearInterval(heartbeat);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
-		res.write(encodeErrorEvent(message));
-		res.end();
+		writeStreamError(res, message);
+		endStreamResponse(res);
 		return;
 	}
 
@@ -764,8 +864,8 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 			for await (const event of stream) {
 				const proxyEvent = toProxyEvent(event);
 				if (proxyEvent) {
-					recordStreamRunEvent(run, proxyEvent);
-					res.write(encodeProxyEvent(proxyEvent));
+					touchStreamRun(run);
+					writeStreamEvent(res, proxyEvent);
 				}
 				if (event.type === "done") {
 					completeStreamRun(run, event.message);
@@ -777,13 +877,13 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 			clearInterval(heartbeat);
 		}
 
-		res.end();
+		endStreamResponse(res);
 	})().catch((err) => {
 		clearInterval(heartbeat);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
-		res.write(encodeErrorEvent(message));
-		res.end();
+		writeStreamError(res, message);
+		endStreamResponse(res);
 	});
 }
 
@@ -838,11 +938,6 @@ async function handlePostRequest(
 		return true;
 	}
 
-	if (pathname === "/api/session/drop-last-assistant-error") {
-		handleDropLastAssistantError(config, body as SessionIdBody, res);
-		return true;
-	}
-
 	if (pathname === "/api/session/compact") {
 		await handleSessionCompact(config, body as SessionCompactBody, res);
 		return true;
@@ -893,19 +988,19 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 			const fromParam = url.searchParams.get("from");
 			const from = fromParam === null ? undefined : Number(fromParam);
 			if (from !== undefined && (!Number.isInteger(from) || from < 0)) {
-				sendJson(res, 400, { error: "from must be a non-negative integer" });
+				sendError(res, 400, "from must be a non-negative integer", PiServerErrorCode.INVALID_REQUEST);
 				return;
 			}
 			const entriesFromParam = url.searchParams.get("entriesFrom");
 			const entriesFrom = entriesFromParam === null ? undefined : Number(entriesFromParam);
 			if (entriesFrom !== undefined && (!Number.isInteger(entriesFrom) || entriesFrom < 0)) {
-				sendJson(res, 400, { error: "entriesFrom must be a non-negative integer" });
+				sendError(res, 400, "entriesFrom must be a non-negative integer", PiServerErrorCode.INVALID_REQUEST);
 				return;
 			}
 			const revisionParam = url.searchParams.get("revision");
 			const revision = revisionParam === null ? undefined : Number(revisionParam);
 			if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) {
-				sendJson(res, 400, { error: "revision must be a non-negative integer" });
+				sendError(res, 400, "revision must be a non-negative integer", PiServerErrorCode.INVALID_REQUEST);
 				return;
 			}
 			handleSessionHistory(
@@ -927,11 +1022,19 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 					sendJson(res, 200, chunkResult.ack);
 					return;
 				}
-				await handlePostRequest(config, chunkResult.target, JSON.parse(chunkResult.bodyJson) as unknown, res);
+				const handled = await handlePostRequest(
+					config,
+					chunkResult.target,
+					JSON.parse(chunkResult.bodyJson) as unknown,
+					res,
+				);
+				if (!handled && !res.headersSent) {
+					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
+				}
 			} catch (err) {
 				logRequestError(req, err);
 				if (!res.headersSent) {
-					sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+					sendError(res, 400, err instanceof Error ? err.message : String(err), PiServerErrorCode.INVALID_REQUEST);
 				} else {
 					res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
 					res.end();
@@ -944,10 +1047,14 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
 				if (await handlePostRequest(config, url.pathname, body, res)) return;
+				if (!res.headersSent) {
+					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
+					return;
+				}
 			} catch (err) {
 				logRequestError(req, err);
 				if (!res.headersSent) {
-					sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+					sendError(res, 500, err instanceof Error ? err.message : String(err), PiServerErrorCode.INTERNAL_ERROR);
 				} else {
 					res.write(encodeErrorEvent(err instanceof Error ? err.message : String(err)));
 					res.end();
@@ -959,12 +1066,13 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		if (req.method === "DELETE" && url.pathname.startsWith("/api/session/")) {
 			const sessionId = decodeURIComponent(url.pathname.slice("/api/session/".length));
 			deleteSessionFromStore(sessionId);
+			deleteStreamRunsForSession(sessionId);
 			deletePersistedSession(config.sessionStoreDir, sessionId);
 			sendJson(res, 200, { deleted: sessionId });
 			return;
 		}
 
-		sendJson(res, 404, { error: "Not found" });
+		sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
 	});
 
 	return server;
@@ -1016,9 +1124,14 @@ function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent 
 		case "toolcall_delta":
 			return { type: "toolcall_delta", contentIndex: event.contentIndex, delta: event.delta };
 		case "toolcall_end":
-			return { type: "toolcall_end", contentIndex: event.contentIndex };
+			return { type: "toolcall_end", contentIndex: event.contentIndex, toolCall: event.toolCall };
 		case "done":
-			return { type: "done", reason: event.reason, usage: event.message.usage };
+			return {
+				type: "done",
+				reason: event.reason,
+				usage: event.message.usage,
+				deferred: event.message.deferred,
+			};
 		case "error":
 			return {
 				type: "error",

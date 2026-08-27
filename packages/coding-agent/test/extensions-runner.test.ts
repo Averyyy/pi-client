@@ -1,4 +1,4 @@
-import { createModelRegistry } from "./model-runtime-test-utils.ts";
+import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 /**
  * Tests for ExtensionRunner - conflict detection, error handling, tool wrapping.
  */
@@ -18,6 +18,7 @@ import type {
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
+import type { ScopedModel } from "../src/core/model-resolver.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
 describe("ExtensionRunner", () => {
@@ -32,8 +33,7 @@ describe("ExtensionRunner", () => {
 		extensionsDir = path.join(tempDir, "extensions");
 		fs.mkdirSync(extensionsDir);
 		sessionManager = SessionManager.inMemory();
-		const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
-		modelRegistry = await createModelRegistry(authStorage);
+		modelRegistry = await createInMemoryModelRegistry(AuthStorage.inMemory());
 	});
 
 	afterEach(() => {
@@ -99,7 +99,24 @@ describe("ExtensionRunner", () => {
 		getContextUsage: () => undefined,
 		compact: () => {},
 		getSystemPrompt: () => "",
+		getScopedModels: () => [],
 	};
+
+	describe("scopedModels", () => {
+		it("reflects the getScopedModels context action on ctx.scopedModels", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			// Before bindCore the default is an empty list (never undefined).
+			expect(runner.createContext().scopedModels).toEqual([]);
+
+			// After bindCore wires a getScopedModels action, ctx.scopedModels
+			// returns it live (same reference, lazy getter).
+			const scoped = [{ model: { id: "scoped-test" }, thinkingLevel: "high" }] as unknown as ScopedModel[];
+			runner.bindCore(extensionActions, { ...extensionContextActions, getScopedModels: () => scoped });
+			expect(runner.createContext().scopedModels).toBe(scoped);
+		});
+	});
 
 	describe("project_trust", () => {
 		it("continues past undecided handlers and returns the first yes/no decision", async () => {
@@ -576,6 +593,21 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("message and entry renderers", () => {
+		it("gets Markdown transformers in extension load order", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerMarkdownTransformer((markdown) => markdown);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "markdown-renderer-a.ts"), extCode);
+			fs.writeFileSync(path.join(extensionsDir, "markdown-renderer-b.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			expect(runner.getMarkdownTransformers()).toHaveLength(2);
+		});
+
 		it("gets message renderer by type", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -838,7 +870,7 @@ describe("ExtensionRunner", () => {
 			expect(errors).toEqual([
 				'/tmp/broken-extension.ts: Provider broken-provider: "api" is required when registering streamSimple.',
 			]);
-			await expect(modelRegistry.refresh()).resolves.toBeUndefined();
+			await expect(modelRegistry.refresh()).resolves.toMatchObject({ aborted: false });
 		});
 
 		it("pre-bind unregister removes all queued registrations for a provider", () => {

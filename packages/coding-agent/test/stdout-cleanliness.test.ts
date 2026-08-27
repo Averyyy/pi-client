@@ -2,13 +2,19 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
+import { allowNetwork } from "./test-network-env.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxLoaderPath = resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 
 const tempDirs: string[] = [];
+
+beforeEach(() => {
+	allowNetwork();
+});
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) {
@@ -55,7 +61,7 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 	);
 
 	return await new Promise((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderPath, cliPath, ...args], {
+		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...args], {
 			cwd: projectDir,
 			env: {
 				...process.env,

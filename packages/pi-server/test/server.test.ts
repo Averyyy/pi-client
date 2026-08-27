@@ -4,23 +4,24 @@ import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as AgentCore from "@earendil-works/pi-agent-core";
-import { compact as compactAgentCore } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import { compactLegacy as compactAgentCore } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import { registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createPiServer, resolveStreamOptions, type ServerConfig } from "../src/server.ts";
+import { createPiServer, type ServerConfig } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 
 vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
 	const actual = await importOriginal<typeof AgentCore>();
 	return {
 		...actual,
-		compact: vi.fn(async () => ({
+		compactLegacy: vi.fn(async () => ({
 			ok: true,
 			value: {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		})),
 	};
@@ -230,6 +231,50 @@ describe("pi-server HTTP", () => {
 		expect(responseBody.path).toBe(join(uploadDir, "chunked-upload"));
 		expect(responseBody.files).toBe(1);
 		expect(readFileSync(join(uploadDir, "chunked-upload", "nested", "file.txt"), "utf-8")).toBe("hello");
+	});
+
+	it("returns a structured error code for tree divergence", async () => {
+		const res = await fetch(`${baseUrl}/api/session/tree/append`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({
+				sessionId: "tree-error",
+				entries: [
+					{
+						type: "message",
+						id: "child",
+						parentId: "missing-parent",
+						timestamp: "2026-01-01T00:00:00.000Z",
+						message: { role: "user", content: "test", timestamp: 1000 },
+					},
+				],
+				leafId: "child",
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({
+			error: "parent entry missing-parent does not exist",
+			code: "PARENT_ENTRY_NOT_FOUND",
+			details: { parentId: "missing-parent" },
+		});
+	});
+
+	it("returns a response for an unknown chunk target", async () => {
+		const encoded = Buffer.from(JSON.stringify({ sessionId: "unknown-target" }), "utf8").toString("base64");
+		const res = await fetch(`${baseUrl}/api/request/chunk`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({
+				requestId: "unknown-target-request",
+				target: "/api/session/removed",
+				chunkIndex: 0,
+				totalChunks: 1,
+				sha256: sha256(encoded),
+				chunk: encoded,
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ code: "INVALID_REQUEST" });
 	});
 
 	it("rejects receive paths that could escape the upload directory", async () => {
@@ -547,6 +592,7 @@ describe("pi-server HTTP", () => {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		});
 
@@ -639,6 +685,7 @@ describe("pi-server HTTP", () => {
 				summary: "summary",
 				firstKeptEntryId: "u2",
 				tokensBefore: 10,
+				retainedTail: [],
 			},
 		});
 
@@ -877,71 +924,6 @@ describe("pi-server HTTP", () => {
 		expect(getSession("missing-history")).toBeUndefined();
 	});
 
-	it("drops only the last assistant error message", async () => {
-		const errorMessage = {
-			role: "assistant" as const,
-			content: [],
-			api: "openai-completions" as const,
-			provider: "opencode-go" as const,
-			model: "glm-5.1",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error" as const,
-			errorMessage: "retryable",
-			timestamp: 2000,
-		};
-
-		await fetch(`${baseUrl}/api/session/sync`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer test-token",
-			},
-			body: JSON.stringify({
-				sessionId: "drop-error",
-				messages: [{ role: "user", content: "hello", timestamp: 1000 }, errorMessage],
-			}),
-		});
-
-		const res = await fetch(`${baseUrl}/api/session/drop-last-assistant-error`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer test-token",
-			},
-			body: JSON.stringify({ sessionId: "drop-error" }),
-		});
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as ServerResponse;
-		expect(body.dropped).toBe(true);
-		expect(body.messageCount).toBe(1);
-		expect(getSession("drop-error")?.messages.map((message) => message.role)).toEqual(["user"]);
-	});
-
-	it("does not create a session when dropping a missing assistant error", async () => {
-		const res = await fetch(`${baseUrl}/api/session/drop-last-assistant-error`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer test-token",
-			},
-			body: JSON.stringify({ sessionId: "missing-drop-error" }),
-		});
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as ServerResponse;
-		expect(body.dropped).toBe(false);
-		expect(body.messageCount).toBe(0);
-		expect(getSession("missing-drop-error")).toBeUndefined();
-	});
-
 	it("rejects stream without static context", async () => {
 		const res = await fetch(`${baseUrl}/api/stream`, {
 			method: "POST",
@@ -1061,6 +1043,163 @@ describe("pi-server HTTP", () => {
 		expect(runBody.message?.content).toEqual([{ type: "text", text: "journaled" }]);
 	});
 
+	it("replays a completed run through a second stream request", async () => {
+		const faux = registerFauxProvider();
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "replay me" }],
+			api: faux.models[0].api,
+			provider: faux.models[0].provider,
+			model: faux.models[0].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1000,
+		};
+		faux.setResponses([message]);
+		const sessionId = "stream-replay";
+		const runId = "run-replay";
+		const init = { sessionId, staticContext: { systemPrompt: "Replay" } };
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify(init),
+		});
+		const first = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+		});
+		expect(first.status).toBe(200);
+		await first.text();
+		const second = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+		});
+		expect(second.status).toBe(200);
+		const replay = await second.text();
+		expect(replay).toContain('"type":"done"');
+		expect(replay).toContain("replay me");
+	});
+
+	it("clears completed run journals when deleting a session", async () => {
+		const faux = registerFauxProvider();
+		const makeMessage = (text: string): AssistantMessage => ({
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: faux.models[0].api,
+			provider: faux.models[0].provider,
+			model: faux.models[0].id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1000,
+		});
+		faux.setResponses([makeMessage("first"), makeMessage("second")]);
+		const sessionId = "deleted-run-session";
+		const runId = "reused-run";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "test" } }),
+		});
+		let response = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+		});
+		await response.text();
+		response = await fetch(`${baseUrl}/api/session/${sessionId}`, {
+			method: "DELETE",
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(response.status).toBe(200);
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "test" } }),
+		});
+		response = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+		});
+		const secondStream = await response.text();
+		expect(secondStream).toContain("second");
+		expect(faux.state.callCount).toBe(2);
+	});
+
+	it("preserves deferred response handles in proxied done events", async () => {
+		const faux = registerFauxProvider();
+		faux.setResponses([
+			{
+				role: "assistant",
+				content: [],
+				api: faux.models[0].api,
+				provider: faux.models[0].provider,
+				model: faux.models[0].id,
+				usage: {
+					input: 1,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "deferred",
+				deferred: {
+					provider: faux.models[0].provider,
+					modelId: faux.models[0].id,
+					api: faux.models[0].api,
+					id: "deferred-response-1",
+				},
+				timestamp: 1000,
+			},
+		]);
+
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-deferred",
+				staticContext: { systemPrompt: "Deferred test" },
+			}),
+		});
+
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer test-token",
+			},
+			body: JSON.stringify({
+				sessionId: "stream-deferred",
+				model: faux.models[0],
+			}),
+		});
+
+		const eventStream = await res.text();
+		expect(eventStream).toContain('"reason":"deferred"');
+		expect(eventStream).toContain('"id":"deferred-response-1"');
+	});
+
 	it("returns 404 for unknown routes with auth", async () => {
 		const res = await fetch(`${baseUrl}/unknown`, {
 			headers: { Authorization: "Bearer test-token" },
@@ -1105,57 +1244,5 @@ describe("pi-server HTTP", () => {
 
 		expect(getSession("session-a")).toBeUndefined();
 		expect(getSession("session-b")).toBeDefined();
-	});
-});
-
-describe("resolveStreamOptions", () => {
-	const baseModel: Model<"openai-completions"> = {
-		id: "test-model",
-		name: "Test",
-		api: "openai-completions",
-		provider: "opencode-go",
-		baseUrl: "https://original.example.com",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1000,
-		maxTokens: 100,
-	};
-
-	it("returns original model when no provider overrides are set", () => {
-		const config: ServerConfig = {
-			host: "127.0.0.1",
-			port: 4217,
-			authToken: undefined,
-			sessionStoreDir: "unused",
-			uploadDir: "unused",
-		};
-		const { model, options } = resolveStreamOptions(config, baseModel, {
-			sessionId: "s1",
-			model: baseModel,
-		});
-		expect(model.baseUrl).toBe("https://original.example.com");
-		expect(options.apiKey).toBeUndefined();
-	});
-
-	it("ignores server-side provider request config", () => {
-		const config = {
-			host: "127.0.0.1",
-			port: 4217,
-			authToken: undefined,
-			sessionStoreDir: "unused",
-			uploadDir: "unused",
-			providerApiKey: "sk-server",
-			providerBaseUrl: "https://server-proxy.example.com/v1",
-			providerHeaders: { "X-Server": "yes" },
-		} as ServerConfig;
-		const { model, options } = resolveStreamOptions(config, baseModel, {
-			sessionId: "s1",
-			model: baseModel,
-			options: { headers: { "X-Client": "yes" } },
-		});
-		expect(model.baseUrl).toBe("https://original.example.com");
-		expect(options.apiKey).toBeUndefined();
-		expect(options.headers).toEqual({ "X-Client": "yes" });
 	});
 });

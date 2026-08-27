@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
@@ -7,6 +8,7 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	truncateSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -198,12 +200,19 @@ function parsePersistedSessionFile(raw: string, sourcePath: string): PersistedSe
 	};
 }
 
+class PersistedSessionWalSyntaxError extends Error {
+	constructor(sourcePath: string, lineNumber: number, cause: unknown) {
+		super(`Persisted session WAL contains invalid JSON: ${sourcePath}:${lineNumber}`, { cause });
+		this.name = "PersistedSessionWalSyntaxError";
+	}
+}
+
 function parseWalLine(raw: string, sourcePath: string, lineNumber: number): PersistedSessionWalRecord {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch (error) {
-		throw new Error(`Persisted session WAL contains invalid JSON: ${sourcePath}:${lineNumber}`, { cause: error });
+		throw new PersistedSessionWalSyntaxError(sourcePath, lineNumber, error);
 	}
 	assertPersistedWalRecord(parsed, sourcePath, lineNumber);
 	return parsed;
@@ -213,6 +222,7 @@ function applyWalRecord(session: PersistedSessionState, record: PersistedSession
 	if (record.sessionId !== session.sessionId) {
 		throw new Error(`Persisted session WAL sessionId does not match snapshot: ${record.sessionId}`);
 	}
+	if (record.revision <= session.revision) return;
 	if (record.baseEntryCount < session.entries.length) {
 		if (record.baseEntryCount + record.entries.length <= session.entries.length) return;
 		throw new Error(`Persisted session WAL overlaps snapshot for ${record.sessionId}`);
@@ -233,9 +243,21 @@ function applyPersistedWal(sessionStoreDir: string, session: PersistedSessionSta
 	const lines = readFileSync(filePath, "utf-8").split("\n");
 	let applied = 0;
 	for (const [index, line] of lines.entries()) {
-		if (!line) continue;
-		applyWalRecord(session, parseWalLine(line, filePath, index + 1));
-		applied++;
+		if (!line.trim()) continue;
+		try {
+			applyWalRecord(session, parseWalLine(line, filePath, index + 1));
+			applied++;
+		} catch (error) {
+			const isPhysicalTail = lines.slice(index + 1).every((remainingLine) => !remainingLine.trim());
+			if (isPhysicalTail && error instanceof PersistedSessionWalSyntaxError) {
+				const prefix = lines.slice(0, index).join("\n");
+				const truncateAt = Buffer.byteLength(prefix, "utf8") + (index > 0 ? 1 : 0);
+				truncateSync(filePath, truncateAt);
+				console.warn(`Discarding torn WAL tail line at ${filePath}:${index + 1}`);
+				break;
+			}
+			throw error;
+		}
 	}
 	return applied;
 }
@@ -246,17 +268,21 @@ export function loadPersistedSessions(sessionStoreDir: string): void {
 	for (const entry of entries) {
 		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
 		const filePath = join(sessionStoreDir, entry.name);
-		const persisted = parsePersistedSessionFile(readFileSync(filePath, "utf-8"), filePath);
-		const expectedFileName = sessionFileName(persisted.session.sessionId);
-		if (entry.name !== expectedFileName) {
-			throw new Error(`Persisted session file name does not match sessionId: ${filePath}`);
+		try {
+			const persisted = parsePersistedSessionFile(readFileSync(filePath, "utf-8"), filePath);
+			const expectedFileName = sessionFileName(persisted.session.sessionId);
+			if (entry.name !== expectedFileName) {
+				throw new Error(`Persisted session file name does not match sessionId: ${filePath}`);
+			}
+			const walRecords = applyPersistedWal(sessionStoreDir, persisted.session);
+			restoreSessionState(persisted.session);
+			persistedSessions.set(persistedSessionKey(sessionStoreDir, persisted.session.sessionId), {
+				entryCount: persisted.session.entries.length,
+				walRecords,
+			});
+		} catch (error) {
+			console.error(`Failed to load session from ${filePath}, skipping:`, error);
 		}
-		const walRecords = applyPersistedWal(sessionStoreDir, persisted.session);
-		restoreSessionState(persisted.session);
-		persistedSessions.set(persistedSessionKey(sessionStoreDir, persisted.session.sessionId), {
-			entryCount: persisted.session.entries.length,
-			walRecords,
-		});
 	}
 }
 

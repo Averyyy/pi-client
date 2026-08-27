@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { join, parse } from "node:path";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
@@ -29,6 +29,8 @@ function createFakeTui(): TUI {
 		requestRender: () => {},
 	} as unknown as TUI;
 }
+
+const outsideAgentsPath = join(parse(process.cwd()).root, "pi-tool-execution-outside", "AGENTS.md");
 
 describe("ToolExecutionComponent parity", () => {
 	beforeAll(() => {
@@ -348,7 +350,7 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("arg:bar");
 	});
 
-	test("falls back when custom renderers are absent", () => {
+	test("collapses fallback results until expanded", () => {
 		const toolDefinition: ToolDefinition = {
 			...createBaseToolDefinition(),
 		};
@@ -362,10 +364,20 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("custom_tool");
-		expect(rendered).toContain("done");
+		const output = Array.from({ length: 15 }, (_, index) => `line-${index + 1}`).join("\n");
+		component.updateResult({ content: [{ type: "text", text: output }], details: {}, isError: false }, false);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("custom_tool");
+		expect(collapsed).toContain("line-10");
+		expect(collapsed).not.toContain("line-11");
+		expect(collapsed).toContain("5 more lines");
+		expect(collapsed).toContain("to expand");
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toContain("line-15");
+		expect(expanded).not.toContain("more lines");
 	});
 
 	test("trims trailing blank display lines from write previews", () => {
@@ -466,10 +478,18 @@ describe("ToolExecutionComponent parity", () => {
 			absent: undefined,
 		},
 		{
+			title: "AGENTS.override.md",
+			path: join(process.cwd(), ".pi", "AGENTS.override.md"),
+			content: "Hidden override instructions",
+			compact: "read resource .pi/AGENTS.override.md",
+			hidden: "Hidden override instructions",
+			absent: undefined,
+		},
+		{
 			title: "outside AGENTS.md",
-			path: resolve(process.cwd(), "..", "AGENTS.md"),
+			path: outsideAgentsPath,
 			content: "Hidden outside resource instructions",
-			compact: `read resource ${resolve(process.cwd(), "..", "AGENTS.md").replace(/\\/g, "/")}`,
+			compact: `read resource ${outsideAgentsPath.replace(/\\/g, "/")}`,
 			hidden: "Hidden outside resource instructions",
 			absent: undefined,
 		},

@@ -1,14 +1,11 @@
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-	appendAssistantResponse,
 	appendCompactionEntry,
 	appendMessages,
 	appendSessionEntries,
 	clearAllSessions,
 	deleteSession,
-	dropLastAssistantError,
-	getActiveMessages,
 	getOrCreateSession,
 	getSession,
 	getSessionBranch,
@@ -150,14 +147,14 @@ describe("session-store", () => {
 			"u2",
 		);
 
-		expect(getActiveMessages("tree-session").map((message) => message.content)).toEqual([
+		expect(getSession("tree-session")?.messages.map((message) => message.content)).toEqual([
 			"one",
 			[{ type: "text", text: "first answer" }],
 			"two",
 		]);
 
 		switchSessionLeaf("tree-session", "a1");
-		expect(getActiveMessages("tree-session").map((message) => message.content)).toEqual([
+		expect(getSession("tree-session")?.messages.map((message) => message.content)).toEqual([
 			"one",
 			[{ type: "text", text: "first answer" }],
 		]);
@@ -290,63 +287,7 @@ describe("session-store", () => {
 		expect(session.entries.map((storedEntry) => storedEntry.id)).toEqual(["u1", "a1", "u2", entry.id]);
 		expect(session.leafId).toBe(entry.id);
 		expect(getSessionBranch(session).map((branchEntry) => branchEntry.id)).toEqual(["u1", "u2", entry.id]);
-		expect(getActiveMessages("tree-compact-branch").some((message) => message.role === "assistant")).toBe(false);
-	});
-
-	it("appends assistant response", () => {
-		getOrCreateSession("test-1");
-		const assistantMsg = {
-			role: "assistant" as const,
-			content: [{ type: "text" as const, text: "Hi there!" }],
-			api: "openai-completions" as const,
-			provider: "opencode-go" as const,
-			model: "glm-5.1",
-			usage: {
-				input: 10,
-				output: 5,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 15,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop" as const,
-			timestamp: 2000,
-		};
-		appendAssistantResponse("test-1", assistantMsg);
-		const session = getSession("test-1")!;
-		expect(session.messages.length).toBe(1);
-		expect(session.messages[0].role).toBe("assistant");
-	});
-
-	it("drops the last assistant error only", () => {
-		const errorMessage = {
-			role: "assistant" as const,
-			content: [],
-			api: "openai-completions" as const,
-			provider: "opencode-go" as const,
-			model: "glm-5.1",
-			usage: {
-				input: 10,
-				output: 5,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 15,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error" as const,
-			errorMessage: "retryable",
-			timestamp: 2000,
-		};
-
-		replaceMessages("test-drop", [{ role: "user", content: "hello", timestamp: 1000 }, errorMessage]);
-		expect(dropLastAssistantError("test-drop")).toBe(true);
-		expect(getSession("test-drop")?.messages).toEqual([{ role: "user", content: "hello", timestamp: 1000 }]);
-		expect(dropLastAssistantError("test-drop")).toBe(false);
-	});
-
-	it("does not create a session when dropping a missing assistant error", () => {
-		expect(dropLastAssistantError("missing-drop")).toBe(false);
-		expect(getSession("missing-drop")).toBeUndefined();
+		expect(getSession("tree-compact-branch")?.messages.some((message) => message.role === "assistant")).toBe(false);
 	});
 
 	it("deletes a session", () => {

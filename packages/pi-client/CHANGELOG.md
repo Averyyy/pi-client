@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Handled malformed `settings.json` when checking for the Tau Codex extension instead of crashing `pi-client web`.
 - Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 
 ### Changed

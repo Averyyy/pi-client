@@ -10,7 +10,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
-import { type PiServerHistorySnapshot, type PiServerTreeSnapshot, streamPiServer } from "./pi-server-client.ts";
+import { type PiServerHistorySnapshot, streamPiServer } from "./pi-server-client.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -63,9 +63,11 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Optional allowlist of tool names.
 	 *
-	 * When omitted, pi enables the default built-in tools (read, bash, edit, write)
-	 * and leaves extension/custom tools enabled unless `noTools` changes that default.
-	 * When provided, only the listed tool names are enabled.
+	 * When omitted, pi uses the `defaultTools` setting for the initial built-in
+	 * selection when configured. Otherwise it enables the default built-in tools
+	 * (read, bash, edit, write). Extension/custom tools remain enabled unless
+	 * `noTools` changes that default. When provided, only the listed tool names are
+	 * enabled.
 	 */
 	tools?: string[];
 	/** Optional denylist of tool names to disable. Applies after `tools` when both are provided. */
@@ -134,40 +136,12 @@ function getDefaultAgentDir(): string {
 	return getAgentDir();
 }
 
-function messagesEqual(left: Message[], right: Message[]): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
-}
-
 export interface PiServerContextSync {
-	sessionTree: PiServerTreeSnapshot;
-	ephemeralMessages?: Message[];
-	contextOverlay?: Message[];
+	contextOverlay: Message[];
 }
 
-export function buildPiServerContextSync(
-	sessionManager: SessionManager,
-	contextMessages: Message[],
-): PiServerContextSync {
-	const entries = sessionManager.getEntries();
-	const localContextMessages = convertToLlm(sessionManager.buildSessionContext().messages);
-	if (messagesEqual(localContextMessages, contextMessages)) {
-		return { sessionTree: { entries, leafId: sessionManager.getLeafId() } };
-	}
-
-	const hasLocalPrefix =
-		localContextMessages.length <= contextMessages.length &&
-		messagesEqual(localContextMessages, contextMessages.slice(0, localContextMessages.length));
-	if (hasLocalPrefix) {
-		return {
-			sessionTree: { entries, leafId: sessionManager.getLeafId() },
-			ephemeralMessages: contextMessages.slice(localContextMessages.length),
-		};
-	}
-
-	return {
-		sessionTree: { entries, leafId: sessionManager.getLeafId() },
-		contextOverlay: contextMessages,
-	};
+export function buildPiServerContextSync(contextMessages: Message[]): PiServerContextSync {
+	return { contextOverlay: contextMessages };
 }
 
 /**
@@ -282,11 +256,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
+	const configuredDefaultToolNames = settingsManager.getDefaultTools();
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
-	const initialActiveToolNames: string[] = (
-		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
+	const initialActiveToolNames = (
+		options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))
 	).filter((name) => !excludedToolNameSet?.has(name));
 
 	let agent: Agent;
@@ -350,7 +325,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const activeAgentSession = agentSession;
 			const piServerContext = activeAgentSession
-				? buildPiServerContextSync(activeAgentSession.sessionManager, context.messages as Message[])
+				? buildPiServerContextSync(context.messages as Message[])
 				: undefined;
 			const headerRunner = extensionRunnerRef.current;
 			const commonOptions = {
@@ -377,8 +352,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return streamPiServer(model, context, {
 					...commonOptions,
-					sessionTree: piServerContext?.sessionTree,
-					ephemeralMessages: piServerContext?.ephemeralMessages,
 					contextOverlay: piServerContext?.contextOverlay,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)

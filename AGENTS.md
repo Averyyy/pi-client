@@ -6,6 +6,9 @@
 - No emojis in commits, issues, PR comments, or code
 - No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!")
 - Technical prose only, be direct
+- Use concise, clear, simple language. Define unavoidable jargon before using it.
+- Explain non-trivial designs and problems as: problem, concrete example or short trace, then solution. State why the solution is necessary and distinguish it from optional complexity.
+- Prefer concrete behavior and small illustrations over abstract summaries, dense terminology, or unexplained lists of changes.
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
@@ -30,12 +33,15 @@
 - Coalesce tool progress updates at the shared `executePreparedToolCall()` callback path, not inside individual tools or UI renderers. `tool_execution_update` may drop intermediate same-tick partials, but must flush the latest partial before `tool_execution_end`; the final tool result remains authoritative.
 - Keep hot-path message/context transforms single-pass in shared code such as `convertToLlm()` and `buildSessionContext()`. Benchmark before keeping perf changes, and revert candidates that only move cost or improve one path while measurably regressing the common path.
 - Validation-aware tool-loop hints belong in transient next-turn context, not persisted session history: record edit/write paths and failed bash output from finalized tool results, inject one hidden `pi:validation-hint` before the next provider request, and de-dupe old hints each turn.
-- Keep TUI transcript rendering separate from model context projection: rebuild chat from the full active branch, render persisted compaction entries only once, and clear the working indicator only after `agent_settled`, restoring it after transient compaction or retry indicators while the session is still streaming.
+- Keep TUI transcript rendering separate from model context projection: preserve the full active branch in the durable session tree, but for long compacted sessions initialize the visible transcript from the latest compaction-aware context and lazy-load older active-branch entries in bounded batches; render persisted compaction entries only once, and clear the working indicator only after `agent_settled`, restoring it after transient compaction or retry indicators while the session is still streaming.
+- When replaying OpenAI Responses history after a tool changes representation, keep `call_id` as the tool-call/output pairing key and omit the optional item `id` unless its prefix matches the serialized item type: `fc_*` for `function_call`, `ctc_*` for `custom_tool_call`.
 
 ## pi-client / pi-server Request Sync
 
+- Treat ordinary `/api/stream` calls as stateless provider proxy requests: send the exact projected `context.messages` as `contextOverlay`; do not synchronize the durable session tree before or after provider calls. Full tree synchronization is reserved for operations that actually require tree state, such as server-side compaction.
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
 - If the server has messages the client does not have, the server may send those messages or the full server history back to the client. Client receive size is not constrained by the proxy POST-body limit.
+- When `pi-server` converts provider events to proxy SSE, preserve the complete `toolCall` on `toolcall_end`; the client reconstructs the assistant event and durable tool metadata from that payload.
 - If client and server history diverge, server history is authoritative. Reconcile the client to the server history and refresh the UI/session state instead of uploading the divergent client history.
 - When `pi-server` reports an existing `treeHash` and `entryCount`, treat that as the server-known prefix. If the local tree extends that prefix, append only the new tail entries; do not full-sync just because in-memory entry-id tracking was reset by resume/import/process restart.
 - When `pi-server` reports the same full tree hash but a different `leafId`, switch the leaf with `/api/session/tree/switch`; do not resend entries.
@@ -45,6 +51,7 @@
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
 - Chunk envelopes must include `requestId`, `chunkIndex`, `totalChunks`, and a `sha256` of the encoded chunk string. Identical duplicate chunks are acknowledgement-only no-ops; checksum mismatches or divergent duplicate indexes fail in `request-chunks`.
 - Chunk upload may run with bounded parallelism, but chunk ack bodies must echo `requestId`, `chunkIndex`, and `totalChunks`; otherwise the client treats the response as the final target response.
+- Keep the legacy Base64 request-chunk pending budget at 1 GiB. It counts encoded chunk strings, so the previous 64 MiB budget rejected session-tree append bodies above roughly 48 MiB of raw JSON before the target request could run.
 - Keep request-chunk pending state bounded with TTL/byte cleanup and keep a short completed-request tombstone so retrying the completing chunk can return the original target body.
 - Static context hashes must be real fixed-size digests over canonical `{systemPrompt, tools:[name,description,parameters]}` data, never the raw prompt/tools string.
 - Transient provider context such as validation hints or extension overlays must travel as `ephemeralMessages`/`contextOverlay` on `/api/stream`; it must not be converted into durable pending tree entries or trigger full-tree sync.
@@ -53,15 +60,18 @@
 - Keep server update-command install-shape handling in its updater wrapper: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 - `pi-client update` must not reinstall a source checkout into the active global path: update the published global packages, leave active sessions running, and require `/reload` to restart a session on the new runtime.
 - Route `pi-client send <path>` through `ChunkRequest` to `/api/receive`; pi-server saves the basename under `PI_SERVER_UPLOAD_DIR` (default `~/.pi/upload_files`) and must reject path traversal and existing destinations.
+- Keep machine-specific pi-server public-access runbooks, credentials, Windows service paths, and tunnel details in the exact ignored file `docs/pi-server-public-access.local.md`; never copy those values into tracked documentation or external messages.
 
 ## pi-client / pi-server Compact and Resilience
 
+- Keep the pi-client/pi-server `firstKeptEntryId` session-tree adapter explicit through `buildLegacySessionContext()`, `prepareLegacyCompaction()`, and `compactLegacy()`; do not pass that durable wire format into Harness v2 APIs that require `seq` and embedded `retainedTail` entries.
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
 - Prefer delta responses for server-side compact/history when the client supplies a matching base tree hash or entry offset; keep full history/tree responses as the mismatch fallback.
-- `pi-server` stream requests should include a `runId`; the server journals the final assistant message so a client can recover a completed run after a stream disconnect.
+- `pi-server` stream requests should include a `runId`; the server journals only the final assistant message so a client can recover or replay a completed run after a stream disconnect without retaining all deltas. Poll the same run while it is still running, classify recovery transport failures outside `provider_stream`, and clear a session's run journals when deleting that session.
 - Structure pi-server failures with phase metadata (`session_init`, `tree_sync`, `provider_stream`, etc.) and only let provider-stream failures enter LLM retry logic.
 - Session persistence should use append-only WAL records for append/switch/static-context mutations and periodic snapshots; avoid rewriting the full JSON session on every mutation.
+- WAL recovery may discard and truncate only a final JSON-syntax-torn record. Complete invalid records must still reject that session, and records whose revision is not newer than the snapshot must be ignored so a crash after snapshot rename but before WAL deletion cannot roll state backward.
 - Cache rolling tree hashes/prefix hashes in server session state. Append should update the hash from new entries, and leaf switches must not recompute the tree hash.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
 - Server-side compaction over Cloudflare must use a streaming response with heartbeat bytes; a plain long JSON response can hit Cloudflare 524 before compaction finishes.
@@ -86,6 +96,7 @@
 - `pi-client web` depends on the standalone `@averyyy/pi-tau-codex` Pi extension. The wrapper should check shared Pi agent settings and print a `请安装` install command when the extension is missing, rather than bundling the web UI or adding a pi-client runtime dependency.
 - If `pi-client web` is interactive and the Tau Codex extension is missing, prompt `y/N` and install it via `pi-client install npm:@averyyy/pi-tau-codex`; non-TTY should only print the install command and exit.
 - Bind Tau to localhost by default for `pi-client web` (`TAU_HOST=127.0.0.1`); users can set `TAU_HOST=0.0.0.0` when they intentionally want LAN/mobile access.
+- Session resume hints must use `pi-client` when `PI_SERVER_MODE=true`; keep `pi` for local coding-agent sessions.
 - When publishing the standalone client package, publish `packages/pi-client` as `@averyyy/pi-client` and keep its runtime dependencies as registry versions, not workspace `file:` links.
 - `@jmfederico/pi-web` peers use stable upstream semver ranges, so `@averyyy/*@0.80.3-piclient.N` aliases can trigger non-fatal npm peer override warnings when upstream Pi is already installed globally. For documented/manual fork installs and npm-global updater paths, use `--legacy-peer-deps`; do not install upstream stable peers to silence the warning.
 
@@ -94,6 +105,7 @@
 - Publish the scoped fork packages with `npm run publish:averyyy -- --version 0.80.3-piclient.N`. The version must use npm prerelease format: upstream Pi version plus `-piclient.N`, not four numeric segments.
 - Dry-run locally with `npm run publish:averyyy:dry -- --version 0.80.3-piclient.N`. Use `--skip-build` only when existing `dist` output was already built for the same source.
 - The script publishes `@averyyy/pi-ai`, `@averyyy/pi-tui`, `@averyyy/pi-agent-core`, `@averyyy/pi-coding-agent`, `@averyyy/pi-client`, and `@averyyy/pi-server` from temporary package directories. It rewrites internal runtime dependencies to exact `npm:@averyyy/...@version` aliases and does not mutate workspace package versions.
+- Keep `scripts/publish-averyyy-npm.mjs` build workspaces topologically complete when upstream packages add local runtime dependencies; its self-test must reject a missing or late-built local dependency before publishing starts.
 - The temporary package metadata must set `repository.url` to `https://github.com/Averyyy/pi-client`; npm provenance rejects packages whose repository points at upstream `earendil-works/pi`.
 - Remote publishing is handled by `.github/workflows/publish-averyyy-npm.yml`. Creating or editing a draft release does not trigger GitHub Actions; publish the draft release, or run the workflow manually with `workflow_dispatch`.
 - Scheduled Averyyy publishing lives in `.github/workflows/publish-averyyy-npm.yml`. Daily runs must derive the release prefix from the current upstream package version, increment the highest existing `v<base>-piclient.N` tag, and create the GitHub release only after npm publish succeeds so the next run can reliably skip when there are no commits since the latest release.
@@ -106,11 +118,13 @@
 - On Windows with Node 26, `spawnSync("npm.cmd", ...)` can fail with `EINVAL`; release scripts that spawn npm must invoke npm's CLI through `process.execPath` instead.
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - Never run `npm run build` or `npm test` unless requested by the user.
-- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
+- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root:
+  - Vitest: `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/specific.test.ts`
+  - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
-- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files.
+- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files. Pass the loader through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
 - Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
 - Keep automatic session naming disabled in general faux-session harnesses; enable it only in tests that explicitly cover the extra first-turn provider request.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
@@ -119,6 +133,7 @@
 ## Dependency and Install Security
 
 - Treat npm dep and lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
+- When updating `undici`, you MUST read its changelog/release notes for the target version and evaluate whether any changes may affect functionality before applying the update.
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
 - If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
 - If `packages/coding-agent/npm-shrinkwrap.json` needs regen, run `node scripts/generate-coding-agent-shrinkwrap.mjs` (verify with `--check` or `npm run check`). New deps with lifecycle scripts require review and an explicit allowlist entry in that script; never add one silently.
@@ -235,16 +250,20 @@ Attribution:
 
    The release script bumps all package versions, updates changelogs, regenerates release artifacts, runs `npm run check`, commits `Release vX.Y.Z`, tags `vX.Y.Z`, adds fresh `## [Unreleased]` changelog sections, commits `Add [Unreleased] section for next cycle`, then pushes `main` and the tag. Do not rerun the release script after a tag was pushed.
 
-4. **CI publishes npm packages**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required.
+4. **CI verifies and announces the npm release**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required. After publishing, `announce-pi-dev-release` verifies every public workspace package resolves at the exact release version and that its npm tarball is available, then writes the verified release marker to R2. `pi.dev/api/latest-version` reads that marker; it must never announce a release from npm before this job succeeds.
 
-5. **If CI publish fails**: inspect the failed `publish-npm` job. The publish helper is idempotent and skips package versions already present on npm, so rerun the tag workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
+5. **If CI publish or announcement fails**: inspect the failed job. The publish helper is idempotent and skips package versions already present on npm; the announcement job rechecks availability before updating the R2 marker. Rerun the failed job or workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
 
 ## Upstream Sync
 
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
 - Cross-platform tests for platform-specific behavior must set the simulated platform explicitly when asserting the opposite platform, instead of relying on the host OS.
+- Real Unix-domain socket integration tests must use an explicit non-Windows `runIf` guard, matching `packages/client`; keep option-validation and transport-neutral tests enabled on Windows.
+- Keep home-shortened image fallback text in the documented `~/...` form on every platform; OSC 8 `file://` links must still target the original absolute path.
+- Normalize both Windows and POSIX separators before comparing resource paths with the home directory; render matched paths in the documented `~/...` form and do not shorten sibling prefixes.
 - On Windows with WSL or Git Bash, harness file names must split both path separators, and cwd tests should use a marker file instead of asserting shell `$PWD`, which may be translated to a POSIX path.
 - If hydration removes a retired direct-OpenAI model used only by API-key-gated e2e tests, update those tests to an explicit current catalog model; do not restore a removed stale-model fallback.
+- If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.
 - After upstream merges, strict `tsgo --noEmit` may require explicit guards before reading optional results in upstream-added tests; use a clear error assertion rather than a non-null fallback.
 
 ## User Override

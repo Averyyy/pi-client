@@ -100,6 +100,8 @@ export type {
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
+	MarkdownTransformContext,
+	MarkdownTransformer,
 	MessageEndEvent,
 	MessageRenderer,
 	MessageRenderOptions,
@@ -177,6 +179,8 @@ export {
 } from "./core/model-resolver.ts";
 export {
 	type CreateModelRuntimeOptions,
+	CredentialSynchronizationError,
+	type CredentialSynchronizationOperation,
 	ModelRuntime,
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
@@ -246,11 +250,13 @@ export {
 export {
 	type CompactionSettings,
 	type DefaultProjectTrust,
+	type FullscreenExitOutput,
 	type ImageSettings,
 	type PackageSource,
 	type RetrySettings,
 	SettingsManager,
 	type SettingsManagerCreateOptions,
+	type TuiMode,
 } from "./core/settings-manager.ts";
 // Skills
 export {
@@ -331,6 +337,7 @@ export { type MainOptions, main } from "./main.ts";
 export {
 	InteractiveMode,
 	type InteractiveModeOptions,
+	type JsonAgentSessionEvent,
 	type ModelInfo,
 	type PrintModeOptions,
 	RpcClient,

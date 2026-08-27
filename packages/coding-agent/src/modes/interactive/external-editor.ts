@@ -15,17 +15,20 @@ export async function editInExternalEditor(options: ExternalEditorOptions): Prom
 	const filePath = join(directory, "prompt.md");
 	try {
 		writeFileSync(filePath, options.content, "utf-8");
-		const [editor, ...editorArgs] = options.command.split(" ");
 		process.stdout.write(`Launching external editor: ${options.command}\nPi will resume when the editor exits.\n`);
 
 		// Do not use spawnSync here. On Windows, synchronous child_process calls can keep
 		// Node/libuv's console input read active after the parent pauses stdin, racing
 		// vim/nvim for the console input buffer until Ctrl+C cancels the pending read.
 		const exitCode = await new Promise<number | null>((resolve) => {
-			const child = spawn(editor, [...editorArgs, filePath], {
-				stdio: "inherit",
-				shell: process.platform === "win32",
-			});
+			const [editor, ...editorArgs] = options.command.split(" ");
+			const child =
+				process.platform === "win32"
+					? spawn(`${options.command} "${filePath.replaceAll('"', '""')}"`, {
+							stdio: "inherit",
+							shell: true,
+						})
+					: spawn(editor, [...editorArgs, filePath], { stdio: "inherit" });
 			child.on("error", () => resolve(null));
 			child.on("close", (code) => resolve(code));
 		});

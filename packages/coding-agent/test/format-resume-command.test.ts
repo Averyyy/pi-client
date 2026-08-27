@@ -8,12 +8,18 @@ import { formatResumeCommand } from "../src/modes/interactive/interactive-mode.t
 
 const tempDirs: string[] = [];
 const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+const originalPiServerMode = process.env.PI_SERVER_MODE;
 
 afterEach(() => {
 	if (originalStdoutIsTTY) {
 		Object.defineProperty(process.stdout, "isTTY", originalStdoutIsTTY);
 	} else {
 		Reflect.deleteProperty(process.stdout, "isTTY");
+	}
+	if (originalPiServerMode === undefined) {
+		delete process.env.PI_SERVER_MODE;
+	} else {
+		process.env.PI_SERVER_MODE = originalPiServerMode;
 	}
 
 	for (const dir of tempDirs.splice(0)) {
@@ -56,6 +62,15 @@ describe("formatResumeCommand", () => {
 		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
 
 		expect(formatResumeCommand(sessionManager)).toBe(`${APP_NAME} --session test-session`);
+	});
+
+	it("uses pi-client for pi-server sessions", () => {
+		setStdoutIsTTY(true);
+		process.env.PI_SERVER_MODE = "true";
+		const sessionFile = createTempFile();
+		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
+
+		expect(formatResumeCommand(sessionManager)).toBe("pi-client --session test-session");
 	});
 
 	it("includes unquoted safe session dirs for non-default session dirs", () => {

@@ -11,7 +11,6 @@ const ALLOWED_TARGETS = new Set([
 	"/api/session/tree/sync",
 	"/api/session/tree/append",
 	"/api/session/tree/switch",
-	"/api/session/drop-last-assistant-error",
 	"/api/session/compact",
 	"/api/stream",
 	"/api/receive",
@@ -71,7 +70,7 @@ const completedRequests = new Map<string, CompletedRequest>();
 let pendingRequestBytes = 0;
 
 export const REQUEST_CHUNK_PENDING_TTL_MS = 5 * 60 * 1000;
-export const REQUEST_CHUNK_MAX_PENDING_BYTES = 64 * 1024 * 1024;
+export const REQUEST_CHUNK_MAX_PENDING_BYTES = 1024 * 1024 * 1024;
 export const REQUEST_CHUNK_COMPLETED_TTL_MS = 60 * 1000;
 
 interface ReceiveRequestChunkOptions {

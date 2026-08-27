@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { clearAllRequestChunks, receiveRequestChunk } from "../src/request-chunks.ts";
+import { clearAllRequestChunks, REQUEST_CHUNK_MAX_PENDING_BYTES, receiveRequestChunk } from "../src/request-chunks.ts";
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
@@ -25,6 +25,10 @@ describe("request chunks", () => {
 
 	afterEach(() => {
 		clearAllRequestChunks();
+	});
+
+	it("allows up to one GiB of pending encoded request chunks", () => {
+		expect(REQUEST_CHUNK_MAX_PENDING_BYTES).toBe(1024 * 1024 * 1024);
 	});
 
 	it("accepts identical duplicate chunks as idempotent no-ops", () => {

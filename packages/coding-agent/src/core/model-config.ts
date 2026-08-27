@@ -84,6 +84,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 			Type.Literal("openai"),
 			Type.Literal("openrouter"),
 			Type.Literal("together"),
+			Type.Literal("baseten"),
 			Type.Literal("deepseek"),
 			Type.Literal("zai"),
 			Type.Literal("qwen"),
@@ -94,6 +95,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 		]),
 	),
 	chatTemplateKwargs: Type.Optional(Type.Record(Type.String(), ChatTemplateKwargSchema)),
+	chatTemplateArgs: Type.Optional(Type.Record(Type.String(), ChatTemplateKwargSchema)),
 	cacheControlFormat: Type.Optional(Type.Literal("anthropic")),
 	openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
 	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
@@ -115,6 +117,7 @@ const OpenAIResponsesCompatSchema = Type.Object({
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 	supportsStrictMode: Type.Optional(Type.Boolean()),
 	supportsOpenAIGrammarTools: Type.Optional(Type.Boolean()),
+	supportsAdditionalTools: Type.Optional(Type.Boolean()),
 	supportsToolSearch: Type.Optional(Type.Boolean()),
 });
 
@@ -162,6 +165,7 @@ const ModelDefinitionSchema = Type.Object({
 	cost: Type.Optional(ModelCostSchema),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	samplingParams: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -182,6 +186,7 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	samplingParams: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });

@@ -42,4 +42,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 .pi/pi-server/
+# Local-only deployment notes; this file contains credentials and machine details.
+/docs/pi-server-public-access.local.md
 collect.sh
