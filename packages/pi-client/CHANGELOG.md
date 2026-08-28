@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- Fixed automatic update checks to compare the installed `pi-client` version instead of the upstream `pi` version.
+
 ### Added
 
 - Added automatic `pi` → `pi-client` command rewriting when running in `PI_SERVER_MODE`. The adapter installs a process-local PATH shim for subprocess execution and rewrites displayed commands for consistency.
