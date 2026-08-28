@@ -18,7 +18,7 @@ const workspacePackages = findPackageDirectories(packageRoot)
 		const path = join(directory, "package.json");
 		return { data: JSON.parse(readFileSync(path, "utf8")), path };
 	});
-const publishedPackages = workspacePackages.filter((pkg) => pkg.data.private !== true);
+const publishedPackages = workspacePackages.filter((pkg) => pkg.data.private !== true && !pkg.data.name?.startsWith("@averyyy/"));
 const versionMap = new Map(workspacePackages.map((pkg) => [pkg.data.name, pkg.data.version]));
 
 console.log("Current versions:");
