@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { runPiClientSend } from "./send.js";
 
 const args = process.argv.slice(2);
+const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
 const modulePromise =
 	args[0] === "send"
 		? runPiClientSend(args.slice(1)).then((code) => {
@@ -40,6 +41,7 @@ function runPiClientCli(args) {
 					...process.env,
 					PI_CODING_AGENT: "true",
 					PI_SERVER_MODE: "true",
+					PI_CLIENT_VERSION: packageVersion,
 					PI_CLIENT_RELOAD_STATE_PATH: reloadStatePath,
 				},
 				stdio: "inherit",

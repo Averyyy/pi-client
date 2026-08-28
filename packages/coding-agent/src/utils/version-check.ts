@@ -3,6 +3,7 @@ import { fetchWithRetry } from "./management-http.ts";
 import { getPiUserAgent } from "./pi-user-agent.ts";
 
 const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
+const LATEST_CLIENT_VERSION_URL = "https://registry.npmjs.org/@averyyy%2Fpi-client/latest";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
 export interface LatestPiRelease {
@@ -55,7 +56,7 @@ export async function getLatestPiRelease(
 	if (process.env.PI_OFFLINE) return undefined;
 
 	const response = await fetchWithRetry(
-		LATEST_VERSION_URL,
+		process.env.PI_SERVER_MODE === "true" ? LATEST_CLIENT_VERSION_URL : LATEST_VERSION_URL,
 		{
 			headers: {
 				"User-Agent": getPiUserAgent(currentVersion),

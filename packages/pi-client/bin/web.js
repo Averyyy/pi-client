@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const defaultPort = "1838";
 const defaultPiServerUrl = "http://127.0.0.1:4217";
+const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
 const tauCodexPackage = "@averyyy/pi-tau-codex";
 const tauCodexInstallTarget = "npm:@averyyy/pi-tau-codex";
 const tauCodexGitTarget = "git:github.com/Averyyy/pi-tau-codex";
@@ -64,6 +65,7 @@ export function piClientWebEnv(env = process.env, options) {
 		...env,
 		PI_CODING_AGENT: "true",
 		PI_SERVER_MODE: "true",
+		PI_CLIENT_VERSION: packageVersion,
 		PI_SERVER_URL: env.PI_SERVER_URL ?? defaultPiServerUrl,
 		TAU_HOST: options.host,
 		TAU_MIRROR_PORT: options.port,
