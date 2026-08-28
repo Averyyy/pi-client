@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cloudflare AI Gateway dispatch to match its supported generated model APIs.
+
 ## [0.84.3] - 2026-08-24
 
 ### Breaking Changes

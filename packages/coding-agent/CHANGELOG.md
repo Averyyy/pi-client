@@ -7,6 +7,7 @@
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 ### Fixed
 
+- Fixed model and thinking default persistence plus PowerShell tool construction after the upstream 0.84.3 update.
 - Fixed pi-client shutdown resume hints to use `pi-client --session` instead of `pi --session`.
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.
 - Fixed long compacted sessions blocking the terminal by rendering the latest compaction context first and lazy-loading earlier transcript entries in bounded batches.
