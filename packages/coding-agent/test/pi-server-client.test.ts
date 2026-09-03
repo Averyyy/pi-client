@@ -1162,11 +1162,13 @@ describe("pi-server-client", () => {
 
 	it("reports HTML stream proxy failures with response details", async () => {
 		const entries = baseTree().slice(0, 1);
+		const capturedPaths: string[] = [];
 
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (url: string, init?: RequestInit) => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				capturedPaths.push(new URL(url).pathname);
 
 				if (url.endsWith("/api/stream")) {
 					return new Response("<html>Bad gateway</html>", {
@@ -1194,13 +1196,130 @@ describe("pi-server-client", () => {
 		}
 
 		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
-			| { error?: { errorMessage?: string; diagnostics?: Array<{ details?: { phase?: unknown } }> } }
+			| {
+					error?: {
+						errorMessage?: string;
+						diagnostics?: Array<{ details?: { phase?: unknown; retryable?: unknown } }>;
+					};
+			  }
 			| undefined;
 		expect(errorEvent?.error?.errorMessage).toContain("502 Bad Gateway");
 		expect(errorEvent?.error?.errorMessage).toContain("content-type: text/html");
 		expect(errorEvent?.error?.errorMessage).toContain("body excerpt: <html>Bad gateway</html>");
 		expect(errorEvent?.error?.errorMessage).not.toContain("Unexpected token");
-		expect(errorEvent?.error?.diagnostics?.[0]?.details?.phase).toBe("provider_stream");
+		expect(errorEvent?.error?.diagnostics?.[0]?.details).toMatchObject({
+			phase: "provider_stream",
+			retryable: true,
+		});
+		expect(capturedPaths.some((path) => path.includes("/runs/"))).toBe(false);
+	});
+
+	it("keeps HTTP 502 stream failures retryable when run recovery is also unavailable", async () => {
+		const entries = baseTree().slice(0, 1);
+		const capturedPaths: string[] = [];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+				if (path.includes("/runs/")) {
+					return new Response("Bad Gateway", { status: 502, statusText: "Bad Gateway" });
+				}
+
+				if (url.endsWith("/api/stream")) {
+					return new Response("<html>Bad gateway</html>", {
+						status: 502,
+						statusText: "Bad Gateway",
+						headers: { "Content-Type": "text/html" },
+					});
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "html-stream-502-recovery-down", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
+			| {
+					error?: {
+						errorMessage?: string;
+						diagnostics?: Array<{ details?: { phase?: unknown; retryable?: unknown } }>;
+					};
+			  }
+			| undefined;
+		expect(errorEvent?.error?.errorMessage).toContain("502 Bad Gateway");
+		expect(errorEvent?.error?.diagnostics?.[0]?.details).toMatchObject({
+			phase: "provider_stream",
+			retryable: true,
+		});
+		expect(capturedPaths.some((path) => path.includes("/runs/"))).toBe(false);
+	});
+
+	it("does not poll run recovery when the stream POST never starts", async () => {
+		const entries = baseTree().slice(0, 1);
+		const capturedPaths: string[] = [];
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				capturedPaths.push(path);
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+
+				if (path.includes("/runs/")) {
+					throw new Error("run recovery network failed");
+				}
+
+				if (url.endsWith("/api/stream")) {
+					throw new Error("fetch failed");
+				}
+
+				return new Response(JSON.stringify({ sessionId: body.sessionId, leafId: body.leafId, entryCount: 1 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "You are helpful.", messages: [textMessage("one", 1000)] },
+			{ sessionId: "stream-post-fetch-failed", sessionTree: { entries, leafId: "u1" } },
+		);
+		const events: object[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find((event) => (event as { type?: string }).type === "error") as
+			| {
+					error?: {
+						errorMessage?: string;
+						diagnostics?: Array<{ details?: { phase?: unknown; retryable?: unknown } }>;
+					};
+			  }
+			| undefined;
+		expect(errorEvent?.error?.errorMessage).toContain("fetch failed");
+		expect(errorEvent?.error?.diagnostics?.[0]?.details).toMatchObject({
+			phase: "provider_stream",
+			retryable: true,
+		});
+		expect(capturedPaths.some((path) => path.includes("/runs/"))).toBe(false);
 	});
 
 	it("rebuilds missing server state once when streaming after a pi-server restart", async () => {

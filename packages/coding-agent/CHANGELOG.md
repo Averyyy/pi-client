@@ -15,6 +15,7 @@
 - Fixed pi-server provider requests to send only the projected, compaction-aware LLM context instead of synchronizing the full durable session tree.
 - Fixed pi-server tree recovery to use structured error codes and preserve authoritative tool-call namespaces.
 - Fixed disconnected pi-server streams to recover the same run before allowing an outer provider retry, preventing duplicate concurrent provider requests.
+- Fixed pi-client skipping auto-retry on pi-server HTTP 502/proxy failures. Same-run recovery now runs only after an event-stream has started, so a down proxy no longer reclassifies the original stream error as non-retryable.
 
 ## [0.84.4] - 2026-08-28
 

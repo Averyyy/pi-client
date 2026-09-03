@@ -351,6 +351,15 @@ function getPiServerFailurePhase(message: AssistantMessage): string | undefined 
 	return undefined;
 }
 
+function getPiServerFailureRetryable(message: AssistantMessage): boolean | undefined {
+	for (const diagnostic of message.diagnostics ?? []) {
+		if (diagnostic.type !== "pi_server_failure") continue;
+		const retryable = diagnostic.details?.retryable;
+		if (typeof retryable === "boolean") return retryable;
+	}
+	return undefined;
+}
+
 function toolTextContent(content: Array<TextContent | ImageContent>): string {
 	return content
 		.filter((part): part is TextContent => part.type === "text")
@@ -3319,13 +3328,20 @@ export class AgentSession {
 	 * Check if an error is retryable. Provider error text is retryable by default,
 	 * except usage/quota/balance limits and session or context failures.
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
+	 * Pi-server diagnostics may mark recovery/history failures as non-retryable;
+	 * transient session_init/tree_sync outages stay retryable so the next attempt
+	 * re-runs the whole stream path.
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
-		const piServerPhase = getPiServerFailurePhase(message);
-		if (piServerPhase && piServerPhase !== "provider_stream") return false;
+		const piServerRetryable = getPiServerFailureRetryable(message);
+		if (piServerRetryable === false) return false;
+		if (piServerRetryable !== true) {
+			const piServerPhase = getPiServerFailurePhase(message);
+			if (piServerPhase && piServerPhase !== "provider_stream") return false;
+		}
 		return isRetryableAssistantError(message);
 	}
 

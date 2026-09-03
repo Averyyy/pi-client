@@ -60,7 +60,7 @@ const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
 const RESPONSE_BODY_EXCERPT_CHARS = 500;
 const TRANSIENT_PI_SERVER_RETRY_DELAYS_MS = [250, 750, 1500];
-const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([502, 503, 504, 530]);
+const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([500, 502, 503, 504, 524, 530]);
 const PI_SERVER_RUN_RECOVERY_POLL_MS = 250;
 const DEFAULT_PI_SERVER_RUN_RECOVERY_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -395,10 +395,19 @@ function isTransientPiServerFetchError(error: unknown): boolean {
 	);
 }
 
-function isTransientPiServerResponse(response: Response, bodyText: string): boolean {
-	if (!TRANSIENT_PI_SERVER_STATUS_CODES.has(response.status)) return false;
-	if (response.status === 530) return true;
-	return /CONNECT timeout|Bad Gateway|upstream|timeout/i.test(`${response.statusText}\n${bodyText}`);
+function isTransientPiServerError(error: unknown): boolean {
+	if (isTransientPiServerFetchError(error)) return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		/\b(?:500|502|503|504|524|530)\b/.test(message) ||
+		/CONNECT timeout|Bad Gateway|upstream|A timeout occurred/i.test(message)
+	);
+}
+
+function isRetryablePiServerFailure(phase: PiServerFailurePhase, error: unknown): boolean {
+	if (phase === "provider_stream") return true;
+	if (phase === "history_reconcile") return false;
+	return isTransientPiServerError(error);
 }
 
 async function waitForPiServerRetry(attempt: number, signal: AbortSignal | undefined): Promise<void> {
@@ -432,7 +441,7 @@ async function postPiServerJsonWithTransientRetry<T>(
 			if (
 				attempt < TRANSIENT_PI_SERVER_RETRY_DELAYS_MS.length &&
 				!request.options.signal?.aborted &&
-				isTransientPiServerResponse(response, bodyText)
+				TRANSIENT_PI_SERVER_STATUS_CODES.has(response.status)
 			) {
 				await waitForPiServerRetry(attempt, request.options.signal);
 				continue;
@@ -886,6 +895,7 @@ export async function streamPiServer(
 
 	(async () => {
 		let phase: PiServerFailurePhase = "session_init";
+		let streamOpened = false;
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
@@ -921,6 +931,7 @@ export async function streamPiServer(
 			}
 
 			await ensurePiServerEventStream(response);
+			streamOpened = true;
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
 			const parser = new ServerSentEventParser();
@@ -966,7 +977,11 @@ export async function streamPiServer(
 			stream.end();
 		} catch (error) {
 			let errorMessage = error instanceof Error ? error.message : String(error);
-			if (!options?.signal?.aborted && phase === "provider_stream") {
+			// Same-run recovery only applies to an interrupted event-stream. HTTP/proxy
+			// failures before the stream starts (502/504/fetch failed) never opened a run
+			// we can poll; attempting recovery against a down proxy reclassifies the error
+			// as history_reconcile and blocks session auto-retry.
+			if (!options?.signal?.aborted && phase === "provider_stream" && streamOpened) {
 				try {
 					const recoveredRun = await waitForPiServerRunCompletion(
 						sessionId,
@@ -1013,7 +1028,11 @@ export async function streamPiServer(
 					type: "pi_server_failure",
 					timestamp: Date.now(),
 					error: { name: error instanceof Error ? error.name : "Error", message: errorMessage },
-					details: { phase, source: "pi-server", retryable: phase === "provider_stream" },
+					details: {
+						phase,
+						source: "pi-server",
+						retryable: isRetryablePiServerFailure(phase, error),
+					},
 				},
 			];
 			stream.push({
