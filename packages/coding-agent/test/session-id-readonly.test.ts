@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Args } from "../src/cli/args.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -10,6 +11,7 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createSessionManager } from "../src/main.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
+const tsxLoader = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -54,7 +56,7 @@ async function runCli(args: string[]): Promise<{ code: number | null; agentDir: 
 	mkdirSync(projectDir, { recursive: true });
 
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, [cliPath, ...args], {
+		const child = spawn(process.execPath, ["--import", tsxLoader, cliPath, ...args], {
 			cwd: projectDir,
 			env: {
 				...process.env,

@@ -76,6 +76,13 @@ describe("provider retry classification", () => {
 		},
 	);
 
+	it.each(["This operation was aborted", "Request was cancelled"])(
+		"keeps cancellation errors non-retryable: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
 	it("retries errors without usage text by default", () => {
 		for (const errorMessage of [
 			"invalid_api_key",

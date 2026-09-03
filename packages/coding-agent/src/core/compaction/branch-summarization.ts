@@ -361,7 +361,14 @@ export async function generateBranchSummary(
 		if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 			return { aborted: true };
 		}
-		return { error: error instanceof Error ? error.message.replace(/^Summarization failed: /, "") : String(error) };
+		const message = error instanceof Error ? error.message : String(error);
+		if (message === "Summarization attempted to call a tool") {
+			return { error: "Branch summarization attempted to call a tool" };
+		}
+		if (message.startsWith("Summarization failed: ")) {
+			return { error: `Branch summarization failed: ${message.slice("Summarization failed: ".length)}` };
+		}
+		return { error: message };
 	}
 
 	if (signal.aborted) {

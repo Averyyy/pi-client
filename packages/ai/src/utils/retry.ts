@@ -137,5 +137,6 @@ export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	// Usage/quota/balance failures are generally deterministic account limits.
 	// Everything else is retried by default; callers still apply their own
 	// context-overflow, phase, abort, and retry-budget policies.
+	if (/^(?:this operation was aborted|request was cancel(?:led|ed))$/i.test(message.errorMessage.trim())) return false;
 	return !/usage|quota|balance/i.test(message.errorMessage);
 }

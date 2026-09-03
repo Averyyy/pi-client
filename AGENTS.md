@@ -79,6 +79,8 @@
 - Trigger intra-turn compaction only from the projected total context threshold. `keepRecentTokens` controls the retained tail after compaction; a large tool result must not use it as an independent trigger.
 - Compaction summaries must preserve operational state: modified files, read files, open failures, last command and exit, last failing assertion/error, and pending TODO.
 - Tree/branch summaries are part of the same compaction family: use the shared chunked summarizer instead of pre-dropping old branch messages or sending a single oversized summary request.
+- When merging upstream summarization safeguards into the fork's chunked path, carry tool-call/length-stop validation and routing session IDs through every chunk while preserving context-overflow recursion.
+- Auto-compaction cancellation and failure paths must notify `session_compact_failed`; cancellation errors are terminal and must not enter provider retry.
 - Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
 - Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.
@@ -127,6 +129,7 @@
 - When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files. Pass the loader through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
 - Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
 - Keep automatic session naming disabled in general faux-session harnesses; enable it only in tests that explicitly cover the extra first-turn provider request.
+- When regression tests fix a GitHub issue, add a comment with the GitHub issue number next to the test.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 - After finishing workspace changes, commit and push only your own changes unless the user explicitly says not to.
 

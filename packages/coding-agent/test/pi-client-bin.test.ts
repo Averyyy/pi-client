@@ -10,7 +10,7 @@ describe("coding-agent bins", () => {
 	it("package.json exposes only pi bin, not pi-client", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 		expect(pkg.bin).toBeDefined();
-		expect(pkg.bin.pi).toBe("dist/cli.js");
+		expect(pkg.bin.pi).toBe("dist/bundle/cli.js");
 		expect(pkg.bin["pi-client"]).toBeUndefined();
 	});
 
