@@ -2170,6 +2170,18 @@ export class InteractiveMode {
 		);
 	}
 
+	private restoreWorkingStatusIndicatorIfStreaming(): void {
+		if (!this.session.isStreaming) {
+			return;
+		}
+		if (this.workingVisible && this.activeStatusIndicator?.kind !== "working") {
+			this.showWorkingStatusIndicator();
+		}
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(true);
+		}
+	}
+
 	private setWorkingVisible(visible: boolean): void {
 		this.workingVisible = visible;
 		if (!visible) {
@@ -3379,10 +3391,6 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
-				if (this.settingsManager.getShowTerminalProgress()) {
-					this.ui.terminal.setProgress(false);
-				}
-				this.clearStatusIndicator("working");
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -3394,6 +3402,10 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.settingsManager.getShowTerminalProgress()) {
+					this.ui.terminal.setProgress(false);
+				}
+				this.clearStatusIndicator("working");
 				await this.checkShutdownRequested();
 				break;
 
@@ -3457,6 +3469,7 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 					}
 				}
+				this.restoreWorkingStatusIndicatorIfStreaming();
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
 				break;
@@ -3486,6 +3499,7 @@ export class InteractiveMode {
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				}
+				this.restoreWorkingStatusIndicatorIfStreaming();
 				this.ui.requestRender();
 				break;
 			}
