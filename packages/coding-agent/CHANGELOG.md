@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Removed persistent validation hints that repeatedly injected stale bash failures after corrected commands succeeded. Ordinary tool results remain the source of validation evidence.
 - Fixed model and thinking default persistence plus PowerShell tool construction after the upstream 0.84.3 update.
 - Fixed pi-client shutdown resume hints to use `pi-client --session` instead of `pi --session`.
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.

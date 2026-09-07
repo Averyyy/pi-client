@@ -319,9 +319,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 const INTRA_TURN_COMPACTION_MARKER_TYPE = "pi:intra-turn-compaction";
 const INTRA_TURN_COMPACTION_MARKER_TEXT =
 	"Continue from the compaction summary above. The previous tool loop was compacted before the next provider request; use the summary's Operational State, file lists, failures, last command, and next steps.";
-const VALIDATION_HINT_MESSAGE_TYPE = "pi:validation-hint";
-const VALIDATION_HINT_FILE_LIMIT = 12;
-const VALIDATION_HINT_FAILURE_CHAR_LIMIT = 1200;
 const AUTO_SESSION_NAME_INPUT_CHAR_LIMIT = 4000;
 const AUTO_SESSION_NAME_MAX_CHARS = 80;
 const AUTO_SESSION_NAME_PROMPT =
@@ -333,12 +330,6 @@ function isPiServerMode(): boolean {
 
 function toProviderReasoning(thinkingLevel: ThinkingLevel): SimpleStreamOptions["reasoning"] {
 	return thinkingLevel === "off" ? undefined : thinkingLevel;
-}
-
-function getStringField(input: unknown, key: string): string | undefined {
-	if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
-	const value = (input as Record<string, unknown>)[key];
-	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
 function getPiServerFailurePhase(message: AssistantMessage): string | undefined {
@@ -357,20 +348,6 @@ function getPiServerFailureRetryable(message: AssistantMessage): boolean | undef
 		if (typeof retryable === "boolean") return retryable;
 	}
 	return undefined;
-}
-
-function toolTextContent(content: Array<TextContent | ImageContent>): string {
-	return content
-		.filter((part): part is TextContent => part.type === "text")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
-}
-
-function compactValidationSummary(text: string): string {
-	const trimmed = text.trim();
-	if (trimmed.length <= VALIDATION_HINT_FAILURE_CHAR_LIMIT) return trimmed;
-	return `...${trimmed.slice(trimmed.length - VALIDATION_HINT_FAILURE_CHAR_LIMIT + 3)}`;
 }
 
 function messageTextContent(message: AgentMessage): string {
@@ -404,11 +381,6 @@ function sanitizeGeneratedSessionName(text: string): string | undefined {
 		.trim();
 	if (!title) return undefined;
 	return title.length > AUTO_SESSION_NAME_MAX_CHARS ? title.slice(0, AUTO_SESSION_NAME_MAX_CHARS).trim() : title;
-}
-
-interface ValidationFailureState {
-	command: string;
-	summary: string;
 }
 
 // ============================================================================
@@ -454,8 +426,6 @@ export class AgentSession {
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
-	private _validationModifiedFiles = new Set<string>();
-	private _validationFailure: ValidationFailureState | undefined = undefined;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -604,96 +574,6 @@ export class AgentSession {
 		}
 	}
 
-	private _resetValidationHintState(): void {
-		this._validationModifiedFiles.clear();
-		this._validationFailure = undefined;
-	}
-
-	private _recordValidationToolResult(
-		toolName: string,
-		input: unknown,
-		content: Array<TextContent | ImageContent>,
-		isError: boolean,
-	): void {
-		if ((toolName === "edit" || toolName === "write") && !isError) {
-			const path = getStringField(input, "path") ?? getStringField(input, "file_path");
-			if (path) {
-				this._validationModifiedFiles.add(path);
-			}
-			return;
-		}
-
-		if (toolName !== "bash") {
-			return;
-		}
-
-		const command = getStringField(input, "command");
-		if (!command) {
-			return;
-		}
-
-		if (isError) {
-			this._validationFailure = {
-				command,
-				summary: compactValidationSummary(toolTextContent(content)),
-			};
-		} else if (this._validationFailure?.command === command) {
-			this._resetValidationHintState();
-		} else if (!this._validationFailure) {
-			this._validationModifiedFiles.clear();
-		}
-	}
-
-	private _createValidationHintMessage():
-		| CustomMessage<{ modifiedFiles: string[]; failedCommand?: string }>
-		| undefined {
-		const modifiedFiles = Array.from(this._validationModifiedFiles).slice(-VALIDATION_HINT_FILE_LIMIT);
-		if (modifiedFiles.length === 0 && !this._validationFailure) {
-			return undefined;
-		}
-
-		const lines = ["<validation-hint>"];
-		if (modifiedFiles.length > 0) {
-			lines.push("Recent modified files:", ...modifiedFiles.map((file) => `- ${file}`));
-		}
-		if (this._validationFailure) {
-			lines.push(
-				"Recent failed command:",
-				this._validationFailure.command,
-				"Failure summary:",
-				this._validationFailure.summary || "(no output)",
-				"Suggested next validation command:",
-				this._validationFailure.command,
-			);
-		} else {
-			lines.push("Suggested next step:", "Run the smallest project validation that covers the modified files.");
-		}
-		lines.push(
-			"Inspect failures, fix the root cause, then rerun validation before finalizing.",
-			"</validation-hint>",
-		);
-
-		return {
-			role: "custom",
-			customType: VALIDATION_HINT_MESSAGE_TYPE,
-			content: [{ type: "text", text: lines.join("\n") }],
-			display: false,
-			details: { modifiedFiles, failedCommand: this._validationFailure?.command },
-			timestamp: Date.now(),
-		};
-	}
-
-	private _withValidationHint(context: AgentContext): AgentContext {
-		const messages = context.messages.filter(
-			(message) => !(message.role === "custom" && message.customType === VALIDATION_HINT_MESSAGE_TYPE),
-		);
-		const hint = this._createValidationHintMessage();
-		return {
-			...context,
-			messages: hint ? [...messages, hint] : messages,
-		};
-	}
-
 	/**
 	 * Install tool hooks once on the Agent instance.
 	 *
@@ -743,8 +623,6 @@ export class AgentSession {
 			const normalizedContent = await normalizeToolResultImages(content, {
 				autoResizeImages: this.settingsManager.getImageAutoResize(),
 			});
-			const finalIsError = hookResult?.isError ?? isError;
-			this._recordValidationToolResult(toolCall.name, args, normalizedContent, finalIsError);
 
 			if (!hookResult && normalizedContent === content) {
 				return undefined;
@@ -773,11 +651,11 @@ export class AgentSession {
 
 			return {
 				...previousSnapshot,
-				context: this._withValidationHint({
+				context: {
 					...previousContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
-				}),
+				},
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
@@ -1373,7 +1251,6 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._resetValidationHintState();
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
