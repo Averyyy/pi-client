@@ -21,6 +21,7 @@ import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "
 import { rewritePiCliCommand } from "../pi-client-cli-adapter.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
+import { BASH_UPDATE_THROTTLE_MS } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
@@ -208,15 +209,13 @@ export interface BashToolOptions {
 	spawnHook?: BashSpawnHook;
 }
 
-const BASH_PREVIEW_LINES = 5;
-const BASH_UPDATE_THROTTLE_MS = 100;
-
 export type BashRenderState = {
 	startedAt: number | undefined;
 	endedAt: number | undefined;
 	interval: NodeJS.Timeout | undefined;
 };
 
+const BASH_PREVIEW_LINES = 5;
 type BashResultRenderState = {
 	cachedWidth: number | undefined;
 	cachedLines: string[] | undefined;
@@ -359,10 +358,16 @@ export function createShellToolDefinition(
 			{ command, timeout }: { command: string; timeout?: number },
 			signal?: AbortSignal,
 			onUpdate?,
-			ctx?,
+			ctx?: ExtensionContext,
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
-			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook, exposeSessionEnvironment, ctx);
+			const spawnContext = resolveSpawnContext(
+				resolvedCommand,
+				ctx?.cwd || cwd,
+				spawnHook,
+				exposeSessionEnvironment,
+				ctx,
+			);
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
@@ -490,12 +495,12 @@ export function createShellToolDefinition(
 			text.setText(formatShellCall(args, config.prompt));
 			return text;
 		},
-		renderResult(result, options, _theme, context) {
+		renderResult(result, renderOptions, _theme, context) {
 			const state = context.state;
-			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+			if (state.startedAt !== undefined && renderOptions.isPartial && !state.interval) {
 				state.interval = setInterval(() => context.invalidate(), 1000);
 			}
-			if (!options.isPartial || context.isError) {
+			if (!renderOptions.isPartial || context.isError) {
 				state.endedAt ??= Date.now();
 				if (state.interval) {
 					clearInterval(state.interval);
@@ -507,7 +512,7 @@ export function createShellToolDefinition(
 			rebuildBashResultRenderComponent(
 				component,
 				result as any,
-				options,
+				renderOptions,
 				context.showImages,
 				state.startedAt,
 				state.endedAt,

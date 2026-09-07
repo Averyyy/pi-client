@@ -12,6 +12,7 @@ import { createSessionManager } from "../src/main.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxLoader = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
+const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -56,7 +57,7 @@ async function runCli(args: string[]): Promise<{ code: number | null; agentDir: 
 	mkdirSync(projectDir, { recursive: true });
 
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoader, cliPath, ...args], {
+		const child = spawn(process.execPath, ["--import", tsxLoader, "--import", sourceResolverUrl, cliPath, ...args], {
 			cwd: projectDir,
 			env: {
 				...process.env,

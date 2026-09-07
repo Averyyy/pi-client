@@ -579,6 +579,15 @@ async function executeScheduledToolCalls(
 	let parallelBatch: Array<{ index: number; preparation: PreparedToolCall }> = [];
 
 	const runPrepared = async (preparation: PreparedToolCall) => {
+		if (signal?.aborted) {
+			const finalized = {
+				toolCall: preparation.toolCall,
+				result: createErrorToolResult("Operation aborted"),
+				isError: true,
+			} satisfies FinalizedToolCallOutcome;
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		}
 		const executed = await executePreparedToolCall(preparation, signal, emit);
 		const finalized = await finalizeExecutedToolCall(
 			currentContext,

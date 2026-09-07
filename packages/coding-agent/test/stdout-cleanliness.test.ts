@@ -9,6 +9,7 @@ import { allowNetwork } from "./test-network-env.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
+const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
 
 const tempDirs: string[] = [];
 
@@ -61,15 +62,19 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 	);
 
 	return await new Promise((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...args], {
-			cwd: projectDir,
-			env: {
-				...process.env,
-				[ENV_AGENT_DIR]: agentDir,
-				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+		const child = spawn(
+			process.execPath,
+			["--import", tsxLoaderUrl, "--import", sourceResolverUrl, cliPath, ...args],
+			{
+				cwd: projectDir,
+				env: {
+					...process.env,
+					[ENV_AGENT_DIR]: agentDir,
+					TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				},
+				stdio: ["ignore", "pipe", "pipe"],
 			},
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+		);
 
 		let stdout = "";
 		let stderr = "";

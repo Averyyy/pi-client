@@ -8,6 +8,7 @@ import { ENV_AGENT_DIR } from "../src/config.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
+const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -25,16 +26,20 @@ function createTempDir(): string {
 async function runCli(args: string[], cwd: string, agentDir: string): Promise<{ code: number | null; stderr: string }> {
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["--import", tsxLoaderUrl, cliPath, ...args], {
-			cwd,
-			env: {
-				...process.env,
-				[ENV_AGENT_DIR]: agentDir,
-				PI_OFFLINE: "1",
-				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+		const child = spawn(
+			process.execPath,
+			["--import", tsxLoaderUrl, "--import", sourceResolverUrl, cliPath, ...args],
+			{
+				cwd,
+				env: {
+					...process.env,
+					[ENV_AGENT_DIR]: agentDir,
+					PI_OFFLINE: "1",
+					TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				},
+				stdio: ["ignore", "ignore", "pipe"],
 			},
-			stdio: ["ignore", "ignore", "pipe"],
-		});
+		);
 		child.stderr.on("data", (chunk) => {
 			stderr += chunk.toString();
 		});
