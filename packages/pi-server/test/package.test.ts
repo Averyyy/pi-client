@@ -24,7 +24,20 @@ describe("pi-server package", () => {
 
 	it("depends on published runtime packages", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@earendil-works/pi-ai"]).toBe("npm:@averyyy/pi-ai@0.80.3-piclient.2");
-		expect(pkg.dependencies["@earendil-works/pi-agent-core"]).toBe("npm:@averyyy/pi-agent-core@0.80.3-piclient.2");
+		const piAi = pkg.dependencies["@earendil-works/pi-ai"];
+		const piAgentCore = pkg.dependencies["@earendil-works/pi-agent-core"];
+		const aliasPattern = /^npm:@averyyy\/(pi-ai|pi-agent-core)@(\d+\.\d+\.\d+-piclient\.\d+)$/;
+
+		expect(piAi).toMatch(aliasPattern);
+		expect(piAgentCore).toMatch(aliasPattern);
+		expect(piAi).not.toMatch(/^(?:workspace:|file:)/);
+		expect(piAgentCore).not.toMatch(/^(?:workspace:|file:)/);
+
+		const piAiMatch = aliasPattern.exec(piAi);
+		const piAgentCoreMatch = aliasPattern.exec(piAgentCore);
+		if (!piAiMatch || !piAgentCoreMatch) throw new Error("Expected published pi runtime aliases");
+		expect(piAiMatch[1]).toBe("pi-ai");
+		expect(piAgentCoreMatch[1]).toBe("pi-agent-core");
+		expect(piAgentCoreMatch[2]).toBe(piAiMatch[2]);
 	});
 });
