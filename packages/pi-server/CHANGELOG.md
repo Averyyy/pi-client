@@ -20,6 +20,13 @@
 
 ### Fixed
 
+- Rejected stale compaction results after concurrent session changes instead of attaching summaries to the wrong branch.
+- Preserved authoritative final assistant messages in healthy proxy streams, including redacted thinking and provider response metadata.
+- Persisted static-context-only updates across restarts by advancing session revisions.
+- Handled IPv6 request routing and printed bracketed IPv6 listening addresses with the actual bound port.
+- Removed quadratic array prepends from long session-branch reconstruction.
+- Made help, version, and unknown CLI arguments exit without starting the server or loading sessions.
+- Forwarded compaction request timeouts to the summarizer provider without changing cancellation or upload-time budgeting.
 - Recovered and truncated torn WAL tail records without hiding complete invalid records or allowing one corrupt session file to prevent server startup.
 - Preserved complete authoritative tool-call metadata through proxy streams and completed-run replay.
 - Bounded stream-run journals with TTL cleanup, final-message-only storage, same-run recovery, and session-delete cleanup.

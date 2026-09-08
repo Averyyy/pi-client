@@ -3,6 +3,8 @@
 ### Fixed
 
 - Fixed automatic update checks to compare the installed `pi-client` version instead of the upstream `pi` version.
+- Used `pi-client` in fork help and documented `web`, `send`, server configuration, global package updates, and `/reload` without changing upstream Pi help.
+- Reported upload HTTP and connection failures with the target, response metadata, and a bounded, token-redacted body excerpt instead of JSON or network stack traces.
 
 ### Added
 

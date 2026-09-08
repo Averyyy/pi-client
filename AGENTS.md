@@ -43,6 +43,7 @@
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
 - If the server has messages the client does not have, the server may send those messages or the full server history back to the client. Client receive size is not constrained by the proxy POST-body limit.
 - When `pi-server` converts provider events to proxy SSE, preserve the complete `toolCall` on `toolcall_end`; the client reconstructs the assistant event and durable tool metadata from that payload.
+- Send the authoritative assistant `message` on every successful proxy `done` event, just as completed-run replay does. Consumers must preserve final-only content, redacted thinking, signatures, and message-level provider metadata instead of saving a partial reconstruction.
 - If client and server history diverge, server history is authoritative. Reconcile the client to the server history and refresh the UI/session state instead of uploading the divergent client history.
 - When `pi-server` reports an existing `treeHash` and `entryCount`, treat that as the server-known prefix. If the local tree extends that prefix, append only the new tail entries; do not full-sync just because in-memory entry-id tracking was reset by resume/import/process restart.
 - When `pi-server` reports the same full tree hash but a different `leafId`, switch the leaf with `/api/session/tree/switch`; do not resend entries.
@@ -58,6 +59,7 @@
 - Transient provider context such as validation hints or extension overlays must travel as `ephemeralMessages`/`contextOverlay` on `/api/stream`; it must not be converted into durable pending tree entries or trigger full-tree sync.
 - Do not export Node-only pi-server protocol helpers from the browser-safe `@earendil-works/pi-agent-core` root entrypoint; keep them in Node-only package modules unless a browser-safe implementation exists.
 - Keep provider request timeout inside serialized pi-server stream/compact options; `ChunkRequest` should only use the caller abort signal so chunk upload time does not consume LLM API timeout.
+- The compaction request's model adapter must forward `timeoutMs` into its provider stream options; serializing it on the HTTP body alone does not make the summarizer's SDK enforce the timeout.
 - Keep server update-command install-shape handling in its updater wrapper: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 - `pi-client update` must not reinstall a source checkout into the active global path: update the published global packages, leave active sessions running, and require `/reload` to restart a session on the new runtime.
 - Route `pi-client send <path>` through `ChunkRequest` to `/api/receive`; pi-server saves the basename under `PI_SERVER_UPLOAD_DIR` (default `~/.pi/upload_files`) and must reject path traversal and existing destinations.
@@ -68,12 +70,15 @@
 - Keep the pi-client/pi-server `firstKeptEntryId` session-tree adapter explicit through `buildLegacySessionContext()`, `prepareLegacyCompaction()`, and `compactLegacy()`; do not pass that durable wire format into Harness v2 APIs that require `seq` and embedded `retainedTail` entries.
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.
 - Server-side compaction is authoritative. `pi-server` should append the compaction entry, persist it, and return the updated tree snapshot; `pi-client` should replace its local tree from that snapshot instead of locally appending a compaction and syncing it back.
+- Capture compaction's session identity, revision, tree hash, leaf, and entry count before awaiting the summarizer. Reject a stale result before writing if the session changed or was deleted; never attach an old branch summary to a newly selected branch.
 - Prefer delta responses for server-side compact/history when the client supplies a matching base tree hash or entry offset; keep full history/tree responses as the mismatch fallback.
 - `pi-server` stream requests should include a `runId`; the server journals only the final assistant message so a client can recover or replay a completed run after a stream disconnect without retaining all deltas. Poll the same run while it is still running, classify recovery transport failures outside `provider_stream`, and clear a session's run journals when deleting that session.
 - Structure pi-server failures with phase metadata (`session_init`, `tree_sync`, `provider_stream`, etc.) and only let provider-stream failures enter LLM retry logic.
 - Session persistence should use append-only WAL records for append/switch/static-context mutations and periodic snapshots; avoid rewriting the full JSON session on every mutation.
+- Real static-context changes must increment the same monotonic session revision as tree mutations; identical context updates are no-ops. Keep recovery's old-revision WAL rejection intact.
 - WAL recovery may discard and truncate only a final JSON-syntax-torn record. Complete invalid records must still reject that session, and records whose revision is not newer than the snapshot must be ignored so a crash after snapshot rename but before WAL deletion cannot roll state backward.
 - Cache rolling tree hashes/prefix hashes in server session state. Append should update the hash from new entries, and leaf switches must not recompute the tree hash.
+- Reconstruct long parent chains with append plus one reverse, not repeated array prepends. Retain branch order and cycle detection, and compare raw benchmark samples before keeping performance changes.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
 - Server-side compaction over Cloudflare must use a streaming response with heartbeat bytes; a plain long JSON response can hit Cloudflare 524 before compaction finishes.
 - Intra-turn tool-loop compaction must run before the next provider request from `prepareNextTurn`. When compacting a huge latest tool result, insert a hidden keep marker and force compaction to that marker so the next request carries the compaction summary plus marker, not the oversized tool-result tail.
@@ -90,6 +95,7 @@
 - When `PI_SERVER_MODE` is set, the pi-client CLI adapter automatically installs a process-local PATH shim that redirects `pi` subprocess invocations to `pi-client`, and rewrites displayed command strings to show `pi-client` instead of `pi` for consistency.
 ## pi-client Web UI
 
+- In the standalone `packages/pi-webui` inspector, capture each send's session ID and history before the first await, and carry that target through append, stream, and finalization. Only render for the matching viewed session; loading guards must cover keyboard sends as well as buttons.
 - `pi-client web` is the remote-backend Tau entrypoint. It should launch the forked coding-agent CLI with `PI_SERVER_MODE=true`, `PI_SERVER_URL`, and `TAU_MIRROR_PORT=1838`; Tau remains the browser mirror, not the backend selector.
 - Local `pi` and remote `pi-client` may share the same `~/.pi/agent` Tau install. The backend is whichever process loads Tau: `pi` for local provider calls, `pi-client web` for pi-client-to-pi-server transport.
 - Do not revive `@jmfederico/pi-web` or `packages/pi-webui` for `pi-client web` unless the user explicitly asks; `packages/pi-webui` is a pi-server inspector/proxy, not the client GUI.
@@ -106,6 +112,7 @@
 - Publish the scoped fork packages with `npm run publish:averyyy -- --version 0.80.3-piclient.N`. The version must use npm prerelease format: upstream Pi version plus `-piclient.N`, not four numeric segments.
 - Dry-run locally with `npm run publish:averyyy:dry -- --version 0.80.3-piclient.N`. Use `--skip-build` only when existing `dist` output was already built for the same source.
 - The script publishes `@averyyy/pi-ai`, `@averyyy/pi-tui`, `@averyyy/pi-agent-core`, `@averyyy/pi-coding-agent`, `@averyyy/pi-client`, and `@averyyy/pi-server` from temporary package directories. It rewrites internal runtime dependencies to exact `npm:@averyyy/...@version` aliases and does not mutate workspace package versions.
+- Package tests should enforce the exact scoped registry-alias contract and matching fork versions, not hardcode a historical alias version that goes stale when dependencies change.
 - Keep `scripts/publish-averyyy-npm.mjs` build workspaces topologically complete when upstream packages add local runtime dependencies; its self-test must reject a missing or late-built local dependency before publishing starts.
 - The temporary package metadata must set `repository.url` to `https://github.com/Averyyy/pi-client`; npm provenance rejects packages whose repository points at upstream `earendil-works/pi`.
 - Remote publishing is handled by `.github/workflows/publish-averyyy-npm.yml`. Creating or editing a draft release does not trigger GitHub Actions; publish the draft release, or run the workflow manually with `workflow_dispatch`.
