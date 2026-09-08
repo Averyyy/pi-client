@@ -1,7 +1,10 @@
 const state = {
 	config: { tokenConfigured: false, piServerUrl: "" },
 	currentSessionId: "",
+	loadedSessionId: "",
 	currentHistory: undefined,
+	sessionLoadRequest: 0,
+	loadingSession: false,
 	streaming: false,
 };
 
@@ -146,7 +149,12 @@ function renderMessages(messages) {
 }
 
 function updateSendState() {
-	elements.sendButton.disabled = !state.currentSessionId || state.streaming || elements.prompt.value.trim().length === 0;
+	elements.sendButton.disabled =
+		!state.currentSessionId ||
+		state.currentSessionId !== state.loadedSessionId ||
+		state.loadingSession ||
+		state.streaming ||
+		elements.prompt.value.trim().length === 0;
 }
 
 async function loadConfig() {
@@ -235,6 +243,12 @@ async function loadSession(sessionId) {
 		setStatus("Session ID is required", "error");
 		return;
 	}
+	const requestId = ++state.sessionLoadRequest;
+	const previousLoadedSessionId = state.loadedSessionId;
+	const previousHistory = state.currentHistory;
+	state.currentSessionId = trimmed;
+	state.loadingSession = true;
+	updateSendState();
 
 	try {
 		const response = await piFetch(`/api/session/${encodeURIComponent(trimmed)}/history`);
@@ -245,16 +259,29 @@ async function loadSession(sessionId) {
 		if (!Array.isArray(body.messages)) {
 			throw new Error("Session history response is missing messages");
 		}
+		if (requestId !== state.sessionLoadRequest) return;
 		state.currentSessionId = trimmed;
+		state.loadedSessionId = trimmed;
 		state.currentHistory = body;
+		state.loadingSession = false;
 		elements.sessionTitle.textContent = trimmed;
 		elements.sessionMeta.textContent = `${body.messageCount} messages | ${body.entryCount} entries | leaf ${body.leafId || "none"}`;
 		elements.refreshHistoryButton.disabled = false;
 		renderMessages(body.messages);
 		updateSendState();
 		await refreshSessions();
+		if (requestId !== state.sessionLoadRequest) return;
 		setStatus("Session loaded", "ok");
 	} catch (error) {
+		if (requestId !== state.sessionLoadRequest) return;
+		state.currentSessionId = previousLoadedSessionId;
+		state.loadedSessionId = previousLoadedSessionId;
+		state.currentHistory = previousHistory;
+		state.loadingSession = false;
+		if (previousHistory) {
+			renderMessages(previousHistory.messages);
+		}
+		updateSendState();
 		setStatus(error instanceof Error ? error.message : String(error), "error");
 	}
 }
@@ -398,11 +425,11 @@ function applyProxyEvent(event, partial) {
 	}
 }
 
-async function appendMessages(messages) {
+async function appendMessages(sessionId, messages) {
 	const response = await piFetch("/api/session/append", {
 		method: "POST",
 		body: JSON.stringify({
-			sessionId: state.currentSessionId,
+			sessionId,
 			messages,
 		}),
 	});
@@ -412,13 +439,13 @@ async function appendMessages(messages) {
 	}
 }
 
-async function streamAssistant(model, options) {
+async function streamAssistant(model, options, sessionId, history) {
 	const partial = makeAssistantMessage(model);
 	const response = await piFetch("/api/stream", {
 		method: "POST",
 		headers: { Accept: "text/event-stream" },
 		body: JSON.stringify({
-			sessionId: state.currentSessionId,
+			sessionId,
 			model,
 			options,
 		}),
@@ -448,7 +475,9 @@ async function streamAssistant(model, options) {
 			if (!data) continue;
 			const event = JSON.parse(data);
 			applyProxyEvent(event, partial);
-			renderMessages([...(state.currentHistory?.messages || []), partial]);
+			if (state.currentSessionId === sessionId) {
+				renderMessages([...history.messages, partial]);
+			}
 			if (event.type === "done" || event.type === "error") {
 				terminalEvent = true;
 			}
@@ -459,14 +488,25 @@ async function streamAssistant(model, options) {
 		partial.stopReason = "error";
 		partial.errorMessage = "Stream ended without done or error event";
 	}
-	await appendMessages([partial]);
+	await appendMessages(sessionId, [partial]);
 	return partial;
 }
 
 async function sendMessage() {
-	if (!state.currentSessionId || state.streaming) return;
+	if (
+		!state.currentSessionId ||
+		state.currentSessionId !== state.loadedSessionId ||
+		state.loadingSession ||
+		state.streaming
+	)
+		return;
 	const prompt = elements.prompt.value.trim();
 	if (!prompt) return;
+	const sessionId = state.currentSessionId;
+	const history = {
+		...(state.currentHistory || {}),
+		messages: [...(state.currentHistory?.messages || [])],
+	};
 
 	try {
 		const model = parseModel();
@@ -476,23 +516,29 @@ async function sendMessage() {
 		setStatus("Sending");
 
 		const userMessage = { role: "user", content: prompt, timestamp: Date.now() };
-		await appendMessages([userMessage]);
-		state.currentHistory = {
-			...(state.currentHistory || {}),
-			messages: [...(state.currentHistory?.messages || []), userMessage],
-		};
-		renderMessages(state.currentHistory.messages);
+		await appendMessages(sessionId, [userMessage]);
+		history.messages = [...history.messages, userMessage];
+		if (state.currentSessionId === sessionId) {
+			state.currentHistory = history;
+			renderMessages(history.messages);
+		}
 		elements.prompt.value = "";
 
-		const assistant = await streamAssistant(model, options);
+		const assistant = await streamAssistant(model, options, sessionId, history);
 		if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
-			setStatus(assistant.errorMessage || assistant.stopReason, "error");
-		} else {
+			if (state.currentSessionId === sessionId) {
+				setStatus(assistant.errorMessage || assistant.stopReason, "error");
+			}
+		} else if (state.currentSessionId === sessionId) {
 			setStatus("Response appended", "ok");
 		}
-		await loadSession(state.currentSessionId);
+		if (state.currentSessionId === sessionId) {
+			await loadSession(sessionId);
+		}
 	} catch (error) {
-		setStatus(error instanceof Error ? error.message : String(error), "error");
+		if (state.currentSessionId === sessionId) {
+			setStatus(error instanceof Error ? error.message : String(error), "error");
+		}
 	} finally {
 		state.streaming = false;
 		updateSendState();
