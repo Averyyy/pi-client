@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadPersistedSessions, savePersistedSession } from "../src/session-persistence.ts";
-import { appendSessionEntries, clearAllSessions, getSession, replaceSessionTree } from "../src/session-store.ts";
+import {
+	appendMessages,
+	appendSessionEntries,
+	clearAllSessions,
+	getSession,
+	replaceSessionTree,
+	setStaticContext,
+} from "../src/session-store.ts";
 
 describe("session-persistence", () => {
 	let tempDir: string;
@@ -108,5 +115,65 @@ describe("session-persistence", () => {
 		loadPersistedSessions(tempDir);
 
 		expect(getSession("persist-wal")?.messages.map((message) => message.content)).toEqual(["one", "two"]);
+	});
+
+	it("persists changed static context through WAL across restart", () => {
+		const sessionId = "persist-static-context";
+		const initial = setStaticContext(sessionId, { systemPrompt: "old prompt", tools: [] });
+		savePersistedSession(tempDir, initial);
+		expect(initial.revision).toBe(1);
+
+		const promptUpdated = setStaticContext(sessionId, { systemPrompt: "new prompt", tools: [] });
+		savePersistedSession(tempDir, promptUpdated);
+		const promptRevision = promptUpdated.revision;
+		expect(promptRevision).toBe(2);
+
+		const duplicate = setStaticContext(sessionId, { systemPrompt: "new prompt", tools: [] });
+		savePersistedSession(tempDir, duplicate);
+		expect(duplicate.revision).toBe(promptRevision);
+
+		clearAllSessions();
+		loadPersistedSessions(tempDir);
+		const promptRestored = getSession(sessionId);
+		expect(promptRestored?.staticContext).toEqual({ systemPrompt: "new prompt", tools: [] });
+		expect(promptRestored?.revision).toBe(promptRevision);
+
+		const toolsUpdated = setStaticContext(sessionId, {
+			systemPrompt: "new prompt",
+			tools: [{ name: "read", description: "Read a file", parameters: {} }],
+		});
+		savePersistedSession(tempDir, toolsUpdated);
+		const toolsRevision = toolsUpdated.revision;
+		expect(toolsRevision).toBe(promptRevision + 1);
+		const staticContextHash = toolsUpdated.staticContextHash;
+
+		clearAllSessions();
+		loadPersistedSessions(tempDir);
+
+		const restored = getSession(sessionId);
+		expect(restored?.staticContext).toEqual(toolsUpdated.staticContext);
+		expect(restored?.staticContextHash).toBe(staticContextHash);
+		expect(restored?.revision).toBe(toolsRevision);
+	});
+
+	it("keeps static context updates after message WAL records and a snapshot cycle", () => {
+		const sessionId = "persist-static-context-cycle";
+		const initial = setStaticContext(sessionId, { systemPrompt: "v0", tools: [] });
+		savePersistedSession(tempDir, initial);
+		const withMessage = appendMessages(sessionId, [{ role: "user", content: "message", timestamp: 1000 }]);
+		savePersistedSession(tempDir, withMessage);
+
+		for (let index = 1; index <= 33; index++) {
+			const updated = setStaticContext(sessionId, { systemPrompt: `v${index}`, tools: [] });
+			savePersistedSession(tempDir, updated);
+		}
+
+		clearAllSessions();
+		loadPersistedSessions(tempDir);
+
+		const restored = getSession(sessionId);
+		expect(restored?.staticContext?.systemPrompt).toBe("v33");
+		expect(restored?.messages.map((message) => message.content)).toEqual(["message"]);
+		expect(restored?.revision).toBe(35);
 	});
 });

@@ -144,8 +144,10 @@ export function restoreSessionState(persisted: PersistedSessionState): SessionSt
 export function setStaticContext(sessionId: string, context: SessionStaticContext): SessionState {
 	const session = getOrCreateSession(sessionId);
 	const newHash = hashStaticContext(context);
+	if (session.staticContextHash === newHash) return session;
 	session.staticContext = context;
 	session.staticContextHash = newHash;
+	session.revision++;
 	session.updatedAt = Date.now();
 	markWalPersistenceChange(session, []);
 	return session;
