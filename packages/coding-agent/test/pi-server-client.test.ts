@@ -1,7 +1,8 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { Context, Message, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stream as streamAnthropic } from "../../ai/src/api/anthropic-messages.ts";
 import {
 	cancelPiServerOperations,
 	compactPiServer,
@@ -206,6 +207,108 @@ describe("pi-server-client", () => {
 			| undefined;
 		expect(toolEnd?.toolCall?.namespace).toBe("functions_dyn");
 	});
+
+	it.each(["live", "recovery"])(
+		"preserves authoritative message fields and redacted thinking during %s delivery",
+		async (delivery) => {
+			const model: Model<"anthropic-messages"> = {
+				id: "test-claude",
+				name: "Test Claude",
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "http://127.0.0.1:9",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 4096,
+			};
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [
+					{
+						type: "thinking",
+						thinking: "[Reasoning redacted]",
+						redacted: true,
+						thinkingSignature: "encrypted-payload",
+					},
+					{ type: "text", text: "Final-only answer", textSignature: "signed-text" },
+				],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				responseId: "resp_authoritative",
+				responseModel: "resolved-model",
+				rawStopReason: "end_turn",
+				endTurn: true,
+				usage: {
+					input: 1,
+					output: 2,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 3,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1234,
+			};
+			const paths: string[] = [];
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string) => {
+					const path = new URL(url).pathname;
+					paths.push(path);
+					if (path === "/api/session/init") {
+						return Response.json({ sessionId: `authoritative-${delivery}`, staticContextHash: "test" });
+					}
+					if (path === "/api/stream") {
+						return makeMockResponse([
+							{ type: "start" },
+							{ type: "thinking_start", contentIndex: 0 },
+							{ type: "thinking_end", contentIndex: 0, contentSignature: "encrypted-payload" },
+							...(delivery === "live" ? [{ type: "done", reason: "stop", usage: message.usage, message }] : []),
+						]);
+					}
+					if (path.startsWith(`/api/session/authoritative-${delivery}/runs/`)) {
+						return Response.json({ status: "completed", message });
+					}
+					throw new Error(`Unexpected request: ${path}`);
+				}),
+			);
+			const stream = await streamPiServer(
+				model,
+				{ systemPrompt: "Test", messages: [] },
+				{ sessionId: `authoritative-${delivery}` },
+			);
+			for await (const _event of stream) {
+				// Drain the stream so request cleanup completes before restoring mocks.
+			}
+			const result = await stream.result();
+			expect(result).toEqual(message);
+			expect(paths.filter((path) => path === "/api/stream")).toHaveLength(1);
+			expect(paths.some((path) => path.includes("/runs/"))).toBe(delivery === "recovery");
+
+			let payload: { messages: Array<{ role: string; content: unknown }> } | undefined;
+			const serialized = await streamAnthropic(
+				model,
+				{
+					messages: [textMessage("first", 1), result, textMessage("continue", 2000)],
+				},
+				{
+					apiKey: "fake-key",
+					onPayload(value) {
+						payload = value as typeof payload;
+						throw new Error("Captured payload before network request");
+					},
+				},
+			).result();
+			expect(serialized.errorMessage).toBe("Captured payload before network request");
+			expect(payload?.messages.find((item) => item.role === "assistant")?.content).toEqual([
+				{ type: "redacted_thinking", data: "encrypted-payload" },
+				{ type: "text", text: "Final-only answer" },
+			]);
+		},
+	);
 
 	it("includes tool parameters in the static context hash", () => {
 		const ctx1: Context = {

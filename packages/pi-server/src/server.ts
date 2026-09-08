@@ -1331,6 +1331,7 @@ function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent 
 				reason: event.reason,
 				usage: event.message.usage,
 				deferred: event.message.deferred,
+				message: event.message,
 			};
 		case "error":
 			return {

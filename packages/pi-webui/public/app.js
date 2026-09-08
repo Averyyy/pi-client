@@ -412,8 +412,12 @@ function applyProxyEvent(event, partial) {
 			return;
 		}
 		case "done":
-			partial.stopReason = event.reason;
-			partial.usage = event.usage;
+			if (event.message) {
+				Object.assign(partial, event.message);
+			} else {
+				partial.stopReason = event.reason;
+				partial.usage = event.usage;
+			}
 			return;
 		case "error":
 			partial.stopReason = event.reason;

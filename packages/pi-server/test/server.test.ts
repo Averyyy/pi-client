@@ -1773,6 +1773,77 @@ describe("pi-server HTTP", () => {
 		await stream.body?.cancel();
 	});
 
+	it("preserves the same authoritative final message in live streams and completed-run replay", async () => {
+		const faux = registerFauxProvider();
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: "[Reasoning redacted]",
+					redacted: true,
+					thinkingSignature: "encrypted-payload",
+				},
+				{ type: "text", text: "Final-only answer", textSignature: "signed-text" },
+			],
+			api: faux.models[0].api,
+			provider: faux.models[0].provider,
+			model: faux.models[0].id,
+			responseId: "resp_authoritative",
+			responseModel: "resolved-model",
+			rawStopReason: "end_turn",
+			endTurn: true,
+			usage: {
+				input: 1,
+				output: 2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1234,
+		};
+		let providerCalls = 0;
+		const provide = () => {
+			providerCalls++;
+			const stream = createAssistantMessageEventStream();
+			const partial: AssistantMessage = { ...message, content: [message.content[0]] };
+			stream.push({ type: "start", partial });
+			stream.push({ type: "thinking_start", contentIndex: 0, partial });
+			stream.push({ type: "thinking_end", contentIndex: 0, content: "[Reasoning redacted]", partial });
+			stream.push({ type: "done", reason: "stop", message });
+			stream.end();
+			return stream;
+		};
+		registerApiProvider({ api: faux.api, stream: provide, streamSimple: provide });
+		const sessionId = "authoritative-final-message";
+		const runId = "authoritative-final-run";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		const init = await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "Final message test" } }),
+		});
+		expect(init.status).toBe(200);
+		for (const _delivery of ["live", "replay"]) {
+			const response = await fetch(`${baseUrl}/api/stream`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+			});
+			expect(response.status).toBe(200);
+			const events = (await response.text())
+				.split("\n")
+				.filter((line) => line.startsWith("data: "))
+				.map((line) => JSON.parse(line.slice(6)) as { type: string; message?: AssistantMessage });
+			expect(events.find((event) => event.type === "done")?.message).toEqual(message);
+		}
+		expect(providerCalls).toBe(1);
+		const run = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}`, { headers });
+		expect(await run.json()).toMatchObject({ status: "completed", message });
+	});
+
 	it("journals a completed stream run for recovery by run id", async () => {
 		const faux = registerFauxProvider();
 		const journaledMessage: AssistantMessage = {
