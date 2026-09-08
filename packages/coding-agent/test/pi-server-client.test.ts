@@ -3,6 +3,7 @@ import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	cancelPiServerOperations,
 	compactPiServer,
 	hashStaticContext,
 	resetAllSessionTracking,
@@ -824,6 +825,72 @@ describe("pi-server-client", () => {
 		expect(capturedBodies[0].body).toEqual({ sessionId: "tree-switch", leafId: "a1" });
 	});
 
+	it("cancels an owned stream with one terminal acknowledgement", async () => {
+		const providerAbort = new AbortController();
+		let streamBodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let resolveStreamBodyReady: (() => void) | undefined;
+		const streamBodyReady = new Promise<void>((resolve) => {
+			resolveStreamBodyReady = resolve;
+		});
+		let abortCount = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				if (path.endsWith("/api/session/init")) {
+					return new Response(JSON.stringify({ sessionId: body.sessionId, staticContextHash: "hash" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (path === "/api/stream") {
+					const streamBody = new ReadableStream<Uint8Array>({
+						start(controller) {
+							streamBodyController = controller;
+							resolveStreamBodyReady?.();
+						},
+					});
+					return new Response(streamBody, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+				}
+				if (path.endsWith("/abort")) {
+					abortCount++;
+					if (abortCount === 1) {
+						return new Response(JSON.stringify({ error: "temporary cancellation failure" }), {
+							status: 503,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response(
+						JSON.stringify({ sessionId: body.sessionId, runId: body.runId, status: "aborted" }),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				throw new Error(`Unexpected request ${path}`);
+			}),
+		);
+
+		const stream = await streamPiServer(
+			testModel,
+			{ systemPrompt: "test", messages: [] },
+			{ sessionId: "owned-stream", ownerSessionId: "owner-session", signal: providerAbort.signal },
+		);
+		await streamBodyReady;
+		providerAbort.abort();
+		await expect(cancelPiServerOperations("owner-session")).rejects.toThrow("temporary cancellation failure");
+		expect(abortCount).toBe(1);
+		streamBodyController?.close();
+		for await (const _event of stream) {
+			// Drain the terminal aborted event.
+		}
+		expect(abortCount).toBe(1);
+		const firstRetry = cancelPiServerOperations("owner-session");
+		const secondRetry = cancelPiServerOperations("owner-session");
+		await Promise.all([firstRetry, secondRetry]);
+		expect(abortCount).toBe(2);
+	});
+
 	it("streams through pi-server without sending messages in the stream request", async () => {
 		const capturedBodies: { url: string; body: JsonObject }[] = [];
 		const entries = baseTree().slice(0, 1);
@@ -1456,6 +1523,83 @@ describe("pi-server-client", () => {
 		expect(compactBody?.streamResponse).toBe(true);
 		expect(result.entries).toEqual([...entries, serverEntry]);
 		expect(result.leafId).toBe("c1");
+	});
+
+	it("cancels an owned server compaction when its signal aborts", async () => {
+		const controller = new AbortController();
+		let compactBodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let resolveCompactBodyReady: (() => void) | undefined;
+		const compactBodyReady = new Promise<void>((resolve) => {
+			resolveCompactBodyReady = resolve;
+		});
+		let abortCount = 0;
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init?: RequestInit) => {
+				const path = new URL(url).pathname;
+				const body = parseJsonObject((init?.body as string | undefined) ?? "");
+				if (path.endsWith("/api/session/init")) {
+					return new Response(JSON.stringify({ sessionId: body.sessionId, staticContextHash: "hash" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (path.endsWith("/api/session/tree/sync")) {
+					return new Response(JSON.stringify({ sessionId: body.sessionId, entryCount: 0, leafId: null }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (path.endsWith("/api/session/compact")) {
+					const compactBody = new ReadableStream<Uint8Array>({
+						start(streamController) {
+							compactBodyController = streamController;
+							resolveCompactBodyReady?.();
+						},
+					});
+					return new Response(compactBody, {
+						status: 200,
+						headers: { "Content-Type": "text/event-stream" },
+					});
+				}
+				if (path.endsWith("/abort")) {
+					abortCount++;
+					if (abortCount === 1) {
+						return new Response(JSON.stringify({ error: "temporary cancellation failure" }), {
+							status: 503,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response(
+						JSON.stringify({ sessionId: body.sessionId, runId: body.runId, status: "aborted" }),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				throw new Error(`Unexpected request ${path}`);
+			}),
+		);
+
+		const compactPromise = compactPiServer(
+			testModel,
+			{ systemPrompt: "test", messages: [] },
+			{
+				sessionId: "compact-owned",
+				ownerSessionId: "owner-session",
+				sessionTree: { entries: [], leafId: null },
+				signal: controller.signal,
+			},
+		);
+		await compactBodyReady;
+		controller.abort();
+		await expect(cancelPiServerOperations("owner-session")).rejects.toThrow("temporary cancellation failure");
+		expect(abortCount).toBe(1);
+		compactBodyController?.close();
+		await expect(compactPromise).rejects.toThrow("Session run cancellation failed");
+		const firstRetry = cancelPiServerOperations("owner-session");
+		const secondRetry = cancelPiServerOperations("owner-session");
+		await Promise.all([firstRetry, secondRetry]);
+		expect(abortCount).toBe(2);
 	});
 
 	it("reconciles server history before compact instead of full-syncing over a different tree", async () => {

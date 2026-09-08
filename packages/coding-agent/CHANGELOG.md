@@ -7,6 +7,7 @@
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 ### Fixed
 
+- Fixed pi-client cancellation to show `Aborting...`, ignore repeated interrupts, and send messages queued during cancellation once the previous operation has fully settled.
 - Fixed model and thinking default persistence plus PowerShell tool construction after the upstream 0.84.3 update.
 - Fixed pi-client shutdown resume hints to use `pi-client --session` instead of `pi --session`.
 - Fixed compaction rendering to preserve the full active transcript, avoid duplicate compaction summaries, and keep the working indicator visible until the agent run settles.

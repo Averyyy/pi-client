@@ -16,9 +16,10 @@ import {
 	type TextContent,
 } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import * as piServerClient from "../src/core/pi-server-client.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
@@ -78,9 +79,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		}
 	});
 
-	async function createSession() {
+	async function createSession(sessionOptions?: { completeAfterAbort?: boolean }) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		let abortSignal: AbortSignal | undefined;
+		let callCount = 0;
 
 		// Use a stream function that responds to abort
 		const agent = new Agent({
@@ -91,12 +92,17 @@ describe("AgentSession concurrent prompt guard", () => {
 				tools: [],
 			},
 			streamFn: (_model, _context, options) => {
-				abortSignal = options?.signal;
+				callCount++;
+				const signal = options?.signal;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (sessionOptions?.completeAfterAbort && callCount > 1) {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+						return;
+					}
 					const checkAbort = () => {
-						if (abortSignal?.aborted) {
+						if (signal?.aborted) {
 							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
 						} else {
 							setTimeout(checkAbort, 5);
@@ -125,7 +131,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			autoSessionName: false,
 		});
 
-		return session;
+		return { session, getCallCount: () => callCount };
 	}
 
 	it("should throw when prompt() called while streaming", async () => {
@@ -180,6 +186,77 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {});
+	});
+
+	it("defers intent queued during abort until the cancelled run settles", async () => {
+		const lifecycle: string[] = [];
+		const created = await createSession({ completeAfterAbort: true });
+		session.subscribe((event) => {
+			if (event.type === "abort_start" || event.type === "abort_end") {
+				lifecycle.push(event.type);
+			}
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		const abortPromise = session.abort();
+		expect(session.isAborting).toBe(true);
+		expect(session.abort()).toBe(abortPromise);
+		await session.steer("Steering after abort");
+		await session.followUp("Follow-up after abort");
+
+		await abortPromise;
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(lifecycle).toEqual(["abort_start", "abort_end"]);
+		expect(created.getCallCount()).toBe(3);
+		expect(session.pendingMessageCount).toBe(0);
+		expect(session.isAborting).toBe(false);
+		expect(session.isStreaming).toBe(false);
+	});
+
+	it("keeps queued intent when cancellation fails and resumes after retry", async () => {
+		const previousPiServerMode = process.env.PI_SERVER_MODE;
+		process.env.PI_SERVER_MODE = "true";
+		const cancelSpy = vi
+			.spyOn(piServerClient, "cancelPiServerOperations")
+			.mockRejectedValueOnce(new Error("remote cancellation failed"))
+			.mockResolvedValueOnce(undefined);
+		try {
+			const created = await createSession({ completeAfterAbort: true });
+			const abortErrors: string[] = [];
+			session.subscribe((event) => {
+				if (event.type === "abort_error") abortErrors.push(event.errorMessage);
+			});
+
+			const firstPrompt = session.prompt("First message");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			await expect(session.abort()).rejects.toThrow("remote cancellation failed");
+			expect(session.isAborting).toBe(true);
+			expect(session.abortError).toBe("remote cancellation failed");
+			await session.steer("Steering after failed abort");
+
+			await session.abort();
+			await firstPrompt;
+			await session.waitForIdle();
+
+			expect(cancelSpy).toHaveBeenCalledTimes(2);
+			expect(abortErrors).toEqual(["remote cancellation failed"]);
+			expect(session.abortError).toBeUndefined();
+			expect(session.isAborting).toBe(false);
+			expect(session.pendingMessageCount).toBe(0);
+			expect(created.getCallCount()).toBe(2);
+		} finally {
+			cancelSpy.mockRestore();
+			if (previousPiServerMode === undefined) {
+				delete process.env.PI_SERVER_MODE;
+			} else {
+				process.env.PI_SERVER_MODE = previousPiServerMode;
+			}
+		}
 	});
 
 	it("should queue extension-origin steering messages while streaming", async () => {

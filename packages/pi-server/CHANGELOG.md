@@ -9,6 +9,7 @@
 - `/api/session/update` endpoint for updating session static context.
 - `GET /api/session/:id/history` endpoint for reading full server-side session history without a request body.
 - `/api/stream` endpoint for streaming incremental LLM requests with delta messages.
+- `POST /api/session/:sessionId/runs/:runId/abort` for explicit cancellation with acknowledgement after provider cleanup. Matching late-arriving stream or compaction requests cannot restart a cancelled operation.
 - `/api/request/chunk` endpoint for reassembling oversized client requests before dispatch.
 - `DELETE /api/session/:id` endpoint for removing one server-side session.
 - `/health` endpoint for health checks.

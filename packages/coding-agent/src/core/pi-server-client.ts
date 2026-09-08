@@ -58,6 +58,18 @@ const sessionTreeHashes = new Map<string, string>();
 const sessionTreeEntryCounts = new Map<string, number>();
 const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
+interface ActivePiServerOperation {
+	ownerSessionId: string;
+	sessionId: string;
+	runId: string;
+	signal?: AbortSignal;
+	cancelListener?: () => void;
+	cancelPromise?: Promise<void>;
+	cancelFailed?: boolean;
+	cancelConfirmed?: boolean;
+}
+
+const activePiServerOperations = new Map<string, Map<string, ActivePiServerOperation>>();
 const RESPONSE_BODY_EXCERPT_CHARS = 500;
 const TRANSIENT_PI_SERVER_RETRY_DELAYS_MS = [250, 750, 1500];
 const TRANSIENT_PI_SERVER_STATUS_CODES = new Set([502, 503, 504, 530]);
@@ -112,6 +124,99 @@ export function resetAllSessionTracking(): void {
 	sessionTreeEntryCounts.clear();
 	sessionTreeLeafIds.clear();
 	sessionHasTemporaryTree.clear();
+	activePiServerOperations.clear();
+}
+
+function registerPiServerOperation(
+	ownerSessionId: string | undefined,
+	sessionId: string,
+	runId: string,
+	signal?: AbortSignal,
+): ActivePiServerOperation | undefined {
+	if (!ownerSessionId) return undefined;
+	let operations = activePiServerOperations.get(ownerSessionId);
+	if (!operations) {
+		operations = new Map();
+		activePiServerOperations.set(ownerSessionId, operations);
+	}
+	const operation: ActivePiServerOperation = { ownerSessionId, sessionId, runId, signal };
+	operations.set(runId, operation);
+	if (signal) {
+		const onAbort = () => {
+			void cancelPiServerOperation(operation).catch(() => {
+				// The owner session retries cancellation and reports the failure.
+			});
+		};
+		operation.cancelListener = onAbort;
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+	}
+	return operation;
+}
+
+function removePiServerOperation(operation: ActivePiServerOperation): void {
+	const operations = activePiServerOperations.get(operation.ownerSessionId);
+	operation.cancelConfirmed = true;
+	if (operation.signal && operation.cancelListener) {
+		operation.signal.removeEventListener("abort", operation.cancelListener);
+	}
+	operation.cancelListener = undefined;
+	if (!operations || operations.get(operation.runId) !== operation) return;
+	operations.delete(operation.runId);
+	if (operations.size === 0) activePiServerOperations.delete(operation.ownerSessionId);
+}
+
+async function finishPiServerOperation(
+	operation: ActivePiServerOperation | undefined,
+	aborted: boolean,
+): Promise<void> {
+	if (!operation) return;
+	if (aborted) {
+		if (operation.cancelPromise) await operation.cancelPromise;
+	} else {
+		removePiServerOperation(operation);
+	}
+}
+
+async function cancelPiServerOperation(operation: ActivePiServerOperation, retryFailed = false): Promise<void> {
+	if (operation.cancelConfirmed) return;
+	if (retryFailed && operation.cancelFailed) {
+		operation.cancelFailed = false;
+		operation.cancelPromise = undefined;
+	}
+	if (operation.cancelPromise) return operation.cancelPromise;
+
+	const cancellation = (async () => {
+		const request = createPiServerRequest();
+		const response = await request.postJson(
+			`/api/session/${encodeURIComponent(operation.sessionId)}/runs/${encodeURIComponent(operation.runId)}/abort`,
+			{ sessionId: operation.sessionId, runId: operation.runId },
+		);
+		const result = await readPiServerJson<PiServerAbortResponse>(response, "Session run cancellation failed");
+		if (result.sessionId !== operation.sessionId || result.runId !== operation.runId) {
+			throw new Error("Session run cancellation failed (response did not echo the cancelled run)");
+		}
+		if (result.status !== "aborted" && result.status !== "completed" && result.status !== "failed") {
+			throw new Error("Session run cancellation failed (response was not terminal)");
+		}
+		removePiServerOperation(operation);
+	})();
+
+	operation.cancelPromise = cancellation;
+	try {
+		await cancellation;
+	} catch (error) {
+		operation.cancelFailed = true;
+		throw error;
+	}
+}
+
+/** Cancel all provider operations owned by a coding-agent session and wait for terminal acknowledgements. */
+export async function cancelPiServerOperations(ownerSessionId: string): Promise<void> {
+	const operations = [...(activePiServerOperations.get(ownerSessionId)?.values() ?? [])];
+	const results = await Promise.allSettled(operations.map((operation) => cancelPiServerOperation(operation, true)));
+	const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (failure) throw failure.reason;
 }
 
 interface SessionInitResponse {
@@ -146,6 +251,7 @@ export interface PiServerHistorySnapshot {
 }
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
+	ownerSessionId?: string;
 	sessionTree?: PiServerTreeSnapshot;
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
@@ -251,9 +357,15 @@ class ServerSentEventParser {
 
 interface PiServerRunResponse {
 	runId: string;
-	status: "running" | "completed" | "failed";
+	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
 	errorMessage?: string;
+}
+
+interface PiServerAbortResponse {
+	sessionId: string;
+	runId: string;
+	status: "aborted" | "completed" | "failed";
 }
 
 interface PiServerSyncOptions {
@@ -786,6 +898,7 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 }
 
 export interface PiServerCompactOptions extends SimpleStreamOptions {
+	ownerSessionId?: string;
 	customInstructions?: string;
 	settings?: unknown;
 	preparation?: CompactionPreparationOptions;
@@ -799,61 +912,71 @@ export async function compactPiServer(
 	options?: PiServerCompactOptions,
 ): Promise<PiServerCompactionResult> {
 	const sessionId = options?.sessionId ?? "default";
+	const runId = randomUUID();
+	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const request = createPiServerRequest(options?.signal);
 
-	await ensureSessionInit(sessionId, context, request);
-	const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
-	await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
+	try {
+		await ensureSessionInit(sessionId, context, request);
+		const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
+		await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
 
-	const makeBody = () => ({
-		sessionId,
-		model,
-		options: serializeOptions(options),
-		settings: options?.settings,
-		preparation: options?.preparation,
-		customInstructions: options?.customInstructions,
-		baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
-		streamResponse: true,
-	});
-	let response = await request.postJson("/api/session/compact", makeBody());
-	if (!response.ok) {
-		let failure = await readPiServerFailure(response);
-		if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
-			resetSessionTracking(sessionId);
-			await ensureSessionInit(sessionId, context, request);
-			await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
-			response = await request.postJson("/api/session/compact", makeBody());
-			if (response.ok) {
-				failure = { details: "", code: undefined };
-			} else {
-				failure = await readPiServerFailure(response);
+		const makeBody = () => ({
+			sessionId,
+			runId,
+			model,
+			options: serializeOptions(options),
+			settings: options?.settings,
+			preparation: options?.preparation,
+			customInstructions: options?.customInstructions,
+			baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
+			streamResponse: true,
+		});
+		let response = await request.postJson("/api/session/compact", makeBody());
+		if (!response.ok) {
+			let failure = await readPiServerFailure(response);
+			if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
+				resetSessionTracking(sessionId);
+				await ensureSessionInit(sessionId, context, request);
+				await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
+				response = await request.postJson("/api/session/compact", makeBody());
+				if (response.ok) {
+					failure = { details: "", code: undefined };
+				} else {
+					failure = await readPiServerFailure(response);
+				}
+			}
+			if (!response.ok) {
+				throw new Error(`Server compaction failed (${failure.details})`);
 			}
 		}
-		if (!response.ok) {
-			throw new Error(`Server compaction failed (${failure.details})`);
+		const result = await readPiServerCompactResponse<PiServerCompactionResponse>(
+			response,
+			"Server compaction failed",
+		);
+		if (!result.compaction) {
+			throw new Error("Server compaction response did not include a compaction result");
 		}
+		const resultEntries =
+			result.entries ??
+			(result.treePatch
+				? [...tree.entries.slice(0, result.treePatch.entriesFrom), ...result.treePatch.entries]
+				: undefined);
+		const resultLeafId = result.leafId ?? result.treePatch?.leafId;
+		if (!result.compactionEntry || !resultEntries || resultLeafId === undefined) {
+			throw new Error("Server compaction response did not include the updated session tree");
+		}
+		markTreeSynced(sessionId, { entries: resultEntries, leafId: resultLeafId });
+		return {
+			compaction: result.compaction,
+			compactionEntry: result.compactionEntry,
+			entries: resultEntries,
+			leafId: resultLeafId,
+			messages: result.messages ?? [],
+		};
+	} finally {
+		await finishPiServerOperation(operation, options?.signal?.aborted === true);
 	}
-	const result = await readPiServerCompactResponse<PiServerCompactionResponse>(response, "Server compaction failed");
-	if (!result.compaction) {
-		throw new Error("Server compaction response did not include a compaction result");
-	}
-	const resultEntries =
-		result.entries ??
-		(result.treePatch
-			? [...tree.entries.slice(0, result.treePatch.entriesFrom), ...result.treePatch.entries]
-			: undefined);
-	const resultLeafId = result.leafId ?? result.treePatch?.leafId;
-	if (!result.compactionEntry || !resultEntries || resultLeafId === undefined) {
-		throw new Error("Server compaction response did not include the updated session tree");
-	}
-	markTreeSynced(sessionId, { entries: resultEntries, leafId: resultLeafId });
-	return {
-		compaction: result.compaction,
-		compactionEntry: result.compactionEntry,
-		entries: resultEntries,
-		leafId: resultLeafId,
-		messages: result.messages ?? [],
-	};
 }
 
 export async function streamPiServer(
@@ -864,6 +987,7 @@ export async function streamPiServer(
 	const sessionId = options?.sessionId ?? randomUUID();
 	const runId = randomUUID();
 	const isEphemeralSession = options?.sessionId === undefined;
+	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const stream = new PiServerEventStream();
 
 	const partial: AssistantMessage = {
@@ -999,9 +1123,21 @@ export async function streamPiServer(
 					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
 						errorMessage = recoveredRun.errorMessage;
 					}
+					if (recoveredRun?.status === "aborted") {
+						errorMessage = recoveredRun.errorMessage ?? "pi-server run aborted";
+					}
 				} catch (recoveryError) {
 					phase = "history_reconcile";
 					errorMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+				}
+			}
+			if (options?.signal?.aborted && operation && !operation.cancelConfirmed) {
+				try {
+					await cancelPiServerOperation(operation);
+				} catch (cancelError) {
+					errorMessage = `${errorMessage}; cancellation failed: ${
+						cancelError instanceof Error ? cancelError.message : String(cancelError)
+					}`;
 				}
 			}
 			const reason = options?.signal?.aborted ? "aborted" : "error";
@@ -1022,6 +1158,13 @@ export async function streamPiServer(
 				error: partial,
 			});
 			stream.end();
+		} finally {
+			try {
+				await finishPiServerOperation(operation, options?.signal?.aborted === true);
+			} catch {
+				// The owning session's cancellation helper reports the failure and keeps
+				// this operation registered for a retry.
+			}
 		}
 	})();
 

@@ -492,6 +492,8 @@ export class InteractiveMode {
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
+	private abortInputListenerCleanup?: () => void;
+	private abortingStatusActive = false;
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
@@ -551,6 +553,9 @@ export class InteractiveMode {
 	// Convenience accessors
 	private get session(): AgentSession {
 		return this.runtimeHost.session;
+	}
+	private get sessionAbortError(): string | undefined {
+		return this.session.abortError;
 	}
 	private get agent() {
 		return this.session.agent;
@@ -872,6 +877,7 @@ export class InteractiveMode {
 		}
 		this.renderer = nextUi;
 		this.options.tuiMode = mode;
+		this.bindAbortInputListener();
 		this.mountInteractiveTui(nextUi, components);
 		nextUi.invalidate();
 		nextUi.setFocus(focus);
@@ -950,6 +956,7 @@ export class InteractiveMode {
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
+		this.bindAbortInputListener();
 		this.isInitialized = true;
 
 		await this.themeController.applyFromSettings();
@@ -1178,7 +1185,10 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(
+					userInput,
+					this.session.isStreaming || this.session.isAborting ? { streamingBehavior: "steer" } : undefined,
+				);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -2130,18 +2140,49 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private showStatusIndicator(indicator: StatusIndicator): void {
+	private showStatusIndicator(indicator: StatusIndicator, force = false): void {
+		if (this.session.isAborting && !force) {
+			indicator.dispose();
+			if (!this.abortingStatusActive) {
+				this.showAbortingStatusIndicator();
+			}
+			return;
+		}
 		this.activeStatusIndicator?.dispose();
 		this.activeStatusIndicator = indicator;
 		this.statusContainer.clear();
 		this.statusContainer.addChild(indicator);
 	}
 
-	private clearStatusIndicator(kind?: StatusIndicator["kind"]): void {
+	private showAbortingStatusIndicator(): void {
+		if (this.sessionAbortError) {
+			this.showCancellationFailedStatusIndicator();
+			return;
+		}
+		this.abortingStatusActive = true;
+		this.showStatusIndicator(new WorkingStatusIndicator(this.ui, "Aborting..."), true);
+		this.ui.requestRender();
+	}
+
+	private showCancellationFailedStatusIndicator(): void {
+		this.abortingStatusActive = true;
+		this.showStatusIndicator(
+			new WorkingStatusIndicator(this.ui, `Cancellation not confirmed (${keyText("app.interrupt")} to retry)`),
+			true,
+		);
+		this.ui.requestRender();
+	}
+
+	private clearStatusIndicator(kind?: StatusIndicator["kind"], force = false): void {
+		if (this.session.isAborting && !force) {
+			this.showAbortingStatusIndicator();
+			return;
+		}
 		if (kind && this.activeStatusIndicator?.kind !== kind) {
 			return;
 		}
 		const hadActiveStatusIndicator = this.activeStatusIndicator !== undefined;
+		this.abortingStatusActive = false;
 		this.activeStatusIndicator?.dispose();
 		this.activeStatusIndicator = undefined;
 		this.statusContainer.clear();
@@ -2152,6 +2193,10 @@ export class InteractiveMode {
 
 	private setWorkingVisible(visible: boolean): void {
 		this.workingVisible = visible;
+		if (this.session.isAborting) {
+			this.showAbortingStatusIndicator();
+			return;
+		}
 		if (!visible) {
 			this.clearStatusIndicator("working");
 			this.ui.requestRender();
@@ -2167,6 +2212,28 @@ export class InteractiveMode {
 			);
 		}
 		this.ui.requestRender();
+	}
+
+	private refreshStatusIndicator(): void {
+		if (this.session.isAborting) {
+			this.showAbortingStatusIndicator();
+			return;
+		}
+		if (this.session.isStreaming) {
+			if (this.workingVisible) {
+				this.showStatusIndicator(
+					new WorkingStatusIndicator(
+						this.ui,
+						this.workingMessage ?? this.defaultWorkingMessage,
+						this.workingIndicatorOptions,
+					),
+				);
+			} else {
+				this.clearStatusIndicator(undefined, true);
+			}
+			return;
+		}
+		this.clearStatusIndicator(undefined, true);
 	}
 
 	private setWorkingIndicator(options?: WorkingIndicatorOptions): void {
@@ -2272,7 +2339,7 @@ export class InteractiveMode {
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
-		if (this.activeStatusIndicator?.kind === "working") {
+		if (this.activeStatusIndicator?.kind === "working" && !this.session.isAborting) {
 			this.activeStatusIndicator.setMessage(
 				`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`,
 			);
@@ -2405,6 +2472,24 @@ export class InteractiveMode {
 		}
 	}
 
+	/**
+	 * Keep repeated interrupts from reaching editors or extension input handlers
+	 * while the session is completing an abort. Other input remains available so
+	 * prompts submitted during this window can be queued by AgentSession.
+	 */
+	private bindAbortInputListener(): void {
+		this.abortInputListenerCleanup?.();
+		this.abortInputListenerCleanup = this.ui.addInputListener((data) => {
+			if (this.session.isAborting && this.keybindings.matches(data, "app.interrupt")) {
+				if (this.sessionAbortError) {
+					this.requestAbort();
+				}
+				return { consume: true };
+			}
+			return undefined;
+		});
+	}
+
 	private clearExtensionTerminalInputListeners(): void {
 		for (const subscription of this.extensionTerminalInputSubscriptions) subscription.unsubscribe();
 		this.extensionTerminalInputSubscriptions.clear();
@@ -2438,7 +2523,7 @@ export class InteractiveMode {
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
-				if (this.activeStatusIndicator?.kind === "working") {
+				if (this.activeStatusIndicator?.kind === "working" && !this.session.isAborting) {
 					this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
 				}
 			},
@@ -2847,10 +2932,34 @@ export class InteractiveMode {
 	// Key Handlers
 	// =========================================================================
 
+	private requestAbort(): void {
+		if (this.session.isAborting && !this.sessionAbortError) {
+			return;
+		}
+
+		this.showAbortingStatusIndicator();
+		void this.session.abort().catch((error: unknown) => {
+			if (!this.sessionAbortError) {
+				this.showAbortError(error instanceof Error ? error.message : String(error));
+			}
+			this.refreshStatusIndicator();
+		});
+	}
+
+	private showAbortError(message: string): void {
+		this.showError(`Cancellation not confirmed: ${message}. Press ${keyText("app.interrupt")} to retry.`);
+	}
+
 	private setupKeyHandlers(): void {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
+			if (this.session.isAborting) {
+				if (this.sessionAbortError) {
+					this.requestAbort();
+				}
+				return;
+			}
 			if (this.session.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
@@ -2895,10 +3004,18 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand({ flashConfirmation: true }));
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
-		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
-		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
-		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
-		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onAction("app.session.new", () => {
+			if (!this.session.isAborting) void this.handleClearCommand();
+		});
+		this.defaultEditor.onAction("app.session.tree", () => {
+			if (!this.session.isAborting) this.showTreeSelector();
+		});
+		this.defaultEditor.onAction("app.session.fork", () => {
+			if (!this.session.isAborting) this.showUserMessageSelector();
+		});
+		this.defaultEditor.onAction("app.session.resume", () => {
+			if (!this.session.isAborting) this.showSessionSelector();
+		});
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -2959,10 +3076,37 @@ export class InteractiveMode {
 		this.showStatus("Startup is still in progress");
 	}
 
+	private async submitStreamingMessage(text: string, streamingBehavior: "steer" | "followUp"): Promise<void> {
+		this.editor.addToHistory?.(text);
+		this.editor.setText("");
+		try {
+			await this.session.prompt(text, { streamingBehavior });
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
+		} catch (error: unknown) {
+			const currentText = this.editor.getText().trim();
+			this.editor.setText([text, currentText].filter((value) => value.length > 0).join("\n\n"));
+			this.showError(`Failed to queue message: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+
+			// AgentSession owns the post-abort queue. Ordinary prompts can be queued
+			// while cancellation is in flight, but commands must wait so their TUI
+			// semantics are not changed into provider prompt text.
+			if (this.session.isAborting) {
+				if (this.isInteractiveCommand(text)) {
+					this.editor.setText(text);
+					this.showStatus("Wait for cancellation to finish before running commands.");
+					return;
+				}
+				await this.submitStreamingMessage(text, "steer");
+				return;
+			}
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3133,11 +3277,7 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
-				this.editor.addToHistory?.(text);
-				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
+				await this.submitStreamingMessage(text, "steer");
 				return;
 			}
 
@@ -3179,7 +3319,9 @@ export class InteractiveMode {
 					this.defaultEditor.onEscape = this.retryEscapeHandler;
 					this.retryEscapeHandler = undefined;
 				}
-				if (this.workingVisible) {
+				if (this.session.isAborting) {
+					this.showAbortingStatusIndicator();
+				} else if (this.workingVisible) {
 					this.showStatusIndicator(
 						new WorkingStatusIndicator(
 							this.ui,
@@ -3189,6 +3331,27 @@ export class InteractiveMode {
 					);
 				} else {
 					this.clearStatusIndicator();
+				}
+				this.ui.requestRender();
+				break;
+
+			case "abort_start":
+				this.showAbortingStatusIndicator();
+				if (this.settingsManager.getShowTerminalProgress()) {
+					this.ui.terminal.setProgress(true);
+				}
+				break;
+
+			case "abort_error":
+				this.showAbortError(event.errorMessage);
+				this.showCancellationFailedStatusIndicator();
+				this.ui.requestRender();
+				break;
+
+			case "abort_end":
+				this.refreshStatusIndicator();
+				if (!this.session.isStreaming && !this.session.isCompacting && !this.session.isRetrying) {
+					this.ui.terminal.setProgress(false);
 				}
 				this.ui.requestRender();
 				break;
@@ -3363,10 +3526,6 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
-				if (this.settingsManager.getShowTerminalProgress()) {
-					this.ui.terminal.setProgress(false);
-				}
-				this.clearStatusIndicator("working");
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -3378,6 +3537,16 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.session.isAborting) {
+					this.showAbortingStatusIndicator();
+				} else if (this.session.isStreaming) {
+					this.refreshStatusIndicator();
+				} else if (!this.session.isCompacting && !this.session.isRetrying) {
+					if (this.settingsManager.getShowTerminalProgress()) {
+						this.ui.terminal.setProgress(false);
+					}
+					this.clearStatusIndicator("working", true);
+				}
 				await this.checkShutdownRequested();
 				break;
 
@@ -3388,7 +3557,7 @@ export class InteractiveMode {
 				// Keep editor active; submissions are queued during compaction.
 				this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortCompaction();
+					this.restoreQueuedMessagesToEditor({ abort: true });
 				};
 				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
 				this.ui.requestRender();
@@ -3441,7 +3610,14 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 					}
 				}
-				void this.flushCompactionQueue({ willRetry: event.willRetry });
+				if (this.session.isAborting) {
+					this.showAbortingStatusIndicator();
+				} else if (this.session.isStreaming) {
+					this.refreshStatusIndicator();
+				}
+				if (!event.aborted && !this.session.isAborting) {
+					void this.flushCompactionQueue({ willRetry: event.willRetry });
+				}
 				this.ui.requestRender();
 				break;
 			}
@@ -3450,7 +3626,7 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortRetry();
+					this.restoreQueuedMessagesToEditor({ abort: true });
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
@@ -3469,6 +3645,11 @@ export class InteractiveMode {
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+				}
+				if (this.session.isAborting) {
+					this.showAbortingStatusIndicator();
+				} else if (this.session.isStreaming) {
+					this.refreshStatusIndicator();
 				}
 				this.ui.requestRender();
 				break;
@@ -3496,6 +3677,9 @@ export class InteractiveMode {
 
 			case "summarization_retry_finished": {
 				this.clearStatusIndicator("retry");
+				if (this.session.isAborting) {
+					this.showAbortingStatusIndicator();
+				}
 				this.ui.requestRender();
 				break;
 			}
@@ -4097,6 +4281,15 @@ export class InteractiveMode {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
 
+		if (this.session.isAborting) {
+			if (this.isInteractiveCommand(text)) {
+				this.showStatus("Wait for cancellation to finish before running commands.");
+				return;
+			}
+			await this.submitStreamingMessage(text, "followUp");
+			return;
+		}
+
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
 			if (this.isExtensionCommand(text)) {
@@ -4112,16 +4305,12 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
-			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
-			this.updatePendingMessagesDisplay();
-			this.ui.requestRender();
+			await this.submitStreamingMessage(text, "followUp");
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
 			this.editor.setText("");
-			this.editor.onSubmit(text);
+			await this.editor.onSubmit(text);
 		}
 	}
 
@@ -4356,12 +4545,15 @@ export class InteractiveMode {
 	}
 
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+		if (options?.abort && this.session.isAborting) {
+			return 0;
+		}
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				this.agent.abort();
+				this.requestAbort();
 			}
 			return 0;
 		}
@@ -4371,7 +4563,7 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			this.agent.abort();
+			this.requestAbort();
 		}
 		return allQueued.length;
 	}
@@ -4392,6 +4584,14 @@ export class InteractiveMode {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		return !!extensionRunner.getCommand(commandName);
+	}
+
+	private isInteractiveCommand(text: string): boolean {
+		if (text.startsWith("!")) return true;
+		if (!text.startsWith("/")) return false;
+		const spaceIndex = text.indexOf(" ");
+		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		return BUILTIN_SLASH_COMMANDS.some((command) => command.name === commandName) || this.isExtensionCommand(text);
 	}
 
 	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
@@ -5245,7 +5445,7 @@ export class InteractiveMode {
 
 					if (wantsSummary) {
 						this.defaultEditor.onEscape = () => {
-							this.session.abortBranchSummary();
+							this.restoreQueuedMessagesToEditor({ abort: true });
 						};
 						this.chatContainer.addChild(new Spacer(1));
 						this.showStatusIndicator(new BranchSummaryStatusIndicator(this.ui));
@@ -6532,8 +6732,10 @@ export class InteractiveMode {
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
-		this.clearStatusIndicator();
+		this.clearStatusIndicator(undefined, true);
 		this.themeController.disableAutoSync();
+		this.abortInputListenerCleanup?.();
+		this.abortInputListenerCleanup = undefined;
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

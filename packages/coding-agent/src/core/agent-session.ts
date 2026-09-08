@@ -102,7 +102,12 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
-import { compactPiServer, type PiServerCompactionResult, type PiServerHistorySnapshot } from "./pi-server-client.ts";
+import {
+	cancelPiServerOperations,
+	compactPiServer,
+	type PiServerCompactionResult,
+	type PiServerHistorySnapshot,
+} from "./pi-server-client.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type {
@@ -158,6 +163,9 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 	  }
 	| { type: "agent_settled" }
+	| { type: "abort_start" }
+	| { type: "abort_end" }
+	| { type: "abort_error"; errorMessage: string }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -419,6 +427,10 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _abortPromise: Promise<void> | undefined;
+	private _isAborting = false;
+	private _abortError: string | undefined;
+	private _continueAfterAbortRequested = false;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -430,18 +442,26 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _compactionCompletionPromise: Promise<void> | undefined = undefined;
+	private _prePromptAbortController: AbortController | undefined = undefined;
+	private _prePromptCompletionPromise: Promise<void> | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _lastServerCompactionTimestamp: number | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
+	private _branchSummaryCompletionPromise: Promise<void> | undefined = undefined;
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
 
+	// Post-turn session naming is a provider request too, so cancellation must reach it.
+	private _sessionNameAbortController: AbortController | undefined = undefined;
+
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
+	private readonly _bashCompletionPromises = new Set<Promise<void>>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
 	private _validationModifiedFiles = new Set<string>();
 	private _validationFailure: ValidationFailureState | undefined = undefined;
@@ -1165,6 +1185,16 @@ export class AgentSession {
 		return this._isAgentRunActive;
 	}
 
+	/** Whether the current run is being cancelled. New queued intent is drained after cancellation. */
+	get isAborting(): boolean {
+		return this._isAborting;
+	}
+
+	/** Error from the most recent cancellation attempt, if it failed. */
+	get abortError(): string | undefined {
+		return this._abortError;
+	}
+
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
 		return !this._isAgentRunActive;
@@ -1346,12 +1376,17 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
 		this._resetValidationHintState();
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await start();
 			while (await this._handlePostAgentRun()) {
+				// Esc cancels the current agent run. Keep messages queued during that
+				// cancellation for the single deferred continuation in abort().
+				if (this._isAborting) {
+					break;
+				}
 				try {
 					await this.agent.continue();
 				} catch (error) {
@@ -1368,12 +1403,18 @@ export class AgentSession {
 					throw error;
 				}
 			}
-			await this._maybeGenerateSessionName();
+			if (!this._isAborting) {
+				await this._maybeGenerateSessionName();
+			}
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
 		}
+	}
+
+	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._runAgentOperation(() => this.agent.prompt(messages));
 	}
 
 	private _sessionHasInfoEntry(): boolean {
@@ -1408,6 +1449,7 @@ export class AgentSession {
 		const transcript = this._buildSessionNameTranscript();
 		if (!model || !transcript) return;
 
+		this._sessionNameAbortController = new AbortController();
 		try {
 			const stream = await this.agent.streamFunction(
 				model,
@@ -1429,6 +1471,7 @@ export class AgentSession {
 					transport: this.agent.transport,
 					thinkingBudgets: this.agent.thinkingBudgets,
 					maxRetryDelayMs: this.agent.maxRetryDelayMs,
+					signal: this._sessionNameAbortController.signal,
 				},
 			);
 			for await (const _event of stream) {
@@ -1440,6 +1483,8 @@ export class AgentSession {
 			if (title) this.setSessionName(title);
 		} catch {
 			// Session naming is a post-turn convenience; the completed assistant turn stays authoritative.
+		} finally {
+			this._sessionNameAbortController = undefined;
 		}
 	}
 
@@ -1449,9 +1494,18 @@ export class AgentSession {
 		if (!msg) {
 			return false;
 		}
+		if (this._isAborting) {
+			if (isPiServerMode() && this._isTerminalAssistantFailure(msg)) {
+				this._detachPiServerTerminalAssistantFailure();
+			}
+			return false;
+		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
 			return true;
+		}
+		if (this._isAborting) {
+			return false;
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
@@ -1503,7 +1557,7 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController !== undefined) {
+			if (this._compactionAbortController !== undefined && !this._isAborting) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 				);
@@ -1537,7 +1591,7 @@ export class AgentSession {
 			}
 
 			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
+			if (this.isStreaming || this._isAborting) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1577,9 +1631,34 @@ export class AgentSession {
 
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
+			if (this._isAborting) {
+				preflightResult?.(false);
+				return;
+			}
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+				const prePromptAbortController = new AbortController();
+				let resolvePrePromptCompletion: (() => void) | undefined;
+				const prePromptCompletion = new Promise<void>((resolve) => {
+					resolvePrePromptCompletion = resolve;
+				});
+				this._prePromptAbortController = prePromptAbortController;
+				this._prePromptCompletionPromise = prePromptCompletion;
+				try {
+					await this._checkCompaction(lastAssistant, false, prePromptAbortController.signal);
+				} finally {
+					if (this._prePromptAbortController === prePromptAbortController) {
+						this._prePromptAbortController = undefined;
+					}
+					if (this._prePromptCompletionPromise === prePromptCompletion) {
+						this._prePromptCompletionPromise = undefined;
+					}
+					resolvePrePromptCompletion?.();
+				}
+				if (prePromptAbortController.signal.aborted || this._isAborting) {
+					preflightResult?.(false);
+					return;
+				}
 			}
 
 			if (isPiServerMode()) {
@@ -1765,6 +1844,9 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		if (this._isAborting) {
+			this._continueAfterAbortRequested = true;
+		}
 	}
 
 	/**
@@ -1782,6 +1864,9 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		if (this._isAborting) {
+			this._continueAfterAbortRequested = true;
+		}
 	}
 
 	/**
@@ -1826,11 +1911,17 @@ export class AgentSession {
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming && options?.triggerTurn !== false) {
+		} else if ((this.isStreaming || this._isAborting) && options?.triggerTurn !== false) {
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(appMessage);
+				if (this._isAborting) {
+					this._continueAfterAbortRequested = true;
+				}
 			} else {
 				this.agent.steer(appMessage);
+				if (this._isAborting) {
+					this._continueAfterAbortRequested = true;
+				}
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
@@ -1921,13 +2012,83 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	/**
-	 * Abort current operation and wait for agent to become idle.
-	 */
-	async abort(): Promise<void> {
+	private _startQueuedAgentRunAfterAbort(): void {
+		if (this._isAgentRunActive || this._isAborting || !this.agent.hasQueuedMessages()) {
+			return;
+		}
+
+		void this._runAgentOperation(() => this.agent.continue()).catch((error: unknown) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<runtime>",
+				event: "abort_continuation",
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
+
+	private async _performAbort(): Promise<void> {
 		this.abortRetry();
+		this.abortCompaction();
+		this.abortBranchSummary();
+		this.abortBash();
+		this._prePromptAbortController?.abort();
+		this._sessionNameAbortController?.abort();
 		this.agent.abort();
-		await this.waitForIdle();
+
+		// _runAgentOperation owns the settled event and the idle waiter. Do not
+		// start a queued continuation until that cleanup has completed.
+		try {
+			const cleanupPromises: Promise<unknown>[] = [
+				this.waitForIdle(),
+				...(this._compactionCompletionPromise ? [this._compactionCompletionPromise] : []),
+				...(this._prePromptCompletionPromise ? [this._prePromptCompletionPromise] : []),
+				...(this._branchSummaryCompletionPromise ? [this._branchSummaryCompletionPromise] : []),
+				...this._bashCompletionPromises,
+			];
+			if (isPiServerMode()) {
+				cleanupPromises.push(cancelPiServerOperations(this.sessionId));
+			}
+			const cleanupResults = await Promise.allSettled(cleanupPromises);
+			const cleanupFailure = cleanupResults.find((result) => result.status === "rejected");
+			if (cleanupFailure?.status === "rejected") {
+				throw cleanupFailure.reason;
+			}
+		} catch (error) {
+			this._abortError = error instanceof Error ? error.message : String(error);
+			this._abortPromise = undefined;
+			this._emit({ type: "abort_error", errorMessage: this._abortError });
+			throw error;
+		}
+
+		this._isAborting = false;
+		const continueAfterAbort = this._continueAfterAbortRequested && this.agent.hasQueuedMessages();
+		this._continueAfterAbortRequested = false;
+		this._abortError = undefined;
+		this._abortPromise = undefined;
+		this._emit({ type: "abort_end" });
+		if (continueAfterAbort) {
+			this._startQueuedAgentRunAfterAbort();
+		}
+	}
+
+	/**
+	 * Abort the current operation and wait for cancellation cleanup to finish.
+	 * Messages queued while cancellation is in progress are sent in one deferred continuation.
+	 */
+	abort(): Promise<void> {
+		if (this._abortPromise) {
+			return this._abortPromise;
+		}
+
+		if (this._isAborting) {
+			this._abortError = undefined;
+		} else {
+			this._isAborting = true;
+		}
+		const abortPromise = this._performAbort();
+		this._abortPromise = abortPromise;
+		this._emit({ type: "abort_start" });
+		return abortPromise;
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -2234,9 +2395,14 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		let resolveCompactionCompletion: (() => void) | undefined;
+		const compactionCompletion = new Promise<void>((resolve) => {
+			resolveCompactionCompletion = resolve;
+		});
+		this._compactionCompletionPromise = compactionCompletion;
 
 		try {
+			this._emit({ type: "compaction_start", reason: "manual" });
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
@@ -2406,6 +2572,10 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			if (this._compactionCompletionPromise === compactionCompletion) {
+				this._compactionCompletionPromise = undefined;
+			}
+			resolveCompactionCompletion?.();
 		}
 	}
 
@@ -2436,7 +2606,12 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		externalSignal?: AbortSignal,
+	): Promise<boolean> {
+		if (externalSignal?.aborted) return false;
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -2474,7 +2649,7 @@ export class AgentSession {
 			const willRetry = assistantMessage.stopReason !== "stop";
 
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return await this._runAutoCompaction("overflow", false, undefined, undefined, externalSignal);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -2504,7 +2679,13 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 			}
-			return await this._runAutoCompaction("overflow", willRetry, terminalFailurePreparation);
+			return await this._runAutoCompaction(
+				"overflow",
+				willRetry,
+				terminalFailurePreparation,
+				undefined,
+				externalSignal,
+			);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2533,7 +2714,7 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return await this._runAutoCompaction("threshold", false, undefined, undefined, externalSignal);
 		}
 		return false;
 	}
@@ -2546,9 +2727,13 @@ export class AgentSession {
 		willRetry: boolean,
 		preparationOverride?: CompactionPreparation,
 		preparationOptions?: CompactionPreparationOptions,
+		externalSignal?: AbortSignal,
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		if (externalSignal?.aborted) return false;
+		const abortExternal = () => this._autoCompactionAbortController?.abort();
+		externalSignal?.addEventListener("abort", abortExternal, { once: true });
 
 		try {
 			if (!this.model) {
@@ -2556,10 +2741,12 @@ export class AgentSession {
 			}
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			if (externalSignal?.aborted) return false;
 
 			if (isPiServerMode()) {
 				this._emit({ type: "compaction_start", reason });
 				this._autoCompactionAbortController = new AbortController();
+				if (externalSignal?.aborted) this._autoCompactionAbortController.abort();
 				started = true;
 				const signal = this._autoCompactionAbortController.signal;
 				const piServerResult = await compactPiServer(
@@ -2581,6 +2768,10 @@ export class AgentSession {
 						onHistoryReconciled: (snapshot) => this.reconcilePiServerHistory(snapshot),
 					},
 				);
+				if (externalSignal?.aborted || signal.aborted) {
+					this._emit({ type: "compaction_end", reason, result: undefined, aborted: true, willRetry: false });
+					return false;
+				}
 				const result = await this._applyPiServerCompactionResult(piServerResult, reason, willRetry);
 				this._lastServerCompactionTimestamp = Date.now();
 				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
@@ -2588,6 +2779,7 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
+			if (externalSignal?.aborted) return false;
 			const preparation = preparationOverride ?? prepareCompaction(pathEntries, settings);
 			if (!preparation) {
 				return false;
@@ -2595,6 +2787,7 @@ export class AgentSession {
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
+			if (externalSignal?.aborted) this._autoCompactionAbortController.abort();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2663,7 +2856,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
-			if (this._autoCompactionAbortController.signal.aborted) {
+			if (externalSignal?.aborted || this._autoCompactionAbortController.signal.aborted) {
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -2738,6 +2931,7 @@ export class AgentSession {
 			}
 			return false;
 		} finally {
+			externalSignal?.removeEventListener("abort", abortExternal);
 			this._autoCompactionAbortController = undefined;
 		}
 	}
@@ -3389,6 +3583,11 @@ export class AgentSession {
 	): Promise<BashResult> {
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
+		let resolveBashCompletion: (() => void) | undefined;
+		const bashCompletion = new Promise<void>((resolve) => {
+			resolveBashCompletion = resolve;
+		});
+		this._bashCompletionPromises.add(bashCompletion);
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -3413,6 +3612,8 @@ export class AgentSession {
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
+			this._bashCompletionPromises.delete(bashCompletion);
+			resolveBashCompletion?.();
 		}
 	}
 
@@ -3562,6 +3763,11 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		let resolveBranchSummaryCompletion: (() => void) | undefined;
+		const branchSummaryCompletion = new Promise<void>((resolve) => {
+			resolveBranchSummaryCompletion = resolve;
+		});
+		this._branchSummaryCompletionPromise = branchSummaryCompletion;
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -3701,6 +3907,10 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			if (this._branchSummaryCompletionPromise === branchSummaryCompletion) {
+				this._branchSummaryCompletionPromise = undefined;
+			}
+			resolveBranchSummaryCompletion?.();
 		}
 	}
 

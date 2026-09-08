@@ -1,6 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, getUserTexts, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
 
 function createUsage(totalTokens: number) {
 	return {
@@ -71,5 +71,74 @@ describe("pre-prompt compaction regression", () => {
 		});
 		expect(getUserTexts(harness)).toContain("next prompt");
 		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("does not start the original prompt after aborting pre-prompt compaction", async () => {
+		let releaseCompaction: (() => void) | undefined;
+		let compactionStarted: (() => void) | undefined;
+		const compactionReady = new Promise<void>((resolve) => {
+			compactionStarted = resolve;
+		});
+		const compactionGate = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						compactionStarted?.();
+						await compactionGate;
+						return {
+							compaction: {
+								summary: "pre-prompt summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const now = Date.now();
+		const model = harness.getModel();
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "previous prompt" }],
+			timestamp: now - 1000,
+		});
+		harness.sessionManager.appendMessage({
+			...fauxAssistantMessage("length-stop assistant response", { stopReason: "length", timestamp: now - 500 }),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: createUsage(100),
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		harness.setResponses([fauxAssistantMessage("queued response")]);
+
+		const originalPrompt = harness.session.prompt("original prompt");
+		await compactionReady;
+		const abortPromise = harness.session.abort();
+		await harness.session.steer("queued after abort");
+		releaseCompaction?.();
+
+		await abortPromise;
+		await originalPrompt;
+		await harness.session.waitForIdle();
+
+		const persistedUserTexts = harness.sessionManager
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "user" ? [getMessageText(entry.message)] : [],
+			);
+		expect(persistedUserTexts).not.toContain("original prompt");
+		expect(persistedUserTexts).toContain("queued after abort");
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("compaction_end").some((event) => event.aborted)).toBe(true);
 	});
 });

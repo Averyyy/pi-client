@@ -756,6 +756,12 @@ describe("AgentSession pi-server sync", () => {
 							});
 						});
 					}
+					if (url.endsWith("/abort")) {
+						return new Response(
+							JSON.stringify({ sessionId: body.sessionId, runId: body.runId, status: "aborted" }),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
 
 					return new Response(
 						JSON.stringify({

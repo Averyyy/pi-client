@@ -361,6 +361,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return streamPiServer(model, context, {
 					...commonOptions,
+					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
 					contextOverlay: piServerContext?.contextOverlay,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)

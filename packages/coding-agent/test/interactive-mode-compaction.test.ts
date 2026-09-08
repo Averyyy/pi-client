@@ -137,6 +137,7 @@ describe("InteractiveMode compaction events", () => {
 		};
 		const fakeThis = {
 			isInitialized: true,
+			session: { isAborting: false, isStreaming: false, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
 			autoCompactionLoader: undefined,

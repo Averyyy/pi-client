@@ -95,6 +95,7 @@ interface SessionTreeSwitchBody {
 
 interface SessionCompactBody {
 	sessionId: string;
+	runId?: string;
 	model: Model<any>;
 	options?: SimpleStreamOptions;
 	settings?: CompactionSettings;
@@ -130,11 +131,16 @@ function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 interface StreamRunRecord {
 	sessionId: string;
 	runId: string;
-	status: "running" | "completed" | "failed";
+	kind: "stream" | "compact";
+	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
 	errorMessage?: string;
 	createdAt: number;
 	updatedAt: number;
+	cancelRequested: boolean;
+	controller: AbortController;
+	settled: Promise<void>;
+	resolveSettled: (() => void) | undefined;
 }
 
 const STREAM_HEARTBEAT = ": keep-alive\n\n";
@@ -208,25 +214,64 @@ function getStreamRun(sessionId: string, runId: string): StreamRunRecord | undef
 	return streamRuns.get(runKey(sessionId, runId));
 }
 
-function startStreamRun(sessionId: string, runId: string): StreamRunRecord {
-	const existing = getStreamRun(sessionId, runId);
-	if (existing?.status === "completed") return existing;
-	const now = Date.now();
-	const run: StreamRunRecord = existing ?? {
+function createRunRecord(sessionId: string, runId: string, kind: StreamRunRecord["kind"]): StreamRunRecord {
+	let resolveSettled: (() => void) | undefined;
+	const settled = new Promise<void>((resolve) => {
+		resolveSettled = resolve;
+	});
+	return {
 		sessionId,
 		runId,
+		kind,
 		status: "running",
-		createdAt: now,
-		updatedAt: now,
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+		cancelRequested: false,
+		controller: new AbortController(),
+		settled,
+		resolveSettled,
 	};
+}
+
+function settleRun(run: StreamRunRecord | undefined): void {
+	if (!run) return;
+	const resolve = run.resolveSettled;
+	run.resolveSettled = undefined;
+	resolve?.();
+}
+
+function startStreamRun(sessionId: string, runId: string, kind: StreamRunRecord["kind"] = "stream"): StreamRunRecord {
+	const existing = getStreamRun(sessionId, runId);
+	if (existing?.status === "completed" || existing?.status === "aborted") return existing;
+	const run = existing ?? createRunRecord(sessionId, runId, kind);
 	if (existing) {
 		run.message = undefined;
 		run.errorMessage = undefined;
+		run.cancelRequested = false;
+		run.controller = new AbortController();
+		let resolveSettled: (() => void) | undefined;
+		run.settled = new Promise<void>((resolve) => {
+			resolveSettled = resolve;
+		});
+		run.resolveSettled = resolveSettled;
 	}
+	run.kind = kind;
 	run.status = "running";
-	run.updatedAt = now;
+	run.updatedAt = Date.now();
 	streamRuns.set(runKey(sessionId, runId), run);
 	return run;
+}
+
+function streamRunResponseBody(run: StreamRunRecord) {
+	return {
+		sessionId: run.sessionId,
+		runId: run.runId,
+		status: run.status,
+		createdAt: run.createdAt,
+		updatedAt: run.updatedAt,
+		...(run.message ? { message: run.message } : {}),
+		...(run.errorMessage ? { errorMessage: run.errorMessage } : {}),
+	};
 }
 
 function replayStreamRun(run: StreamRunRecord): ProxyAssistantMessageEvent[] {
@@ -279,6 +324,13 @@ function replayStreamRun(run: StreamRunRecord): ProxyAssistantMessageEvent[] {
 
 function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantMessage): void {
 	if (!run) return;
+	if (run.cancelRequested) {
+		run.status = "aborted";
+		run.message = undefined;
+		run.errorMessage = "Stream run aborted";
+		run.updatedAt = Date.now();
+		return;
+	}
 	run.status = "completed";
 	run.message = message;
 	run.errorMessage = undefined;
@@ -287,6 +339,12 @@ function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantM
 
 function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): void {
 	if (!run) return;
+	if (run.cancelRequested) {
+		run.status = "aborted";
+		run.errorMessage = "Stream run aborted";
+		run.updatedAt = Date.now();
+		return;
+	}
 	run.status = "failed";
 	run.errorMessage = errorMessage;
 	run.updatedAt = Date.now();
@@ -578,17 +636,21 @@ async function completeSessionCompact(
 	config: ServerConfig,
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
+	run?: StreamRunRecord,
 ): Promise<SessionCompactHttpResponse> {
 	const result = await compactLegacy(
 		prepared.preparation,
 		createRequestModels(body.model, prepared.options),
 		body.model,
 		body.customInstructions,
-		undefined,
+		run?.controller.signal,
 		prepared.options.reasoning,
 	);
 	if (!result.ok) {
 		return { status: 500, body: { error: result.error.message, code: PiServerErrorCode.INTERNAL_ERROR } };
+	}
+	if (run?.cancelRequested || run?.controller.signal.aborted) {
+		return { status: 409, body: { error: "Compaction aborted", code: PiServerErrorCode.INVALID_REQUEST } };
 	}
 
 	const baseTreeHash = prepared.session.treeHash;
@@ -639,6 +701,7 @@ async function handleSessionCompactStream(
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 	res: ServerResponse,
+	run?: StreamRunRecord,
 ): Promise<void> {
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
@@ -649,6 +712,7 @@ async function handleSessionCompactStream(
 	res.write(STREAM_HEARTBEAT);
 
 	const heartbeat = setInterval(() => {
+		touchStreamRun(run);
 		if (!res.writableEnded) {
 			res.write(STREAM_HEARTBEAT);
 		}
@@ -656,13 +720,20 @@ async function handleSessionCompactStream(
 	heartbeat.unref();
 
 	try {
-		const result = await completeSessionCompact(config, body, prepared);
+		const result = await completeSessionCompact(config, body, prepared, run);
 		writeServerSentEvent(res, result.status >= 400 ? "error" : "result", result.body);
+		finishCompactRun(run, result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
+		if (run) {
+			run.status = run.cancelRequested ? "aborted" : "failed";
+			run.errorMessage = message;
+			run.updatedAt = Date.now();
+		}
 		writeServerSentEvent(res, "error", { error: message });
 	} finally {
 		clearInterval(heartbeat);
+		settleRun(run);
 		res.end();
 	}
 }
@@ -672,6 +743,7 @@ async function handleSessionCompactJsonStream(
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 	res: ServerResponse,
+	run?: StreamRunRecord,
 ): Promise<void> {
 	res.writeHead(200, {
 		"Content-Type": "application/json",
@@ -682,6 +754,7 @@ async function handleSessionCompactJsonStream(
 	res.write(JSON_HEARTBEAT);
 
 	const heartbeat = setInterval(() => {
+		touchStreamRun(run);
 		if (!res.writableEnded) {
 			res.write(JSON_HEARTBEAT);
 		}
@@ -689,15 +762,36 @@ async function handleSessionCompactJsonStream(
 	heartbeat.unref();
 
 	try {
-		const result = await completeSessionCompact(config, body, prepared);
+		const result = await completeSessionCompact(config, body, prepared, run);
 		res.write(JSON.stringify(result.body));
+		finishCompactRun(run, result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
+		if (run) {
+			run.status = run.cancelRequested ? "aborted" : "failed";
+			run.errorMessage = message;
+			run.updatedAt = Date.now();
+		}
 		res.write(JSON.stringify({ error: message }));
 	} finally {
 		clearInterval(heartbeat);
+		settleRun(run);
 		res.end();
 	}
+}
+
+function finishCompactRun(run: StreamRunRecord | undefined, result: SessionCompactHttpResponse): void {
+	if (!run) return;
+	if (run.cancelRequested || run.controller.signal.aborted) {
+		run.status = "aborted";
+		run.errorMessage = "Compaction aborted";
+	} else {
+		run.status = result.status >= 400 ? "failed" : "completed";
+		if (result.status >= 400 && "error" in result.body) {
+			run.errorMessage = result.body.error;
+		}
+	}
+	run.updatedAt = Date.now();
 }
 
 async function handleSessionCompact(
@@ -711,12 +805,26 @@ async function handleSessionCompact(
 		return;
 	}
 
+	let run: StreamRunRecord | undefined;
+	if (body.runId) {
+		const existingRun = getStreamRun(body.sessionId, body.runId);
+		if (existingRun?.status === "aborted") {
+			sendJson(res, 409, { error: "Compaction run was aborted", code: PiServerErrorCode.INVALID_REQUEST });
+			return;
+		}
+		if (existingRun?.status === "running") {
+			sendError(res, 409, "A run with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
+			return;
+		}
+		run = startStreamRun(body.sessionId, body.runId, "compact");
+	}
+
 	if (body.streamResponse) {
-		await handleSessionCompactStream(config, body, prepared, res);
+		await handleSessionCompactStream(config, body, prepared, res, run);
 		return;
 	}
 
-	await handleSessionCompactJsonStream(config, body, prepared, res);
+	await handleSessionCompactJsonStream(config, body, prepared, res, run);
 }
 
 function handleSessionHistory(
@@ -751,7 +859,39 @@ function handleSessionRun(sessionId: string, runId: string, res: ServerResponse)
 		sendError(res, 404, "run not found", PiServerErrorCode.RUN_NOT_FOUND);
 		return;
 	}
-	sendJson(res, 200, run);
+	sendJson(res, 200, streamRunResponseBody(run));
+}
+
+async function handleSessionRunAbort(sessionId: string, runId: string, res: ServerResponse): Promise<void> {
+	if (!sessionId || !runId) {
+		sendError(res, 400, "sessionId and runId are required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		return;
+	}
+
+	let run = getStreamRun(sessionId, runId);
+	if (!run) {
+		run = createRunRecord(sessionId, runId, "stream");
+		run.status = "aborted";
+		run.cancelRequested = true;
+		run.errorMessage = "Stream run aborted before it started";
+		run.updatedAt = Date.now();
+		settleRun(run);
+		streamRuns.set(runKey(sessionId, runId), run);
+		sendJson(res, 200, streamRunResponseBody(run));
+		return;
+	}
+
+	if (run.status !== "running") {
+		await run.settled;
+		sendJson(res, 200, streamRunResponseBody(run));
+		return;
+	}
+
+	run.cancelRequested = true;
+	run.updatedAt = Date.now();
+	run.controller.abort();
+	await run.settled;
+	sendJson(res, 200, streamRunResponseBody(run));
 }
 
 export function buildStreamContext(
@@ -808,7 +948,6 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 
 	const resolvedModel = body.model;
-	const streamOptions: SimpleStreamOptions = { ...(body.options ?? {}) };
 
 	if (existingRun?.status === "completed") {
 		res.writeHead(200, {
@@ -824,10 +963,20 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		endStreamResponse(res);
 		return;
 	}
+	if (existingRun?.status === "aborted") {
+		sendError(res, 409, "The stream run was aborted", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
 	if (existingRun?.status === "running") {
 		sendError(res, 409, "A stream with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
 		return;
 	}
+
+	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
+	const streamOptions: SimpleStreamOptions = {
+		...(body.options ?? {}),
+		...(run ? { signal: run.controller.signal } : {}),
+	};
 
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
@@ -836,8 +985,6 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	});
 	res.flushHeaders();
 	res.write(STREAM_HEARTBEAT);
-
-	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
 
 	const heartbeat = setInterval(() => {
 		touchStreamRun(run);
@@ -854,12 +1001,13 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		clearInterval(heartbeat);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
+		settleRun(run);
 		writeStreamError(res, message);
 		endStreamResponse(res);
 		return;
 	}
 
-	(async () => {
+	void (async () => {
 		try {
 			for await (const event of stream) {
 				const proxyEvent = toProxyEvent(event);
@@ -873,18 +1021,19 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 					failStreamRun(run, event.error.errorMessage ?? event.reason);
 				}
 			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			failStreamRun(run, message);
+			writeStreamError(res, message);
 		} finally {
 			clearInterval(heartbeat);
+			if (run?.status === "running") {
+				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
+			}
+			settleRun(run);
+			endStreamResponse(res);
 		}
-
-		endStreamResponse(res);
-	})().catch((err) => {
-		clearInterval(heartbeat);
-		const message = err instanceof Error ? err.message : String(err);
-		failStreamRun(run, message);
-		writeStreamError(res, message);
-		endStreamResponse(res);
-	});
+	})();
 }
 
 async function handlePostRequest(
@@ -980,6 +1129,13 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		const runMatch = /^\/api\/session\/([^/]+)\/runs\/([^/]+)$/.exec(url.pathname);
 		if (req.method === "GET" && runMatch) {
 			handleSessionRun(decodeURIComponent(runMatch[1]), decodeURIComponent(runMatch[2]), res);
+			return;
+		}
+
+		const runAbortMatch = /^\/api\/session\/([^/]+)\/runs\/([^/]+)\/abort$/.exec(url.pathname);
+		if (req.method === "POST" && runAbortMatch) {
+			await readBody(req);
+			await handleSessionRunAbort(decodeURIComponent(runAbortMatch[1]), decodeURIComponent(runAbortMatch[2]), res);
 			return;
 		}
 

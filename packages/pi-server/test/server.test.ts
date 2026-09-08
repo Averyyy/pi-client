@@ -5,8 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as AgentCore from "@earendil-works/pi-agent-core";
 import { compactLegacy as compactAgentCore } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import { registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
+	type Context,
+	createAssistantMessageEventStream,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	type StreamOptions,
+} from "@earendil-works/pi-ai";
+import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPiServer, type ServerConfig } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
@@ -66,9 +76,78 @@ interface ServerResponse {
 }
 
 interface RunResponse {
-	status?: "running" | "completed" | "failed";
+	status?: "running" | "completed" | "failed" | "aborted";
 	message?: Message;
 	error?: string;
+	errorMessage?: string;
+}
+
+function createCleanupGateStream(
+	message: AssistantMessage,
+	releaseGate: Promise<void>,
+	onDoneYield: () => void,
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent> {
+		onDoneYield();
+		yield { type: "done", reason: "stop", message };
+		await releaseGate;
+	};
+	return stream;
+}
+
+function registerCleanupGateProvider(message: AssistantMessage): {
+	model: Model<"cleanup-gate">;
+	waitForStart: () => Promise<void>;
+	waitForDoneYield: () => Promise<void>;
+	release: () => void;
+	getAbortCount: () => number;
+} {
+	const api = "cleanup-gate" as const;
+	const model: Model<typeof api> = {
+		id: "cleanup-gate-model",
+		name: "cleanup-gate-model",
+		api,
+		provider: "cleanup-gate-provider",
+		baseUrl: "http://cleanup-gate.invalid",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	let release: (() => void) | undefined;
+	let start: (() => void) | undefined;
+	let doneYield: (() => void) | undefined;
+	let abortCount = 0;
+	const started = new Promise<void>((resolve) => {
+		start = resolve;
+	});
+	const doneYielded = new Promise<void>((resolve) => {
+		doneYield = resolve;
+	});
+	const stream = (_model: Model<typeof api>, _context: Context, options?: StreamOptions | SimpleStreamOptions) => {
+		options?.signal?.addEventListener(
+			"abort",
+			() => {
+				abortCount += 1;
+			},
+			{ once: true },
+		);
+		start?.();
+		const releaseGate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		return createCleanupGateStream(message, releaseGate, () => doneYield?.());
+	};
+	registerApiProvider({ api, stream, streamSimple: stream });
+	return {
+		model,
+		waitForStart: () => started,
+		waitForDoneYield: () => doneYielded,
+		release: () => release?.(),
+		getAbortCount: () => abortCount,
+	};
 }
 
 function sha256(value: string): string {
@@ -701,6 +780,87 @@ describe("pi-server HTTP", () => {
 		expect(body.entryCount).toBe(3);
 	});
 
+	it("does not persist a compaction cancelled before the summary completes", async () => {
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "old", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "keep", timestamp: 2000 },
+			},
+		];
+		const sessionId = "compact-cancelled";
+		const runId = "compact-cancelled-run";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries, leafId: "u2" }),
+		});
+
+		let compactSignal: AbortSignal | undefined;
+		let resolveCompact: ((value: Awaited<ReturnType<typeof compactAgentCore>>) => void) | undefined;
+		vi.mocked(compactAgentCore).mockImplementationOnce((...args) => {
+			compactSignal = args[4];
+			return new Promise((resolve) => {
+				resolveCompact = resolve;
+			});
+		});
+
+		const compactResponse = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				runId,
+				streamResponse: true,
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		});
+		expect(compactResponse.status).toBe(200);
+		const reader = compactResponse.body!.getReader();
+		const firstChunk = await reader.read();
+		expect(firstChunk.done).toBe(false);
+		expect(new TextDecoder().decode(firstChunk.value)).toContain(": keep-alive");
+		await vi.waitFor(() => expect(compactSignal).toBeDefined());
+
+		let abortSettled = false;
+		const abortPromise = fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		}).then((response) => {
+			abortSettled = true;
+			return response;
+		});
+		await vi.waitFor(() => expect(compactSignal?.aborted).toBe(true));
+		expect(abortSettled).toBe(false);
+		resolveCompact?.({
+			ok: true,
+			value: { summary: "cancelled", firstKeptEntryId: "u2", tokensBefore: 10, retainedTail: [] },
+		});
+		const abort = await abortPromise;
+		expect(abort.status).toBe(200);
+		expect(await abort.json()).toMatchObject({ sessionId, runId, status: "aborted" });
+		await reader.cancel();
+
+		const history = await fetch(`${baseUrl}/api/session/${sessionId}/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		const historyBody = (await history.json()) as ServerResponse;
+		expect(historyBody.entryCount).toBe(2);
+	});
+
 	it("lists active sessions with summary counts", async () => {
 		await fetch(`${baseUrl}/api/session/sync`, {
 			method: "POST",
@@ -981,6 +1141,194 @@ describe("pi-server HTTP", () => {
 
 		expect(firstChunk.done).toBe(false);
 		expect(new TextDecoder().decode(firstChunk.value)).toContain(": keep-alive");
+	});
+
+	it("records and replays a cancel-before-start tombstone", async () => {
+		const sessionId = "stream-cancel-before-start";
+		const runId = "cancel-before-start";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		const abort = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		});
+		expect(abort.status).toBe(200);
+		expect(await abort.json()).toMatchObject({ sessionId, runId, status: "aborted" });
+
+		const duplicate = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		});
+		expect(duplicate.status).toBe(200);
+		expect(await duplicate.json()).toMatchObject({ sessionId, runId, status: "aborted" });
+
+		const run = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(run.status).toBe(200);
+		expect(((await run.json()) as RunResponse).status).toBe("aborted");
+
+		const faux = registerFauxProvider();
+		faux.setResponses([
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "must not run" }],
+				api: faux.models[0].api,
+				provider: faux.models[0].provider,
+				model: faux.models[0].id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		]);
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "cancel" } }),
+		});
+		const stream = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId, model: faux.models[0] }),
+		});
+		expect(stream.status).toBe(409);
+		expect(faux.state.callCount).toBe(0);
+		faux.unregister();
+	});
+
+	it("rejects a compact run after cancel-before-start without starting or persisting it", async () => {
+		const sessionId = "compact-cancel-before-start";
+		const runId = "compact-cancel-before-start-run";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		const entries = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "old", timestamp: 1000 },
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "u1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "keep", timestamp: 2000 },
+			},
+		];
+
+		const abort = await fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		});
+		expect(abort.status).toBe(200);
+		expect(await abort.json()).toMatchObject({ sessionId, runId, status: "aborted" });
+
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries, leafId: "u2" }),
+		});
+		vi.mocked(compactAgentCore).mockClear();
+
+		const compact = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				runId,
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "https://example.com" },
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		});
+		expect(compact.status).toBe(409);
+		expect(await compact.json()).toMatchObject({ error: "Compaction run was aborted" });
+		expect(compactAgentCore).not.toHaveBeenCalled();
+
+		const history = await fetch(`${baseUrl}/api/session/${sessionId}/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(((await history.json()) as ServerResponse).entryCount).toBe(2);
+	});
+
+	it("waits for provider iterator cleanup before acknowledging run cancellation", async () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "delayed" }],
+			api: "cleanup-gate",
+			provider: "cleanup-gate-provider",
+			model: "cleanup-gate-model",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const cleanup = registerCleanupGateProvider(message);
+		const sessionId = "stream-cancel-running";
+		const runId = "cancel-running";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "cancel" } }),
+		});
+
+		const stream = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId, model: cleanup.model }),
+		});
+		expect(stream.status).toBe(200);
+		await cleanup.waitForStart();
+		await cleanup.waitForDoneYield();
+
+		let firstAbortSettled = false;
+		let duplicateAbortSettled = false;
+		const abortPromise = fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		}).then((response) => {
+			firstAbortSettled = true;
+			return response;
+		});
+		const duplicateAbortPromise = fetch(`${baseUrl}/api/session/${sessionId}/runs/${runId}/abort`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, runId }),
+		}).then((response) => {
+			duplicateAbortSettled = true;
+			return response;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(firstAbortSettled).toBe(false);
+		expect(duplicateAbortSettled).toBe(false);
+		cleanup.release();
+		const [abort, duplicateAbort] = await Promise.all([abortPromise, duplicateAbortPromise]);
+		const abortBody = (await abort.json()) as RunResponse & { sessionId: string; runId: string };
+		const duplicateAbortBody = (await duplicateAbort.json()) as RunResponse & { sessionId: string; runId: string };
+		expect(abort.status).toBe(200);
+		expect(abortBody).toMatchObject({ sessionId, runId, status: "completed" });
+		expect(duplicateAbort.status).toBe(200);
+		expect(duplicateAbortBody).toMatchObject({ sessionId, runId, status: "completed" });
+		expect(cleanup.getAbortCount()).toBe(0);
+		await stream.body?.cancel();
 	});
 
 	it("journals a completed stream run for recovery by run id", async () => {
