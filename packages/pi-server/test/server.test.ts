@@ -47,6 +47,7 @@ interface ServerResponse {
 	entryCount?: number;
 	leafId?: string | null;
 	revision?: number;
+	code?: string;
 	sessions?: {
 		sessionId: string;
 		treeHash?: string;
@@ -152,6 +153,72 @@ function registerCleanupGateProvider(message: AssistantMessage): {
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
+}
+
+type CompactResult = Awaited<ReturnType<typeof compactAgentCore>>;
+
+function createCompactGate(
+	summary: string,
+	firstKeptEntryId: string,
+): {
+	started: Promise<void>;
+	implementation: () => Promise<CompactResult>;
+	release: () => void;
+} {
+	let resolveStarted: (() => void) | undefined;
+	let resolveResult: ((value: CompactResult) => void) | undefined;
+	const started = new Promise<void>((resolve) => {
+		resolveStarted = resolve;
+	});
+	const result = new Promise<CompactResult>((resolve) => {
+		resolveResult = resolve;
+	});
+	return {
+		started,
+		implementation: () => {
+			resolveStarted?.();
+			return result;
+		},
+		release: () =>
+			resolveResult?.({
+				ok: true,
+				value: { summary, firstKeptEntryId, tokensBefore: 10, retainedTail: [] },
+			}),
+	};
+}
+
+function userTreeEntry(id: string, parentId: string | null, content: string, timestamp: number) {
+	return {
+		type: "message" as const,
+		id,
+		parentId,
+		timestamp: new Date(timestamp).toISOString(),
+		message: { role: "user" as const, content, timestamp },
+	};
+}
+
+function compactModel(): Model<"openai-completions"> {
+	return {
+		id: "test",
+		name: "test",
+		api: "openai-completions",
+		provider: "opencode-go",
+		baseUrl: "https://example.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+}
+
+function branchEntries() {
+	return [
+		userTreeEntry("a1", null, "BRANCH A root", 1000),
+		userTreeEntry("a2", "a1", "BRANCH A leaf", 2000),
+		userTreeEntry("b1", null, "BRANCH B root", 3000),
+		userTreeEntry("b2", "b1", "BRANCH B leaf", 4000),
+	];
 }
 
 describe("pi-server HTTP", () => {
@@ -593,6 +660,235 @@ describe("pi-server HTTP", () => {
 		expect(body.treePatch?.entries).toHaveLength(1);
 		expect(body.treePatch?.leafId).toBe(body.leafId);
 		expect(body.entryCount).toBe(3);
+	});
+
+	it("rejects a JSON compaction result after the active leaf changes", async () => {
+		const sessionId = "compact-stale-switch-json";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		const entries = branchEntries();
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries, leafId: "a2" }),
+		});
+
+		const gate = createCompactGate("Summary of BRANCH A only", "a2");
+		vi.mocked(compactAgentCore).mockImplementationOnce(gate.implementation);
+		const compactRequest = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		await gate.started;
+
+		const switchResponse = await fetch(`${baseUrl}/api/session/tree/switch`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, leafId: "b2" }),
+		});
+		expect(switchResponse.status).toBe(200);
+		gate.release();
+
+		const compactResponse = await compactRequest;
+		expect(compactResponse.status).toBe(200);
+		const compactBody = (await compactResponse.json()) as ServerResponse;
+		expect(compactBody).toMatchObject({
+			code: "SESSION_STATE_CONFLICT",
+			error: "Session changed while compaction was running",
+		});
+		expect(getSession(sessionId)?.entries.map((entry) => entry.id)).toEqual(["a1", "a2", "b1", "b2"]);
+		expect(getSession(sessionId)?.leafId).toBe("b2");
+		expect(getSession(sessionId)?.messages.map((message) => message.content)).toEqual([
+			"BRANCH B root",
+			"BRANCH B leaf",
+		]);
+	});
+
+	it("emits a clear SSE conflict when compaction observes a changed leaf", async () => {
+		const sessionId = "compact-stale-switch-sse";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries: branchEntries(), leafId: "a2" }),
+		});
+
+		const gate = createCompactGate("Summary of BRANCH A only", "a2");
+		vi.mocked(compactAgentCore).mockImplementationOnce(gate.implementation);
+		const compactResponse = await fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				streamResponse: true,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		expect(compactResponse.headers.get("content-type")).toContain("text/event-stream");
+		await gate.started;
+		const reader = compactResponse.body!.getReader();
+		const firstChunk = await reader.read();
+		expect(firstChunk.done).toBe(false);
+		expect(new TextDecoder().decode(firstChunk.value)).toContain(": keep-alive");
+
+		const switchResponse = await fetch(`${baseUrl}/api/session/tree/switch`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, leafId: "b2" }),
+		});
+		expect(switchResponse.status).toBe(200);
+		gate.release();
+
+		const chunks = [new TextDecoder().decode(firstChunk.value)];
+		while (true) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			chunks.push(new TextDecoder().decode(chunk.value));
+		}
+		const body = chunks.join("");
+		expect(body).toContain("event: error");
+		expect(body).toContain('"code":"SESSION_STATE_CONFLICT"');
+		expect(getSession(sessionId)?.leafId).toBe("b2");
+		expect(getSession(sessionId)?.entries).toHaveLength(4);
+	});
+
+	it("rejects compaction after a message append during summarization", async () => {
+		const sessionId = "compact-stale-append";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries: branchEntries(), leafId: "a2" }),
+		});
+
+		const gate = createCompactGate("stale summary", "a2");
+		vi.mocked(compactAgentCore).mockImplementationOnce(gate.implementation);
+		const compactRequest = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		await gate.started;
+
+		const appendResponse = await fetch(`${baseUrl}/api/session/tree/append`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				entries: [userTreeEntry("a3", "a2", "BRANCH A appended", 5000)],
+				leafId: "a3",
+			}),
+		});
+		expect(appendResponse.status).toBe(200);
+		gate.release();
+
+		const compactResponse = await compactRequest;
+		const compactBody = (await compactResponse.json()) as ServerResponse;
+		expect(compactBody.code).toBe("SESSION_STATE_CONFLICT");
+		expect(getSession(sessionId)?.leafId).toBe("a3");
+		expect(getSession(sessionId)?.entries).toHaveLength(5);
+	});
+
+	it("rejects an older compaction after another compaction commits", async () => {
+		const sessionId = "compact-stale-compact";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries: branchEntries(), leafId: "a2" }),
+		});
+
+		const firstGate = createCompactGate("first summary", "a2");
+		const secondGate = createCompactGate("second summary", "a2");
+		vi.mocked(compactAgentCore)
+			.mockImplementationOnce(firstGate.implementation)
+			.mockImplementationOnce(secondGate.implementation);
+		const firstRequest = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		await firstGate.started;
+		const secondRequest = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		await secondGate.started;
+
+		secondGate.release();
+		const secondResponse = await secondRequest;
+		expect(secondResponse.status).toBe(200);
+		await secondResponse.json();
+		firstGate.release();
+
+		const firstResponse = await firstRequest;
+		const firstBody = (await firstResponse.json()) as ServerResponse;
+		expect(firstBody.code).toBe("SESSION_STATE_CONFLICT");
+		expect(getSession(sessionId)?.entries.filter((entry) => entry.type === "compaction")).toHaveLength(1);
+	});
+
+	it("does not recreate a deleted session when compaction completes late", async () => {
+		const sessionId = "compact-stale-delete";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries: branchEntries(), leafId: "a2" }),
+		});
+
+		const gate = createCompactGate("deleted summary", "a2");
+		vi.mocked(compactAgentCore).mockImplementationOnce(gate.implementation);
+		const compactRequest = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model: compactModel(),
+				settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "a2" },
+			}),
+		});
+		await gate.started;
+
+		const deleteResponse = await fetch(`${baseUrl}/api/session/${sessionId}`, {
+			method: "DELETE",
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(deleteResponse.status).toBe(200);
+		expect(getSession(sessionId)).toBeUndefined();
+		gate.release();
+
+		const compactResponse = await compactRequest;
+		const compactBody = (await compactResponse.json()) as ServerResponse;
+		expect(compactBody.code).toBe("SESSION_STATE_CONFLICT");
+		expect(getSession(sessionId)).toBeUndefined();
+		const historyResponse = await fetch(`${baseUrl}/api/session/${sessionId}/history`, {
+			headers: { Authorization: "Bearer test-token" },
+		});
+		expect(historyResponse.status).toBe(404);
 	});
 
 	it("streams compact heartbeat before upstream compaction finishes", async () => {

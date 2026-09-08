@@ -436,6 +436,11 @@ type PreparedCompaction = Parameters<typeof compactLegacy>[0];
 
 interface PreparedSessionCompact {
 	session: SessionState;
+	sessionId: string;
+	revision: number;
+	treeHash: string;
+	leafId: string | null;
+	entryCount: number;
 	preparation: PreparedCompaction;
 	options: SimpleStreamOptions;
 }
@@ -627,8 +632,36 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 	const options = body.options ?? {};
 	return {
 		session,
+		sessionId: session.sessionId,
+		revision: session.revision,
+		treeHash: session.treeHash,
+		leafId: session.leafId,
+		entryCount: session.entries.length,
 		preparation: preparationResult.value,
 		options,
+	};
+}
+
+function sessionCompactConflict(
+	body: SessionCompactBody,
+	prepared: PreparedSessionCompact,
+	currentSession: SessionState | undefined,
+): SessionCompactHttpResponse {
+	return {
+		status: 409,
+		body: {
+			error: "Session changed while compaction was running",
+			code: PiServerErrorCode.SESSION_STATE_CONFLICT,
+			details: {
+				sessionId: body.sessionId,
+				expectedRevision: prepared.revision,
+				expectedTreeHash: prepared.treeHash,
+				expectedLeafId: prepared.leafId,
+				actualRevision: currentSession?.revision ?? null,
+				actualTreeHash: currentSession?.treeHash ?? null,
+				actualLeafId: currentSession?.leafId ?? null,
+			},
+		},
 	};
 }
 
@@ -653,8 +686,19 @@ async function completeSessionCompact(
 		return { status: 409, body: { error: "Compaction aborted", code: PiServerErrorCode.INVALID_REQUEST } };
 	}
 
-	const baseTreeHash = prepared.session.treeHash;
-	const baseEntryCount = prepared.session.entries.length;
+	const currentSession = getSession(prepared.sessionId);
+	if (
+		!currentSession ||
+		currentSession !== prepared.session ||
+		currentSession.revision !== prepared.revision ||
+		currentSession.treeHash !== prepared.treeHash ||
+		currentSession.leafId !== prepared.leafId
+	) {
+		return sessionCompactConflict(body, prepared, currentSession);
+	}
+
+	const baseTreeHash = prepared.treeHash;
+	const baseEntryCount = prepared.entryCount;
 	const compaction = result.value;
 	const { session: updatedSession, entry: compactionEntry } = appendCompactionEntry(body.sessionId, compaction);
 	persistSession(config, updatedSession);
