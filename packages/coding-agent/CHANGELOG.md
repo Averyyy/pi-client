@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed interactive working-status cleanup and redraws when agent turns resume or settle after compaction and retry transitions.
 - Fixed pi-client cancellation to show `Aborting...`, ignore repeated interrupts, and send messages queued during cancellation once the previous operation has fully settled.
 - Removed persistent validation hints that repeatedly injected stale bash failures after corrected commands succeeded. Ordinary tool results remain the source of validation evidence.
 - Fixed model and thinking default persistence plus PowerShell tool construction after the upstream 0.84.3 update.

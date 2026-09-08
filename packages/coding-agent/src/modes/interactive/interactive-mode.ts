@@ -3347,7 +3347,10 @@ export class InteractiveMode {
 				}
 				if (this.workingVisible && this.activeStatusIndicator?.kind !== "working") {
 					this.showWorkingStatusIndicator();
+				} else if (!this.workingVisible) {
+					this.clearStatusIndicator();
 				}
+				this.ui.requestRender();
 				break;
 
 			case "abort_start":

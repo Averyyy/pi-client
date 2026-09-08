@@ -137,7 +137,7 @@ describe("InteractiveMode compaction events", () => {
 		};
 		const fakeThis = {
 			isInitialized: true,
-			session: { isAborting: false, isStreaming: false, isCompacting: false, isRetrying: false },
+			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
 			autoCompactionLoader: undefined,
@@ -248,6 +248,7 @@ describe("InteractiveMode compaction events", () => {
 	test("clears the working indicator on agent_settled instead of agent_end", async () => {
 		const fakeThis = {
 			isInitialized: true,
+			session: { isAborting: false, isStreaming: false, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			streamingComponent: undefined,
 			streamingMessage: undefined,
@@ -268,7 +269,7 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.ui.terminal.setProgress).not.toHaveBeenCalled();
 
 		await handleEvent.call(fakeThis, { type: "agent_settled" });
-		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith("working");
+		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith("working", true);
 		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(false);
 		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});
@@ -276,6 +277,7 @@ describe("InteractiveMode compaction events", () => {
 	test("restores the working indicator after a retry indicator while still streaming", async () => {
 		const fakeThis = {
 			isInitialized: true,
+			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			retryEscapeHandler: undefined as (() => void) | undefined,
 			defaultEditor: { onEscape: vi.fn() },
@@ -299,6 +301,7 @@ describe("InteractiveMode compaction events", () => {
 	test("updates the working state when the same agent run resumes after compaction", async () => {
 		const fakeThis = {
 			isInitialized: true,
+			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			activeStatusIndicator: undefined,
 			workingVisible: true,
