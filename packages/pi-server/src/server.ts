@@ -1149,7 +1149,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 	loadPersistedSessions(config.sessionStoreDir);
 
 	const server = createServer(async (req, res) => {
-		const url = new URL(req.url ?? "/", `http://${config.host}:${config.port}`);
+		const url = new URL(req.url ?? "/", "http://localhost");
 
 		if (req.method === "GET" && url.pathname === "/health") {
 			sendJson(res, 200, { status: "ok" });
@@ -1348,7 +1348,10 @@ export function startServer(configOverride?: Partial<ServerConfig>): HttpServer 
 	const config = loadConfig(configOverride);
 	const server = createPiServer(configOverride);
 	server.listen(config.port, config.host, () => {
-		console.log(`pi-server listening on ${config.host}:${config.port}`);
+		const address = server.address();
+		const port = typeof address === "object" && address !== null ? address.port : config.port;
+		const host = config.host.includes(":") && !config.host.startsWith("[") ? `[${config.host}]` : config.host;
+		console.log(`pi-server listening on ${host}:${port}`);
 	});
 	return server;
 }

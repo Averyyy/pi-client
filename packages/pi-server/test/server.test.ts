@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createPiServer, type ServerConfig } from "../src/server.ts";
+import { createPiServer, type ServerConfig, startServer } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 
 vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
@@ -221,6 +221,60 @@ function branchEntries() {
 	];
 }
 
+async function listenOnHost(server: Server, host: string): Promise<number> {
+	await new Promise<void>((resolve, reject) => {
+		const onError = (error: Error) => {
+			server.off("listening", onListening);
+			reject(error);
+		};
+		const onListening = () => {
+			server.off("error", onError);
+			resolve();
+		};
+		server.once("error", onError);
+		server.once("listening", onListening);
+		server.listen(0, host);
+	});
+	const address = server.address();
+	if (typeof address !== "object" || address === null) {
+		throw new Error(`Expected ${host} listener to expose an address`);
+	}
+	return address.port;
+}
+
+async function waitForListening(server: Server): Promise<number> {
+	if (!server.listening) {
+		await new Promise<void>((resolve, reject) => {
+			const onError = (error: Error) => {
+				server.off("listening", onListening);
+				reject(error);
+			};
+			const onListening = () => {
+				server.off("error", onError);
+				resolve();
+			};
+			server.once("error", onError);
+			server.once("listening", onListening);
+		});
+	}
+	const address = server.address();
+	if (typeof address !== "object" || address === null) {
+		throw new Error("Expected listener to expose an address");
+	}
+	return address.port;
+}
+
+async function closeTestServer(server: Server): Promise<void> {
+	if (!server.listening) return;
+	await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function isUnavailableIpv6Error(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "EADDRNOTAVAIL" || code === "EAFNOSUPPORT" || code === "ENETUNREACH";
+}
+
 describe("pi-server HTTP", () => {
 	let server: Server;
 	let baseUrl: string;
@@ -270,6 +324,98 @@ describe("pi-server HTTP", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as ServerResponse;
 		expect(body.status).toBe("ok");
+	});
+
+	it("serves health, init, and history on IPv4 and hostname listeners", async () => {
+		for (const host of ["127.0.0.1", "localhost"]) {
+			const hostServer = createPiServer({
+				authToken: "test-token",
+				host,
+				sessionStoreDir: join(sessionStoreDir, host),
+				uploadDir,
+			} as Partial<ServerConfig>);
+			const port = await listenOnHost(hostServer, host);
+			const hostBaseUrl = `http://${host}:${port}`;
+			try {
+				const health = await fetch(`${hostBaseUrl}/health`);
+				expect(health.status).toBe(200);
+				expect(await health.json()).toEqual({ status: "ok" });
+
+				const sessionId = `host-${host}`;
+				const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+				const init = await fetch(`${hostBaseUrl}/api/session/init`, {
+					method: "POST",
+					headers,
+					body: JSON.stringify({ sessionId, staticContext: { systemPrompt: host } }),
+				});
+				expect(init.status).toBe(200);
+
+				const history = await fetch(`${hostBaseUrl}/api/session/${sessionId}/history`, {
+					headers: { Authorization: "Bearer test-token" },
+				});
+				expect(history.status).toBe(200);
+				expect(((await history.json()) as ServerResponse).sessionId).toBe(sessionId);
+
+				const unknown = await fetch(`${hostBaseUrl}/not-found`, {
+					headers: { Authorization: "Bearer test-token" },
+				});
+				expect(unknown.status).toBe(404);
+				const healthAfterError = await fetch(`${hostBaseUrl}/health`);
+				expect(healthAfterError.status).toBe(200);
+			} finally {
+				await closeTestServer(hostServer);
+			}
+		}
+	});
+
+	it("serves IPv6 loopback requests and logs a bracketed listening URL", async ({ skip }) => {
+		const host = "::1";
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const ipv6Server = startServer({
+			authToken: "test-token",
+			host,
+			port: 0,
+			sessionStoreDir: join(sessionStoreDir, "ipv6"),
+			uploadDir,
+		} as Partial<ServerConfig>);
+		let port: number;
+		try {
+			port = await waitForListening(ipv6Server);
+		} catch (error) {
+			logSpy.mockRestore();
+			await closeTestServer(ipv6Server);
+			if (isUnavailableIpv6Error(error)) {
+				skip(`IPv6 loopback unavailable: ${(error as NodeJS.ErrnoException).code}`);
+			}
+			throw error;
+		}
+		try {
+			expect(logSpy).toHaveBeenCalledWith(`pi-server listening on [${host}]:${port}`);
+			const base = `http://[${host}]:${port}`;
+			const health = await fetch(`${base}/health`);
+			expect(health.status).toBe(200);
+
+			const sessionId = "ipv6-session";
+			const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+			const init = await fetch(`${base}/api/session/init`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ sessionId, staticContext: { systemPrompt: "ipv6" } }),
+			});
+			expect(init.status).toBe(200);
+			const history = await fetch(`${base}/api/session/${sessionId}/history`, {
+				headers: { Authorization: "Bearer test-token" },
+			});
+			expect(history.status).toBe(200);
+			const unknown = await fetch(`${base}/not-found`, {
+				headers: { Authorization: "Bearer test-token" },
+			});
+			expect(unknown.status).toBe(404);
+			expect((await fetch(`${base}/health`)).status).toBe(200);
+		} finally {
+			logSpy.mockRestore();
+			await closeTestServer(ipv6Server);
+		}
 	});
 
 	it("includes the package version with an unauthorized root response", async () => {
