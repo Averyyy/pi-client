@@ -1,5 +1,57 @@
-import { describe, expect, test } from "vitest";
-import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
+import { describe, expect, test, vi } from "vitest";
+import { normalizeSessionName, parseArgs, printHelp } from "../src/cli/args.ts";
+
+function captureHelp(piClientMode: boolean): string {
+	const previousMode = process.env.PI_SERVER_MODE;
+	if (piClientMode) process.env.PI_SERVER_MODE = "true";
+	else delete process.env.PI_SERVER_MODE;
+
+	const output: string[] = [];
+	const log = vi.spyOn(console, "log").mockImplementation((value: unknown) => {
+		output.push(String(value));
+	});
+	try {
+		printHelp([
+			{
+				name: "plan",
+				type: "boolean",
+				description: "Enable plan mode",
+				extensionPath: "/tmp/plan.ts",
+			},
+		]);
+	} finally {
+		log.mockRestore();
+		if (previousMode === undefined) delete process.env.PI_SERVER_MODE;
+		else process.env.PI_SERVER_MODE = previousMode;
+	}
+	return output.join("\n");
+}
+
+describe.sequential("printHelp", () => {
+	test("uses pi-client help for fork-specific commands and settings", () => {
+		const help = captureHelp(true);
+		expect(help).toContain("pi-client - AI coding assistant");
+		expect(help).toContain("pi-client web [--port <port>]");
+		expect(help).toContain("pi-client send <path>");
+		expect(help).toContain("PI_SERVER_URL");
+		expect(help).toContain("PI_SERVER_AUTH_TOKEN");
+		expect(help).toContain("PI_CLIENT_MAX_REQUEST_KB");
+		expect(help).toContain("TAU_HOST");
+		expect(help).toContain("/reload");
+		expect(help).toContain("@averyyy/pi-client");
+		expect(help).toContain("--plan");
+	});
+
+	test("keeps upstream command names and extension flags in upstream mode", () => {
+		const help = captureHelp(false);
+		expect(help).toContain("pi - AI coding assistant");
+		expect(help).toContain("pi update [source|self|pi]");
+		expect(help).not.toContain("pi-client web");
+		expect(help).not.toContain("pi-client send");
+		expect(help).not.toContain("PI_SERVER_URL");
+		expect(help).toContain("--plan");
+	});
+});
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {

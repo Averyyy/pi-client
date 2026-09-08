@@ -160,8 +160,8 @@ Project-local `AGENTS.md`, extensions, skills, prompts, and themes continue to u
 
 ### Operational notes
 
-- Update this fork with `pi-client update`. It updates the checkout with `git pull --ff-only`, refreshes dependencies with `npm install --ignore-scripts`, then reinstalls both `pi-client` and `pi-server`. The update stops if the checkout has uncommitted changes.
-- `pi-server` stores session history in process memory. Restarting `pi-server` clears server-side session state.
+- Update this fork with `pi-client update`. It updates the published global `@averyyy/pi-client` and `@averyyy/pi-server` packages without stopping active sessions. Run `/reload` in each active session to switch it to the new runtime; this preserves its persisted session history. This command does not update a source checkout; pull and install checkout changes manually when developing from the repository.
+- `pi-server` persists session history under `PI_SERVER_SESSION_STORE_DIR` (by default `.pi/pi-server/sessions` in its working directory). Restarting `pi-server` does not clear persisted session state.
 - Read full server-side history with `GET /api/session/:id/history`. This is a response-only large payload path; the client POST size cap still applies only to client-to-server request bodies.
 - Run `pi-server` behind your own TLS/reverse proxy if accessing it over a network.
 - Keep `PI_SERVER_AUTH_TOKEN` set when `pi-server` is reachable by anything other than local trusted processes.
@@ -315,14 +315,14 @@ pi-client update
 它会：
 
 1. 输出当前 `pi-client` 版本以及基于哪个 upstream Pi 版本和 commit。
-2. 检查当前 checkout 是否有未提交修改；如果有，会停止更新。
-3. 执行 `git pull --ff-only`。
-4. 执行 `npm install --ignore-scripts`。
-5. 重新安装全局 `pi-client` 和 `pi-server`。
+2. 更新全局发布包 `@averyyy/pi-client@latest` 和 `@averyyy/pi-server@latest`，不会停止正在运行的 session。
+3. 在每个正在运行的 session 中执行 `/reload`，让它切换到新 runtime；已有的持久化 session 历史会保留。
+
+`pi-client update` 不会修改 source checkout。开发仓库代码时，请自行执行 `git pull` 和 `npm install --ignore-scripts`，再重新运行对应的全局安装命令。
 
 ### 运行注意事项
 
-- `pi-server` 的 session 历史保存在进程内存里，重启后会清空。
+- `pi-server` 的 session 历史会持久化到 `PI_SERVER_SESSION_STORE_DIR`，默认是工作目录下的 `.pi/pi-server/sessions`；重启后不会清空。
 - `GET /api/session/:id/history` 可以读取服务端完整历史。这是只读的大响应路径；`PI_CLIENT_MAX_REQUEST_KB` 仍只限制 client 到 server 的请求体大小。
 - 如果 `pi-server` 不只暴露给本机可信进程，请务必设置 `PI_SERVER_AUTH_TOKEN`。
 - 如果跨机器访问 `pi-server`，建议放在你自己的 TLS 或反向代理后面。

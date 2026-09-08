@@ -4,8 +4,9 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
+import { getCliBinName } from "../core/pi-client-cli-adapter.ts";
 import type { TuiMode } from "../core/settings-manager.ts";
 
 export type Mode = "text" | "json" | "rpc";
@@ -249,6 +250,15 @@ export function parseArgs(args: string[]): Args {
 }
 
 export function printHelp(extensionFlags?: ExtensionFlag[]): void {
+	const APP_NAME = getCliBinName();
+	const isPiClient = APP_NAME === "pi-client";
+	const updateCommand = isPiClient
+		? `  ${APP_NAME} update                    Update global @averyyy/pi-client and @averyyy/pi-server; run /reload in active sessions`
+		: `  ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs`;
+	const forkCommands = isPiClient
+		? `  ${APP_NAME} web [--port <port>]       Start the Tau browser mirror
+  ${APP_NAME} send <path>              Upload a file or folder to pi-server`
+		: "";
 	const extensionFlagsText =
 		extensionFlags && extensionFlags.length > 0
 			? `\n${chalk.bold("Extension CLI Flags:")}\n${extensionFlags
@@ -268,11 +278,12 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} install <source> [-l]     Install extension source and add to settings
   ${APP_NAME} remove <source> [-l]      Remove extension source from settings
   ${APP_NAME} uninstall <source> [-l]   Alias for remove
-  ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
+${updateCommand}
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   ${APP_NAME} auth <command>            Print credentials or check provider readiness
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
+  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/${isPiClient ? "" : "update/"}list/config/auth
+${forkCommands}
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
@@ -433,6 +444,15 @@ ${chalk.bold("Environment Variables:")}
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+${
+	isPiClient
+		? `  PI_SERVER_URL                    - pi-server URL (default: http://127.0.0.1:4217)
+  PI_SERVER_AUTH_TOKEN              - Bearer token for pi-server
+  PI_CLIENT_MAX_REQUEST_KB          - Maximum client-to-server JSON request size in KB (default: 512)
+  TAU_HOST                          - Tau bind host for ${APP_NAME} web (default: 127.0.0.1)
+  TAU_MIRROR_PORT                   - Tau mirror port for ${APP_NAME} web (default: 1838)`
+		: ""
+}
 
 ${chalk.bold("Built-in Tool Names:")}
   read       - Read file contents
