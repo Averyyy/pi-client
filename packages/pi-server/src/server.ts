@@ -18,6 +18,7 @@ import {
 	createProvider,
 	type Message,
 	type Model,
+	type ProviderStreams,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
@@ -108,6 +109,11 @@ interface SessionCompactBody {
 
 function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 	const models = createModels();
+	const requestStream: ProviderStreams["streamSimple"] = (requestModel, context, streamOptions) =>
+		streamSimple(requestModel, context, {
+			...streamOptions,
+			...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+		});
 	models.setProvider(
 		createProvider({
 			id: model.provider,
@@ -120,8 +126,8 @@ function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 				},
 			},
 			api: {
-				stream: (requestModel, context, streamOptions) => streamSimple(requestModel, context, streamOptions),
-				streamSimple: (requestModel, context, streamOptions) => streamSimple(requestModel, context, streamOptions),
+				stream: requestStream,
+				streamSimple: requestStream,
 			},
 		}),
 	);

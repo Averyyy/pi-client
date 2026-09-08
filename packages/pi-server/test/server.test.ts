@@ -18,6 +18,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { compactLegacy as realCompactLegacy } from "../../agent/src/harness/compaction/compaction.ts";
+import { stream as streamAnthropic } from "../../ai/src/api/anthropic-messages.ts";
 import { createPiServer, type ServerConfig, startServer } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 
@@ -753,6 +755,82 @@ describe("pi-server HTTP", () => {
 		expect(body.treePatch?.baseRevision).toBe(1);
 		expect(body.treePatch?.entries).toEqual([entries[1]]);
 		expect(body.treePatch?.revision).toBe(body.revision);
+	});
+
+	it("forwards compaction timeout to the provider and stops a stalled SDK request", async () => {
+		const model: Model<"anthropic-messages"> = {
+			id: "test-claude",
+			name: "Test Claude",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "http://127.0.0.1:9",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		};
+		const timeouts: Array<number | undefined> = [];
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		let stopFetch: (() => void) | undefined;
+		let sdkAborted = false;
+		const provide = (requestModel: Model<"anthropic-messages">, context: Context, options?: SimpleStreamOptions) => {
+			timeouts.push(options?.timeoutMs);
+			return streamAnthropic(requestModel, context, {
+				...options,
+				fetch: (_request, init) => {
+					markStarted?.();
+					const signal = init?.signal;
+					if (!signal) throw new Error("Anthropic SDK did not supply a request signal");
+					return new Promise<Response>((_resolve, reject) => {
+						const onAbort = () => {
+							sdkAborted = true;
+							reject(new DOMException("Aborted", "AbortError"));
+						};
+						signal.addEventListener("abort", onAbort, { once: true });
+						stopFetch = () => {
+							signal.removeEventListener("abort", onAbort);
+							reject(new Error("Fixture shut down"));
+						};
+					});
+				},
+			});
+		};
+		registerApiProvider({ api: model.api, stream: provide, streamSimple: provide });
+		vi.mocked(compactAgentCore).mockImplementationOnce(realCompactLegacy);
+		const sessionId = "compact-provider-timeout";
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		const entries = [userTreeEntry("u1", null, "old", 1000), userTreeEntry("u2", "u1", "keep", 2000)];
+		const sync = await fetch(`${baseUrl}/api/session/tree/sync`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId, entries, leafId: "u2" }),
+		});
+		expect(sync.status).toBe(200);
+		const responsePromise = fetch(`${baseUrl}/api/session/compact`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId,
+				model,
+				options: { apiKey: "fake-key", timeoutMs: 25 },
+				settings: { enabled: true, reserveTokens: 1024, keepRecentTokens: 0 },
+				preparation: { firstKeptEntryId: "u2" },
+			}),
+		}).then((response) => response.json());
+		try {
+			await started;
+			expect(timeouts).toEqual([25]);
+			expect(await responsePromise).toMatchObject({ error: expect.stringContaining("timed out") });
+			expect(sdkAborted).toBe(true);
+			expect(getSession(sessionId)?.entries).toEqual(entries);
+		} finally {
+			stopFetch?.();
+			await responsePromise;
+		}
 	});
 
 	it("returns compact tree patch when the client base tree hash matches", async () => {
