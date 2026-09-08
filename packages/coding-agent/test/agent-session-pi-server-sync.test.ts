@@ -470,6 +470,108 @@ describe("AgentSession pi-server sync", () => {
 		}
 	});
 
+	it("retries a pi-server HTTP 502 stream failure even when run recovery is also 502", async () => {
+		const tempDir = join(tmpdir(), `pi-stream-502-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const cwd = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		const modelRuntime = await createTestModelRuntime(model!.provider);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
+		const capturedRequests: { url: string; body: Record<string, unknown> }[] = [];
+		let streamCount = 0;
+
+		try {
+			process.env.PI_SERVER_MODE = "true";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					capturedRequests.push({ url, body });
+
+					if (url.includes("/runs/")) {
+						return new Response("Bad Gateway", { status: 502, statusText: "Bad Gateway" });
+					}
+
+					if (url.endsWith("/api/stream")) {
+						streamCount++;
+						if (streamCount === 1) {
+							return new Response("<html>Bad gateway</html>", {
+								status: 502,
+								statusText: "Bad Gateway",
+								headers: { "Content-Type": "text/html" },
+							});
+						}
+						return new Response(
+							[
+								'data: {"type":"start"}\n\n',
+								'data: {"type":"text_start","contentIndex":0}\n\n',
+								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
+								'data: {"type":"text_end","contentIndex":0}\n\n',
+								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+							].join(""),
+							{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+
+					return new Response(
+						JSON.stringify({
+							sessionId: body.sessionId,
+							leafId: body.leafId,
+							staticContextHash: "hash-502",
+							entryCount: Array.isArray(body.entries) ? body.entries.length : 0,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}),
+			);
+
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				thinkingLevel: "off",
+				modelRuntime,
+				sessionManager,
+				settingsManager,
+				resourceLoader: createTestResourceLoader(),
+			});
+			const events: string[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+				if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+			});
+			try {
+				await session.prompt("will 502");
+				await session.agent.waitForIdle();
+			} finally {
+				session.dispose();
+			}
+
+			expect(streamCount).toBe(2);
+			expect(events).toEqual(["start:1", "end:success=true"]);
+			expect(capturedRequests.some((request) => request.url.includes("/runs/"))).toBe(false);
+			const activeMessages = sessionManager.buildSessionContext().messages;
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(
+				activeMessages.some(
+					(message) =>
+						message.role === "assistant" &&
+						message.stopReason === "error" &&
+						message.errorMessage?.includes("502"),
+				),
+			).toBe(false);
+		} finally {
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("continues from the last valid leaf when an existing session ends on an assistant failure", async () => {
 		const tempDir = join(
 			tmpdir(),

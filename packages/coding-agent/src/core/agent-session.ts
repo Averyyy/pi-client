@@ -86,6 +86,7 @@ import {
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
+	type SessionCompactFailedEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type ToolDefinition,
@@ -200,7 +201,6 @@ export type AgentSessionEvent =
 			reason: "manual" | "threshold" | "overflow";
 	  }
 	| { type: "summarization_retry_finished" }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "bash_execution_update"; id?: string; delta: string };
 
 /** Listener function for agent session events */
@@ -327,9 +327,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 const INTRA_TURN_COMPACTION_MARKER_TYPE = "pi:intra-turn-compaction";
 const INTRA_TURN_COMPACTION_MARKER_TEXT =
 	"Continue from the compaction summary above. The previous tool loop was compacted before the next provider request; use the summary's Operational State, file lists, failures, last command, and next steps.";
-const VALIDATION_HINT_MESSAGE_TYPE = "pi:validation-hint";
-const VALIDATION_HINT_FILE_LIMIT = 12;
-const VALIDATION_HINT_FAILURE_CHAR_LIMIT = 1200;
 const AUTO_SESSION_NAME_INPUT_CHAR_LIMIT = 4000;
 const AUTO_SESSION_NAME_MAX_CHARS = 80;
 const AUTO_SESSION_NAME_PROMPT =
@@ -343,12 +340,6 @@ function toProviderReasoning(thinkingLevel: ThinkingLevel): SimpleStreamOptions[
 	return thinkingLevel === "off" ? undefined : thinkingLevel;
 }
 
-function getStringField(input: unknown, key: string): string | undefined {
-	if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
-	const value = (input as Record<string, unknown>)[key];
-	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-}
-
 function getPiServerFailurePhase(message: AssistantMessage): string | undefined {
 	for (const diagnostic of message.diagnostics ?? []) {
 		if (diagnostic.type !== "pi_server_failure") continue;
@@ -358,18 +349,13 @@ function getPiServerFailurePhase(message: AssistantMessage): string | undefined 
 	return undefined;
 }
 
-function toolTextContent(content: Array<TextContent | ImageContent>): string {
-	return content
-		.filter((part): part is TextContent => part.type === "text")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
-}
-
-function compactValidationSummary(text: string): string {
-	const trimmed = text.trim();
-	if (trimmed.length <= VALIDATION_HINT_FAILURE_CHAR_LIMIT) return trimmed;
-	return `...${trimmed.slice(trimmed.length - VALIDATION_HINT_FAILURE_CHAR_LIMIT + 3)}`;
+function getPiServerFailureRetryable(message: AssistantMessage): boolean | undefined {
+	for (const diagnostic of message.diagnostics ?? []) {
+		if (diagnostic.type !== "pi_server_failure") continue;
+		const retryable = diagnostic.details?.retryable;
+		if (typeof retryable === "boolean") return retryable;
+	}
+	return undefined;
 }
 
 function messageTextContent(message: AgentMessage): string {
@@ -405,11 +391,6 @@ function sanitizeGeneratedSessionName(text: string): string | undefined {
 	return title.length > AUTO_SESSION_NAME_MAX_CHARS ? title.slice(0, AUTO_SESSION_NAME_MAX_CHARS).trim() : title;
 }
 
-interface ValidationFailureState {
-	command: string;
-	summary: string;
-}
-
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -438,6 +419,8 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
+	private _pendingCustomMessages: CustomMessage[] = [];
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -463,8 +446,6 @@ export class AgentSession {
 	private readonly _bashAbortControllers = new Set<AbortController>();
 	private readonly _bashCompletionPromises = new Set<Promise<void>>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
-	private _validationModifiedFiles = new Set<string>();
-	private _validationFailure: ValidationFailureState | undefined = undefined;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -613,96 +594,6 @@ export class AgentSession {
 		}
 	}
 
-	private _resetValidationHintState(): void {
-		this._validationModifiedFiles.clear();
-		this._validationFailure = undefined;
-	}
-
-	private _recordValidationToolResult(
-		toolName: string,
-		input: unknown,
-		content: Array<TextContent | ImageContent>,
-		isError: boolean,
-	): void {
-		if ((toolName === "edit" || toolName === "write") && !isError) {
-			const path = getStringField(input, "path") ?? getStringField(input, "file_path");
-			if (path) {
-				this._validationModifiedFiles.add(path);
-			}
-			return;
-		}
-
-		if (toolName !== "bash") {
-			return;
-		}
-
-		const command = getStringField(input, "command");
-		if (!command) {
-			return;
-		}
-
-		if (isError) {
-			this._validationFailure = {
-				command,
-				summary: compactValidationSummary(toolTextContent(content)),
-			};
-		} else if (this._validationFailure?.command === command) {
-			this._resetValidationHintState();
-		} else if (!this._validationFailure) {
-			this._validationModifiedFiles.clear();
-		}
-	}
-
-	private _createValidationHintMessage():
-		| CustomMessage<{ modifiedFiles: string[]; failedCommand?: string }>
-		| undefined {
-		const modifiedFiles = Array.from(this._validationModifiedFiles).slice(-VALIDATION_HINT_FILE_LIMIT);
-		if (modifiedFiles.length === 0 && !this._validationFailure) {
-			return undefined;
-		}
-
-		const lines = ["<validation-hint>"];
-		if (modifiedFiles.length > 0) {
-			lines.push("Recent modified files:", ...modifiedFiles.map((file) => `- ${file}`));
-		}
-		if (this._validationFailure) {
-			lines.push(
-				"Recent failed command:",
-				this._validationFailure.command,
-				"Failure summary:",
-				this._validationFailure.summary || "(no output)",
-				"Suggested next validation command:",
-				this._validationFailure.command,
-			);
-		} else {
-			lines.push("Suggested next step:", "Run the smallest project validation that covers the modified files.");
-		}
-		lines.push(
-			"Inspect failures, fix the root cause, then rerun validation before finalizing.",
-			"</validation-hint>",
-		);
-
-		return {
-			role: "custom",
-			customType: VALIDATION_HINT_MESSAGE_TYPE,
-			content: [{ type: "text", text: lines.join("\n") }],
-			display: false,
-			details: { modifiedFiles, failedCommand: this._validationFailure?.command },
-			timestamp: Date.now(),
-		};
-	}
-
-	private _withValidationHint(context: AgentContext): AgentContext {
-		const messages = context.messages.filter(
-			(message) => !(message.role === "custom" && message.customType === VALIDATION_HINT_MESSAGE_TYPE),
-		);
-		const hint = this._createValidationHintMessage();
-		return {
-			...context,
-			messages: hint ? [...messages, hint] : messages,
-		};
-	}
-
 	/**
 	 * Install tool hooks once on the Agent instance.
 	 *
@@ -752,8 +643,6 @@ export class AgentSession {
 			const normalizedContent = await normalizeToolResultImages(content, {
 				autoResizeImages: this.settingsManager.getImageAutoResize(),
 			});
-			const finalIsError = hookResult?.isError ?? isError;
-			this._recordValidationToolResult(toolCall.name, args, normalizedContent, finalIsError);
 
 			if (!hookResult && normalizedContent === content) {
 				return undefined;
@@ -782,11 +671,11 @@ export class AgentSession {
 
 			return {
 				...previousSnapshot,
-				context: this._withValidationHint({
+				context: {
 					...previousContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
-				}),
+				},
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
@@ -812,6 +701,12 @@ export class AgentSession {
 		});
 	}
 
+	private async _emitSessionCompactFailed(event: Omit<SessionCompactFailedEvent, "type">): Promise<void> {
+		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
+			await this._extensionRunner.emit({ type: "session_compact_failed", ...event });
+		}
+	}
+
 	private _getIdleWaitPromise(): Promise<void> {
 		if (!this._idleWaitPromise) {
 			this._idleWaitPromise = new Promise((resolve) => {
@@ -822,7 +717,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -915,6 +810,15 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 			}
+		}
+
+		// A turn ends after its assistant message and every tool result has been appended,
+		// so this is the first point in the run where a context-only custom message can be
+		// inserted without landing between a tool call and its result. Flushing after the
+		// extension and listener dispatch above also picks up messages that turn_end
+		// handlers queued.
+		if (event.type === "turn_end") {
+			this._flushPendingCustomMessages();
 		}
 	};
 
@@ -1195,9 +1099,9 @@ export class AgentSession {
 		return this._abortError;
 	}
 
-	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
+	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1377,7 +1281,6 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
-		this._resetValidationHintState();
 		this._isAgentRunActive = true;
 		try {
 			await start();
@@ -1409,6 +1312,7 @@ export class AgentSession {
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
 		}
 	}
@@ -1606,8 +1510,9 @@ export class AgentSession {
 				return;
 			}
 
-			// Flush any pending bash messages before the new prompt
+			// Flush any pending bash and custom messages before the new prompt
 			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
 
 			// Validate model
 			if (!this.model) {
@@ -1887,8 +1792,9 @@ export class AgentSession {
 	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
-	 * Handles three cases:
+	 * Handles four cases:
 	 * - Streaming: queues message, processed when loop pulls from queue
+	 * - Streaming + triggerTurn false: appended to state/session once the current turn ends
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
@@ -1925,16 +1831,40 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
+		} else if (this.isStreaming) {
+			// Appending now would put the message between an assistant tool call and its
+			// result, which providers that validate message order reject on replay. Defer
+			// to the end of the turn. Nothing is emitted yet: message events must not
+			// describe messages the session tree does not contain.
+			this._pendingCustomMessages.push(appMessage);
 		} else {
-			this.agent.state.messages.push(appMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
-			this._emit({ type: "message_start", message: appMessage });
-			this._emit({ type: "message_end", message: appMessage });
+			this._appendCustomMessage(appMessage);
+		}
+	}
+
+	private _appendCustomMessage(appMessage: CustomMessage): void {
+		this.agent.state.messages.push(appMessage);
+		this.sessionManager.appendCustomMessageEntry(
+			appMessage.customType,
+			appMessage.content,
+			appMessage.display,
+			appMessage.details,
+		);
+		this._emit({ type: "message_start", message: appMessage });
+		this._emit({ type: "message_end", message: appMessage });
+	}
+
+	/**
+	 * Append custom messages queued while the agent was running.
+	 * Called once the current turn's tool results are in agent state and session history.
+	 */
+	private _flushPendingCustomMessages(): void {
+		if (this._pendingCustomMessages.length === 0) return;
+
+		const pending = this._pendingCustomMessages;
+		this._pendingCustomMessages = [];
+		for (const appMessage of pending) {
+			this._appendCustomMessage(appMessage);
 		}
 	}
 
@@ -2137,6 +2067,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this._addPersistedDefaultToNonEmptyScope(model);
 		}
 
 		// Apply thinking level for the new model.
@@ -2145,6 +2076,20 @@ export class AgentSession {
 		this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(model, previousModel, "set");
+	}
+
+	private _addPersistedDefaultToNonEmptyScope(model: Model<any>): void {
+		if (this._scopedModels.length === 0) return;
+		if (this._scopedModels.some((scoped) => modelsAreEqual(scoped.model, model))) return;
+
+		this._scopedModels = [...this._scopedModels, { model }];
+
+		const enabledModels = this.settingsManager.getEnabledModels();
+		if (!enabledModels?.length) return;
+
+		const modelReference = `${model.provider}/${model.id}`;
+		if (enabledModels.some((pattern) => pattern.toLowerCase() === modelReference.toLowerCase())) return;
+		this.settingsManager.setEnabledModels([...enabledModels, modelReference]);
 	}
 
 	/**
@@ -2189,6 +2134,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+			this._addPersistedDefaultToNonEmptyScope(next.model);
 		}
 
 		// Apply thinking level for the new model.
@@ -2223,6 +2169,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+			this._addPersistedDefaultToNonEmptyScope(nextModel);
 		}
 
 		// Apply thinking level for the new model.
@@ -2387,6 +2334,11 @@ export class AgentSession {
 		return compactionResult;
 	}
 
+	private _clearManualCompactionState(): void {
+		this._compactionAbortController = undefined;
+		this._resolveIdleWaitIfIdle();
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -2548,7 +2500,7 @@ export class AgentSession {
 				details,
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
-			this._compactionAbortController = undefined;
+			this._clearManualCompactionState();
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -2561,16 +2513,19 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
 			this._compactionAbortController = undefined;
+			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
+			this._clearManualCompactionState();
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
 				result: undefined,
 				aborted,
 				willRetry: false,
-				errorMessage: aborted ? undefined : `Compaction failed: ${message}`,
+				errorMessage,
 			});
 			throw error;
 		} finally {
+			this._clearManualCompactionState();
 			this._compactionAbortController = undefined;
 			if (this._compactionCompletionPromise === compactionCompletion) {
 				this._compactionCompletionPromise = undefined;
@@ -2644,8 +2599,9 @@ export class AgentSession {
 		// independent of the configured context size or any context-clamped provider request limit.
 		// A successful response over the configured window should compact but must not retry: the
 		// assistant answer already completed and agent.continue() cannot continue from an assistant.
+		const contextOverflow = sameModel && isContextOverflow(assistantMessage, contextWindow);
 		const recoverableLength = sameModel && isRecoverableLength(assistantMessage, this.model?.maxTokens ?? 0);
-		if (sameModel && (isContextOverflow(assistantMessage, contextWindow) || recoverableLength)) {
+		if (contextOverflow || recoverableLength) {
 			const willRetry = assistantMessage.stopReason !== "stop";
 
 			if (!willRetry) {
@@ -2653,14 +2609,16 @@ export class AgentSession {
 			}
 
 			if (this._overflowRecoveryAttempted) {
+				const errorMessage = contextOverflow
+					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+					: "Truncated response recovery failed after one compact-and-retry attempt.";
 				this._emit({
 					type: "compaction_end",
 					reason: "overflow",
 					result: undefined,
 					aborted: false,
 					willRetry: false,
-					errorMessage:
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+					errorMessage,
 				});
 				return false;
 			}
@@ -2697,17 +2655,18 @@ export class AgentSession {
 		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
-			if (estimate.lastUsageIndex === null) return false; // No usage data at all
-			// Verify the usage source is post-compaction. Kept pre-compaction messages
-			// have stale usage reflecting the old (larger) context and would falsely
-			// trigger compaction right after one just finished.
-			const usageMsg = messages[estimate.lastUsageIndex];
-			if (
-				compactionTimestamp > 0 &&
-				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
-			) {
-				return false;
+			// When a valid usage entry exists, verify it is post-compaction. Kept
+			// pre-compaction messages have stale usage reflecting the old (larger)
+			// context and would falsely trigger compaction right after one finished.
+			if (estimate.lastUsageIndex !== null) {
+				const usageMsg = messages[estimate.lastUsageIndex];
+				if (
+					compactionTimestamp > 0 &&
+					usageMsg.role === "assistant" &&
+					(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
+				) {
+					return false;
+				}
 			}
 			contextTokens = estimate.tokens;
 		} else {
@@ -2731,6 +2690,7 @@ export class AgentSession {
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		let fromExtension = false;
 		if (externalSignal?.aborted) return false;
 		const abortExternal = () => this._autoCompactionAbortController?.abort();
 		externalSignal?.addEventListener("abort", abortExternal, { once: true });
@@ -2791,7 +2751,6 @@ export class AgentSession {
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
-			let fromExtension = false;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
 				const extensionResult = (await this._extensionRunner.emit({
@@ -2811,6 +2770,12 @@ export class AgentSession {
 						result: undefined,
 						aborted: true,
 						willRetry: false,
+					});
+					await this._emitSessionCompactFailed({
+						reason,
+						aborted: true,
+						willRetry: false,
+						fromExtension: false,
 					});
 					return false;
 				}
@@ -2863,6 +2828,12 @@ export class AgentSession {
 					result: undefined,
 					aborted: true,
 					willRetry: false,
+				});
+				await this._emitSessionCompactFailed({
+					reason,
+					aborted: true,
+					willRetry: false,
+					fromExtension,
 				});
 				return false;
 			}
@@ -2928,11 +2899,22 @@ export class AgentSession {
 							? `Context overflow recovery failed: ${errorMessage}`
 							: `Auto-compaction failed: ${errorMessage}`,
 				});
+				await this._emitSessionCompactFailed({
+					reason,
+					errorMessage:
+						reason === "overflow"
+							? `Context overflow recovery failed: ${errorMessage}`
+							: `Auto-compaction failed: ${errorMessage}`,
+					aborted: false,
+					willRetry: false,
+					fromExtension,
+				});
 			}
 			return false;
 		} finally {
 			externalSignal?.removeEventListener("abort", abortExternal);
 			this._autoCompactionAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -3425,13 +3407,20 @@ export class AgentSession {
 	 * Check if an error is retryable. Provider error text is retryable by default,
 	 * except usage/quota/balance limits and session or context failures.
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
+	 * Pi-server diagnostics may mark recovery/history failures as non-retryable;
+	 * transient session_init/tree_sync outages stay retryable so the next attempt
+	 * re-runs the whole stream path.
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;
-		const piServerPhase = getPiServerFailurePhase(message);
-		if (piServerPhase && piServerPhase !== "provider_stream") return false;
+		const piServerRetryable = getPiServerFailureRetryable(message);
+		if (piServerRetryable === false) return false;
+		if (piServerRetryable !== true) {
+			const piServerPhase = getPiServerFailurePhase(message);
+			if (piServerPhase && piServerPhase !== "provider_stream") return false;
+		}
 		return isRetryableAssistantError(message);
 	}
 
@@ -3911,6 +3900,7 @@ export class AgentSession {
 				this._branchSummaryCompletionPromise = undefined;
 			}
 			resolveBranchSummaryCompletion?.();
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 

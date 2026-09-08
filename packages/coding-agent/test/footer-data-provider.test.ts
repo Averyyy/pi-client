@@ -77,14 +77,10 @@ function createReftableWorktree(tempDir: string): WorktreeFixture {
 	return { worktreeDir, reftableDir };
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
-	const startedAt = Date.now();
-	while (!condition()) {
-		if (Date.now() - startedAt > timeoutMs) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
+function emitReftableChange(provider: FooterDataProvider): void {
+	const { reftableWatcher } = provider as unknown as { reftableWatcher: FSWatcher | null };
+	expect(reftableWatcher).not.toBeNull();
+	reftableWatcher?.emit("change", "change", "tables.list");
 }
 
 describe("FooterDataProvider reftable branch detection", () => {
@@ -167,8 +163,10 @@ describe("FooterDataProvider reftable branch detection", () => {
 		}
 	});
 
+	// Drive debounce behavior explicitly; native fs.watch delivery can race watcher startup.
 	it("does not notify listeners when reftable updates keep the same branch", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+		vi.useFakeTimers();
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
 		const provider = new FooterDataProvider(worktreeDir);
@@ -178,8 +176,8 @@ describe("FooterDataProvider reftable branch detection", () => {
 			const onBranchChange = vi.fn();
 			provider.onBranchChange(onBranchChange);
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
+			emitReftableChange(provider);
+			await vi.advanceTimersByTimeAsync(501);
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
@@ -187,6 +185,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 			expect(onBranchChange).not.toHaveBeenCalled();
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 

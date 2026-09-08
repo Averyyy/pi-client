@@ -552,6 +552,20 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+/**
+ * Returns an error message when a summarization response cannot safely be persisted.
+ * A length stop contains partial text and must not become a session checkpoint.
+ */
+export function getSummarizationFailure(response: AssistantMessage, label: string): string | undefined {
+	if (response.stopReason === "error") {
+		return `${label} failed: ${response.errorMessage || "Unknown error"}`;
+	}
+	if (response.stopReason === "length") {
+		return `${label} failed: generation hit the token cap and the summary is incomplete`;
+	}
+	return undefined;
+}
+
 function createSummarizationOptions(
 	model: Model<any>,
 	maxTokens: number,
@@ -560,8 +574,9 @@ function createSummarizationOptions(
 	env: Record<string, string> | undefined,
 	signal: AbortSignal | undefined,
 	thinkingLevel: ThinkingLevel | undefined,
+	sessionId: string | undefined,
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env };
+	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
@@ -645,7 +660,7 @@ export async function completeSummarization(
 	const requestOptions: SimpleStreamOptions = {
 		...options,
 		cacheRetention: "none",
-		sessionId: uuidv7(),
+		sessionId: options.sessionId ?? uuidv7(),
 	};
 	const produce = async (): Promise<AssistantMessage> =>
 		streamFn
@@ -669,6 +684,7 @@ async function summarizeChunk(
 	previousSummary: string | undefined,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
 	const basePrompt = previousSummary ? updatePrompt : initialPrompt;
 	const promptText = buildSummaryPrompt(conversationText, basePrompt, previousSummary);
@@ -683,7 +699,7 @@ async function summarizeChunk(
 	const response = await completeSummarization(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),
+		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,
 		callbacks,
@@ -706,6 +722,7 @@ async function summarizeChunk(
 			previousSummary,
 			retry,
 			callbacks,
+			sessionId,
 		);
 		const rightSummary = await summarizeChunk(
 			conversationText.slice(middle),
@@ -722,6 +739,7 @@ async function summarizeChunk(
 			leftSummary.text,
 			retry,
 			callbacks,
+			sessionId,
 		);
 		return {
 			text: rightSummary.text,
@@ -729,8 +747,12 @@ async function summarizeChunk(
 		};
 	}
 
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+	const failure = getSummarizationFailure(response, "Summarization");
+	if (failure) {
+		throw new Error(failure);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
 	}
 
 	return { text: contentText(response.content), usage: response.usage };
@@ -751,6 +773,7 @@ export async function summarizeMessages(
 	previousSummary: string | undefined,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
 	let remaining = toSummarySegments(messages);
 	if (remaining.length === 0) {
@@ -769,6 +792,7 @@ export async function summarizeMessages(
 			previousSummary,
 			retry,
 			callbacks,
+			sessionId,
 		);
 	}
 	let summary = previousSummary;
@@ -791,6 +815,7 @@ export async function summarizeMessages(
 			summary,
 			retry,
 			callbacks,
+			sessionId,
 		);
 		summary = chunkSummary.text;
 		summaryUsage = summaryUsage ? combineUsage(summaryUsage, chunkSummary.usage) : chunkSummary.usage;
@@ -818,6 +843,7 @@ export async function generateSummary(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<string> {
 	return (
 		await generateSummaryWithUsage(
@@ -834,6 +860,7 @@ export async function generateSummary(
 			env,
 			retry,
 			callbacks,
+			sessionId,
 		)
 	).text;
 }
@@ -853,6 +880,7 @@ export async function generateSummaryWithUsage(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = getSummaryMaxTokens(model, reserveTokens);
 
@@ -878,6 +906,7 @@ export async function generateSummaryWithUsage(
 		previousSummary,
 		retry,
 		callbacks,
+		sessionId,
 	);
 }
 
@@ -1049,6 +1078,7 @@ export async function compact(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1083,6 +1113,7 @@ export async function compact(
 				env,
 				retry,
 				callbacks,
+				sessionId,
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -1099,6 +1130,7 @@ export async function compact(
 			streamFn,
 			retry,
 			callbacks,
+			sessionId,
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -1119,6 +1151,7 @@ export async function compact(
 			env,
 			retry,
 			callbacks,
+			sessionId,
 		);
 		summary = result.text;
 		summaryUsage = result.usage;
@@ -1156,6 +1189,7 @@ async function generateTurnPrefixSummary(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -1178,9 +1212,13 @@ async function generateTurnPrefixSummary(
 			undefined,
 			retry,
 			callbacks,
+			sessionId,
 		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		if (message === "Summarization attempted to call a tool") {
+			throw new Error("Turn prefix summarization attempted to call a tool");
+		}
 		throw new Error(`Turn prefix summarization failed: ${message.replace(/^Summarization failed: /, "")}`);
 	}
 }

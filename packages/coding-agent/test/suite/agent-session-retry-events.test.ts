@@ -135,7 +135,7 @@ describe("AgentSession retry and event characterization", () => {
 	it("does not retry non-retryable errors", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" })]);
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" })]);
 
 		await harness.session.prompt("test");
 
@@ -189,6 +189,7 @@ describe("AgentSession retry and event characterization", () => {
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("final answer"),
+			fauxAssistantMessage("follow-up answer"),
 		]);
 
 		await harness.session.prompt("test");
@@ -326,7 +327,7 @@ describe("AgentSession retry and event characterization", () => {
 	it("emits agent_end for error responses", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "broken" })]);
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" })]);
 
 		await harness.session.prompt("hi");
 

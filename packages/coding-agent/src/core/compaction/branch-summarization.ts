@@ -71,7 +71,7 @@ export interface GenerateBranchSummaryOptions {
 	customInstructions?: string;
 	/** If true, customInstructions replaces the default prompt instead of being appended */
 	replaceInstructions?: boolean;
-	/** Tokens reserved for prompt + LLM response (default 16384) */
+	/** Tokens reserved when selecting branch history (default 16384) */
 	reserveTokens?: number;
 	/** Optional session stream function. Used to preserve SDK request behavior without mutating agent state. */
 	streamFn?: StreamFn;
@@ -331,7 +331,7 @@ export async function generateBranchSummary(
 	}
 
 	const maxTokens = Math.min(
-		2048,
+		4096,
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
@@ -361,7 +361,14 @@ export async function generateBranchSummary(
 		if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 			return { aborted: true };
 		}
-		return { error: error instanceof Error ? error.message.replace(/^Summarization failed: /, "") : String(error) };
+		const message = error instanceof Error ? error.message : String(error);
+		if (message === "Summarization attempted to call a tool") {
+			return { error: "Branch summarization attempted to call a tool" };
+		}
+		if (message.startsWith("Summarization failed: ")) {
+			return { error: `Branch summarization failed: ${message.slice("Summarization failed: ".length)}` };
+		}
+		return { error: message };
 	}
 
 	if (signal.aborted) {
