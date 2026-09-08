@@ -160,6 +160,25 @@ describe("session-store", () => {
 		]);
 	});
 
+	it("keeps null leaves empty and still rejects parent cycles", () => {
+		const empty = replaceSessionTree("tree-empty", [], null);
+		expect(getSessionBranch(empty)).toEqual([]);
+
+		const cyclic = getOrCreateSession("tree-cycle");
+		cyclic.entries = [
+			{
+				type: "message",
+				id: "cycle",
+				parentId: "cycle",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "cycle", timestamp: 1000 },
+			},
+		];
+		cyclic.leafId = "cycle";
+
+		expect(() => getSessionBranch(cyclic)).toThrow("session tree contains a parent cycle at entry cycle");
+	});
+
 	it("keeps a rolling tree hash across append and leaf switch", () => {
 		const first: SessionTreeEntry = {
 			type: "message",

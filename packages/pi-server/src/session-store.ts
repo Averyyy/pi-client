@@ -173,9 +173,10 @@ export function getSessionBranch(session: SessionState): SessionTreeEntry[] {
 			throw new Error(`session tree contains a parent cycle at entry ${current.id}`);
 		}
 		seen.add(current.id);
-		branch.unshift(current);
+		branch.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	branch.reverse();
 	return branch;
 }
 
