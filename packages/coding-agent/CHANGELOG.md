@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Continued pi-server compaction after authoritative history reconciliation, validated incremental tree prefixes, and recovered committed compaction results after interrupted response delivery.
+
 - Fixed interactive working-status cleanup and redraws when agent turns resume or settle after compaction and retry transitions.
 - Fixed pi-client cancellation to show `Aborting...`, ignore repeated interrupts, and send messages queued during cancellation once the previous operation has fully settled.
 - Removed persistent validation hints that repeatedly injected stale bash failures after corrected commands succeeded. Ordinary tool results remain the source of validation evidence.

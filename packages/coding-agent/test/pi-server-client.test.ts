@@ -1836,6 +1836,16 @@ describe("pi-server-client", () => {
 			vi.fn(async (url: string, init?: RequestInit) => {
 				const body = parseJsonObject((init?.body as string | undefined) ?? "");
 				capturedBodies.push({ url, body });
+				if (url.endsWith("/api/session/compact")) {
+					expect(body.baseTreeHash).toBe(hashEntries(serverEntries));
+					expect(body.preparation).toBeUndefined();
+					const entry = compactionEntry("c1", "a1", "summary", "a1");
+					return makeCompactEventStreamResponse({
+						compaction: entry,
+						compactionEntry: entry,
+						treePatch: { entriesFrom: serverEntries.length, entries: [entry], leafId: "c1", revision: 2 },
+					});
+				}
 
 				if (url.endsWith("/api/session/init")) {
 					return new Response(
@@ -1872,16 +1882,18 @@ describe("pi-server-client", () => {
 			compactPiServer(testModel, context, {
 				sessionId: "compact-diverged",
 				apiKey: "sk-client",
+				preparation: { firstKeptEntryId: "local-u1" },
 				sessionTree: { entries: localEntries, leafId: "local-u1" },
 				onHistoryReconciled: (snapshot) => {
 					reconciled = { entries: snapshot.entries, leafId: snapshot.leafId };
 				},
 			}),
-		).rejects.toThrow("pi-server history differed");
+		).resolves.toMatchObject({ entries: [...serverEntries, compactionEntry("c1", "a1", "summary", "a1")] });
 
 		expect(capturedBodies.map((request) => new URL(request.url).pathname)).toEqual([
 			"/api/session/init",
 			"/api/session/compact-diverged/history",
+			"/api/session/compact",
 		]);
 		expect(reconciled).toEqual({ entries: serverEntries, leafId: "a1" });
 	});

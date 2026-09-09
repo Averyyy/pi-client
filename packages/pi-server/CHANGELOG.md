@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Made compaction of an active compaction leaf idempotent and exposed completed compaction results for same-run recovery after response interruption.
+
 - Rejected stale compaction results after concurrent session changes instead of attaching summaries to the wrong branch.
 - Preserved authoritative final assistant messages in healthy proxy streams, including redacted thinking and provider response metadata.
 - Persisted static-context-only updates across restarts by advancing session revisions.

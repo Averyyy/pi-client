@@ -140,6 +140,7 @@ interface StreamRunRecord {
 	kind: "stream" | "compact";
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
+	compactResult?: SessionCompactSuccessBody;
 	errorMessage?: string;
 	createdAt: number;
 	updatedAt: number;
@@ -276,6 +277,7 @@ function streamRunResponseBody(run: StreamRunRecord) {
 		createdAt: run.createdAt,
 		updatedAt: run.updatedAt,
 		...(run.message ? { message: run.message } : {}),
+		...(run.compactResult ? { compactResult: run.compactResult } : {}),
 		...(run.errorMessage ? { errorMessage: run.errorMessage } : {}),
 	};
 }
@@ -453,7 +455,7 @@ interface PreparedSessionCompact {
 
 interface SessionCompactSuccessBody {
 	success: true;
-	compaction: LegacyCompactResult;
+	compaction: Omit<LegacyCompactResult, "retainedTail">;
 	compactionEntry: SessionTreeEntry;
 	sessionId: string;
 	staticContextHash: string;
@@ -623,6 +625,28 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 	}
 
 	const entries = getSessionBranch(session);
+	const leaf = entries.at(-1);
+	if (leaf?.type === "compaction") {
+		if (!leaf.firstKeptEntryId) {
+			return { status: 400, body: { error: "Stored compaction is missing firstKeptEntryId" } };
+		}
+		return {
+			status: 200,
+			body: {
+				success: true,
+				compaction: {
+					summary: leaf.summary,
+					firstKeptEntryId: leaf.firstKeptEntryId,
+					tokensBefore: leaf.tokensBefore,
+					details: leaf.details,
+				},
+				compactionEntry: leaf,
+				...sessionResponseBody(session),
+				entries: session.entries,
+				messages: session.messages,
+			},
+		};
+	}
 	const preparationResult = prepareLegacyCompaction(
 		entries,
 		body.settings ?? DEFAULT_COMPACTION_SETTINGS,
@@ -771,11 +795,11 @@ async function handleSessionCompactStream(
 
 	try {
 		const result = await completeSessionCompact(config, body, prepared, run);
-		writeServerSentEvent(res, result.status >= 400 ? "error" : "result", result.body);
 		finishCompactRun(run, result);
+		writeServerSentEvent(res, result.status >= 400 ? "error" : "result", result.body);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (run) {
+		if (run?.status === "running") {
 			run.status = run.cancelRequested ? "aborted" : "failed";
 			run.errorMessage = message;
 			run.updatedAt = Date.now();
@@ -813,11 +837,11 @@ async function handleSessionCompactJsonStream(
 
 	try {
 		const result = await completeSessionCompact(config, body, prepared, run);
-		res.write(JSON.stringify(result.body));
 		finishCompactRun(run, result);
+		res.write(JSON.stringify(result.body));
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (run) {
+		if (run?.status === "running") {
 			run.status = run.cancelRequested ? "aborted" : "failed";
 			run.errorMessage = message;
 			run.updatedAt = Date.now();
@@ -839,6 +863,8 @@ function finishCompactRun(run: StreamRunRecord | undefined, result: SessionCompa
 		run.status = result.status >= 400 ? "failed" : "completed";
 		if (result.status >= 400 && "error" in result.body) {
 			run.errorMessage = result.body.error;
+		} else if ("success" in result.body) {
+			run.compactResult = { ...result.body, entries: result.body.entries?.slice() };
 		}
 	}
 	run.updatedAt = Date.now();
@@ -849,6 +875,15 @@ async function handleSessionCompact(
 	body: SessionCompactBody,
 	res: ServerResponse,
 ): Promise<void> {
+	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
+	if (existingRun?.status === "aborted") {
+		sendJson(res, 409, { error: "Compaction run was aborted", code: PiServerErrorCode.INVALID_REQUEST });
+		return;
+	}
+	if (existingRun?.status === "completed" && existingRun.compactResult) {
+		sendJson(res, 200, existingRun.compactResult);
+		return;
+	}
 	const prepared = prepareSessionCompact(body);
 	if ("status" in prepared) {
 		sendJson(res, prepared.status, prepared.body);

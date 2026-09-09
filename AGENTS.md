@@ -47,7 +47,7 @@
 - If client and server history diverge, server history is authoritative. Reconcile the client to the server history and refresh the UI/session state instead of uploading the divergent client history.
 - When `pi-server` reports an existing `treeHash` and `entryCount`, treat that as the server-known prefix. If the local tree extends that prefix, append only the new tail entries; do not full-sync just because in-memory entry-id tracking was reset by resume/import/process restart.
 - When `pi-server` reports the same full tree hash but a different `leafId`, switch the leaf with `/api/session/tree/switch`; do not resend entries.
-- If `pi-server` reports a non-empty tree that is not a prefix of the local tree, fetch `/api/session/:id/history`, refresh the local tree from that snapshot, and stop the current operation. Do not overwrite the server with a client full-tree sync.
+- If `pi-server` reports a non-empty tree that is not a prefix of the local tree, fetch `/api/session/:id/history` and refresh the local tree from that snapshot. Compaction continues with the authoritative snapshot and recomputes branch-specific cut points; other sync callers stop the current operation. Do not overwrite the server with a client full-tree sync.
 - If `/api/session/tree/append` or `/api/session/tree/switch` returns a recoverable divergence for a non-empty server tree, reconcile from `/api/session/:id/history`; do not treat it as permission to replace the server tree.
 - If a client-to-server full-history upload is truly unavoidable, it must go through `ChunkRequest`. Never add a direct full-history POST path that can bypass the configured request-size limit.
 - Keep request-size handling transport-local: normal callers should use the pi-server request abstraction and should not manually split or stringify large bodies at feature call sites.
@@ -66,6 +66,8 @@
 - Keep machine-specific pi-server public-access runbooks, credentials, Windows service paths, and tunnel details in the exact ignored file `docs/pi-server-public-access.local.md`; never copy those values into tracked documentation or external messages.
 
 ## pi-client / pi-server Compact and Resilience
+
+- Validate the server-known tree prefix by content before incremental append; cached entry IDs alone cannot detect changed entries. Compact response patches must use the reconciled tree as their base. Record completed compact results before response delivery and recover the same run after an interrupted SSE response; an active compaction leaf returns its persisted result without another summarizer call.
 
 - Keep the pi-client/pi-server `firstKeptEntryId` session-tree adapter explicit through `buildLegacySessionContext()`, `prepareLegacyCompaction()`, and `compactLegacy()`; do not pass that durable wire format into Harness v2 APIs that require `seq` and embedded `retainedTail` entries.
 - Treat the session tree as durable full history. Compaction is branch-local: add a compaction entry on the active branch and let `buildSessionContext()` derive the compacted active context. Never physically prune sibling branches or old entries during sync.

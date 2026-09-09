@@ -53,7 +53,6 @@ function createPiServerRequest(signal?: AbortSignal): ChunkRequest {
 }
 
 const sessionStaticContextHashes = new Map<string, string>();
-const sessionSyncedEntryIds = new Map<string, Set<string>>();
 const sessionTreeHashes = new Map<string, string>();
 const sessionTreeEntryCounts = new Map<string, number>();
 const sessionTreeLeafIds = new Map<string, string | null>();
@@ -110,7 +109,6 @@ function getLinearTreeFromMessages(messages: Message[]): { entries: SessionTreeE
 
 export function resetSessionTracking(sessionId: string): void {
 	sessionStaticContextHashes.delete(sessionId);
-	sessionSyncedEntryIds.delete(sessionId);
 	sessionTreeHashes.delete(sessionId);
 	sessionTreeEntryCounts.delete(sessionId);
 	sessionTreeLeafIds.delete(sessionId);
@@ -119,7 +117,6 @@ export function resetSessionTracking(sessionId: string): void {
 
 export function resetAllSessionTracking(): void {
 	sessionStaticContextHashes.clear();
-	sessionSyncedEntryIds.clear();
 	sessionTreeHashes.clear();
 	sessionTreeEntryCounts.clear();
 	sessionTreeLeafIds.clear();
@@ -237,7 +234,7 @@ export interface PiServerTreeSnapshot {
 }
 
 export interface PiServerCompactionResult {
-	compaction: LegacyCompactResult;
+	compaction: Omit<LegacyCompactResult, "retainedTail">;
 	compactionEntry: SessionTreeEntry;
 	entries: SessionTreeEntry[];
 	leafId: string | null;
@@ -359,6 +356,7 @@ interface PiServerRunResponse {
 	runId: string;
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
+	compactResult?: PiServerCompactionResponse;
 	errorMessage?: string;
 }
 
@@ -635,7 +633,6 @@ function getStaticContext(context: Context) {
 }
 
 function markTreeSynced(sessionId: string, tree: PiServerTreeSnapshot): void {
-	sessionSyncedEntryIds.set(sessionId, new Set(tree.entries.map((entry) => entry.id)));
 	const prefixHashes = buildPiServerTreePrefixHashes(tree.entries);
 	sessionTreeHashes.set(sessionId, prefixHashes[prefixHashes.length - 1]);
 	sessionTreeEntryCounts.set(sessionId, tree.entries.length);
@@ -736,9 +733,7 @@ function getKnownServerPrefixIds(sessionId: string, entries: SessionTreeEntry[])
 	if (prefixHashes[entryCount] !== treeHash) {
 		return undefined;
 	}
-	const ids = new Set(entries.slice(0, entryCount).map((entry) => entry.id));
-	sessionSyncedEntryIds.set(sessionId, ids);
-	return ids;
+	return new Set(entries.slice(0, entryCount).map((entry) => entry.id));
 }
 
 function isRecoverableTreeDivergenceCode(code: string | undefined): boolean {
@@ -794,14 +789,12 @@ async function recoverPiServerTreeDivergence(
 	tree: PiServerTreeSnapshot,
 	request: ChunkRequest,
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>,
-): Promise<void> {
+): Promise<PiServerHistorySnapshot | undefined> {
 	if (shouldUseServerHistory(sessionId, tree)) {
 		const snapshot = await fetchPiServerHistory(sessionId, request, tree);
 		if (snapshot && snapshot.entries.length > 0) {
 			await applyPiServerHistory(sessionId, snapshot, onHistoryReconciled);
-			throw new Error(
-				"pi-server history differed from local history; local session was reconciled to server history",
-			);
+			return snapshot;
 		}
 	}
 
@@ -816,7 +809,16 @@ export async function syncPiServerTree(
 ): Promise<void> {
 	const request = createPiServerRequest(options?.signal);
 	await ensureSessionInit(sessionId, context, request);
-	await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
+	const reconciled = await syncPiServerTreeWithRequest(
+		sessionId,
+		context,
+		tree,
+		request,
+		options?.onHistoryReconciled,
+	);
+	if (reconciled) {
+		throw new Error("pi-server history differed from local history; local session was reconciled to server history");
+	}
 }
 
 async function syncPiServerTreeWithRequest(
@@ -825,7 +827,7 @@ async function syncPiServerTreeWithRequest(
 	tree: PiServerTreeSnapshot,
 	request: ChunkRequest,
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>,
-): Promise<void> {
+): Promise<PiServerHistorySnapshot | undefined> {
 	const syncTree = tree;
 	const currentHash = hashEntries(syncTree.entries);
 	const previousHash = sessionTreeHashes.get(sessionId);
@@ -844,8 +846,7 @@ async function syncPiServerTreeWithRequest(
 				if (!isRecoverableTreeDivergenceError(error)) {
 					throw error;
 				}
-				await recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
-				return;
+				return recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
 			}
 			sessionTreeLeafIds.set(sessionId, syncTree.leafId);
 		}
@@ -855,7 +856,7 @@ async function syncPiServerTreeWithRequest(
 
 	const syncedIds =
 		!tree.replace && !sessionHasTemporaryTree.has(sessionId)
-			? (sessionSyncedEntryIds.get(sessionId) ?? getKnownServerPrefixIds(sessionId, syncTree.entries))
+			? getKnownServerPrefixIds(sessionId, syncTree.entries)
 			: undefined;
 	if (syncedIds) {
 		const deltaEntries = syncTree.entries.filter((entry) => !syncedIds.has(entry.id));
@@ -876,15 +877,14 @@ async function syncPiServerTreeWithRequest(
 				if (!isRecoverableTreeDivergenceError(error)) {
 					throw error;
 				}
-				await recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
-				return;
+				return recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
 			}
 			markTreeSynced(sessionId, syncTree);
 			return;
 		}
 	}
 
-	await recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
+	return recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
 }
 
 function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStreamOptions {
@@ -927,8 +927,23 @@ export async function compactPiServer(
 
 	try {
 		await ensureSessionInit(sessionId, context, request);
-		const tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
-		await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
+		let tree = options?.sessionTree ?? getLinearTreeFromMessages(context.messages as Message[]);
+		let preparation = options?.preparation;
+		const syncTree = async () => {
+			const reconciled = await syncPiServerTreeWithRequest(
+				sessionId,
+				context,
+				tree,
+				request,
+				options?.onHistoryReconciled,
+			);
+			if (reconciled) {
+				tree = reconciled;
+				// A forced cut point belongs to the old branch. Recompute it on the authoritative tree.
+				preparation = undefined;
+			}
+		};
+		await syncTree();
 
 		const makeBody = () => ({
 			sessionId,
@@ -936,7 +951,7 @@ export async function compactPiServer(
 			model,
 			options: serializeOptions(options),
 			settings: options?.settings,
-			preparation: options?.preparation,
+			preparation,
 			customInstructions: options?.customInstructions,
 			baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
 			streamResponse: true,
@@ -947,7 +962,7 @@ export async function compactPiServer(
 			if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 				resetSessionTracking(sessionId);
 				await ensureSessionInit(sessionId, context, request);
-				await syncPiServerTreeWithRequest(sessionId, context, tree, request, options?.onHistoryReconciled);
+				await syncTree();
 				response = await request.postJson("/api/session/compact", makeBody());
 				if (response.ok) {
 					failure = { details: "", code: undefined };
@@ -959,10 +974,18 @@ export async function compactPiServer(
 				throw new Error(`Server compaction failed (${failure.details})`);
 			}
 		}
-		const result = await readPiServerCompactResponse<PiServerCompactionResponse>(
-			response,
-			"Server compaction failed",
-		);
+		let result: PiServerCompactionResponse;
+		try {
+			result = await readPiServerCompactResponse<PiServerCompactionResponse>(response, "Server compaction failed");
+		} catch (error) {
+			if (options?.signal?.aborted || !getResponseContentType(response).startsWith("text/event-stream")) throw error;
+			const run = await waitForPiServerRunCompletion(sessionId, runId, request, options);
+			if (run?.status !== "completed" || !run.compactResult) {
+				if (run?.errorMessage) throw new Error(`Server compaction failed: ${run.errorMessage}`);
+				throw error;
+			}
+			result = run.compactResult;
+		}
 		if (!result.compaction) {
 			throw new Error("Server compaction response did not include a compaction result");
 		}
