@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added native Devin Pro OAuth, account model discovery, and Connect/protobuf inference with tool calls, images, and signed thinking replay. No Devin CLI or external Pi extension is required.
+
 ## [0.85.1] - 2026-09-05
 
 ### Added

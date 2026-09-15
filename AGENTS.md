@@ -67,6 +67,8 @@
 
 ## pi-client / pi-server Compact and Resilience
 
+- Preserve providers' native `refreshModels` implementations instead of wrapping them with the static pi.dev catalog overlay. Devin's account catalog is not published by pi.dev. Keep Node bundle entries and Bun static registration in sync with new Node-only provider/OAuth loaders; source-only smoke tests do not prove packaged loaders resolve.
+
 - Validate the server-known tree prefix by content before incremental append; cached entry IDs alone cannot detect changed entries. Compact response patches must use the reconciled tree as their base. Record completed compact results before response delivery and recover the same run after an interrupted SSE response; an active compaction leaf returns its persisted result without another summarizer call.
 
 - Keep the pi-client/pi-server `firstKeptEntryId` session-tree adapter explicit through `buildLegacySessionContext()`, `prepareLegacyCompaction()`, and `compactLegacy()`; do not pass that durable wire format into Harness v2 APIs that require `seq` and embedded `retainedTail` entries.

@@ -1,3 +1,4 @@
+import type { Model, ProviderStreams } from "../../types.ts";
 import type { OAuthAuth } from "../types.ts";
 
 /**
@@ -12,6 +13,8 @@ const importOAuthModule = (specifier: string): Promise<unknown> => {
 };
 
 type OAuthFlowLoaders = {
+	devin: () => OAuthAuth | Promise<OAuthAuth>;
+	devinRuntime: () => DevinRuntime | Promise<DevinRuntime>;
 	anthropic: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiCodex: () => OAuthAuth | Promise<OAuthAuth>;
 	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
@@ -22,6 +25,21 @@ type OAuthFlowLoaders = {
 };
 
 let bundledLoaders: OAuthFlowLoaders | undefined;
+
+export const loadDevinOAuth = async (): Promise<OAuthAuth> => {
+	if (bundledLoaders) return bundledLoaders.devin();
+	return ((await importOAuthModule("./devin.ts")) as { devinOAuth: OAuthAuth }).devinOAuth;
+};
+
+export interface DevinRuntime extends ProviderStreams {
+	discoverDevinModels(apiKey: string, signal: AbortSignal): Promise<Model<"devin">[]>;
+}
+
+/** Reuse the Node-only module boundary for Devin's protobuf/compression runtime. */
+export const loadDevinRuntime = async (): Promise<DevinRuntime> => {
+	if (bundledLoaders) return bundledLoaders.devinRuntime();
+	return (await importOAuthModule("./devin-runtime.ts")) as DevinRuntime;
+};
 
 /** Registers statically bundled OAuth flows for standalone Bun binaries. */
 export function registerBundledOAuthFlowLoaders(loaders: OAuthFlowLoaders): void {

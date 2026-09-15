@@ -4,9 +4,13 @@
 
 ### Added
 
+- Added native Devin Pro login and account model selection while retaining pi-server inference routing.
+
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 
 ### Fixed
+
+- Preserved native provider model discovery instead of replacing it with the public static catalog overlay.
 
 - Continued pi-server compaction after authoritative history reconciliation, validated incremental tree prefixes, and recovered committed compaction results after interrupted response delivery.
 

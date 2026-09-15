@@ -41,6 +41,7 @@ import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
+import { devinApi } from "./providers/devin.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
 
@@ -176,6 +177,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 }
 
 const BUILTIN_APIS: [Api, ProviderStreams][] = [
+	["devin", devinApi()],
 	["anthropic-messages", anthropicMessagesApi()],
 	["openai-completions", openAICompletionsApi()],
 	["openai-responses", openAIResponsesApi()],

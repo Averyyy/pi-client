@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added native Devin inference dispatch for proxy streams and server-side compaction.
+
 - Initial pi-server package: HTTP proxy server that stores session state and forwards incremental LLM requests to upstream providers.
 - `/api/session/init` endpoint for initializing session static context.
 - `/api/session/update` endpoint for updating session static context.
