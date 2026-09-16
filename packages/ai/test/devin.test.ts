@@ -57,12 +57,15 @@ function mockFetch(frames: Buffer[], fragment = false): typeof fetch {
 	});
 }
 
-function usageMetric(name: string, value: number): Buffer {
+function usageMetric(name: string, value?: number): Buffer {
 	const encodedValue = Buffer.alloc(4);
-	encodedValue.writeFloatLE(value);
+	if (value !== undefined) encodedValue.writeFloatLE(value);
 	return encodeMessage(
 		2,
-		Buffer.concat([encodeString(5, name), encodeMessage(4, Buffer.concat([encodeTag(2, 5), encodedValue]))]),
+		Buffer.concat([
+			encodeString(5, name),
+			encodeMessage(4, value === undefined ? Buffer.alloc(0) : Buffer.concat([encodeTag(2, 5), encodedValue])),
+		]),
 	);
 }
 
@@ -201,6 +204,98 @@ describe("native Devin", () => {
 			totalTokens: 201_871,
 		});
 		expect(calculateContextTokens(result.usage)).toBe(201_871);
+	});
+	it("decodes SWE-2 cached_input_tokens from the live Token Usage metric", async () => {
+		// A repeated 17,123-token prompt reported 35 uncached + 17,088 cached tokens.
+		const usage = encodeMessage(
+			28,
+			Buffer.concat([
+				encodeString(1, "Token Usage"),
+				usageMetric("input_tokens", 35),
+				usageMetric("output_tokens", 33),
+				usageMetric("cached_input_tokens", 17_088),
+			]),
+		);
+		const pricedModel = { ...model, cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 3 } };
+		const result = await streamDevin(pricedModel, context, {
+			apiKey: "test",
+			fetch: mockFetch([frameConnectStream(encodeString(3, "ok")), frameConnectStream(usage), trailer()], true),
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toEqual({
+			input: 35,
+			output: 33,
+			cacheRead: 17_088,
+			cacheWrite: 0,
+			totalTokens: 17_156,
+			cost: {
+				input: (35 * 2) / 1_000_000,
+				output: (33 * 10) / 1_000_000,
+				cacheRead: (17_088 * 0.2) / 1_000_000,
+				cacheWrite: 0,
+				total: (35 * 2) / 1_000_000 + (33 * 10) / 1_000_000 + (17_088 * 0.2) / 1_000_000,
+			},
+		});
+		expect(calculateContextTokens(result.usage)).toBe(17_156);
+	});
+	it("merges separate usage metrics without resetting or accumulating reported counts", async () => {
+		const frames = [
+			usageMetric("input_tokens", 35),
+			usageMetric("cached_input_tokens", 17_088),
+			usageMetric("output_tokens", 20),
+			usageMetric("output_tokens", 33),
+			usageMetric("cache_creation_input_tokens", 128),
+			usageMetric("agent_messages", 1),
+		];
+		const result = await streamDevin(model, context, {
+			apiKey: "test",
+			fetch: mockFetch([
+				frameConnectStream(encodeString(3, "ok")),
+				...frames.map((metric) => frameConnectStream(encodeMessage(28, metric))),
+				trailer(),
+			]),
+		}).result();
+		expect(result.usage).toMatchObject({
+			input: 35,
+			output: 33,
+			cacheRead: 17_088,
+			cacheWrite: 128,
+			totalTokens: 17_284,
+		});
+	});
+	it("treats an omitted protobuf numeric value as zero for a present metric", async () => {
+		const result = await streamDevin(model, context, {
+			apiKey: "test",
+			fetch: mockFetch([
+				frameConnectStream(encodeString(3, "ok")),
+				frameConnectStream(
+					encodeMessage(28, Buffer.concat([usageMetric("input_tokens", 35), usageMetric("output_tokens", 33)])),
+				),
+				frameConnectStream(encodeMessage(28, usageMetric("cached_input_tokens", 17_088))),
+				frameConnectStream(encodeMessage(28, usageMetric("cached_input_tokens"))),
+				frameConnectStream(encodeMessage(28, usageMetric("input_tokens"))),
+				trailer(),
+			]),
+		}).result();
+		expect(result.usage).toMatchObject({ input: 0, output: 33, cacheRead: 0, cacheWrite: 0, totalTokens: 33 });
+	});
+	it("retains a cache-only usage report", async () => {
+		const result = await streamDevin(model, context, {
+			apiKey: "test",
+			fetch: mockFetch([
+				frameConnectStream(encodeString(3, "ok")),
+				frameConnectStream(encodeMessage(28, usageMetric("cached_input_tokens", 17_088))),
+				trailer(),
+			]),
+		}).result();
+		expect(result.usage).toMatchObject({
+			input: 0,
+			output: 0,
+			cacheRead: 17_088,
+			cacheWrite: 0,
+			totalTokens: 17_088,
+		});
 	});
 	it.each([
 		["missing EOS", [frameConnectStream(encodeString(3, "partial"))]],

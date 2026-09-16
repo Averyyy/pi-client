@@ -65,7 +65,6 @@ export type CloudChatEvent =
 			kind: "usage";
 			promptTokens?: number;
 			completionTokens?: number;
-			totalTokens?: number;
 			cachedInputTokens?: number;
 			cacheCreationInputTokens?: number;
 	  };
@@ -253,6 +252,8 @@ function decodeUsage(buf: Buffer): CloudChatEvent | null {
 			if (inner.num === 5 && inner.wire === 2 && Buffer.isBuffer(inner.value)) {
 				metric = inner.value.toString("utf8");
 			} else if (inner.num === 4 && inner.wire === 2 && Buffer.isBuffer(inner.value)) {
+				// Protobuf omits the scalar field when a present numeric metric is zero.
+				value = 0;
 				for (const dim of iterFields(inner.value)) {
 					if (dim.num === 2 && dim.wire === 5 && Buffer.isBuffer(dim.value)) {
 						value = dim.value.readFloatLE(0);
@@ -264,16 +265,20 @@ function decodeUsage(buf: Buffer): CloudChatEvent | null {
 		const n = Math.round(value);
 		if (metric === "input_tokens") promptTokens = n;
 		else if (metric === "output_tokens") completionTokens = n;
-		else if (metric === "cache_read_input_tokens") cachedInputTokens = n;
+		else if (metric === "cached_input_tokens" || metric === "cache_read_input_tokens") cachedInputTokens = n;
 		else if (metric === "cache_creation_input_tokens") cacheCreationInputTokens = n;
 	}
-	if (promptTokens === undefined && completionTokens === undefined) return null;
+	if (
+		promptTokens === undefined &&
+		completionTokens === undefined &&
+		cachedInputTokens === undefined &&
+		cacheCreationInputTokens === undefined
+	)
+		return null;
 	return {
 		kind: "usage",
 		promptTokens,
 		completionTokens,
-		totalTokens:
-			(promptTokens ?? 0) + (completionTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheCreationInputTokens ?? 0),
 		cachedInputTokens,
 		cacheCreationInputTokens,
 	};
@@ -622,12 +627,13 @@ export function streamDevin(
 					output.stopReason =
 						event.reason === "tool_calls" ? "toolUse" : event.reason === "length" ? "length" : "stop";
 				} else if (event.kind === "usage") {
-					output.usage.input = event.promptTokens ?? 0;
-					output.usage.output = event.completionTokens ?? 0;
-					output.usage.cacheRead = event.cachedInputTokens ?? 0;
-					output.usage.cacheWrite = event.cacheCreationInputTokens ?? 0;
+					// Metrics are reported counts, not deltas. Absent fields retain earlier reports.
+					if (event.promptTokens !== undefined) output.usage.input = event.promptTokens;
+					if (event.completionTokens !== undefined) output.usage.output = event.completionTokens;
+					if (event.cachedInputTokens !== undefined) output.usage.cacheRead = event.cachedInputTokens;
+					if (event.cacheCreationInputTokens !== undefined)
+						output.usage.cacheWrite = event.cacheCreationInputTokens;
 					output.usage.totalTokens =
-						event.totalTokens ??
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 				}
 			}

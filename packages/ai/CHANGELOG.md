@@ -10,6 +10,7 @@
 ### Fixed
 
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
+- Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.
 
 ## [0.85.1] - 2026-09-05
 

@@ -68,6 +68,7 @@
 ## pi-client / pi-server Compact and Resilience
 
 - When provider usage includes cache counts, compute `totalTokens` from input, output, cacheRead, and cacheWrite so footer context usage and threshold compaction account for cached prompts.
+- Devin's live Token Usage metric reports cache hits as `cached_input_tokens`, separate from uncached `input_tokens`. Preserve per-metric reports across frames, treat an omitted numeric scalar in a present protobuf metric as zero, and verify repeated SWE-2 prompts against wire usage before claiming a usage fix.
 - Preserve providers' native `refreshModels` implementations instead of wrapping them with the static pi.dev catalog overlay. Devin's account catalog is not published by pi.dev. Keep Node bundle entries and Bun static registration in sync with new Node-only provider/OAuth loaders; source-only smoke tests do not prove packaged loaders resolve.
 
 - Validate the server-known tree prefix by content before incremental append; cached entry IDs alone cannot detect changed entries. Compact response patches must use the reconciled tree as their base. Record completed compact results before response delivery and recover the same run after an interrupted SSE response; an active compaction leaf returns its persisted result without another summarizer call.
