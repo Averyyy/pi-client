@@ -7,6 +7,7 @@ import { packThinkingSignature, unpackThinkingSignature } from "../src/api/devin
 import {
 	encodeMessage,
 	encodeString,
+	encodeTag,
 	encodeVarintField,
 	frameConnectStream,
 	iterFields,
@@ -15,6 +16,7 @@ import { loginDevin } from "../src/auth/oauth/devin.ts";
 import { builtinProviders } from "../src/providers/all.ts";
 import { devinProvider } from "../src/providers/devin.ts";
 import type { AssistantMessage, Model } from "../src/types.ts";
+import { calculateContextTokens } from "../src/utils/estimate.ts";
 
 const model: Model<"devin"> = {
 	id: "swe-2-medium",
@@ -53,6 +55,15 @@ function mockFetch(frames: Buffer[], fragment = false): typeof fetch {
 			{ headers: { "content-type": "application/connect+proto" } },
 		);
 	});
+}
+
+function usageMetric(name: string, value: number): Buffer {
+	const encodedValue = Buffer.alloc(4);
+	encodedValue.writeFloatLE(value);
+	return encodeMessage(
+		2,
+		Buffer.concat([encodeString(5, name), encodeMessage(4, Buffer.concat([encodeTag(2, 5), encodedValue]))]),
+	);
 }
 
 afterEach(() => {
@@ -149,6 +160,30 @@ describe("native Devin", () => {
 		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+	});
+	it("includes cached prompt tokens in total context usage", async () => {
+		const usage = encodeMessage(
+			28,
+			Buffer.concat([
+				usageMetric("input_tokens", 17_111),
+				usageMetric("output_tokens", 512),
+				usageMetric("cache_read_input_tokens", 181_248),
+				usageMetric("cache_creation_input_tokens", 3_000),
+			]),
+		);
+		const result = await streamDevin(model, context, {
+			apiKey: "test",
+			fetch: mockFetch([frameConnectStream(encodeString(3, "ok")), frameConnectStream(usage), trailer()]),
+		}).result();
+
+		expect(result.usage).toMatchObject({
+			input: 17_111,
+			output: 512,
+			cacheRead: 181_248,
+			cacheWrite: 3_000,
+			totalTokens: 201_871,
+		});
+		expect(calculateContextTokens(result.usage)).toBe(201_871);
 	});
 	it.each([
 		["missing EOS", [frameConnectStream(encodeString(3, "partial"))]],
