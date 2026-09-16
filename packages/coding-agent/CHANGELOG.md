@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Fixed startup resolution of configured Devin model scopes so an initially empty account catalog does not leave all discovered Devin models in model cycling.
 - Preserved native provider model discovery instead of replacing it with the public static catalog overlay.
 
 - Continued pi-server compaction after authoritative history reconciliation, validated incremental tree prefixes, and recovered committed compaction results after interrupted response delivery.

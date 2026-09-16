@@ -1045,8 +1045,25 @@ export class InteractiveMode {
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
+			const usesDevinModels =
+				this.session.model?.provider === "devin" ||
+				this.session.scopedModels.some(({ model }) => model.provider === "devin") ||
+				(this.settingsManager.getEnabledModels()?.some((pattern) => pattern.toLowerCase().startsWith("devin/")) ??
+					false);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
-				.then(() => this.updateAvailableProviderCount())
+				.then((result) => {
+					this.updateAvailableProviderCount();
+					if (!usesDevinModels) return;
+					if (result.errors.has("devin")) {
+						this.showWarning(
+							"Could not refresh the Devin model catalog; cached or built-in fallback models remain available.",
+						);
+					} else if (result.aborted && controller.signal.aborted) {
+						this.showWarning(
+							"Devin model catalog refresh timed out; cached or built-in fallback models remain available.",
+						);
+					}
+				})
 				.catch(() => {})
 				.finally(() => clearTimeout(timeout));
 		}

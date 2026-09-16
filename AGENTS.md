@@ -284,6 +284,7 @@ Attribution:
 - If hydration removes a retired direct-OpenAI model used only by API-key-gated e2e tests, update those tests to an explicit current catalog model; do not restore a removed stale-model fallback.
 - If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.
 - After upstream merges, strict `tsgo --noEmit` may require explicit guards before reading optional results in upstream-added tests; use a clear error assertion rather than a non-null fallback.
+- Devin's account-owned model catalog may be empty before the interactive background refresh. Keep explicit fallback definitions for configured IDs available before scope resolution, merge them with restored cache, replace them only after successful discovery, and test that exact configured IDs remain the cycle scope when the live catalog expands. Report failed Devin discovery while those fallbacks remain active.
 
 ## User Override
 

@@ -95,10 +95,20 @@ describe("native Devin", () => {
 		}).result();
 		expect(result.stopReason).toBe("aborted");
 	});
-	it("registers OAuth without a seeded model or CLI dependency", () => {
+	it("registers OAuth and known fallback models without a CLI dependency", () => {
 		const provider = builtinProviders().find((value) => value.id === "devin");
 		expect(provider?.auth.oauth?.isSubscription).toBe(true);
-		expect(provider?.getModels()).toEqual([]);
+		expect(provider?.getModels().map((value) => value.id)).toEqual([
+			"claude-opus-5-max",
+			"swe-2-high",
+			"swe-2-max",
+			"swe-2-medium",
+		]);
+		expect(provider?.getModels().find((value) => value.id === "claude-opus-5-max")).toMatchObject({
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			thinkingLevelMap: { max: "claude-opus-5-max" },
+		});
 	});
 	it("decodes actual catalog limits and reasoning features", () => {
 		const config = Buffer.concat([
@@ -138,7 +148,14 @@ describe("native Devin", () => {
 				return true;
 			},
 		});
-		expect(provider.getModels()).toEqual([model]);
+		expect(provider.getModels().map((value) => value.id)).toEqual([
+			"swe-2-medium",
+			"claude-opus-5-max",
+			"swe-2-high",
+			"swe-2-max",
+		]);
+		expect(provider.getModels()[0]).toEqual(model);
+		const restoredModels = provider.getModels();
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => new Response("failure", { status: 503 })),
@@ -151,7 +168,7 @@ describe("native Devin", () => {
 				publish: async () => true,
 			}),
 		).rejects.toThrow("503");
-		expect(provider.getModels()).toEqual([model]);
+		expect(provider.getModels()).toEqual(restoredModels);
 	});
 	it("handles compressed byte-fragmented streams", async () => {
 		const result = await streamDevin(model, context, {

@@ -1,6 +1,7 @@
+import { DEVIN_BASE_URL } from "./devin-constants.ts";
 import { encodeMessage, encodeString, encodeTimestampBody, encodeVarintField } from "./devin-wire.ts";
 
-export const DEVIN_BASE_URL = "https://server.codeium.com";
+export { DEVIN_BASE_URL };
 
 /** Protocol client identity required by Devin Local; no installed CLI dependency. */
 export function buildMetadata(input: {
