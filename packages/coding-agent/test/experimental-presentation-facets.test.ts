@@ -28,7 +28,7 @@ afterEach(async () => {
 	directories.clear();
 });
 
-describe("server-selected presentation facets", () => {
+describe.runIf(process.platform !== "win32")("server-selected presentation facets", () => {
 	test("rejects local plugin paths for Radius servers", async () => {
 		await expect(
 			openClientRuntime({

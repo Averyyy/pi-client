@@ -15,6 +15,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -777,7 +778,11 @@ describe("pi-server HTTP", () => {
 		});
 		let stopFetch: (() => void) | undefined;
 		let sdkAborted = false;
-		const provide = (requestModel: Model<"anthropic-messages">, context: Context, options?: SimpleStreamOptions) => {
+		const provide = (
+			requestModel: Model<"anthropic-messages">,
+			context: TranscriptContext,
+			options?: SimpleStreamOptions,
+		) => {
 			timeouts.push(options?.timeoutMs);
 			return streamAnthropic(requestModel, context, {
 				...options,

@@ -9,7 +9,7 @@ describe("experimental server session directory", () => {
 	test("uses the experimental directory under the configured agent directory by default", () => {
 		vi.stubEnv("PI_CODING_AGENT_DIR", "/tmp/pi-agent-config");
 
-		expect(resolveSessionDirectory()).toBe("/tmp/pi-agent-config/experimental/sessions");
+		expect(resolveSessionDirectory()).toBe(resolve("/tmp/pi-agent-config/experimental/sessions"));
 	});
 
 	test("resolves an explicit relative directory from the current working directory", () => {

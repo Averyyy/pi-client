@@ -144,7 +144,7 @@ function createFauxModel(
 }
 
 function getPromptText(context: { messages: Message[] }): string {
-	const message = context.messages[0];
+	const message = context.messages.find((entry) => entry.role === "user");
 	if (message?.role !== "user" || !Array.isArray(message.content)) return "";
 	const block = message.content[0];
 	return block?.type === "text" ? block.text : "";
@@ -529,7 +529,8 @@ describe("harness compaction", () => {
 		const { faux, model } = createFauxModel(false);
 		faux.setResponses([
 			(context) => {
-				const message = context.messages[0];
+				// The transcript leads with the summarization system prompt; the request is the first user message.
+				const message = context.messages.find((entry) => entry.role === "user");
 				const content = message?.role === "user" ? message.content : [];
 				promptText = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
 				return fauxAssistantMessage("## Goal\nTest summary");

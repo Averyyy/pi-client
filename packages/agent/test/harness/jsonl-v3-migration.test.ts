@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT, type Context } from "../../src/harness/context.ts";
@@ -16,6 +17,8 @@ import type { AgentMessage } from "../../src/types.ts";
 import { createTempDir } from "./session-test-utils.ts";
 
 const NOW = 1_700_000_000_000;
+const TEST_CWD = resolve("/workspace");
+const TEST_CWD_DIRECTORY = `--${TEST_CWD.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 
 class FailableRenameNodeExecutionEnv extends NodeExecutionEnv {
 	failRename = false;
@@ -67,7 +70,7 @@ describe("JSONL v3 migration", () => {
 		records: readonly unknown[],
 		headerOptions: { parentSession?: string } = {},
 	): Promise<{ path: string; content: string }> {
-		const directory = getOrThrow(await fileSystem.joinPath(["sessions", "--workspace--"], BACKGROUND_CONTEXT));
+		const directory = getOrThrow(await fileSystem.joinPath(["sessions", TEST_CWD_DIRECTORY], BACKGROUND_CONTEXT));
 		getOrThrow(await fileSystem.createDir(directory, undefined, BACKGROUND_CONTEXT));
 		const relativePath = getOrThrow(await fileSystem.joinPath([directory, "legacy.jsonl"], BACKGROUND_CONTEXT));
 		const path = getOrThrow(await fileSystem.absolutePath(relativePath, BACKGROUND_CONTEXT));
@@ -77,7 +80,7 @@ describe("JSONL v3 migration", () => {
 				version: 3,
 				id: "legacy",
 				timestamp: new Date(NOW).toISOString(),
-				cwd: "/workspace",
+				cwd: TEST_CWD,
 				...headerOptions,
 			},
 			...records,
@@ -93,14 +96,14 @@ describe("JSONL v3 migration", () => {
 			parentSession: "/old-session.jsonl",
 		});
 
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		const after = getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT));
 
 		expect(metadata).toMatchObject({
 			id: "legacy",
 			createdAt: NOW,
 			storageVersion: JSONL_STORAGE_VERSION,
-			cwd: "/workspace",
+			cwd: TEST_CWD,
 			path,
 			legacyParentSessionPath: "/old-session.jsonl",
 		});
@@ -117,7 +120,7 @@ describe("JSONL v3 migration", () => {
 				version: 3,
 				id: "legacy-parent",
 				timestamp: new Date(NOW - 1_000).toISOString(),
-				cwd: "/workspace",
+				cwd: TEST_CWD,
 			},
 		},
 		{
@@ -129,7 +132,7 @@ describe("JSONL v3 migration", () => {
 				id: "current-parent",
 				storageVersion: JSONL_STORAGE_VERSION,
 				createdAt: NOW - 1_000,
-				cwd: "/workspace",
+				cwd: TEST_CWD,
 			},
 		},
 	])("resolves an available $format parent path to its session id", async ({ format, parentId, header }) => {
@@ -137,7 +140,7 @@ describe("JSONL v3 migration", () => {
 		getOrThrow(await fileSystem.writeFile(parentPath, `${JSON.stringify(header)}\n`, BACKGROUND_CONTEXT));
 		await writeLegacyV3Fixture([], { parentSession: parentPath });
 
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		expect(metadata).toMatchObject({
@@ -156,7 +159,7 @@ describe("JSONL v3 migration", () => {
 		getOrThrow(await fileSystem.writeFile(parentPath, '{"not":"a session header"}\n', BACKGROUND_CONTEXT));
 		await writeLegacyV3Fixture([], { parentSession: parentPath });
 
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 
 		expect(metadata).toMatchObject({
 			id: "legacy",
@@ -228,7 +231,7 @@ describe("JSONL v3 migration", () => {
 					message: secondMessage,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 			return { ...fixture, metadata };
 		}
@@ -303,28 +306,132 @@ describe("JSONL v3 migration", () => {
 			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(content);
 		});
 
-		it("forks an already-open source without converting or renormalizing it", async () => {
+		it("forks a configured closed source at its main tip when entryId is omitted", async () => {
+			await writeLegacyV3Fixture([
+				{
+					type: "model_change",
+					id: "model",
+					parentId: null,
+					timestamp: new Date(NOW + 1_000).toISOString(),
+					provider: "anthropic",
+					modelId: "claude-sonnet-4-5",
+				},
+				{
+					type: "thinking_level_change",
+					id: "thinking",
+					parentId: "model",
+					timestamp: new Date(NOW + 2_000).toISOString(),
+					thinkingLevel: "high",
+				},
+				{
+					type: "message",
+					id: "tip",
+					parentId: "thinking",
+					timestamp: new Date(NOW + 3_000).toISOString(),
+					message: firstMessage,
+				},
+			]);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
+			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
+
+			const fork = await repo.fork(
+				metadata,
+				{ id: "branch-fork", scope: "branch", branch: "main" },
+				BACKGROUND_CONTEXT,
+			);
+			const entries = await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+			expect(entries).toHaveLength(1);
+			expect(await mainTip(fork)).toBe(entries[0]!.id);
+			expect((await fork.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT))?.value).toEqual({
+				model: { provider: "anthropic", modelId: "claude-sonnet-4-5" },
+				thinkingLevel: "high",
+				activeToolNames: [],
+			});
+			expect((await fork.getValue(storedValues.laneState("main"), BACKGROUND_CONTEXT))?.value).toEqual({
+				currentOperationId: null,
+				lastOperationId: null,
+				inbox: [],
+			});
+			await fork.close(BACKGROUND_CONTEXT);
+		});
+
+		it("forks a configured closed source at an original legacy entry id", async () => {
+			await writeLegacyV3Fixture([
+				{
+					type: "model_change",
+					id: "model",
+					parentId: null,
+					timestamp: new Date(NOW + 1_000).toISOString(),
+					provider: "anthropic",
+					modelId: "claude-sonnet-4-5",
+				},
+				{
+					type: "thinking_level_change",
+					id: "thinking",
+					parentId: "model",
+					timestamp: new Date(NOW + 2_000).toISOString(),
+					thinkingLevel: "high",
+				},
+				{
+					type: "message",
+					id: "message-1",
+					parentId: "thinking",
+					timestamp: new Date(NOW + 3_000).toISOString(),
+					message: firstMessage,
+				},
+				{
+					type: "message",
+					id: "message-2",
+					parentId: "message-1",
+					timestamp: new Date(NOW + 4_000).toISOString(),
+					message: secondMessage,
+				},
+				{
+					type: "message",
+					id: "message-3",
+					parentId: "message-2",
+					timestamp: new Date(NOW + 5_000).toISOString(),
+					message: firstMessage,
+				},
+			]);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
+			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
+
+			const fork = await repo.fork(
+				metadata,
+				{ id: "entry-fork", scope: "branch", branch: "main", entryId: "message-2" },
+				BACKGROUND_CONTEXT,
+			);
+			const entries = await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+			expect(entries).toHaveLength(2);
+			expect(entries[1]).toMatchObject({ parentId: entries[0]!.id, message: secondMessage });
+			expect(await mainTip(fork)).toBe(entries[1]!.id);
+			await fork.close(BACKGROUND_CONTEXT);
+		});
+
+		it("rejects an open v3 source until a non-empty commit persists its format-4 ids", async () => {
 			const { path, content, metadata } = await writeForkFixture();
 			const source = await repo.open(metadata, BACKGROUND_CONTEXT);
 			const sourceEntries = await source.findEntries({ order: "asc" }, BACKGROUND_CONTEXT);
-			const sourceStats = await source.getStats(BACKGROUND_CONTEXT);
 
+			await expect(repo.fork(metadata, { id: "open-fork", scope: "tree" }, BACKGROUND_CONTEXT)).rejects.toThrow(
+				"Cannot fork an open legacy v3 JSONL session",
+			);
+			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(content);
+
+			await source.setName("Upgraded source", BACKGROUND_CONTEXT);
 			const fork = await repo.fork(metadata, { id: "open-fork", scope: "tree" }, BACKGROUND_CONTEXT);
-			const forkEntries = await expectForkedState(fork);
 
 			expect(fork.metadata.id).toBe("open-fork");
-			expect(forkEntries).toEqual(sourceEntries);
-			expect(sourceStats.usage).toEqual(usage);
-			expect(await source.getStats(BACKGROUND_CONTEXT)).toEqual(sourceStats);
-			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(content);
+			expect(await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(sourceEntries);
+			expect(await fork.getName(BACKGROUND_CONTEXT)).toBe("Upgraded source");
 			await Promise.all([source.close(BACKGROUND_CONTEXT), fork.close(BACKGROUND_CONTEXT)]);
-			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(content);
 		});
 	});
 
 	it("opens an empty legacy session with a data-only main Branch", async () => {
 		await writeLegacyV3Fixture([]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -531,7 +638,7 @@ describe("JSONL v3 migration", () => {
 				id: "legacy",
 				storageVersion: JSONL_STORAGE_VERSION,
 				createdAt: NOW,
-				cwd: "/workspace",
+				cwd: TEST_CWD,
 			});
 			expect(JSON.parse(transactionLine)).toEqual([
 				{ kind: "usage", ...adjustment },
@@ -672,7 +779,7 @@ describe("JSONL v3 migration", () => {
 					message: secondMessage,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -747,7 +854,7 @@ describe("JSONL v3 migration", () => {
 					message: secondMessage,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -761,48 +868,6 @@ describe("JSONL v3 migration", () => {
 				lastOperationId: null,
 				inbox: [],
 			});
-			await session.close(BACKGROUND_CONTEXT);
-		});
-
-		it("omits an unsupported nearest value instead of falling back to an older change", async () => {
-			await writeLegacyV3Fixture([
-				{
-					type: "message",
-					id: "root",
-					parentId: null,
-					timestamp: new Date(firstTimestamp).toISOString(),
-					message: firstMessage,
-				},
-				{
-					type: "model_change",
-					id: "older-model",
-					parentId: "root",
-					timestamp: new Date(modelChangeTimestamp).toISOString(),
-					provider: "anthropic",
-					modelId: "older",
-				},
-				{
-					type: "model_change",
-					id: "invalid-model",
-					parentId: "older-model",
-					timestamp: new Date(thinkingChangeTimestamp).toISOString(),
-					provider: "",
-					modelId: "",
-				},
-				{
-					type: "message",
-					id: "tip",
-					parentId: "invalid-model",
-					timestamp: new Date(secondTimestamp).toISOString(),
-					message: secondMessage,
-				},
-			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
-			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
-
-			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
-			expect(await session.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT)).toBeUndefined();
-			expect(await session.getValue(storedValues.laneState("main"), BACKGROUND_CONTEXT)).toBeUndefined();
 			await session.close(BACKGROUND_CONTEXT);
 		});
 
@@ -832,26 +897,6 @@ describe("JSONL v3 migration", () => {
 					},
 				],
 			},
-			{
-				name: "invalid thinking level",
-				changes: [
-					{
-						type: "model_change",
-						id: "model",
-						parentId: "root",
-						timestamp: new Date(modelChangeTimestamp).toISOString(),
-						provider: "anthropic",
-						modelId: "selected",
-					},
-					{
-						type: "thinking_level_change",
-						id: "thinking",
-						parentId: "model",
-						timestamp: new Date(thinkingChangeTimestamp).toISOString(),
-						thinkingLevel: "unsupported",
-					},
-				],
-			},
 		])("leaves main data-only for $name", async ({ changes }) => {
 			await writeLegacyV3Fixture([
 				{
@@ -870,54 +915,12 @@ describe("JSONL v3 migration", () => {
 					message: secondMessage,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
 			expect(await session.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT)).toBeUndefined();
 			expect(await session.getValue(storedValues.laneState("main"), BACKGROUND_CONTEXT)).toBeUndefined();
-			await session.close(BACKGROUND_CONTEXT);
-		});
-
-		it("normalizes malformed active-tool history without compatibility state", async () => {
-			await writeLegacyV3Fixture([
-				{
-					type: "model_change",
-					id: "model",
-					parentId: null,
-					timestamp: new Date(modelChangeTimestamp).toISOString(),
-					provider: "anthropic",
-					modelId: "selected",
-				},
-				{
-					type: "thinking_level_change",
-					id: "thinking",
-					parentId: "model",
-					timestamp: new Date(thinkingChangeTimestamp).toISOString(),
-					thinkingLevel: "high",
-				},
-				{
-					type: "active_tools_change",
-					id: "tools",
-					parentId: "thinking",
-					timestamp: new Date(activeToolsChangeTimestamp).toISOString(),
-					activeToolNames: ["read", 42],
-				},
-			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
-			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
-
-			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
-			expect((await session.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT))?.value).toEqual({
-				model: { provider: "anthropic", modelId: "selected" },
-				thinkingLevel: "high",
-				activeToolNames: [],
-			});
-			expect((await session.getValue(storedValues.laneState("main"), BACKGROUND_CONTEXT))?.value).toEqual({
-				currentOperationId: null,
-				lastOperationId: null,
-				inbox: [],
-			});
 			await session.close(BACKGROUND_CONTEXT);
 		});
 
@@ -932,7 +935,7 @@ describe("JSONL v3 migration", () => {
 				},
 				...configurationChanges,
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -965,7 +968,7 @@ describe("JSONL v3 migration", () => {
 				name: "Imported session",
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1016,7 +1019,7 @@ describe("JSONL v3 migration", () => {
 				name: "Latest name",
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1047,7 +1050,7 @@ describe("JSONL v3 migration", () => {
 				...(name === undefined ? {} : { name }),
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1078,7 +1081,7 @@ describe("JSONL v3 migration", () => {
 				label: "Important",
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1120,7 +1123,7 @@ describe("JSONL v3 migration", () => {
 				message,
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1183,7 +1186,7 @@ describe("JSONL v3 migration", () => {
 				message: secondMessage,
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1228,7 +1231,7 @@ describe("JSONL v3 migration", () => {
 				...(label === undefined ? {} : { label }),
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1269,7 +1272,7 @@ describe("JSONL v3 migration", () => {
 				data,
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1323,7 +1326,7 @@ describe("JSONL v3 migration", () => {
 				display: false,
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1431,7 +1434,7 @@ describe("JSONL v3 migration", () => {
 					...(fromHook === undefined ? {} : { fromHook }),
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1486,7 +1489,7 @@ describe("JSONL v3 migration", () => {
 					summary: "Summary from the root",
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1510,7 +1513,7 @@ describe("JSONL v3 migration", () => {
 					summary: "Summary from a missing source",
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			await expect(repo.open(metadata, BACKGROUND_CONTEXT)).rejects.toThrow(
@@ -1537,7 +1540,7 @@ describe("JSONL v3 migration", () => {
 					summary: "Summary from the root",
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1611,7 +1614,7 @@ describe("JSONL v3 migration", () => {
 					...(fromHook === undefined ? {} : { fromHook }),
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1707,7 +1710,7 @@ describe("JSONL v3 migration", () => {
 					tokensBefore: 8_000,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1788,7 +1791,7 @@ describe("JSONL v3 migration", () => {
 					tokensBefore: 8_000,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1863,7 +1866,7 @@ describe("JSONL v3 migration", () => {
 					tokensBefore: 8_000,
 				},
 			]);
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 			await expect(repo.open(metadata, BACKGROUND_CONTEXT)).rejects.toThrow(
@@ -1908,7 +1911,7 @@ describe("JSONL v3 migration", () => {
 				message: secondMessage,
 			},
 		]);
-		const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 
 		const session = await repo.open(metadata, BACKGROUND_CONTEXT);
@@ -1961,7 +1964,7 @@ describe("JSONL v3 migration", () => {
 				},
 			]));
 			beforeMtime = getOrThrow(await fileSystem.fileInfo(path, BACKGROUND_CONTEXT)).mtimeMs;
-			const [metadata] = await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT);
+			const [metadata] = await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 			if (metadata === undefined) throw new Error("Legacy fixture was not discovered");
 			session = await repo.open(metadata, BACKGROUND_CONTEXT);
 		});

@@ -81,7 +81,7 @@ afterEach(async () => {
 	directories.clear();
 });
 
-describe("experimental durable server composition", () => {
+describe.runIf(process.platform !== "win32")("experimental durable server composition", () => {
 	test("uses PI_SERVER_DIR and PI_SERVER_ID", async () => {
 		const directory = await mkdtemp(join("/tmp", "pi-server-dir-"));
 		directories.add(directory);

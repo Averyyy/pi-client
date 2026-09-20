@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Context, Message, Model } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../../ai/src/api/anthropic-messages.ts";
 import {
@@ -291,9 +292,9 @@ describe("pi-server-client", () => {
 			let payload: { messages: Array<{ role: string; content: unknown }> } | undefined;
 			const serialized = await streamAnthropic(
 				model,
-				{
+				normalizeContext({
 					messages: [textMessage("first", 1), result, textMessage("continue", 2000)],
-				},
+				}),
 				{
 					apiKey: "fake-key",
 					onPayload(value) {

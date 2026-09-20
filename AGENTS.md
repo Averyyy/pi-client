@@ -205,16 +205,7 @@ When closing issues via commit:
 
 ## Testing pi Interactive Mode with tmux
 
-Run the TUI in a controlled terminal (from the repo root):
-
-```bash
-tmux new-session -d -s pi-test -x 80 -y 24
-tmux send-keys -t pi-test "./pi-test.sh" Enter
-sleep 3 && tmux capture-pane -t pi-test -p     # capture after startup
-tmux send-keys -t pi-test "your prompt here" Enter
-tmux send-keys -t pi-test Escape               # special keys (also C-o for ctrl+o, etc.)
-tmux kill-session -t pi-test
-```
+For testing pi's interactive mode, load and follow [.pi/skills/interactive-testing.md](.pi/skills/interactive-testing.md).
 
 ## Changelog
 
@@ -230,8 +221,8 @@ Rules:
 
 Attribution:
 
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi-mono/issues/123))`
-- External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi-mono/pull/456) by [@username](https://github.com/username))`
+- Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi/issues/123))`
+- External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi/pull/456) by [@username](https://github.com/username))`
 
 ## Releasing
 
@@ -273,6 +264,8 @@ Attribution:
 
 5. **If CI publish or announcement fails**: inspect the failed job. The publish helper is idempotent and skips package versions already present on npm; the announcement job rechecks availability before updating the R2 marker. Rerun the failed job or workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
 
+For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
+
 ## Upstream Sync
 
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
@@ -286,6 +279,9 @@ Attribution:
 - If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.
 - After upstream merges, strict `tsgo --noEmit` may require explicit guards before reading optional results in upstream-added tests; use a clear error assertion rather than a non-null fallback.
 - Devin's account-owned model catalog may be empty before the interactive background refresh. Keep explicit fallback definitions for configured IDs available before scope resolution, merge them with restored cache, replace them only after successful discovery, and test that exact configured IDs remain the cycle scope when the live catalog expands. Report failed Devin discovery while those fallbacks remain active.
+- Upstream 0.86 moved provider calls to branded `TranscriptContext`; standalone coding-agent requests and fixtures must use `normalizeContext()` rather than adding the removed `systemPrompt` field to `AgentContext`.
+- Cache-warming `UsageEntry` records are local metadata, not legacy pi-server tree entries. Before sending a legacy tree, omit them and reconnect parent and leaf IDs across omitted usage entries.
+- When upstream removes an old eval harness or native dependency, accept the deletion only after checking fork-specific references; regenerate the root lockfile afterward so retained fork workspaces and aliases are represented.
 
 ## User Override
 

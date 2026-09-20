@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT, type Context } from "../../src/harness/context.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -7,6 +8,10 @@ import { getOrThrow } from "../../src/harness/types.ts";
 import { createTempDir } from "./session-test-utils.ts";
 
 const NOW = 1_700_000_000_000;
+const TEST_CWD = resolve("/workspace");
+const TEST_CWD_A = resolve("/workspace-a");
+const TEST_CWD_B = resolve("/workspace-b");
+const TEST_CWD_DIRECTORY = `--${TEST_CWD.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 
 class AtomicPublicationNodeExecutionEnv extends NodeExecutionEnv {
 	publication:
@@ -32,26 +37,23 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 	it("persists metadata and filters discovery by cwd", async () => {
 		const fileSystem = new NodeExecutionEnv({ cwd: createTempDir() });
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
-		const session = await repo.create(
-			{ id: "child", cwd: "/workspace", parentSessionId: "parent" },
-			BACKGROUND_CONTEXT,
-		);
+		const session = await repo.create({ id: "child", cwd: TEST_CWD, parentSessionId: "parent" }, BACKGROUND_CONTEXT);
 		const metadata = session.metadata;
 
 		expect(metadata).toMatchObject({
 			id: "child",
 			createdAt: NOW,
 			storageVersion: JSONL_STORAGE_VERSION,
-			cwd: "/workspace",
+			cwd: TEST_CWD,
 			parentSessionId: "parent",
 		});
-		expect(metadata.path).toContain("/sessions/--workspace--/");
+		expect(metadata.path).toContain(TEST_CWD_DIRECTORY);
 		expect(metadata.path.endsWith("_child.jsonl")).toBe(true);
 		expect(Number.isFinite(metadata.modifiedAt)).toBe(true);
 		await session.close(BACKGROUND_CONTEXT);
 
-		expect(await repo.list({ cwd: "/other" }, BACKGROUND_CONTEXT)).toEqual([]);
-		expect(await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT)).toEqual([metadata]);
+		expect(await repo.list({ cwd: resolve("/other") }, BACKGROUND_CONTEXT)).toEqual([]);
+		expect(await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT)).toEqual([metadata]);
 		const firstLine = getOrThrow(
 			await fileSystem.readTextLines(metadata.path, { maxLines: 1 }, BACKGROUND_CONTEXT),
 		)[0];
@@ -61,7 +63,7 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 			id: "child",
 			storageVersion: JSONL_STORAGE_VERSION,
 			createdAt: NOW,
-			cwd: "/workspace",
+			cwd: TEST_CWD,
 			parentSessionId: "parent",
 		});
 		await repo.close(BACKGROUND_CONTEXT);
@@ -70,7 +72,7 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 	it("atomically publishes a branchless session header", async () => {
 		const fileSystem = new AtomicPublicationNodeExecutionEnv({ cwd: createTempDir() });
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
-		const session = await repo.create({ id: "session", cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const session = await repo.create({ id: "session", cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 
 		const publication = fileSystem.publication;
 		if (publication === undefined) throw new Error("Expected atomic session publication");
@@ -116,7 +118,7 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 	it("rejects unsupported storage versions without repairing a torn tail", async () => {
 		const fileSystem = new NodeExecutionEnv({ cwd: createTempDir() });
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
-		const session = await repo.create({ id: "future", cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const session = await repo.create({ id: "future", cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		const metadata = session.metadata;
 		await session.close(BACKGROUND_CONTEXT);
 
@@ -139,7 +141,7 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 	it("keeps fork destinations claimed until close and rejects deleting open sessions", async () => {
 		const fileSystem = new NodeExecutionEnv({ cwd: createTempDir() });
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
-		const source = await repo.create({ id: "source", cwd: "/workspace" }, BACKGROUND_CONTEXT);
+		const source = await repo.create({ id: "source", cwd: TEST_CWD }, BACKGROUND_CONTEXT);
 		const fork = await repo.fork(source.metadata, { id: "fork", scope: "tree" }, BACKGROUND_CONTEXT);
 
 		await expect(repo.open(fork.metadata, BACKGROUND_CONTEXT)).rejects.toThrow("already open");
@@ -160,13 +162,13 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
 
 		const results = await Promise.allSettled([
-			repo.create({ id: "session", cwd: "/workspace" }, BACKGROUND_CONTEXT),
-			repo.create({ id: "session", cwd: "/workspace" }, BACKGROUND_CONTEXT),
+			repo.create({ id: "session", cwd: TEST_CWD }, BACKGROUND_CONTEXT),
+			repo.create({ id: "session", cwd: TEST_CWD }, BACKGROUND_CONTEXT),
 		]);
 
 		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
 		expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
-		expect(await repo.list({ cwd: "/workspace" }, BACKGROUND_CONTEXT)).toHaveLength(1);
+		expect(await repo.list({ cwd: TEST_CWD }, BACKGROUND_CONTEXT)).toHaveLength(1);
 		for (const result of results) {
 			if (result.status === "fulfilled") await result.value.close(BACKGROUND_CONTEXT);
 		}
@@ -176,16 +178,16 @@ describe("JsonlSessionRepo cwd-scoped lifecycle", () => {
 	it("allows the same id to be active in different working directories", async () => {
 		const fileSystem = new NodeExecutionEnv({ cwd: createTempDir() });
 		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: "sessions", now: () => NOW });
-		const first = await repo.create({ id: "shared", cwd: "/workspace-a" }, BACKGROUND_CONTEXT);
-		const second = await repo.create({ id: "shared", cwd: "/workspace-b" }, BACKGROUND_CONTEXT);
+		const first = await repo.create({ id: "shared", cwd: TEST_CWD_A }, BACKGROUND_CONTEXT);
+		const second = await repo.create({ id: "shared", cwd: TEST_CWD_B }, BACKGROUND_CONTEXT);
 
 		expect(first.metadata.path).not.toBe(second.metadata.path);
-		await expect(repo.create({ id: "shared", cwd: "/workspace-a" }, BACKGROUND_CONTEXT)).rejects.toThrow(
+		await expect(repo.create({ id: "shared", cwd: TEST_CWD_A }, BACKGROUND_CONTEXT)).rejects.toThrow(
 			"already exists",
 		);
 		expect((await repo.list(undefined, BACKGROUND_CONTEXT)).map(({ cwd, id }) => ({ cwd, id }))).toEqual([
-			{ cwd: "/workspace-a", id: "shared" },
-			{ cwd: "/workspace-b", id: "shared" },
+			{ cwd: TEST_CWD_A, id: "shared" },
+			{ cwd: TEST_CWD_B, id: "shared" },
 		]);
 
 		await Promise.all([first.close(BACKGROUND_CONTEXT), second.close(BACKGROUND_CONTEXT)]);

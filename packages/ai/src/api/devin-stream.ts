@@ -30,6 +30,7 @@ import {
 	type AssistantMessageEventStream,
 	type Context,
 	createAssistantMessageEventStream,
+	type JsonObject,
 	type Model,
 	type SimpleStreamOptions,
 } from "../index.ts";
@@ -492,7 +493,7 @@ export function streamDevin(
 					const parsed: unknown = JSON.parse(state.json);
 					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
 						throw new Error("Invalid Devin tool arguments");
-					block.arguments = parsed as Record<string, unknown>;
+					block.arguments = parsed as JsonObject;
 					stream.push({
 						type: "toolcall_end",
 						contentIndex: state.index,

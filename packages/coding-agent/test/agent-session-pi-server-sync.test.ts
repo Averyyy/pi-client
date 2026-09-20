@@ -188,7 +188,7 @@ describe("AgentSession pi-server sync", () => {
 				role: string;
 				content: unknown;
 			}>;
-			expect(contextOverlay.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+			expect(contextOverlay.map((message) => message.role)).toEqual(["user", "assistant", "system", "user"]);
 			expect(
 				contextOverlay.some(
 					(message) =>
@@ -287,7 +287,7 @@ describe("AgentSession pi-server sync", () => {
 			expect(treeRequests).toEqual([]);
 			expect(streamCount).toBe(2);
 			expect(events).toEqual(["start:1", "end:success=true"]);
-			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(session.state.messages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
@@ -359,7 +359,7 @@ describe("AgentSession pi-server sync", () => {
 
 			expect(streamCount).toBe(1);
 			expect(events).toEqual([]);
-			expect(session.state.messages.map((message) => message.role)).toEqual(["user"]);
+			expect(session.state.messages.map((message) => message.role)).toEqual(["system", "user"]);
 		} finally {
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
@@ -444,7 +444,7 @@ describe("AgentSession pi-server sync", () => {
 			expect(streamCount).toBe(2);
 			expect(events).toEqual(["start:1", "end:success=true"]);
 			const activeMessages = sessionManager.buildSessionContext().messages;
-			expect(activeMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(activeMessages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
 			expect(
 				activeMessages.some(
 					(message) =>
@@ -556,7 +556,7 @@ describe("AgentSession pi-server sync", () => {
 			expect(events).toEqual(["start:1", "end:success=true"]);
 			expect(capturedRequests.some((request) => request.url.includes("/runs/"))).toBe(false);
 			const activeMessages = sessionManager.buildSessionContext().messages;
-			expect(activeMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(activeMessages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
 			expect(
 				activeMessages.some(
 					(message) =>
@@ -667,7 +667,7 @@ describe("AgentSession pi-server sync", () => {
 				contextOverlay.some((message) => message.stopReason === "error" && message.errorMessage === "previous 524"),
 			).toBe(false);
 			const activeMessages = sessionManager.buildSessionContext().messages;
-			expect(activeMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+			expect(activeMessages.map((message) => message.role)).toEqual(["user", "system", "user", "assistant"]);
 			expect(
 				activeMessages.some(
 					(message) =>
@@ -1072,7 +1072,7 @@ describe("AgentSession pi-server sync", () => {
 
 			expect(streamCount).toBe(1);
 			expect(events).toEqual([{ type: "agent_end", willRetry: false }]);
-			expect(session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(session.state.messages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
 			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
 			const syncErrorEntries = sessionManager
 				.getEntries()

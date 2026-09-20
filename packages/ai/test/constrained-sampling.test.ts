@@ -11,8 +11,9 @@ import {
 	convertResponsesTools,
 	processResponsesStream,
 } from "../src/api/openai-responses-shared.ts";
-import type { AssistantMessage, Context, Model, Tool, ToolCall } from "../src/types.ts";
+import type { AssistantMessage, Model, Tool, ToolCall } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 function makeModel(): Model<"openai-responses"> {
 	return {
@@ -204,7 +205,7 @@ describe("constrained tool sampling", () => {
 			name: "sample_tool",
 			arguments: { payload: "abc" },
 		};
-		const context: Context = {
+		const context = normalizeContext({
 			messages: [
 				{
 					role: "assistant",
@@ -225,8 +226,9 @@ describe("constrained tool sampling", () => {
 					timestamp: Date.now(),
 				},
 			],
-		};
-		for (const invalidArguments of [{}, { payload: 42 }]) {
+		});
+		const invalidArgumentsList: ToolCall["arguments"][] = [{}, { payload: 42 }];
+		for (const invalidArguments of invalidArgumentsList) {
 			replayedToolCall.arguments = invalidArguments;
 			expect(() =>
 				convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
@@ -255,7 +257,7 @@ describe("constrained tool sampling", () => {
 	});
 
 	it("omits function item IDs when a tool becomes grammar constrained", () => {
-		const context: Context = {
+		const context = normalizeContext({
 			messages: [
 				{
 					role: "assistant",
@@ -283,7 +285,7 @@ describe("constrained tool sampling", () => {
 					timestamp: Date.now(),
 				},
 			],
-		};
+		});
 
 		const messages = convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
 			grammarToolInputProperties: new Map([["sample_tool", "payload"]]),

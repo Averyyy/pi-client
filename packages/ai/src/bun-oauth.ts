@@ -4,6 +4,7 @@ import { devinOAuth } from "./auth/oauth/devin.ts";
 import { githubCopilotOAuth } from "./auth/oauth/github-copilot.ts";
 import { kimiCodingOAuth } from "./auth/oauth/kimi-coding.ts";
 import { registerBundledOAuthFlowLoaders } from "./auth/oauth/load.ts";
+import { metaOAuth } from "./auth/oauth/meta.ts";
 import { openaiCodexOAuth } from "./auth/oauth/openai-codex.ts";
 import { openRouterOAuth } from "./auth/oauth/openrouter.ts";
 import { createRadiusOAuth } from "./auth/oauth/radius.ts";
@@ -19,6 +20,7 @@ export function registerBunOAuthFlows(): void {
 		githubCopilot: () => githubCopilotOAuth,
 		openrouter: () => openRouterOAuth,
 		kimiCoding: () => kimiCodingOAuth,
+		meta: () => metaOAuth,
 		xai: () => xaiOAuth,
 		radius: createRadiusOAuth,
 	});

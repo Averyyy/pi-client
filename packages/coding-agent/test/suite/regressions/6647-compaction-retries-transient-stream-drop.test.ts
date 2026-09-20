@@ -100,7 +100,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 
 		if (!result) throw new Error("Expected compaction result after retry");
 		expect(result.summary).toContain("recovered summary");
-		expect(getCallCount()).toBe(3); // 1 initial + 2 retries
+		expect(getCallCount()).toBe(3); // 1 prefix-summary attempt + 2 retries
 		const starts = harness.eventsOfType("summarization_retry_scheduled");
 		const ends = harness.eventsOfType("summarization_retry_finished");
 		expect(starts).toHaveLength(2);

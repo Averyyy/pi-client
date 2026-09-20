@@ -162,6 +162,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 			case "user":
 			case "assistant":
 			case "toolResult":
+			case "system":
 				result.push(m);
 				break;
 		}

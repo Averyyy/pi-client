@@ -26,7 +26,7 @@ describe("first-turn session naming", () => {
 		harness.setResponses([
 			fauxAssistantMessage("I can fix that."),
 			(context) => {
-				const titleMessage = context.messages[0];
+				const titleMessage = context.messages.find((message) => message.role === "user");
 				if (!titleMessage) {
 					throw new Error("missing title prompt");
 				}

@@ -1,8 +1,32 @@
 import type { AssistantMessage } from "../types.ts";
 
+function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
+	return new RegExp(patterns.join("|"), "i");
+}
+
+const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
+	// Zen API. These are subscription/account limits, not transient throttles.
+	"GoUsageLimitError",
+	"FreeUsageLimitError",
+
+	// OpenCode Go subscription-limit text asks users to enable available-balance
+	// usage after rolling/weekly/monthly limits are reached.
+	"Monthly usage limit reached",
+	"available balance",
+
+	// Generic quota/budget/billing exhaustion. `insufficient_quota` is OpenAI's
+	// quota/billing error code; the other strings cover common gateway wording.
+	"insufficient_quota",
+	"out of budget",
+	"quota exceeded",
+	"billing",
+]);
+
 /**
  * Retry policy: bounded attempts with exponential backoff (`baseDelayMs * 2^(attempt-1)`).
- * Matches `settings.retry` (`enabled`, `maxRetries`, `baseDelayMs`) in coding-agent; kept
+ * `maxAgentDelayMs` caps each computed delay and defaults to 60 seconds.
+ * Matches `settings.retry` (`enabled`, `maxRetries`, `baseDelayMs`, `maxAgentDelayMs`) in coding-agent; kept
  * here so the classifier and the policy-driven retry loop live together and stay reusable
  * by the SDK and other callers.
  */
@@ -12,6 +36,16 @@ export interface RetryPolicy {
 	maxRetries: number;
 	/** Base delay in ms. Per-attempt delay is `baseDelayMs * 2^(attempt-1)` before jitter. */
 	baseDelayMs: number;
+	/** Optional cap for agent-level retry delays in ms. Defaults to 60 seconds. */
+	maxAgentDelayMs?: number;
+}
+
+export const DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60_000;
+
+export function retryDelayMs(policy: Pick<RetryPolicy, "baseDelayMs" | "maxAgentDelayMs">, attempt: number): number {
+	const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
+	const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
+	return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
 }
 
 /** Optional callbacks emitted by {@link retryAssistantCall} around each retry. */
@@ -104,7 +138,7 @@ export async function retryAssistantCall(
 
 		attempt++;
 		lastRetry = { attempt, errorMessage: response.errorMessage || "Unknown error" };
-		const delayMs = policy!.baseDelayMs * 2 ** (attempt - 1);
+		const delayMs = retryDelayMs(policy!, attempt);
 		await callbacks?.onRetryScheduled?.(attempt, maxAttempts, delayMs, lastRetry.errorMessage);
 
 		// Normalize aborts during retry backoff to the same AssistantMessage shape as
@@ -135,9 +169,15 @@ export async function retryAssistantCall(
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
-	// Usage/quota/balance failures are generally deterministic account limits.
-	// Everything else is retried by default; callers still apply their own
-	// context-overflow, phase, abort, and retry-budget policies.
-	if (/^(?:this operation was aborted|request was cancel(?:led|ed))$/i.test(message.errorMessage.trim())) return false;
-	return !/usage|quota|balance/i.test(message.errorMessage);
+	const errorMessage = message.errorMessage;
+	if (/^(?:this operation was aborted|request was cancel(?:led|ed))$/i.test(errorMessage.trim())) return false;
+	// Keep the fork's broad transport retry behavior while honoring upstream's
+	// explicit account-limit patterns. Unknown provider errors remain retryable;
+	// the caller still applies its retry budget and phase-specific safeguards.
+	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
+	// Azure peak-load responses mention usage size while still representing a
+	// transient capacity failure (upstream regression #9669).
+	if (/currently experiencing high demand|peak load/i.test(errorMessage)) return true;
+	if (/usage|quota|balance/i.test(errorMessage)) return false;
+	return true;
 }
