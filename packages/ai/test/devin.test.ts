@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import * as zlib from "node:zlib";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decodeDevinCatalog } from "../src/api/devin-catalog.ts";
 import { mapContextToChat } from "../src/api/devin-context-map.ts";
@@ -12,11 +14,15 @@ import {
 	frameConnectStream,
 	iterFields,
 } from "../src/api/devin-wire.ts";
+import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { loginDevin } from "../src/auth/oauth/devin.ts";
+import { stream as compatStream, streamSimple as compatStreamSimple } from "../src/compat.ts";
+import { createModels } from "../src/models.ts";
 import { builtinProviders } from "../src/providers/all.ts";
 import { devinProvider } from "../src/providers/devin.ts";
-import type { AssistantMessage, Model } from "../src/types.ts";
+import type { AssistantMessage, Context, Model, Tool } from "../src/types.ts";
 import { calculateContextTokens } from "../src/utils/estimate.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 const model: Model<"devin"> = {
 	id: "swe-2-medium",
@@ -30,7 +36,60 @@ const model: Model<"devin"> = {
 	maxTokens: 128000,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
-const context = { messages: [{ role: "user" as const, content: "test", timestamp: 1 }] };
+const context = normalizeContext({ messages: [{ role: "user" as const, content: "test", timestamp: 1 }] });
+
+function tool(name: string, description: string): Tool {
+	return { name, description, parameters: Type.Object({ path: Type.String() }) };
+}
+
+interface CapturedChatRequest {
+	systemPrompt?: string;
+	tools: Array<{ name: string; description: string; parameters: unknown }>;
+}
+
+function decodeChatRequest(body: unknown): CapturedChatRequest {
+	if (!(body instanceof Uint8Array)) throw new Error("Expected Devin request bytes");
+	const frame = Buffer.from(body);
+	const length = frame.readUInt32BE(1);
+	const encoded = frame.subarray(5, 5 + length);
+	const payload = frame[0] & 1 ? zlib.gunzipSync(encoded) : encoded;
+	let systemPrompt: string | undefined;
+	const tools: CapturedChatRequest["tools"] = [];
+	for (const field of iterFields(payload)) {
+		if (field.num === 2 && field.wire === 2 && Buffer.isBuffer(field.value)) {
+			systemPrompt = field.value.toString("utf8");
+		}
+		if (field.num !== 10 || field.wire !== 2 || !Buffer.isBuffer(field.value)) continue;
+		let name = "";
+		let description = "";
+		let parameters: unknown = {};
+		for (const toolField of iterFields(field.value)) {
+			if (toolField.wire !== 2 || !Buffer.isBuffer(toolField.value)) continue;
+			if (toolField.num === 1) name = toolField.value.toString("utf8");
+			if (toolField.num === 2) description = toolField.value.toString("utf8");
+			if (toolField.num === 3) parameters = JSON.parse(toolField.value.toString("utf8")) as unknown;
+		}
+		tools.push({ name, description, parameters });
+	}
+	return { systemPrompt, tools };
+}
+
+function captureDevinFetch(requests: CapturedChatRequest[]): typeof fetch {
+	return vi.fn(async (input, init) => {
+		if (String(input).endsWith("GetUserJwt")) return new Response(new Uint8Array(encodeString(1, "test-jwt")));
+		requests.push(decodeChatRequest(init?.body));
+		return new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new Uint8Array(frameConnectStream(encodeString(3, "ok"))));
+					controller.enqueue(new Uint8Array(trailer()));
+					controller.close();
+				},
+			}),
+			{ headers: { "content-type": "application/connect+proto" } },
+		);
+	});
+}
 
 function trailer(error?: string, message?: string): Buffer {
 	const payload = Buffer.from(JSON.stringify(error ? { error: { code: error, message } } : {}));
@@ -113,6 +172,75 @@ describe("native Devin", () => {
 			thinkingLevelMap: { max: "claude-opus-5-max" },
 		});
 	});
+	it.each(["compat", "compatSimple", "models", "modelsSimple"] as const)(
+		"maps normalized system/tool transcripts through %s",
+		async (dispatch) => {
+			const keep = tool("keep", "Keep files available to the model");
+			const removed = tool("removed", "This tool must be removed");
+			const added = tool("added", "Added after the first turn");
+			const requestContext: Context = {
+				systemPrompt: "base system prompt",
+				tools: [keep, removed],
+				messages: [
+					{
+						role: "system",
+						content: "runtime instructions",
+						sections: { policy: "old policy", obsolete: "remove this section" },
+						timestamp: 1,
+					},
+					{
+						role: "system",
+						content: "runtime update",
+						sections: { policy: "new policy", obsolete: null },
+						toolsRemoved: [{ name: removed.name }],
+						toolsAdded: [added],
+						timestamp: 2,
+					},
+					{ role: "user", content: "continue", timestamp: 3 },
+				],
+			};
+			const requests: CapturedChatRequest[] = [];
+			const fetch = captureDevinFetch(requests);
+
+			if (dispatch === "compat" || dispatch === "compatSimple") {
+				const stream = dispatch === "compat" ? compatStream : compatStreamSimple;
+				await stream(model, requestContext, { apiKey: "test-token", fetch }).result();
+			} else {
+				const credentials = new InMemoryCredentialStore();
+				await credentials.modify("devin", async () => ({
+					type: "oauth" as const,
+					access: "test-token",
+					refresh: "",
+					expires: Number.MAX_SAFE_INTEGER,
+				}));
+				const models = createModels({ credentials });
+				models.setProvider(devinProvider());
+				const configuredModel = models.getModel("devin", model.id);
+				if (!configuredModel) throw new Error("Expected fallback Devin model");
+				const stream =
+					dispatch === "models"
+						? models.stream(configuredModel, requestContext, { fetch })
+						: models.streamSimple(configuredModel, requestContext, { fetch });
+				await stream.result();
+			}
+
+			expect(requests).toHaveLength(1);
+			expect(requests[0]?.systemPrompt).toBe(
+				"base system prompt\n\nruntime instructions\n\nruntime update\n\nnew policy",
+			);
+			expect(requests[0]?.tools.map((value) => value.name)).toEqual(["keep", "added"]);
+			expect(requests[0]?.tools[0]).toMatchObject({
+				name: "keep",
+				description: keep.description,
+				parameters: { type: "object", properties: { path: { type: "string" } } },
+			});
+			expect(requests[0]?.tools[1]).toMatchObject({
+				name: "added",
+				description: added.description,
+				parameters: { type: "object", properties: { path: { type: "string" } } },
+			});
+		},
+	);
 	it("decodes actual catalog limits and reasoning features", () => {
 		const config = Buffer.concat([
 			encodeString(1, "Unlabelled effort"),
@@ -362,7 +490,7 @@ describe("native Devin", () => {
 			signatureType: "sealed",
 		});
 		const mapped = mapContextToChat(
-			{
+			normalizeContext({
 				messages: [
 					result,
 					{
@@ -374,7 +502,7 @@ describe("native Devin", () => {
 						timestamp: 1,
 					},
 				],
-			},
+			}),
 			model.id,
 		);
 		expect(mapped.messages[0].thinking?.signature).toBe("part1part2");
@@ -384,7 +512,9 @@ describe("native Devin", () => {
 			provider: "other",
 			content: [{ type: "thinking", thinking: "private", thinkingSignature: packThinkingSignature("other") }],
 		};
-		expect(mapContextToChat({ messages: [foreign] }, model.id).messages[0].thinking).toBeUndefined();
+		expect(
+			mapContextToChat(normalizeContext({ messages: [foreign] }), model.id).messages[0].thinking,
+		).toBeUndefined();
 	});
 	it("blocks direct inference in server mode before any network request", async () => {
 		vi.stubEnv("PI_SERVER_MODE", "true");

@@ -28,11 +28,11 @@ import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
-	type Context,
 	createAssistantMessageEventStream,
 	type JsonObject,
 	type Model,
 	type SimpleStreamOptions,
+	type TranscriptContext,
 } from "../index.ts";
 import { type ChatHistoryItem, type ContentPart, mapContextToChat, type ToolDef } from "./devin-context-map.ts";
 import { mintUserJwt } from "./devin-jwt.ts";
@@ -438,7 +438,7 @@ async function* streamChatEvents(args: {
 
 export function streamDevin(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
