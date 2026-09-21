@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(__dirname, "..");
 const repoRoot = join(pkgRoot, "..", "..");
+const publishedCodingAgentSpecifier = /^npm:@averyyy\/pi-coding-agent@(\d+\.\d+\.\d+-piclient\.\d+)$/;
 
 describe("pi-client package", () => {
 	it("exposes only pi-client bin, not pi", () => {
@@ -54,9 +55,7 @@ describe("pi-client package", () => {
 
 	it("depends on the published pi-coding-agent package", () => {
 		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toBe(
-			"npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
-		);
+		expect(pkg.dependencies["@earendil-works/pi-coding-agent"]).toMatch(publishedCodingAgentSpecifier);
 	});
 
 	it("does not bundle a separate web UI dependency", () => {
@@ -67,11 +66,14 @@ describe("pi-client package", () => {
 	});
 
 	it("keeps the root lockfile aligned to published runtime dependencies", () => {
+		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 		const lock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf-8"));
+		const specifier = pkg.dependencies["@earendil-works/pi-coding-agent"];
+		const match = publishedCodingAgentSpecifier.exec(specifier);
 		expect(lock.packages["packages/pi-client"].name).toBe("@averyyy/pi-client");
-		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe(
-			"npm:@averyyy/pi-coding-agent@0.80.3-piclient.3",
-		);
+		expect(match).not.toBeNull();
+		expect(lock.packages["packages/pi-client"].dependencies["@earendil-works/pi-coding-agent"]).toBe(specifier);
+		expect(lock.packages["packages/pi-client/node_modules/@earendil-works/pi-coding-agent"].version).toBe(match?.[1]);
 		expect(lock.packages["packages/pi-client"].dependencies["@jmfederico/pi-web"]).toBeUndefined();
 		expect(lock.packages["node_modules/@jmfederico/pi-web"]).toBeUndefined();
 	});
