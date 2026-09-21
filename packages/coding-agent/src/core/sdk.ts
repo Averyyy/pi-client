@@ -377,12 +377,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
-	agent = new Agent({
+	const agent = new Agent({
 		initialState: {
 			systemPrompt: "",
 			model,
 			thinkingLevel,
 			tools: [],
+			messages: existingSession.messages,
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
@@ -444,9 +445,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
-	// Restore messages if session has existing data
+	// Restore missing settings metadata for older sessions.
 	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
