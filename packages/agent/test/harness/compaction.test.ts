@@ -30,7 +30,11 @@ import {
 	shouldCompact,
 } from "../../src/harness/compaction/compaction.ts";
 import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
-import type { SessionTreeEntry } from "../../src/harness/legacy-session.ts";
+import {
+	buildLegacySessionContext,
+	buildLegacySessionProjection,
+	type SessionTreeEntry,
+} from "../../src/harness/legacy-session.ts";
 import { buildSessionContext } from "../../src/harness/session/context.ts";
 import type {
 	BranchSummaryEntry,
@@ -86,6 +90,16 @@ function createMessageEntry(message: AgentMessage, parentId: string | null = nul
 		parentId,
 		seq: nextId,
 		timestamp: Date.now(),
+		message,
+	};
+}
+
+function createLegacyMessageEntry(message: AgentMessage, parentId: string | null = null): SessionTreeEntry {
+	return {
+		type: "message",
+		id: createId(),
+		parentId,
+		timestamp: new Date(Date.now()).toISOString(),
 		message,
 	};
 }
@@ -359,6 +373,155 @@ describe("harness compaction", () => {
 		]);
 	});
 
+	it("applies the latest context edit to provider messages while retaining raw entries", () => {
+		const originalUser = createLegacyMessageEntry(createUserMessage("omit this"));
+		const originalAssistant = createLegacyMessageEntry(createAssistantMessage("replace this"), originalUser.id);
+		const omitEdit: SessionTreeEntry = {
+			type: "context_edit",
+			id: "omit-edit",
+			parentId: originalAssistant.id,
+			timestamp: new Date(3).toISOString(),
+			targetId: originalUser.id,
+			replacement: null,
+		};
+		const replaceEdit: SessionTreeEntry = {
+			type: "context_edit",
+			id: "replace-edit",
+			parentId: omitEdit.id,
+			timestamp: new Date(4).toISOString(),
+			targetId: originalAssistant.id,
+			replacement: { content: "replacement" },
+		};
+
+		const projection = buildLegacySessionProjection([originalUser, originalAssistant, omitEdit, replaceEdit]);
+		expect(projection.messages).toHaveLength(1);
+		expect(projection.messages[0]).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "replacement" }],
+		});
+		expect(originalUser).toMatchObject({ message: { content: [{ type: "text", text: "omit this" }] } });
+		expect(originalAssistant).toMatchObject({
+			message: { content: [{ type: "text", text: "replace this" }] },
+		});
+	});
+
+	it("uses only the newest compaction and preserves its checkpoint system state", () => {
+		const oldSystem: SessionTreeEntry = {
+			type: "message",
+			id: "old-system",
+			parentId: null,
+			timestamp: new Date(1).toISOString(),
+			message: { role: "system", content: "old prompt", timestamp: 1 },
+		};
+		const oldUser = createLegacyMessageEntry(createUserMessage("old retained"), oldSystem.id);
+		const firstCompaction: SessionTreeEntry = {
+			type: "compaction",
+			id: "first-compaction",
+			parentId: oldUser.id,
+			timestamp: new Date(3).toISOString(),
+			summary: "old summary",
+			firstKeptEntryId: oldUser.id,
+			tokensBefore: 10,
+		};
+		const newerUser = createLegacyMessageEntry(createUserMessage("newer input"), firstCompaction.id);
+		const latestCompaction: SessionTreeEntry = {
+			type: "compaction",
+			id: "latest-compaction",
+			parentId: newerUser.id,
+			timestamp: new Date(5).toISOString(),
+			summary: "latest summary",
+			firstKeptEntryId: "latest-compaction",
+			tokensBefore: 20,
+			systemMessage: {
+				role: "system",
+				content: "checkpoint prompt",
+				toolsAdded: [{ name: "read", description: "read", parameters: {} }],
+				timestamp: 5,
+			},
+		};
+		const after = createLegacyMessageEntry(createUserMessage("after"), latestCompaction.id);
+
+		const context = buildLegacySessionContext([
+			oldSystem,
+			oldUser,
+			firstCompaction,
+			newerUser,
+			latestCompaction,
+			after,
+		]);
+		expect(context.messages).toHaveLength(3);
+		expect(context.messages[0]).toMatchObject({
+			role: "system",
+			content: "checkpoint prompt",
+			toolsAdded: [{ name: "read" }],
+		});
+		expect(context.messages.map((message) => message.role)).toEqual(["system", "compactionSummary", "user"]);
+		expect(
+			context.messages.some((message) => message.role === "compactionSummary" && message.summary === "old summary"),
+		).toBe(false);
+		expect(context.messages.filter((message) => message.role === "user")).toHaveLength(1);
+		expect(context.messages.find((message) => message.role === "user")).toMatchObject({
+			content: [{ type: "text", text: "after" }],
+		});
+	});
+
+	it("drops older compaction and retained system deltas from a newest raw retained range", () => {
+		const oldSystem: SessionTreeEntry = {
+			type: "message",
+			id: "raw-old-system",
+			parentId: null,
+			timestamp: new Date(1).toISOString(),
+			message: { role: "system", content: "old prompt", timestamp: 1 },
+		};
+		const oldUser = createLegacyMessageEntry(createUserMessage("old retained"), oldSystem.id);
+		const firstCompaction: SessionTreeEntry = {
+			type: "compaction",
+			id: "raw-first-compaction",
+			parentId: oldUser.id,
+			timestamp: new Date(3).toISOString(),
+			summary: "old summary",
+			firstKeptEntryId: oldUser.id,
+			tokensBefore: 10,
+		};
+		const newerUser = createLegacyMessageEntry(createUserMessage("newer input"), firstCompaction.id);
+		const latestCompaction: SessionTreeEntry = {
+			type: "compaction",
+			id: "raw-latest-compaction",
+			parentId: newerUser.id,
+			timestamp: new Date(5).toISOString(),
+			summary: "latest summary",
+			firstKeptEntryId: oldSystem.id,
+			tokensBefore: 20,
+			systemMessage: {
+				role: "system",
+				content: "checkpoint prompt",
+				timestamp: 5,
+			},
+		};
+		const after = createLegacyMessageEntry(createUserMessage("after raw range"), latestCompaction.id);
+
+		const context = buildLegacySessionContext([
+			oldSystem,
+			oldUser,
+			firstCompaction,
+			newerUser,
+			latestCompaction,
+			after,
+		]);
+		expect(context.messages.map((message) => message.role)).toEqual([
+			"system",
+			"compactionSummary",
+			"user",
+			"user",
+			"user",
+		]);
+		expect(context.messages[0]).toMatchObject({ role: "system", content: "checkpoint prompt" });
+		expect(context.messages[2]).toMatchObject({ content: [{ type: "text", text: "old retained" }] });
+		expect(
+			context.messages.some((message) => message.role === "compactionSummary" && message.summary === "old summary"),
+		).toBe(false);
+	});
+
 	it("prepares compaction using the latest compaction summary as previousSummary", async () => {
 		const u1 = createMessageEntry(createUserMessage("user msg 1"));
 		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"), u1.id);
@@ -621,6 +784,54 @@ describe("harness compaction", () => {
 			BACKGROUND_CONTEXT,
 		);
 		expect(abortedResult).toMatchObject({ ok: false, error: { code: "aborted", message: "stopped" } });
+	});
+
+	it("rejects incomplete or tool-calling summary chunks", async () => {
+		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
+		const { faux: lengthFaux, model: lengthModel } = createFauxModel(false);
+		lengthFaux.setResponses([fauxAssistantMessage("partial", { stopReason: "length" })]);
+		expect(
+			await generateSummary(
+				messages,
+				models,
+				lengthModel,
+				2000,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				BACKGROUND_CONTEXT,
+			),
+		).toMatchObject({
+			ok: false,
+			error: {
+				code: "summarization_failed",
+				message: "Summarization failed: generation hit the token cap and the summary is incomplete",
+			},
+		});
+
+		const { faux: toolFaux, model: toolModel } = createFauxModel(false);
+		const toolResponse = fauxAssistantMessage("");
+		toolResponse.content = [{ type: "toolCall", id: "summary-tool", name: "read", arguments: {} }];
+		toolFaux.setResponses([toolResponse]);
+		expect(
+			await generateSummary(
+				messages,
+				models,
+				toolModel,
+				2000,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				BACKGROUND_CONTEXT,
+			),
+		).toMatchObject({
+			ok: false,
+			error: { code: "summarization_failed", message: "Summarization attempted to call a tool" },
+		});
 	});
 
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
@@ -972,6 +1183,69 @@ describe("harness compaction", () => {
 		expect(preparation?.firstKeptEntryId).toBe(marker.id);
 		expect(preparation?.messagesToSummarize).toHaveLength(2);
 		expect(preparation?.retainedTail).toMatchObject([{ role: "custom", customType: "pi:validation-hint" }]);
+	});
+
+	it("prepares legacy compaction from projected omission and replacement content", () => {
+		const omitted = createLegacyMessageEntry(createUserMessage("OMIT-ME"));
+		const replaced = createLegacyMessageEntry(createAssistantMessage("raw assistant"), omitted.id);
+		const omitEdit: SessionTreeEntry = {
+			type: "context_edit",
+			id: "legacy-omit-edit",
+			parentId: replaced.id,
+			timestamp: new Date(3).toISOString(),
+			targetId: omitted.id,
+			replacement: null,
+		};
+		const replaceEdit: SessionTreeEntry = {
+			type: "context_edit",
+			id: "legacy-replace-edit",
+			parentId: omitEdit.id,
+			timestamp: new Date(4).toISOString(),
+			targetId: replaced.id,
+			replacement: { content: "projected assistant" },
+		};
+		const kept = createLegacyMessageEntry(createUserMessage("keep"), replaceEdit.id);
+
+		const preparation = getOrThrow(
+			prepareLegacyCompaction([omitted, replaced, omitEdit, replaceEdit, kept], DEFAULT_COMPACTION_SETTINGS, {
+				firstKeptEntryId: kept.id,
+			}),
+		);
+		if (!preparation) throw new Error("Expected projected legacy compaction preparation");
+
+		expect(preparation.firstKeptEntryId).toBe(kept.id);
+		expect(preparation.messagesToSummarize).toMatchObject([
+			{ role: "assistant", content: [{ type: "text", text: "projected assistant" }] },
+		]);
+		expect(JSON.stringify(preparation.messagesToSummarize)).not.toContain("OMIT-ME");
+		expect(preparation.retainedTail).toMatchObject([{ role: "user", content: [{ type: "text", text: "keep" }] }]);
+	});
+
+	it("summarizes an embedded retained tail before new legacy entries", () => {
+		const previous: SessionTreeEntry = {
+			type: "compaction",
+			id: "previous-compaction",
+			parentId: null,
+			timestamp: new Date(1).toISOString(),
+			summary: "previous summary",
+			firstKeptEntryId: "previous-compaction",
+			tokensBefore: 100,
+			retainedTail: [createUserMessage("embedded retained tail")],
+		};
+		const nextUser = createLegacyMessageEntry(createUserMessage("next request"), previous.id);
+		const nextAssistant = createLegacyMessageEntry(createAssistantMessage("next response"), nextUser.id);
+
+		const preparation = getOrThrow(
+			prepareLegacyCompaction([previous, nextUser, nextAssistant], DEFAULT_COMPACTION_SETTINGS, {
+				firstKeptEntryId: nextAssistant.id,
+			}),
+		);
+		if (!preparation) throw new Error("Expected retained-tail compaction preparation");
+
+		expect(preparation.messagesToSummarize).toMatchObject([
+			{ role: "user", content: [{ type: "text", text: "embedded retained tail" }] },
+			{ role: "user", content: [{ type: "text", text: "next request" }] },
+		]);
 	});
 });
 

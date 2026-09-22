@@ -40,6 +40,7 @@ const model: Model<"openai-completions"> = {
 	maxTokens: 4096,
 };
 const context = { systemPrompt: "test", messages: [] };
+const compactSettings = { enabled: true, reserveTokens: 100, keepRecentTokens: 1 };
 const entries: SessionTreeEntry[] = ["u1", "u2"].map((id, index) => ({
 	type: "message",
 	id,
@@ -86,7 +87,11 @@ it("recovers the exact committed compact result after a truncated response witho
 		}
 		return response;
 	});
-	const result = await compactPiServer(model, context, { sessionId: "lost", sessionTree: { entries, leafId: "u2" } });
+	const result = await compactPiServer(model, context, {
+		sessionId: "lost",
+		settings: compactSettings,
+		sessionTree: { entries, leafId: "u2" },
+	});
 	expect(result.entries).toEqual(getSession("lost")?.entries);
 	expect(result.leafId).toBe(getSession("lost")?.leafId);
 	expect(paths.filter((path) => path === "/api/session/compact")).toHaveLength(1);
@@ -95,7 +100,7 @@ it("recovers the exact committed compact result after a truncated response witho
 });
 
 it("reconciles a lost checkpoint after tracking reset and returns it without Nothing to compact", async () => {
-	const options = { sessionId: "checkpoint", sessionTree: { entries, leafId: "u2" } };
+	const options = { sessionId: "checkpoint", settings: compactSettings, sessionTree: { entries, leafId: "u2" } };
 	const first = await compactPiServer(model, context, options);
 	// Reload the persisted checkpoint independently of the in-memory run journal.
 	await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -129,6 +134,7 @@ it("validates known prefix contents instead of accepting modified entries with c
 	const reconciled = vi.fn();
 	const result = await compactPiServer(model, context, {
 		sessionId,
+		settings: compactSettings,
 		sessionTree: { entries: changed, leafId: "metadata" },
 		onHistoryReconciled: reconciled,
 	});
@@ -137,10 +143,134 @@ it("validates known prefix contents instead of accepting modified entries with c
 	expect(result.entries.some((entry) => entry.id === "metadata")).toBe(false);
 });
 
+it("syncs context edits as raw entries and compacts their projected messages", async () => {
+	const omitted: SessionTreeEntry = {
+		type: "message",
+		id: "u0",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		message: { role: "user", content: "omit from context", timestamp: 0 },
+	};
+	const replaced: SessionTreeEntry = {
+		type: "message",
+		id: "u1",
+		parentId: omitted.id,
+		timestamp: new Date(1).toISOString(),
+		message: { role: "user", content: "raw replacement", timestamp: 1 },
+	};
+	const omitEdit: SessionTreeEntry = {
+		type: "context_edit",
+		id: "omit-edit",
+		parentId: replaced.id,
+		timestamp: new Date(2).toISOString(),
+		targetId: omitted.id,
+		replacement: null,
+	};
+	const replaceEdit: SessionTreeEntry = {
+		type: "context_edit",
+		id: "replace-edit",
+		parentId: omitEdit.id,
+		timestamp: new Date(3).toISOString(),
+		targetId: replaced.id,
+		replacement: { content: "projected replacement" },
+	};
+	const kept: SessionTreeEntry = {
+		type: "message",
+		id: "u2",
+		parentId: replaceEdit.id,
+		timestamp: new Date(4).toISOString(),
+		message: { role: "user", content: "keep after compact", timestamp: 4 },
+	};
+	const sessionId = "context-edit-compact";
+	const tree = { entries: [omitted, replaced, omitEdit, replaceEdit, kept], leafId: kept.id };
+	await syncPiServerTree(sessionId, context, tree);
+
+	const result = await compactPiServer(model, context, {
+		sessionId,
+		settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 },
+		preparation: { firstKeptEntryId: kept.id },
+		sessionTree: tree,
+	});
+
+	const compactCall = vi.mocked(compactLegacy).mock.calls[0];
+	const preparation = compactCall?.[0];
+	expect(preparation?.messagesToSummarize).toMatchObject([{ role: "user", content: "projected replacement" }]);
+	expect(JSON.stringify(preparation?.messagesToSummarize)).not.toContain("omit from context");
+	expect(result.entries.map((entry) => entry.id)).toEqual([
+		"u0",
+		"u1",
+		"omit-edit",
+		"replace-edit",
+		"u2",
+		result.compactionEntry.id,
+	]);
+	const active = getSession(sessionId);
+	expect(active?.messages[0]).toMatchObject({
+		role: "user",
+		content: [{ type: "text", text: expect.stringContaining("summary") }],
+	});
+	expect(active?.messages[1]?.content).toBe("keep after compact");
+	expect(JSON.stringify(active?.messages)).not.toContain("omit from context");
+	expect(JSON.stringify(active?.messages)).not.toContain("projected replacement");
+});
+
+it("stores the effective system prompt and tools on a remote compaction checkpoint", async () => {
+	const system: SessionTreeEntry = {
+		type: "message",
+		id: "system-entry",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		message: {
+			role: "system",
+			content: "tree prompt",
+			toolsAdded: [{ name: "read", description: "read", parameters: {} }],
+			timestamp: 0,
+		},
+	};
+	const user: SessionTreeEntry = {
+		type: "message",
+		id: "system-user",
+		parentId: "system-old",
+		timestamp: new Date(1).toISOString(),
+		message: { role: "user", content: "request", timestamp: 1 },
+	};
+	const oldUser: SessionTreeEntry = {
+		type: "message",
+		id: "system-old",
+		parentId: system.id,
+		timestamp: new Date(0, 0, 1).toISOString(),
+		message: { role: "user", content: "old request", timestamp: 0 },
+	};
+	const sessionId = "system-checkpoint-compact";
+	const tree = { entries: [system, oldUser, user], leafId: user.id };
+	await syncPiServerTree(sessionId, context, tree);
+	await compactPiServer(model, context, {
+		sessionId,
+		settings: compactSettings,
+		preparation: { firstKeptEntryId: user.id },
+		sessionTree: tree,
+	});
+
+	const checkpoint = getSession(sessionId)?.entries.at(-1);
+	expect(checkpoint).toMatchObject({
+		type: "compaction",
+		systemMessage: {
+			role: "system",
+			content: "tree prompt",
+			toolsAdded: [{ name: "read" }],
+		},
+	});
+	expect(getSession(sessionId)?.messages[0]).toMatchObject({
+		role: "system",
+		content: "tree prompt",
+		toolsAdded: [{ name: "read" }],
+	});
+});
+
 it("replays a completed run without compacting messages appended afterward", async () => {
 	const sessionId = "replay";
 	await syncPiServerTree(sessionId, context, { entries, leafId: "u2" });
-	const body = { sessionId, runId: "same-run", model };
+	const body = { sessionId, runId: "same-run", model, settings: compactSettings };
 	const firstResponse = await fetch(`${url}/api/session/compact`, { method: "POST", body: JSON.stringify(body) });
 	const first: unknown = await firstResponse.json();
 	const session = getSession(sessionId);
@@ -170,6 +300,7 @@ it("preserves summarizer failures instead of treating them as recovered compacti
 	await expect(
 		compactPiServer(model, context, {
 			sessionId: "failed",
+			settings: compactSettings,
 			sessionTree: { entries, leafId: "u2" },
 		}),
 	).rejects.toThrow("summarizer failed");

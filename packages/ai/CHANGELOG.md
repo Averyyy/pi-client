@@ -12,6 +12,16 @@
 - Fixed Devin losing system instructions and tool definitions after transcript normalization, which caused replies to stop without calling tools.
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
 - Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.
+## [0.87.0] - 2026-09-21
+
+### Added
+
+- Added model image-input limit and cache-safe resize metadata to the generated catalog ([#9631](https://github.com/earendil-works/pi/issues/9631)).
+
+### Fixed
+
+- Fixed unknown OpenAI-compatible Chat Completions endpoints receiving strict tool schemas unless they explicitly advertise support, while preserving strict tools for capable built-in models ([#9816](https://github.com/earendil-works/pi/issues/9816)).
+
 ## [0.86.1] - 2026-09-20
 
 ### Added

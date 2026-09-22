@@ -1,4 +1,12 @@
-import type { ImageContent, TextContent, Usage } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	SystemMessage,
+	TextContent,
+	ToolResultMessage,
+	Usage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "./messages.ts";
 
@@ -37,6 +45,8 @@ export interface LegacyCompactionEntry<T = unknown> extends LegacySessionTreeEnt
 	firstKeptEntryId?: string;
 	tokensBefore: number;
 	retainedTail?: AgentMessage[];
+	/** Complete prompt and tool state at this compaction boundary. */
+	systemMessage?: SystemMessage;
 	details?: T;
 	usage?: Usage;
 	fromHook?: boolean;
@@ -65,6 +75,21 @@ export interface LegacyCustomMessageEntry<T = unknown> extends LegacySessionTree
 	display: boolean;
 }
 
+/** Content that a context edit may replace without changing message metadata. */
+export type LegacyContextEditableContent =
+	| UserMessage["content"]
+	| AssistantMessage["content"]
+	| ToolResultMessage["content"]
+	| LegacyCustomMessageEntry["content"];
+
+/** Append-only overlay for one earlier model-visible entry. */
+export interface LegacyContextEditEntry extends LegacySessionTreeEntryBase {
+	type: "context_edit";
+	targetId: string;
+	/** Null omits the target from provider context. A value replaces only its content. */
+	replacement: { content: LegacyContextEditableContent } | null;
+}
+
 export interface LegacyLabelEntry extends LegacySessionTreeEntryBase {
 	type: "label";
 	targetId: string;
@@ -90,6 +115,7 @@ export type SessionTreeEntry =
 	| LegacyBranchSummaryEntry
 	| LegacyCustomEntry
 	| LegacyCustomMessageEntry
+	| LegacyContextEditEntry
 	| LegacyLabelEntry
 	| LegacySessionInfoEntry
 	| LegacyLeafEntry;
@@ -99,6 +125,16 @@ export interface LegacySessionContext {
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
 	activeToolNames: string[] | null;
+}
+
+/** One raw legacy entry and its model-visible projection after context edits. */
+export interface LegacyProjectedSessionEntry {
+	sourceEntry: SessionTreeEntry;
+	messages: AgentMessage[];
+}
+
+export interface LegacySessionProjection extends LegacySessionContext {
+	entries: LegacyProjectedSessionEntry[];
 }
 
 function getLegacyContextEntries(pathEntries: readonly SessionTreeEntry[]): SessionTreeEntry[] {
@@ -120,35 +156,86 @@ function getLegacyContextEntries(pathEntries: readonly SessionTreeEntry[]): Sess
 		for (let index = 0; index < compactionIndex; index++) {
 			const entry = pathEntries[index];
 			if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
-			if (foundFirstKept) entries.push(entry);
+			if (
+				foundFirstKept &&
+				!(compaction.systemMessage && entry.type === "message" && entry.message.role === "system")
+			) {
+				entries.push(entry);
+			}
 		}
 	}
 	entries.push(...pathEntries.slice(compactionIndex + 1));
 	return entries;
 }
 
-function legacyEntryToContextMessages(entry: SessionTreeEntry): AgentMessage[] {
+function isLegacyContextMessage(message: AgentMessage): boolean {
+	return message.role !== "assistant" || message.stopReason !== "deferred";
+}
+
+/** Convert one raw legacy entry into its unedited provider messages. */
+export function legacyEntryToContextMessages(entry: SessionTreeEntry): AgentMessage[] {
 	if (entry.type === "message") {
-		if (entry.message.role === "assistant" && entry.message.stopReason === "deferred") return [];
-		return [entry.message];
+		return isLegacyContextMessage(entry.message) ? [entry.message] : [];
 	}
 	if (entry.type === "custom_message") {
 		return [createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp)];
 	}
 	if (entry.type === "compaction") {
 		return [
+			...(entry.systemMessage ? [entry.systemMessage] : []),
 			createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
-			...(entry.retainedTail ?? []),
+			...(entry.retainedTail ?? []).filter(isLegacyContextMessage),
 		];
 	}
 	if (entry.type === "branch_summary") {
-		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
+		return entry.summary ? [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)] : [];
 	}
 	return [];
 }
 
-/** Project the pi-client/pi-server session tree into provider context. */
-export function buildLegacySessionContext(pathEntries: readonly SessionTreeEntry[]): LegacySessionContext {
+function projectLegacyContextEntry(entry: SessionTreeEntry, edit: LegacyContextEditEntry | undefined): AgentMessage[] {
+	const messages = legacyEntryToContextMessages(entry);
+	if (!edit) return messages;
+	const replacement = edit.replacement;
+	if (replacement === null) return [];
+
+	return messages.map((message) => {
+		if (
+			message.role !== "user" &&
+			message.role !== "assistant" &&
+			message.role !== "toolResult" &&
+			message.role !== "custom"
+		) {
+			return message;
+		}
+		const content =
+			(message.role === "assistant" || message.role === "toolResult") && typeof replacement.content === "string"
+				? [{ type: "text" as const, text: replacement.content }]
+				: replacement.content;
+		return { ...message, content } as AgentMessage;
+	});
+}
+
+/** Build provenance-preserving provider context for a legacy session branch. */
+export function buildLegacySessionProjection(pathEntries: readonly SessionTreeEntry[]): LegacySessionProjection {
+	const contextEntries = getLegacyContextEntries(pathEntries);
+	const edits = new Map<string, LegacyContextEditEntry>();
+	for (const entry of contextEntries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+	}
+
+	const entries = contextEntries.map(
+		(sourceEntry, index): LegacyProjectedSessionEntry => ({
+			sourceEntry,
+			// Older compactions can remain in the newest compaction's retained raw range.
+			// They are durable history but only the newest checkpoint contributes context.
+			messages:
+				sourceEntry.type === "compaction" && index > 0
+					? []
+					: projectLegacyContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+		}),
+	);
+
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
 	let activeToolNames: string[] | null = null;
@@ -167,6 +254,18 @@ export function buildLegacySessionContext(pathEntries: readonly SessionTreeEntry
 		thinkingLevel,
 		model,
 		activeToolNames,
-		messages: getLegacyContextEntries(pathEntries).flatMap(legacyEntryToContextMessages),
+		entries,
+		messages: entries.flatMap((entry) => entry.messages),
+	};
+}
+
+/** Project the pi-client/pi-server session tree into provider context. */
+export function buildLegacySessionContext(pathEntries: readonly SessionTreeEntry[]): LegacySessionContext {
+	const projection = buildLegacySessionProjection(pathEntries);
+	return {
+		thinkingLevel: projection.thinkingLevel,
+		model: projection.model,
+		activeToolNames: projection.activeToolNames,
+		messages: projection.messages,
 	};
 }

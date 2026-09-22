@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -152,6 +157,60 @@ describe("AgentSession auto-compaction queue resume", () => {
 		)._shouldCompactBeforeNextProviderRequest.bind(session);
 
 		expect(shouldCompact({ toolResults: [toolResult], context: { messages: [toolResult] } })).toBe(false);
+	});
+
+	it("does not force compact before unsent boundary input after tool results", () => {
+		settingsManager.applyOverrides({ compaction: { reserveTokens: 0 } });
+		session.agent.state.model = { ...session.model!, contextWindow: 100 };
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "large-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage(toolResult);
+		sessionManager.appendCustomMessageEntry("next-work", "UNSENT-BOUNDARY-INPUT", false);
+		const shouldCompact = (
+			session as unknown as {
+				_shouldCompactBeforeNextProviderRequest: (turn: {
+					toolResults: ToolResultMessage[];
+					context: { messages: AgentMessage[] };
+				}) => boolean;
+			}
+		)._shouldCompactBeforeNextProviderRequest.bind(session);
+
+		expect(
+			shouldCompact({
+				toolResults: [toolResult],
+				context: { messages: sessionManager.buildSessionProjection().messages },
+			}),
+		).toBe(false);
+	});
+
+	it("does not fall through to regular compact after forced compact cancellation", async () => {
+		const internals = session as unknown as {
+			_compactBeforeNextProviderRequest: (turn: unknown, signal?: AbortSignal) => Promise<unknown>;
+			_compactBeforeNextAssistantResponse: (context: unknown, signal?: AbortSignal) => Promise<unknown>;
+		};
+		const forced = vi.spyOn(internals, "_compactBeforeNextProviderRequest").mockResolvedValue(null);
+		const regular = vi
+			.spyOn(internals, "_compactBeforeNextAssistantResponse")
+			.mockRejectedValue(new Error("regular compact should not run"));
+		const controller = new AbortController();
+		controller.abort();
+		const turn = {
+			message: fauxAssistantMessage("turn"),
+			toolResults: [],
+			context: { messages: [], tools: [] },
+			newMessages: [],
+		};
+
+		await session.agent.prepareNextTurnWithContext?.(turn, controller.signal);
+
+		expect(forced).toHaveBeenCalledTimes(1);
+		expect(regular).not.toHaveBeenCalled();
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {

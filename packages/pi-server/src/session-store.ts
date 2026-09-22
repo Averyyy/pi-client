@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { buildLegacySessionContext, convertToLlm, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { Message, Tool } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, type Message, type Tool } from "@earendil-works/pi-ai";
 import { PiServerError, PiServerErrorCode } from "./error-codes.ts";
 import {
 	appendPiServerTreeHash,
@@ -291,15 +291,18 @@ export function appendCompactionEntry(
 	compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown },
 ): { session: SessionState; entry: SessionTreeEntry } {
 	const session = getOrCreateSession(sessionId);
+	const timestamp = new Date().toISOString();
+	const systemMessage = getCurrentSystemMessage(buildLegacySessionContext(getSessionBranch(session)).messages);
 	const entry: SessionTreeEntry = {
 		type: "compaction",
 		id: randomUUID(),
 		parentId: session.leafId,
-		timestamp: new Date().toISOString(),
+		timestamp,
 		summary: compaction.summary,
 		firstKeptEntryId: compaction.firstKeptEntryId,
 		tokensBefore: compaction.tokensBefore,
 		details: compaction.details,
+		...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
 	};
 	session.entries.push(entry);
 	session.leafId = entry.id;

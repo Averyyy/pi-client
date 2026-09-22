@@ -208,6 +208,43 @@ describe("generateSummary reasoning options", () => {
 		);
 	});
 
+	it("chunks one oversized serialized message before summarization", async () => {
+		const oversizedMessage: AgentMessage = {
+			role: "user",
+			content: "oversized input ".repeat(2_000),
+			timestamp: Date.now(),
+		};
+		const model = { ...createModel(false), contextWindow: 5_000 };
+
+		await expect(generateSummaryWithUsage([oversizedMessage], model, 1_000, "test-key")).resolves.toMatchObject({
+			text: "## Goal\nTest summary",
+		});
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+	});
+
+	it("recursively splits a provider-overflowing summary chunk", async () => {
+		const overflowResponse: AssistantMessage = {
+			...mockSummaryResponse,
+			stopReason: "error",
+			errorMessage: "prompt too long",
+		};
+		completeSimpleMock.mockResolvedValueOnce(overflowResponse).mockResolvedValue(mockSummaryResponse);
+		const oversizedMessage: AgentMessage = {
+			role: "user",
+			content: "provider overflow input ".repeat(1_000),
+			timestamp: Date.now(),
+		};
+
+		await expect(
+			generateSummaryWithUsage([oversizedMessage], createModel(false), 2_000, "test-key"),
+		).resolves.toMatchObject({
+			text: "## Goal\nTest summary",
+		});
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3);
+	});
+
 	it("does not set reasoning when thinking is off", async () => {
 		await generateSummary(
 			messages,

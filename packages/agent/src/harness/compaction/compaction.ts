@@ -3,6 +3,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	contentText,
+	getCurrentSystemMessage,
 	isContextOverflow,
 	type Model,
 	type Models,
@@ -10,18 +11,20 @@ import {
 	type RetryPolicy,
 	retryAssistantCall,
 	type SimpleStreamOptions,
+	type SystemMessage,
 	type Usage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import { BACKGROUND_CONTEXT, type Context, getTelemetryContext, withAbortSignal } from "../context.ts";
-import { buildLegacySessionContext, type LegacyCompactionEntry, type SessionTreeEntry } from "../legacy-session.ts";
 import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "../messages.ts";
+	buildLegacySessionProjection,
+	type LegacyCompactionEntry,
+	type LegacyProjectedSessionEntry,
+	legacyEntryToContextMessages,
+	type SessionTreeEntry,
+} from "../legacy-session.ts";
+import { convertToLlm, createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
 import { buildContextEntries, sessionEntryToContextMessages } from "../session/context.ts";
 import type { CompactionEntry, Entry, JsonValue } from "../session/types.ts";
 import { CompactionError, err, ok, type Result } from "../types.ts";
@@ -121,24 +124,6 @@ function extractLegacyFileOperations(
 	}
 	for (const message of messages) extractFileOpsFromMessage(message, fileOps);
 	return fileOps;
-}
-
-function getMessageFromLegacyEntry(entry: SessionTreeEntry): AgentMessage | undefined {
-	if (entry.type === "message") return entry.message;
-	if (entry.type === "custom_message") {
-		return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
-	}
-	if (entry.type === "branch_summary") {
-		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-	}
-	if (entry.type === "compaction") {
-		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-	}
-	return undefined;
-}
-
-function getMessageFromLegacyEntryForCompaction(entry: SessionTreeEntry): AgentMessage | undefined {
-	return entry.type === "compaction" ? undefined : getMessageFromLegacyEntry(entry);
 }
 
 /** Generated compaction data ready to be persisted as a compaction entry. */
@@ -324,6 +309,18 @@ export function estimateTokens(message: AgentMessage): number {
 	let chars = 0;
 
 	switch (message.role) {
+		case "system": {
+			const system = message as SystemMessage;
+			chars = estimateTextAndImageContentChars(system.content);
+			if (system.sections) {
+				for (const section of Object.values(system.sections)) {
+					if (section) chars += section.length;
+				}
+			}
+			if (system.toolsAdded) chars += safeJsonStringify(system.toolsAdded).length;
+			if (system.toolsRemoved) chars += safeJsonStringify(system.toolsRemoved).length;
+			return Math.ceil(chars / 4);
+		}
 		case "user": {
 			chars = estimateTextAndImageContentChars(
 				(message as { content: string | Array<{ type: string; text?: string }> }).content,
@@ -470,81 +467,125 @@ export function findCutPoint(
 	};
 }
 
-function findLegacyValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
+function isLegacyProjectionCutPointMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "assistant":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		case "toolResult":
+		case "system":
+			return false;
+	}
+}
+
+function isLegacyProjectionTurnStartMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		case "assistant":
+		case "toolResult":
+		case "system":
+			return false;
+	}
+}
+
+function findLegacyProjectedValidCutPoints(
+	entries: LegacyProjectedSessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): number[] {
 	const cutPoints: number[] = [];
 	for (let index = startIndex; index < endIndex; index++) {
 		const entry = entries[index];
-		if (entry.type === "message") {
-			switch (entry.message.role) {
-				case "bashExecution":
-				case "custom":
-				case "branchSummary":
-				case "compactionSummary":
-				case "user":
-				case "assistant":
-					cutPoints.push(index);
-					break;
-				case "toolResult":
-					break;
-			}
-		} else if (entry.type === "branch_summary") {
+		if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isLegacyProjectionCutPointMessage)) {
 			cutPoints.push(index);
 		}
 	}
 	return cutPoints;
 }
 
-function findLegacyTurnStartIndex(entries: SessionTreeEntry[], entryIndex: number, startIndex: number): number {
+function findLegacyProjectedTurnStartIndex(
+	entries: LegacyProjectedSessionEntry[],
+	entryIndex: number,
+	startIndex: number,
+): number {
 	for (let index = entryIndex; index >= startIndex; index--) {
-		const entry = entries[index];
-		if (entry.type === "branch_summary") return index;
-		if (entry.type === "message") {
-			const role = entry.message.role;
-			if (role === "user" || role === "bashExecution") return index;
-		}
+		if (entries[index].messages.some(isLegacyProjectionTurnStartMessage)) return index;
 	}
 	return -1;
 }
 
-function findLegacyCutPoint(
-	entries: SessionTreeEntry[],
+function findLegacyProjectedCutPoint(
+	entries: LegacyProjectedSessionEntry[],
 	startIndex: number,
 	endIndex: number,
 	keepRecentTokens: number,
 ): CutPointResult {
-	const cutPoints = findLegacyValidCutPoints(entries, startIndex, endIndex);
+	const cutPoints = findLegacyProjectedValidCutPoints(entries, startIndex, endIndex);
 	if (cutPoints.length === 0) {
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 
 	let accumulatedTokens = 0;
+	let exceededBudget = false;
 	let cutIndex = cutPoints[0];
 	for (let index = endIndex - 1; index >= startIndex; index--) {
-		const entry = entries[index];
-		if (entry.type !== "message") continue;
-		accumulatedTokens += estimateTokens(entry.message);
+		const messageTokens = entries[index].messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+		if (messageTokens === 0) continue;
+		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
-			for (const cutPoint of cutPoints) {
-				if (cutPoint >= index) {
-					cutIndex = cutPoint;
-					break;
-				}
-			}
+			exceededBudget = true;
+			cutIndex = cutPoints.find((candidate) => candidate >= index) ?? cutPoints[cutPoints.length - 1];
 			break;
 		}
 	}
+
+	// A completed recovery attempt and its omission edits are context-invisible after
+	// the last visible input. Advance past that closed suffix without skipping a
+	// replacement edit for a visible input.
+	const suffix = entries.slice(cutIndex + 1, endIndex);
+	const isIntrinsicallyVisible = (entry: LegacyProjectedSessionEntry): boolean =>
+		entry.sourceEntry.type !== "context_edit" && legacyEntryToContextMessages(entry.sourceEntry).length > 0;
+	const isOmitted = (entry: LegacyProjectedSessionEntry): boolean =>
+		isIntrinsicallyVisible(entry) && entry.messages.length === 0;
+	const omittedSuffixIds = new Set(suffix.filter(isOmitted).map((entry) => entry.sourceEntry.id));
+	const hasExternalReplacement = suffix.some(
+		(entry) =>
+			entry.sourceEntry.type === "context_edit" &&
+			entry.sourceEntry.replacement !== null &&
+			!omittedSuffixIds.has(entry.sourceEntry.targetId),
+	);
+	const isRecoveryOmissionSuffix =
+		exceededBudget &&
+		!hasExternalReplacement &&
+		suffix.some(
+			(entry) =>
+				entry.sourceEntry.type === "message" && entry.sourceEntry.message.role === "assistant" && isOmitted(entry),
+		) &&
+		suffix.every(
+			(entry) => entry.sourceEntry.type !== "compaction" && (!isIntrinsicallyVisible(entry) || isOmitted(entry)),
+		);
+	if (isRecoveryOmissionSuffix) cutIndex++;
+
 	while (cutIndex > startIndex) {
 		const previousEntry = entries[cutIndex - 1];
-		if (previousEntry.type === "compaction" || previousEntry.type === "message") break;
+		if (previousEntry.sourceEntry.type === "compaction" || previousEntry.messages.length > 0) break;
 		cutIndex--;
 	}
-	const cutEntry = entries[cutIndex];
-	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
-	const turnStartIndex = isUserMessage ? -1 : findLegacyTurnStartIndex(entries, cutIndex, startIndex);
+	const startsTurn = entries[cutIndex].messages.some(isLegacyProjectionTurnStartMessage);
+	const turnStartIndex = startsTurn ? -1 : findLegacyProjectedTurnStartIndex(entries, cutIndex, startIndex);
 	return {
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
-		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+		isSplitTurn: !startsTurn && turnStartIndex !== -1,
 	};
 }
 
@@ -771,6 +812,17 @@ async function summarizeChunk(
 				`Summarization failed: ${response.errorMessage || "Unknown error"}`,
 			),
 		);
+	}
+	if (response.stopReason === "length") {
+		return err(
+			new CompactionError(
+				"summarization_failed",
+				"Summarization failed: generation hit the token cap and the summary is incomplete",
+			),
+		);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		return err(new CompactionError("summarization_failed", "Summarization attempted to call a tool"));
 	}
 
 	return ok({ text: contentText(response.content), usage: response.usage });
@@ -1032,6 +1084,56 @@ export interface LegacyCompactionPreparation extends CompactionPreparation {
 	firstKeptEntryId: string;
 }
 
+function estimateLegacyProjectedContextTokens(
+	projection: ReturnType<typeof buildLegacySessionProjection>,
+	pathEntries: SessionTreeEntry[],
+): ContextUsageEstimate {
+	const estimate = estimateContextTokens(projection.messages);
+	if (estimate.lastUsageIndex !== null) {
+		let projectedMessageIndex = 0;
+		let usageEntryId: string | undefined;
+		for (const entry of projection.entries) {
+			const nextMessageIndex = projectedMessageIndex + entry.messages.length;
+			if (estimate.lastUsageIndex < nextMessageIndex) {
+				usageEntryId = entry.sourceEntry.id;
+				break;
+			}
+			projectedMessageIndex = nextMessageIndex;
+		}
+
+		const usageEntryIndex = usageEntryId ? pathEntries.findIndex((entry) => entry.id === usageEntryId) : -1;
+		let latestInvalidatingEntryIndex = -1;
+		for (let index = pathEntries.length - 1; index >= 0; index--) {
+			const entry = pathEntries[index];
+			if (entry.type === "context_edit" || entry.type === "compaction") {
+				latestInvalidatingEntryIndex = index;
+				break;
+			}
+		}
+		if (usageEntryIndex > latestInvalidatingEntryIndex) return estimate;
+	}
+
+	const currentSystem = getCurrentSystemMessage(projection.messages);
+	let tokens = currentSystem ? estimateTokens(currentSystem) : 0;
+	for (const message of projection.messages) {
+		if (message.role !== "system") tokens += estimateTokens(message);
+	}
+	return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
+}
+
+function getLegacyProjectedMessagesForCompaction(entry: LegacyProjectedSessionEntry): AgentMessage[] {
+	if (entry.sourceEntry.type === "compaction") return [];
+	// System messages are prompt state. The compaction entry snapshots their
+	// effective value so they must not be summarized or retained as conversation.
+	return entry.messages.filter((message) => message.role !== "system");
+}
+
+function getLegacyRetainedTailForCompaction(compaction: LegacyCompactionEntry): AgentMessage[] {
+	return (compaction.retainedTail ?? []).filter(
+		(message) => message.role !== "system" && !(message.role === "assistant" && message.stopReason === "deferred"),
+	);
+}
+
 /** Prepare a pi-client/pi-server session branch without changing its durable entry representation. */
 export function prepareLegacyCompaction(
 	pathEntries: SessionTreeEntry[],
@@ -1042,6 +1144,8 @@ export function prepareLegacyCompaction(
 		return ok(undefined);
 	}
 
+	const projection = buildLegacySessionProjection(pathEntries);
+	const projectedEntries = projection.entries;
 	let prevCompactionIndex = -1;
 	for (let index = pathEntries.length - 1; index >= 0; index--) {
 		if (pathEntries[index].type === "compaction") {
@@ -1055,16 +1159,20 @@ export function prepareLegacyCompaction(
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as LegacyCompactionEntry;
 		previousSummary = prevCompaction.summary;
-		const firstKeptEntryIndex = prevCompaction.firstKeptEntryId
-			? pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId)
-			: -1;
-		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		const projectedCompactionIndex = projectedEntries.findIndex(
+			(entry) => entry.sourceEntry.id === prevCompaction.id,
+		);
+		boundaryStart = projectedCompactionIndex >= 0 ? projectedCompactionIndex + 1 : projectedEntries.length;
 	}
-	const boundaryEnd = pathEntries.length;
-	const tokensBefore = estimateContextTokens(buildLegacySessionContext(pathEntries).messages).tokens;
+	const boundaryEnd = projectedEntries.length;
+	const tokensBefore = estimateLegacyProjectedContextTokens(projection, pathEntries).tokens;
+	const previousRetainedTail =
+		prevCompactionIndex >= 0
+			? getLegacyRetainedTailForCompaction(pathEntries[prevCompactionIndex] as LegacyCompactionEntry)
+			: [];
 
 	const forcedFirstKeptEntryIndex = options.firstKeptEntryId
-		? pathEntries.findIndex((entry) => entry.id === options.firstKeptEntryId)
+		? projectedEntries.findIndex((entry) => entry.sourceEntry.id === options.firstKeptEntryId)
 		: -1;
 	if (
 		options.firstKeptEntryId &&
@@ -1075,30 +1183,26 @@ export function prepareLegacyCompaction(
 	const cutPoint =
 		forcedFirstKeptEntryIndex >= boundaryStart && forcedFirstKeptEntryIndex < boundaryEnd
 			? { firstKeptEntryIndex: forcedFirstKeptEntryIndex, turnStartIndex: -1, isSplitTurn: false }
-			: findLegacyCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
-	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
+			: findLegacyProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKeptEntry?.id) {
 		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));
 	}
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
-	const messagesToSummarize: AgentMessage[] = [];
-	for (let index = boundaryStart; index < historyEnd; index++) {
-		const message = getMessageFromLegacyEntryForCompaction(pathEntries[index]);
-		if (message) messagesToSummarize.push(message);
-	}
-	const turnPrefixMessages: AgentMessage[] = [];
-	if (cutPoint.isSplitTurn) {
-		for (let index = cutPoint.turnStartIndex; index < cutPoint.firstKeptEntryIndex; index++) {
-			const message = getMessageFromLegacyEntryForCompaction(pathEntries[index]);
-			if (message) turnPrefixMessages.push(message);
-		}
-	}
-	const retainedTail: AgentMessage[] = [];
-	for (let index = cutPoint.firstKeptEntryIndex; index < boundaryEnd; index++) {
-		const message = getMessageFromLegacyEntryForCompaction(pathEntries[index]);
-		if (message) retainedTail.push(message);
-	}
+	const messagesToSummarize = [
+		...previousRetainedTail,
+		...projectedEntries.slice(boundaryStart, historyEnd).flatMap(getLegacyProjectedMessagesForCompaction),
+	];
+	const turnPrefixMessages = cutPoint.isSplitTurn
+		? projectedEntries
+				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
+				.flatMap(getLegacyProjectedMessagesForCompaction)
+		: [];
+	const retainedTail = projectedEntries
+		.slice(cutPoint.firstKeptEntryIndex, boundaryEnd)
+		.flatMap(getLegacyProjectedMessagesForCompaction);
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return ok(undefined);
 	const fileOps = extractLegacyFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
 	if (cutPoint.isSplitTurn) {
 		for (const message of turnPrefixMessages) extractFileOpsFromMessage(message, fileOps);
