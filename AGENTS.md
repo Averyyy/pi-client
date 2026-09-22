@@ -267,6 +267,8 @@ Attribution:
 
 For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
 
+For the Averyyy fork's combined release publication and local PiServerAtStartup update, use the personal skill `pi-client-release-deploy` and its `release-and-deploy.ps1` script. It performs the six-package tarball/integrity gate and preserves the existing service boundary; use `-ValidateOnly` for a no-mutation preflight.
+
 ## Upstream Sync
 
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
