@@ -654,11 +654,11 @@ function estimateTextTokens(text: string): number {
 }
 
 function buildSummaryPrompt(conversationText: string, basePrompt: string, previousSummary: string | undefined): string {
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	let promptText = `# Conversation\n${conversationText}\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
-	return promptText + basePrompt;
+	return `${promptText}# Instructions\n${basePrompt}`;
 }
 
 function getSummaryInputBudget(
@@ -1169,28 +1169,28 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 
-Summarize the prefix to provide context for the retained suffix:
+Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
 
 ## Original Request
-[What did the user ask for in this turn?]
+[What did the user ask for?]
 
-## Early Progress
-- [Key decisions and work done in the prefix]
+## Progress So Far
+- [Key decisions and work completed in these messages]
 
-## Context for Suffix
-- [Information needed to understand the retained recent work]
+## Context Needed to Continue
+- [Information from these messages needed to understand the later work]
 
-Be concise. Focus on what's needed to understand the kept suffix.`;
+Only summarize information explicitly present above. Do not infer or recreate later messages.`;
 
 const UPDATE_TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are the next part of the same oversized turn prefix.
 
 Update the existing turn-prefix summary in <previous-summary> tags. Keep the same sections:
 
 ## Original Request
-## Early Progress
-## Context for Suffix
+## Progress So Far
+## Context Needed to Continue
 
 Be concise. Preserve exact file paths, function names, and error messages.`;
 
