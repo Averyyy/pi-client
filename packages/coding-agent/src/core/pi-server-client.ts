@@ -911,6 +911,11 @@ export interface PiServerCompactOptions extends SimpleStreamOptions {
 	customInstructions?: string;
 	settings?: unknown;
 	preparation?: CompactionPreparationOptions;
+	/** Fixed-size digest of the exact provider message overlay for this session. */
+	cacheContextHash?: string;
+	/** Fixed-size digest of the synchronized static prompt and tools. */
+	cacheStaticContextHash?: string;
+	cacheFallbackReason?: string;
 	sessionTree?: PiServerTreeSnapshot;
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 }
@@ -953,6 +958,9 @@ export async function compactPiServer(
 			settings: options?.settings,
 			preparation,
 			customInstructions: options?.customInstructions,
+			cacheContextHash: options?.cacheContextHash,
+			cacheStaticContextHash: options?.cacheStaticContextHash,
+			cacheFallbackReason: options?.cacheFallbackReason,
 			baseTreeHash: sessionTreeHashes.get(sessionId) ?? hashEntries(tree.entries),
 			streamResponse: true,
 		});

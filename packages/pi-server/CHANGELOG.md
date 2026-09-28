@@ -38,6 +38,7 @@
 - Updated pi-server runtime dependencies to the current lockstep fork packages.
 - Used `--legacy-peer-deps` for npm-global fork updates so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 - Increased the pending chunk budget to 1 GiB so large session-tree appends do not fail at the previous 64 MiB Base64 limit.
+- Reused authoritative prompt prefixes for eligible server-side compaction summaries while retaining chunked handling for mismatched or oversized contexts.
 
 ### Changed
 

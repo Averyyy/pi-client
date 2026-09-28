@@ -1,9 +1,11 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import {
+	type CompactionCacheRequestOptions,
 	type CompactionPreparationOptions,
 	type CompactionSettings,
 	compactLegacy,
+	convertToLlm,
 	DEFAULT_COMPACTION_SETTINGS,
 	type LegacyCompactResult,
 	type ProxyAssistantMessageEvent,
@@ -26,6 +28,7 @@ import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
+import { hashPiServerProviderMessages } from "./pi-server-protocol.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
@@ -102,6 +105,9 @@ interface SessionCompactBody {
 	settings?: CompactionSettings;
 	preparation?: CompactionPreparationOptions;
 	customInstructions?: string;
+	cacheContextHash?: string;
+	cacheStaticContextHash?: string;
+	cacheFallbackReason?: string;
 	baseTreeHash?: string;
 	fullResponse?: boolean;
 	streamResponse?: boolean;
@@ -451,6 +457,8 @@ interface PreparedSessionCompact {
 	entryCount: number;
 	preparation: PreparedCompaction;
 	options: SimpleStreamOptions;
+	cacheContext?: Context;
+	cacheFallbackReason: string;
 }
 
 interface SessionCompactSuccessBody {
@@ -618,6 +626,13 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 	if (!body.model) {
 		return { status: 400, body: { error: "model is required" } };
 	}
+	const validDigest = (value: string | undefined): boolean => value === undefined || /^[a-f0-9]{64}$/.test(value);
+	if (!validDigest(body.cacheContextHash) || !validDigest(body.cacheStaticContextHash)) {
+		return { status: 400, body: { error: "cache context digests must be 64-character SHA-256 hex strings" } };
+	}
+	if ((body.cacheContextHash === undefined) !== (body.cacheStaticContextHash === undefined)) {
+		return { status: 400, body: { error: "cacheContextHash and cacheStaticContextHash must be supplied together" } };
+	}
 
 	const session = getSession(body.sessionId);
 	if (!session) {
@@ -660,6 +675,33 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 	}
 
 	const options = body.options ?? {};
+	let cacheContext: Context | undefined;
+	let cacheFallbackReason = body.cacheFallbackReason ?? "cache_context_digest_missing";
+	if (body.cacheContextHash && body.cacheStaticContextHash) {
+		if (options.sessionId !== session.sessionId) {
+			cacheFallbackReason = "session_id_mismatch";
+		} else if (options.cacheRetention === "none") {
+			cacheFallbackReason = "prompt_cache_disabled";
+		} else if (body.cacheStaticContextHash !== session.staticContextHash) {
+			cacheFallbackReason = "static_context_hash_mismatch";
+		} else {
+			const projectedMessages = convertToLlm(session.messages);
+			const priorAssistant = [...session.messages].reverse().find((message) => message.role === "assistant");
+			if (hashPiServerProviderMessages(projectedMessages) !== body.cacheContextHash) {
+				cacheFallbackReason = "request_context_digest_mismatch";
+			} else if (
+				!priorAssistant ||
+				priorAssistant.provider !== body.model.provider ||
+				priorAssistant.model !== body.model.id ||
+				priorAssistant.api !== body.model.api
+			) {
+				cacheFallbackReason = "summary_model_mismatch";
+			} else {
+				cacheContext = buildStreamContext(session, { contextOverlay: projectedMessages });
+				cacheFallbackReason = "exact_prefix_unavailable";
+			}
+		}
+	}
 	return {
 		session,
 		sessionId: session.sessionId,
@@ -669,6 +711,8 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 		entryCount: session.entries.length,
 		preparation: preparationResult.value,
 		options,
+		cacheContext,
+		cacheFallbackReason,
 	};
 }
 
@@ -708,6 +752,11 @@ async function completeSessionCompact(
 		body.customInstructions,
 		run?.controller.signal,
 		prepared.options.reasoning,
+		undefined,
+		undefined,
+		prepared.cacheContext,
+		prepared.options as CompactionCacheRequestOptions,
+		prepared.cacheFallbackReason,
 	);
 	if (!result.ok) {
 		return { status: 500, body: { error: result.error.message, code: PiServerErrorCode.INTERNAL_ERROR } };

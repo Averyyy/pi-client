@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type Model, normalizeContext, type TranscriptContext } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	type CompactionCacheRequestOptions,
 	type CompactionPreparation,
 	compact,
 	completeSummarization,
@@ -131,6 +132,7 @@ describe("generateSummary reasoning options", () => {
 	it("preserves the previous summary without an empty history request for a split turn", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			cachePrefixMessages: [],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -151,6 +153,133 @@ describe("generateSummary reasoning options", () => {
 		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
 	});
 
+	it("uses an exact normalized provider prefix and preserves cache routing options", async () => {
+		const stableSystem: AgentMessage = {
+			role: "system",
+			content: "Stable instructions",
+			toolsAdded: [{ name: "read", description: "Read files", parameters: {} }],
+			timestamp: 0,
+		};
+		const summarized: AgentMessage = { role: "user", content: "old work", timestamp: 1 };
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "retained-entry",
+			cachePrefixMessages: [stableSystem, summarized],
+			messagesToSummarize: [summarized],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+		const cachePrefix = normalizeContext({ messages: [stableSystem, summarized] });
+		const cacheOptions: CompactionCacheRequestOptions = {
+			sessionId: "current-session",
+			cacheRetention: "long",
+			transport: "sse",
+		};
+
+		const result = await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			cachePrefix,
+			cacheOptions,
+		);
+
+		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(requestContext.messages.slice(0, cachePrefix.messages.length)).toEqual(cachePrefix.messages);
+		expect(requestContext.messages.filter((message) => message.role === "system")).toHaveLength(1);
+		expect(JSON.stringify(requestContext.messages)).not.toContain("retained work");
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
+			sessionId: "current-session",
+			cacheRetention: "long",
+			transport: "sse",
+		});
+		expect(result.details).toMatchObject({ cachePath: { mode: "exact_prefix", reason: "provider_prefix_request" } });
+	});
+
+	it("keeps an aborted cache-prefix summary terminal", async () => {
+		completeSimpleMock.mockResolvedValueOnce({
+			...mockSummaryResponse,
+			content: [],
+			stopReason: "aborted",
+			errorMessage: "cancelled by provider",
+		});
+		const source: AgentMessage = { role: "user", content: "summary source", timestamp: 1 };
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "retained-entry",
+			cachePrefixMessages: [source],
+			messagesToSummarize: [source],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await expect(
+			compact(
+				preparation,
+				createModel(false),
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				normalizeContext({ messages: [source] }),
+				{ sessionId: "current-session", cacheRetention: "long" },
+			),
+		).rejects.toThrow("cancelled by provider");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("uses chunked summarization when the active session has no cache session ID", async () => {
+		const source: AgentMessage = { role: "user", content: "summary source", timestamp: 1 };
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "retained-entry",
+			cachePrefixMessages: [source],
+			messagesToSummarize: [source],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+		const result = await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			normalizeContext({ messages: [source] }),
+			{ cacheRetention: "long" },
+		);
+
+		expect(result.details).toMatchObject({ cachePath: { mode: "chunked", reason: "session_id_unavailable" } });
+		expect(completeSimpleMock.mock.calls[0]?.[2]?.cacheRetention).toBe("none");
+	});
+
 	it("rejects tool calls from conversation summaries", async () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 
@@ -163,6 +292,7 @@ describe("generateSummary reasoning options", () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			cachePrefixMessages: [],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -196,6 +326,7 @@ describe("generateSummary reasoning options", () => {
 		});
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			cachePrefixMessages: [],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -316,6 +447,7 @@ describe("generateSummary reasoning options", () => {
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			cachePrefixMessages: messages,
 			messagesToSummarize: messages,
 			turnPrefixMessages: messages,
 			isSplitTurn: true,

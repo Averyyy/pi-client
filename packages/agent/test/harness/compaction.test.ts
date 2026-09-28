@@ -8,6 +8,7 @@ import {
 	type Message,
 	type Model,
 	type Models,
+	normalizeContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -16,6 +17,7 @@ import {
 	type CompactionSettings,
 	calculateContextTokens,
 	compact,
+	compactWithRequest,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	estimateTokens,
@@ -26,6 +28,7 @@ import {
 	getLastAssistantUsage,
 	prepareCompaction,
 	prepareLegacyCompaction,
+	type SummaryRequest,
 	serializeConversation,
 	shouldCompact,
 } from "../../src/harness/compaction/compaction.ts";
@@ -35,6 +38,7 @@ import {
 	buildLegacySessionProjection,
 	type SessionTreeEntry,
 } from "../../src/harness/legacy-session.ts";
+import { convertToLlm } from "../../src/harness/messages.ts";
 import { buildSessionContext } from "../../src/harness/session/context.ts";
 import type {
 	BranchSummaryEntry,
@@ -866,6 +870,172 @@ describe("harness compaction", () => {
 		expect(seenOptions.map((options) => options?.cacheRetention)).toEqual(["none", "none"]);
 		const sessionIds = seenOptions.map((options) => options?.sessionId);
 		expect(sessionIds[0]).not.toBe(sessionIds[1]);
+	});
+
+	it("reuses the canonical compacted prefix without duplicating system/tools or the retained tail", async () => {
+		const previousTail = createUserMessage("previous retained work");
+		const summarizedMessage = createUserMessage("work to summarize");
+		const editCall: AssistantMessage = {
+			...createAssistantMessage(""),
+			content: [{ type: "toolCall", id: "edit-cache", name: "edit", arguments: { path: "src/cache.ts" } }],
+			stopReason: "toolUse",
+		};
+		const editResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "edit-cache",
+			toolName: "edit",
+			content: [{ type: "text", text: "updated cache logic" }],
+			isError: false,
+			timestamp: 3,
+		};
+		const retainedUser = createUserMessage("new retained tail");
+		const compaction: SessionTreeEntry = {
+			type: "compaction",
+			id: "previous-compaction",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			summary: "previous checkpoint",
+			firstKeptEntryId: "old-tail",
+			tokensBefore: 100,
+			retainedTail: [previousTail],
+			systemMessage: {
+				role: "system",
+				content: "Stable session instructions",
+				toolsAdded: [{ name: "read", description: "Read files", parameters: {} }],
+				timestamp: 1,
+			},
+		};
+		const summarizedEntry = createLegacyMessageEntry(summarizedMessage, compaction.id);
+		const editEntry = createLegacyMessageEntry(editCall, summarizedEntry.id);
+		const editResultEntry = createLegacyMessageEntry(editResult, editEntry.id);
+		const retainedUserEntry = createLegacyMessageEntry(retainedUser, editResultEntry.id);
+		const sessionEntries = [compaction, summarizedEntry, editEntry, editResultEntry, retainedUserEntry];
+		const preparation = getOrThrow(
+			prepareLegacyCompaction(sessionEntries, {
+				enabled: true,
+				reserveTokens: 2000,
+				keepRecentTokens: 1,
+			}),
+		);
+		if (!preparation) throw new Error("Expected legacy compaction preparation");
+		const cacheContext = {
+			messages: convertToLlm(buildLegacySessionContext(sessionEntries).messages),
+		};
+		const { model } = createFauxModel(false);
+		const calls: Array<{
+			context: { messages: Message[] };
+			options: Record<string, unknown>;
+			preservePromptCache: boolean | undefined;
+		}> = [];
+		const request: SummaryRequest = async (context, options, _context, preservePromptCache) => {
+			calls.push({
+				context,
+				options: options as Record<string, unknown>,
+				preservePromptCache,
+			});
+			return fauxAssistantMessage("## Goal\nUpdated summary");
+		};
+
+		const result = getOrThrow(
+			await compactWithRequest(
+				preparation,
+				{
+					model,
+					cacheContext,
+					cacheOptions: { sessionId: "cache-session", cacheRetention: "long", transport: "sse" },
+				},
+				request,
+				BACKGROUND_CONTEXT,
+			),
+		);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.preservePromptCache).toBe(true);
+		expect(calls[0]?.options).toMatchObject({
+			sessionId: "cache-session",
+			cacheRetention: "long",
+			transport: "sse",
+		});
+		const expectedPrefix = normalizeContext({
+			messages: convertToLlm(preparation.cachePrefixMessages ?? []),
+		}).messages;
+		expect(calls[0]?.context.messages.slice(0, expectedPrefix.length)).toEqual(expectedPrefix);
+		expect(calls[0]?.context.messages.slice(expectedPrefix.length)).toHaveLength(1);
+		expect(calls[0]?.context.messages.filter((message) => message.role === "system")).toHaveLength(1);
+		expect(calls[0]?.context.messages[0]).toMatchObject({
+			role: "system",
+			content: "Stable session instructions",
+			toolsAdded: [{ name: "read", description: "Read files" }],
+		});
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("previous checkpoint");
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("previous retained work");
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("work to summarize");
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("A prior compaction summary appears");
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("## Operational State");
+		expect(JSON.stringify(calls[0]?.context.messages)).toContain("Do not call tools");
+		expect(JSON.stringify(calls[0]?.context.messages)).not.toContain("new retained tail");
+		expect(result.summary).toContain("<modified-files>\nsrc/cache.ts\n</modified-files>");
+		expect(result.details).toMatchObject({ cachePath: { mode: "exact_prefix", reason: "provider_prefix_request" } });
+	});
+
+	it("falls back to chunking only after explicit provider context overflow", async () => {
+		const source = createUserMessage("history to summarize");
+		const preparation: CompactionPreparation = {
+			cachePrefixMessages: [source],
+			messagesToSummarize: [source],
+			turnPrefixMessages: [],
+			retainedTail: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2_000, keepRecentTokens: 20 },
+		};
+		const { model } = createFauxModel(false);
+		const cacheContext = { messages: convertToLlm([source]) };
+		const calls: Array<{ options: Record<string, unknown>; preserve: boolean | undefined }> = [];
+		let requestIndex = 0;
+		const request: SummaryRequest = async (_context, options, _requestContext, preservePromptCache) => {
+			calls.push({ options: options as Record<string, unknown>, preserve: preservePromptCache });
+			requestIndex++;
+			return requestIndex === 1
+				? fauxAssistantMessage("", { stopReason: "error", errorMessage: "maximum context length is 100 tokens" })
+				: fauxAssistantMessage("## Goal\nChunked summary");
+		};
+		const result = getOrThrow(
+			await compactWithRequest(
+				preparation,
+				{
+					model,
+					cacheContext,
+					cacheOptions: { sessionId: "cache-session", cacheRetention: "long" },
+				},
+				request,
+				BACKGROUND_CONTEXT,
+			),
+		);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]).toMatchObject({
+			preserve: true,
+			options: { cacheRetention: "long", sessionId: "cache-session" },
+		});
+		expect(calls[1]?.preserve).not.toBe(true);
+		expect(calls[1]?.options.cacheRetention).toBe("none");
+		expect(result.details).toMatchObject({ cachePath: { mode: "chunked", reason: "provider_context_overflow" } });
+
+		const failedCalls: boolean[] = [];
+		const providerError: SummaryRequest = async () => {
+			failedCalls.push(true);
+			return fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" });
+		};
+		const failed = await compactWithRequest(
+			preparation,
+			{ model, cacheContext, cacheOptions: { sessionId: "cache-session", cacheRetention: "long" } },
+			providerError,
+			BACKGROUND_CONTEXT,
+		);
+		expect(failed.ok).toBe(false);
+		expect(failedCalls).toHaveLength(1);
 	});
 
 	it("chunks summary input to fit the active model context window", async () => {

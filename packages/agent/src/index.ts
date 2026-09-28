@@ -53,6 +53,7 @@ export {
 	prepareBranchEntries,
 } from "./harness/compaction/branch-summarization.ts";
 export {
+	type CompactionCacheRequestOptions,
 	type CompactionPreparation,
 	type CompactionPreparationOptions,
 	type CompactionSettings,

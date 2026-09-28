@@ -3,14 +3,30 @@ import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as AgentCore from "@earendil-works/pi-agent-core";
-import { compactLegacy, type SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import {
+	buildLegacySessionContext,
+	compactLegacy,
+	convertToLlm,
+	type SessionTreeEntry,
+} from "@earendil-works/pi-agent-core";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	type Message,
+	type Model,
+	type Usage,
+} from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { compactWithRequest } from "../../agent/src/harness/compaction/compaction.ts";
+import { BACKGROUND_CONTEXT } from "../../agent/src/harness/context.ts";
 import {
 	compactPiServer,
+	hashStaticContext,
 	resetAllSessionTracking,
 	syncPiServerTree,
 } from "../../coding-agent/src/core/pi-server-client.ts";
+import { hashPiServerProviderMessages as hashClientProviderMessages } from "../../coding-agent/src/core/pi-server-protocol.ts";
+import { hashPiServerProviderMessages as hashServerProviderMessages } from "../src/pi-server-protocol.ts";
 import { createPiServer } from "../src/server.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 
@@ -52,6 +68,22 @@ let server: Server;
 let url: string;
 let storeDir: string;
 const realFetch = globalThis.fetch;
+
+it("hashes provider messages as canonical JSON with a fixed SHA-256 size", () => {
+	const first: Message = {
+		role: "user",
+		content: [{ type: "text", text: "request" }],
+		timestamp: 1,
+	};
+	const sameWithDifferentKeyOrder: Message = {
+		timestamp: 1,
+		content: [{ text: "request", type: "text" }],
+		role: "user",
+	};
+	const clientHash = hashClientProviderMessages([first]);
+	expect(clientHash).toHaveLength(64);
+	expect(clientHash).toBe(hashServerProviderMessages([sameWithDifferentKeyOrder]));
+});
 
 beforeEach(async () => {
 	clearAllSessions();
@@ -212,6 +244,181 @@ it("syncs context edits as raw entries and compacts their projected messages", a
 	expect(active?.messages[1]?.content).toBe("keep after compact");
 	expect(JSON.stringify(active?.messages)).not.toContain("omit from context");
 	expect(JSON.stringify(active?.messages)).not.toContain("projected replacement");
+});
+
+it("uses exact compact prefixes with server static context and rejects divergent overlays", async () => {
+	const compactBodies: Array<Record<string, unknown>> = [];
+	vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0] | URL, init?: RequestInit) => {
+		const requestUrl = input instanceof Request ? input.url : input instanceof URL ? input.href : input;
+		if (new URL(requestUrl).pathname === "/api/session/compact" && typeof init?.body === "string") {
+			const parsed: unknown = JSON.parse(init.body);
+			if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+				compactBodies.push(parsed as Record<string, unknown>);
+			}
+		}
+		return realFetch(input, init);
+	});
+	const usage: Usage = {
+		input: 10,
+		output: 2,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 12,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	const firstUser: SessionTreeEntry = {
+		type: "message",
+		id: "cache-first-user",
+		parentId: null,
+		timestamp: new Date(1).toISOString(),
+		message: { role: "user", content: "old work", timestamp: 1 },
+	};
+	const previousAssistant: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "old response" }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage,
+		stopReason: "stop",
+		timestamp: 2,
+	};
+	const assistantEntry: SessionTreeEntry = {
+		type: "message",
+		id: "cache-assistant",
+		parentId: firstUser.id,
+		timestamp: new Date(2).toISOString(),
+		message: previousAssistant,
+	};
+	const retainedUser: SessionTreeEntry = {
+		type: "message",
+		id: "cache-retained-user",
+		parentId: assistantEntry.id,
+		timestamp: new Date(3).toISOString(),
+		message: { role: "user", content: "retained tail", timestamp: 3 },
+	};
+	const sessionTree = { entries: [firstUser, assistantEntry, retainedUser], leafId: retainedUser.id };
+	const sessionId = "cache-prefix-compact";
+	const staticTool = { name: "read", description: "Read files", parameters: {} };
+	const staticContext = { systemPrompt: "Server session instructions", tools: [staticTool] };
+	const compactContext = { ...staticContext, messages: [] };
+	const cacheMessages = convertToLlm(buildLegacySessionContext(sessionTree.entries).messages);
+	const cacheContextHash = hashClientProviderMessages(cacheMessages);
+	const cacheStaticContextHash = hashStaticContext({ ...staticContext, messages: [] });
+	const summaryRequests: Array<{ context: { messages: Message[] }; options: Record<string, unknown> }> = [];
+
+	vi.mocked(compactLegacy).mockImplementationOnce(
+		async (
+			preparation,
+			_models,
+			requestModel,
+			customInstructions,
+			_signal,
+			thinkingLevel,
+			_retry,
+			_callbacks,
+			cacheContext,
+			cacheOptions,
+			cacheFallbackReason,
+		) => {
+			if (!cacheContext || !cacheOptions) throw new Error("Expected validated cache context");
+			const result = await compactWithRequest(
+				preparation,
+				{
+					model: requestModel,
+					customInstructions,
+					thinkingLevel,
+					cacheContext,
+					cacheOptions,
+					cacheFallbackReason,
+				},
+				async (summaryContext, options) => {
+					summaryRequests.push({ context: summaryContext, options: options as Record<string, unknown> });
+					return fauxAssistantMessage("## Goal\nUpdated summary");
+				},
+				BACKGROUND_CONTEXT,
+			);
+			if (!result.ok) return result;
+			return { ok: true, value: { ...result.value, firstKeptEntryId: preparation.firstKeptEntryId } };
+		},
+	);
+
+	const result = await compactPiServer(model, compactContext, {
+		sessionId,
+		settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 },
+		cacheRetention: "long",
+		sessionTree,
+		cacheContextHash,
+		cacheStaticContextHash,
+	});
+
+	const call = vi.mocked(compactLegacy).mock.calls[0];
+	const preparation = call?.[0];
+	expect(summaryRequests).toHaveLength(1);
+	expect(summaryRequests[0]?.options).toMatchObject({ sessionId, cacheRetention: "long" });
+	expect(summaryRequests[0]?.context.messages.filter((message) => message.role === "system")).toHaveLength(1);
+	expect(summaryRequests[0]?.context.messages[0]).toMatchObject({
+		role: "system",
+		content: "Server session instructions",
+		toolsAdded: [{ name: "read", description: "Read files" }],
+	});
+	expect(summaryRequests[0]?.context.messages.at(-1)?.role).toBe("user");
+	expect(result.compaction.details).toMatchObject({ cachePath: { mode: "exact_prefix" } });
+	expect(compactBodies[0]).not.toHaveProperty("cacheContext");
+	expect(compactBodies[0]?.cacheContextHash).toMatch(/^[a-f0-9]{64}$/);
+	expect(compactBodies[0]?.cacheStaticContextHash).toMatch(/^[a-f0-9]{64}$/);
+	expect(JSON.stringify(compactBodies[0])).not.toContain("old work");
+	expect(preparation?.cachePrefixMessages?.map((message) => JSON.stringify(message)).join("\n")).toContain("old work");
+	expect(JSON.stringify(preparation?.cachePrefixMessages)).not.toContain("retained tail");
+
+	const divergentSessionId = "cache-prefix-divergence";
+	vi.mocked(compactLegacy).mockImplementationOnce(
+		async (
+			preparation,
+			_models,
+			_requestModel,
+			_custom,
+			_signal,
+			_thinking,
+			_retry,
+			_callbacks,
+			cacheContext,
+			cacheOptions,
+			cacheFallbackReason,
+		) => {
+			expect(cacheContext).toBeUndefined();
+			expect(cacheOptions?.sessionId).toBe(divergentSessionId);
+			expect(cacheFallbackReason).toBe("request_context_digest_mismatch");
+			return {
+				ok: true,
+				value: {
+					summary: "chunked summary",
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+					retainedTail: preparation.retainedTail,
+					details: { cachePath: { mode: "chunked", reason: cacheFallbackReason ?? "unknown" } },
+				},
+			};
+		},
+	);
+	const divergentMessages = structuredClone(cacheMessages);
+	const first = divergentMessages[0];
+	if (!first || first.role !== "user") throw new Error("Expected provider user message");
+	first.content = "changed prompt";
+	const divergent = await compactPiServer(model, compactContext, {
+		sessionId: divergentSessionId,
+		settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 },
+		sessionTree: { entries: sessionTree.entries, leafId: sessionTree.leafId },
+		cacheContextHash: hashClientProviderMessages(divergentMessages),
+		cacheStaticContextHash,
+	});
+	const mismatchCall = vi.mocked(compactLegacy).mock.calls[1];
+	expect(mismatchCall?.[8]).toBeUndefined();
+	expect(mismatchCall?.[10]).toBe("request_context_digest_mismatch");
+	expect(divergent.compaction.details).toMatchObject({
+		cachePath: { mode: "chunked", reason: "request_context_digest_mismatch" },
+	});
+	expect(compactBodies[1]).not.toHaveProperty("cacheContext");
 });
 
 it("stores the effective system prompt and tools on a remote compaction checkpoint", async () => {

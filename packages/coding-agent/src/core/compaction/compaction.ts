@@ -51,7 +51,16 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	cachePath?: {
+		mode: "exact_prefix" | "chunked";
+		reason: string;
+	};
 }
+
+export type CompactionCacheRequestOptions = Pick<
+	SimpleStreamOptions,
+	"cacheRetention" | "sessionId" | "transport" | "thinkingBudgets" | "maxRetryDelayMs"
+>;
 
 /**
  * Extract file operations from messages and previous compaction entries.
@@ -704,7 +713,7 @@ function takeSummaryChunk(segments: string[], tokenBudget: number): { chunk: str
 }
 
 /**
- * Shared choke point for every compaction/branch-summary summarization call. Wraps the
+ * Shared choke point for compaction and branch-summary summarization calls. Wraps the
  * single LLM call in {@link retryAssistantCall} so transient stream drops (e.g.
  * `terminated`, socket close) honor the configured retry policy instead of failing
  * the whole compaction on the first attempt. Deterministic errors and aborts return
@@ -717,18 +726,76 @@ export async function completeSummarization(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	preservePromptCache = false,
 ): Promise<AssistantMessage> {
-	// Summaries are standalone requests, so isolate routing and avoid cache writes that cannot be reused.
+	// Chunk and branch summaries are one-off requests. The exact-prefix compaction path opts in explicitly.
 	const requestOptions: SimpleStreamOptions = {
 		...options,
-		cacheRetention: "none",
-		sessionId: options.sessionId ?? uuidv7(),
+		...(!preservePromptCache ? { cacheRetention: "none" as const } : {}),
+		sessionId: preservePromptCache ? options.sessionId : (options.sessionId ?? uuidv7()),
 	};
 	const produce = async (): Promise<AssistantMessage> =>
 		streamFn
 			? (await streamFn(model, context, requestOptions)).result()
 			: completeSimple(model, context, requestOptions);
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
+}
+
+async function summarizeCachePrefix(
+	cachePrefix: TranscriptContext,
+	model: Model<any>,
+	maxTokens: number,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	env: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn | undefined,
+	initialPrompt: string,
+	previousSummary: string | undefined,
+	retry: RetryPolicy | undefined,
+	callbacks: RetryCallbacks | undefined,
+	cacheOptions: CompactionCacheRequestOptions,
+): Promise<{ kind: "overflow" } | { kind: "summary"; text: string; usage: Usage }> {
+	const prefixScope =
+		"Summarize the conversation in the provider context above up to this instruction. That context is the canonical prefix selected by the compaction cut point; the retained tail is excluded. Do not call tools; output only the checkpoint summary. Report only observed failures. Preserve the latest exact failing assertion/error from the prior summary or transcript. Mark it resolved only if the same failing command/assertion passes or direct evidence fixes it; an unrelated later check does not resolve it. Otherwise keep the exact failure as unresolved/last known. Use (none) only when no prior or observed failure exists. Put unrun checks under Pending TODO, never Open failures.";
+	const instruction = previousSummary
+		? `${prefixScope}\n\nA prior compaction summary appears in the provider context above inside <summary> tags. Preserve its information and update the structured summary using the conversation messages that follow it. Keep the same sections and exact file paths, function names, and error messages.\n\n${initialPrompt}`
+		: `${prefixScope}\n\n${initialPrompt}`;
+	const context = normalizeContext({
+		messages: [
+			...cachePrefix.messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: instruction }],
+				timestamp: Date.now(),
+			},
+		],
+	});
+	const options = {
+		...createSummarizationOptions(
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			cacheOptions.sessionId,
+		),
+		...cacheOptions,
+	};
+	const response = await completeSummarization(model, context, options, streamFn, retry, callbacks, true);
+	if (response.stopReason === "error" && isContextOverflow(response, model.contextWindow)) return { kind: "overflow" };
+	if (response.stopReason === "aborted") {
+		throw new Error(response.errorMessage || "Summarization aborted");
+	}
+	const failure = getSummarizationFailure(response, "Summarization");
+	if (failure) throw new Error(failure);
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
+	}
+	return { kind: "summary", text: contentText(response.content), usage: response.usage };
 }
 
 async function summarizeChunk(
@@ -984,6 +1051,8 @@ export async function generateSummaryWithUsage(
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
+	/** Canonical model-visible session prefix before the current cut point. */
+	cachePrefixMessages: AgentMessage[];
 	/** Messages that will be summarized and discarded */
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
@@ -1135,6 +1204,7 @@ export function prepareCompaction(
 	const messagesToSummarize = projectedEntries
 		.slice(boundaryStart, historyEnd)
 		.flatMap(getMessagesFromProjectedEntryForCompaction);
+	const cachePrefixMessages = projectedEntries.slice(0, historyEnd).flatMap((entry) => entry.messages);
 	const turnPrefixMessages = cutPoint.isSplitTurn
 		? projectedEntries
 				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
@@ -1155,6 +1225,7 @@ export function prepareCompaction(
 
 	return {
 		firstKeptEntryId,
+		cachePrefixMessages,
 		messagesToSummarize,
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
@@ -1214,6 +1285,9 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	cachePrefixContext?: TranscriptContext,
+	cacheOptions?: CompactionCacheRequestOptions,
+	cacheFallbackReason?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1229,6 +1303,10 @@ export async function compact(
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
+	let cachePath: CompactionDetails["cachePath"] = {
+		mode: "chunked",
+		reason: isSplitTurn ? "split_turn" : (cacheFallbackReason ?? "exact_prefix_unavailable"),
+	};
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		let historyText = previousSummary ?? "No prior history.";
@@ -1271,25 +1349,60 @@ export async function compact(
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
 		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
 	} else {
-		// Just generate history summary
-		const result = await generateSummaryWithUsage(
-			messagesToSummarize,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			signal,
-			customInstructions,
-			previousSummary,
-			thinkingLevel,
-			streamFn,
-			env,
-			retry,
-			callbacks,
-			sessionId,
-		);
-		summary = result.text;
-		summaryUsage = result.usage;
+		let prefixResult: Awaited<ReturnType<typeof summarizeCachePrefix>> | undefined;
+		if (cachePrefixContext && cacheOptions?.sessionId) {
+			let initialPrompt = SUMMARIZATION_PROMPT;
+			if (customInstructions) {
+				initialPrompt = `${initialPrompt}\n\nAdditional focus: ${customInstructions}`;
+			}
+			prefixResult = await summarizeCachePrefix(
+				cachePrefixContext,
+				model,
+				getSummaryMaxTokens(model, settings.reserveTokens),
+				apiKey,
+				headers,
+				env,
+				signal,
+				thinkingLevel,
+				streamFn,
+				initialPrompt,
+				previousSummary,
+				retry,
+				callbacks,
+				cacheOptions,
+			);
+		}
+
+		if (prefixResult?.kind === "summary") {
+			summary = prefixResult.text;
+			summaryUsage = prefixResult.usage;
+			cachePath = { mode: "exact_prefix", reason: "provider_prefix_request" };
+		} else {
+			if (cachePrefixContext && cacheOptions && !cacheOptions.sessionId) {
+				cachePath = { mode: "chunked", reason: "session_id_unavailable" };
+			}
+			const result = await generateSummaryWithUsage(
+				messagesToSummarize,
+				model,
+				settings.reserveTokens,
+				apiKey,
+				headers,
+				signal,
+				customInstructions,
+				previousSummary,
+				thinkingLevel,
+				streamFn,
+				env,
+				retry,
+				callbacks,
+				sessionId,
+			);
+			summary = result.text;
+			summaryUsage = result.usage;
+			if (prefixResult?.kind === "overflow") {
+				cachePath = { mode: "chunked", reason: "provider_context_overflow" };
+			}
+		}
 	}
 
 	// Compute file lists and append to summary
@@ -1305,7 +1418,7 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, cachePath } as CompactionDetails,
 	};
 }
 

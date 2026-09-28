@@ -63,6 +63,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	type CompactionCacheRequestOptions,
 	type CompactionPreparation,
 	type CompactionPreparationOptions,
 	type CompactionResult,
@@ -115,9 +116,11 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import {
 	cancelPiServerOperations,
 	compactPiServer,
+	hashStaticContext,
 	type PiServerCompactionResult,
 	type PiServerHistorySnapshot,
 } from "./pi-server-client.ts";
+import { hashPiServerProviderMessages } from "./pi-server-protocol.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import {
@@ -480,6 +483,7 @@ export class AgentSession {
 	private _prePromptCompletionPromise: Promise<void> | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _lastServerCompactionTimestamp: number | undefined = undefined;
+	private _cachePrefixUnavailableReason: string | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -760,6 +764,7 @@ export class AgentSession {
 
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
+		if (previousPrepareRequest) this._cachePrefixUnavailableReason ??= "custom_prepare_request";
 		this.agent.prepareRequest = async (request, signal) => {
 			const canonicalContext = {
 				...request.context,
@@ -1707,6 +1712,7 @@ export class AgentSession {
 	 */
 	private _installAgentForcedPromptProjection(): void {
 		const previousTransformContext = this.agent.transformContext;
+		if (previousTransformContext) this._cachePrefixUnavailableReason ??= "custom_context_transform";
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
 			const forced = this._runSystemPromptOptions?.forceSystemPrompt;
@@ -2857,6 +2863,73 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _buildCompactionCacheInput(
+		model: Model<any>,
+		preparation?: CompactionPreparation,
+	): Promise<{
+		cachePrefixContext?: ReturnType<typeof normalizeContext>;
+		cacheContextHash?: string;
+		cacheStaticContextHash?: string;
+		cacheOptions?: CompactionCacheRequestOptions;
+		reason: string;
+	}> {
+		if (this._cachePrefixUnavailableReason) return { reason: this._cachePrefixUnavailableReason };
+		if (this.agent.onPayload) return { reason: "request_payload_hook_active" };
+		if (this._runSystemPromptOptions?.forceSystemPrompt !== undefined) {
+			return { reason: "forced_system_prompt_active" };
+		}
+		const activeModel = this.agent.state.model;
+		if (
+			!modelsAreEqual(model, activeModel) ||
+			model.api !== activeModel.api ||
+			model.baseUrl !== activeModel.baseUrl
+		) {
+			return { reason: "summary_model_mismatch" };
+		}
+		if (!this.agent.sessionId) return { reason: "session_id_unavailable" };
+
+		const projectedMessages = this.sessionManager.buildSessionProjection().messages;
+		if (JSON.stringify(projectedMessages) !== JSON.stringify(this.agent.state.messages)) {
+			return { reason: "request_context_mismatch" };
+		}
+		const fullMessages = await this.agent.convertToLlm(projectedMessages);
+		const fullContext = normalizeContext({ messages: fullMessages });
+		const cacheOptions: CompactionCacheRequestOptions = {
+			sessionId: this.agent.sessionId,
+			transport: this.agent.transport,
+			thinkingBudgets: this.agent.thinkingBudgets,
+			maxRetryDelayMs: this.agent.maxRetryDelayMs,
+		};
+		if (!preparation) {
+			return {
+				cacheContextHash: hashPiServerProviderMessages(fullMessages),
+				cacheStaticContextHash: hashStaticContext({
+					systemPrompt: this.systemPrompt,
+					tools: this.agent.state.tools,
+					messages: [],
+				}),
+				cacheOptions,
+				reason: "exact_prefix_unavailable",
+			};
+		}
+
+		const prefixMessages = await this.agent.convertToLlm(preparation.cachePrefixMessages);
+		const cachePrefixContext = normalizeContext({ messages: prefixMessages });
+		if (
+			cachePrefixContext.messages.length > fullContext.messages.length ||
+			cachePrefixContext.messages.some(
+				(message, index) => JSON.stringify(message) !== JSON.stringify(fullContext.messages[index]),
+			)
+		) {
+			return { reason: "projected_prefix_mismatch" };
+		}
+		return {
+			cachePrefixContext,
+			cacheOptions,
+			reason: "exact_prefix_unavailable",
+		};
+	}
+
 	private async _applyPiServerCompactionResult(
 		result: PiServerCompactionResult,
 		reason: "manual" | "threshold" | "overflow",
@@ -2934,6 +3007,7 @@ export class AgentSession {
 
 			if (isPiServerMode()) {
 				this._detachPiServerTerminalAssistantFailure();
+				const cacheInput = await this._buildCompactionCacheInput(requestModel);
 				const piServerResult = await compactPiServer(
 					requestModel,
 					{
@@ -2942,10 +3016,14 @@ export class AgentSession {
 						tools: this.agent.state.tools,
 					},
 					{
+						...cacheInput.cacheOptions,
 						sessionId: this.sessionId,
 						apiKey,
 						headers,
 						customInstructions,
+						cacheContextHash: cacheInput.cacheContextHash,
+						cacheStaticContextHash: cacheInput.cacheStaticContextHash,
+						cacheFallbackReason: cacheInput.reason,
 						settings: this.settingsManager.getCompactionSettings(),
 						sessionTree: buildPiServerSessionTree(
 							this.sessionManager.getEntries(),
@@ -3019,6 +3097,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Generate compaction result
+				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const result = await compact(
 					preparation,
 					requestModel,
@@ -3031,6 +3110,10 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+					undefined,
+					cacheInput.cachePrefixContext,
+					cacheInput.cacheOptions,
+					cacheInput.reason,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -3315,6 +3398,7 @@ export class AgentSession {
 					headers,
 				} = await this._getSummarizationRequestAuth(model, abortController.signal);
 				abortController.signal.throwIfAborted();
+				const cacheInput = await this._buildCompactionCacheInput(requestModel);
 				const piServerResult = await compactPiServer(
 					requestModel,
 					{
@@ -3323,9 +3407,13 @@ export class AgentSession {
 						tools: this.agent.state.tools,
 					},
 					{
+						...cacheInput.cacheOptions,
 						sessionId: this.sessionId,
 						apiKey,
 						headers,
+						cacheContextHash: cacheInput.cacheContextHash,
+						cacheStaticContextHash: cacheInput.cacheStaticContextHash,
+						cacheFallbackReason: cacheInput.reason,
 						settings,
 						preparation: preparationOptions,
 						sessionTree: buildPiServerSessionTree(
@@ -3408,6 +3496,7 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
+				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const compactResult = await compact(
 					preparation,
 					requestModel,
@@ -3420,6 +3509,10 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
+					undefined,
+					cacheInput.cachePrefixContext,
+					cacheInput.cacheOptions,
+					cacheInput.reason,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;

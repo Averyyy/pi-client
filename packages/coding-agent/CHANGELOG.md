@@ -27,6 +27,7 @@
 - Fixed disconnected pi-server streams to recover the same run before allowing an outer provider retry, preventing duplicate concurrent provider requests.
 - Fixed pi-client skipping auto-retry on pi-server HTTP 502/proxy failures. Same-run recovery now runs only after an event-stream has started, so a down proxy no longer reclassifies the original stream error as non-retryable.
 - Preserved oversized-session chunked summarization and pi-server compaction recovery while adopting upstream canonical context projection and extension boundaries.
+- Preserved eligible provider prompt prefixes during compaction summaries, with explicit reasons when the existing chunked path is required.
 
 ## [0.87.1] - 2026-09-22
 

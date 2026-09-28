@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { Tool } from "@earendil-works/pi-ai";
+import type { Message, Tool } from "@earendil-works/pi-ai";
 
 export interface PiServerStaticContext {
 	systemPrompt?: string;
@@ -18,6 +18,25 @@ export function hashPiServerStaticContext(context: PiServerStaticContext | undef
 		})),
 	};
 	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return Object.fromEntries(
+			Object.entries(record)
+				.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+				.map(([key, item]) => [key, canonicalizeJson(item)]),
+		);
+	}
+	return value;
+}
+
+export function hashPiServerProviderMessages(messages: readonly Message[]): string {
+	return createHash("sha256")
+		.update(JSON.stringify(canonicalizeJson(messages)))
+		.digest("hex");
 }
 
 export const PI_SERVER_EMPTY_TREE_HASH = createHash("sha256").update("pi-tree-v1").digest("hex");
