@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-durable",
-	"version": "0.87.1",
+	"version": "0.99.1",
 	"description": "Durable conversation, task, and document runtime for Pi",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -11,10 +11,30 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
 		},
+		"./env": {
+			"source": "./src/env/index.ts",
+			"types": "./dist/env/index.d.ts",
+			"import": "./dist/env/index.js"
+		},
+		"./env/node": {
+			"source": "./src/env/node.ts",
+			"types": "./dist/env/node.d.ts",
+			"import": "./dist/env/node.js"
+		},
 		"./storage/memory": {
 			"source": "./src/storage/memory.ts",
 			"types": "./dist/storage/memory.d.ts",
 			"import": "./dist/storage/memory.js"
+		},
+		"./storage/jsonl": {
+			"source": "./src/storage/jsonl/index.ts",
+			"types": "./dist/storage/jsonl/index.d.ts",
+			"import": "./dist/storage/jsonl/index.js"
+		},
+		"./storage/jsonl/node": {
+			"source": "./src/storage/jsonl/node.ts",
+			"types": "./dist/storage/jsonl/node.d.ts",
+			"import": "./dist/storage/jsonl/node.js"
 		},
 		"./storage/sqlite": {
 			"source": "./src/storage/sqlite/index.ts",
@@ -26,6 +46,11 @@
 			"types": "./dist/storage/sqlite/node.d.ts",
 			"import": "./dist/storage/sqlite/node.js"
 		},
+		"./testing": {
+			"source": "./src/testing/index.ts",
+			"types": "./dist/testing/index.d.ts",
+			"import": "./dist/testing/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"sideEffects": false,
@@ -36,7 +61,7 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json",
+		"build": "tsc -p tsconfig.build.json",
 		"test": "vitest --run",
 		"bench:storage": "vitest bench --config vitest.benchmark.config.ts",
 		"bench:storage:memory": "node --conditions=source --experimental-strip-types test/storage-memory.ts",
@@ -59,11 +84,11 @@
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@earendil-works/chord": "^0.87.1",
-		"@earendil-works/pi-ai": "^0.87.1"
+		"@earendil-works/chord": "^0.99.1",
+		"@earendil-works/pi-ai": "^0.99.1"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
-		"vitest": "4.1.9"
+		"vitest": "4.1.11"
 	}
 }

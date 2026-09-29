@@ -1,13 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(__dirname, "..");
-const repoRoot = resolve(pkgRoot, "../..");
 
 describe("coding-agent bins", () => {
 	it("package.json exposes only pi bin, not pi-client", () => {
@@ -40,7 +39,7 @@ describe("coding-agent bins", () => {
 					process.execPath,
 					[
 						"--import",
-						pathToFileURL(resolve(repoRoot, "node_modules/tsx/dist/loader.mjs")).href,
+						pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href,
 						join(pkgRoot, "src", "pi-client-cli.ts"),
 						"--help",
 					],
@@ -50,7 +49,6 @@ describe("coding-agent bins", () => {
 							HOME: join(root, "home"),
 							PI_CODING_AGENT_DIR: join(root, "agent"),
 							PI_OFFLINE: "true",
-							TSX_TSCONFIG_PATH: join(repoRoot, "tsconfig.json"),
 						},
 						stdio: ["ignore", stdoutFd, stderrFd],
 						timeout: 5_000,

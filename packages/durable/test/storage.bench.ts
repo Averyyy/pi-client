@@ -1,19 +1,22 @@
 import { strictEqual } from "node:assert/strict";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { afterAll, bench, describe } from "vitest";
-import { MemoryStorage } from "../src/storage/memory.ts";
-import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
-import type { Storage } from "../src/types.ts";
 import {
-	STORAGE_BENCHMARK_BACKENDS,
 	STORAGE_READ_BENCHMARKS,
 	STORAGE_WRITE_BENCHMARKS,
-	type StorageBenchmarkBackend,
 	seedStorageBenchmark,
-} from "./storage-benchmark.ts";
+	seedStorageWriteBenchmark,
+} from "@earendil-works/pi-durable/testing";
+import { afterAll, bench, describe } from "vitest";
+import { openNodeJsonlStorage } from "../src/storage/jsonl/node.ts";
+import { MemoryStorage } from "../src/storage/memory.ts";
+import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import type { EntryId, Storage } from "../src/types.ts";
+
+const STORAGE_BENCHMARK_BACKENDS = ["memory", "sqlite", "jsonl"] as const;
+type StorageBenchmarkBackend = (typeof STORAGE_BENCHMARK_BACKENDS)[number];
 
 const READ_OPTIONS = { time: 300, iterations: 10, warmupTime: 75, warmupIterations: 3 } as const;
 const WRITE_OPTIONS = { time: 0, iterations: 20, warmupTime: 0, warmupIterations: 5 } as const;
@@ -22,7 +25,6 @@ const REOPEN_OPTIONS = { time: 0, iterations: 20, warmupTime: 0, warmupIteration
 type Fixture = {
 	readonly backend: StorageBenchmarkBackend;
 	readonly storage: Storage;
-	readonly path?: string;
 };
 
 const fixtures: Fixture[] = [];
@@ -36,8 +38,17 @@ async function createFixture(backend: StorageBenchmarkBackend): Promise<Fixture>
 	}
 	const directory = await mkdtemp(join(tmpdir(), "pi-durable-benchmark-"));
 	directories.push(directory);
-	const path = join(directory, "storage.sqlite");
-	const fixture = { backend, storage: await openNodeSqliteStorage(path), path } satisfies Fixture;
+	if (backend === "sqlite") {
+		const path = join(directory, "storage.sqlite");
+		const fixture = { backend, storage: await openNodeSqliteStorage(path) } satisfies Fixture;
+		fixtures.push(fixture);
+		return fixture;
+	}
+	const path = join(directory, "storage");
+	const fixture = {
+		backend,
+		storage: await openNodeJsonlStorage(path, BACKGROUND_CONTEXT),
+	} satisfies Fixture;
 	fixtures.push(fixture);
 	return fixture;
 }
@@ -71,21 +82,7 @@ for (const scenario of STORAGE_READ_BENCHMARKS) {
 
 async function createWriteFixture(backend: StorageBenchmarkBackend): Promise<Fixture> {
 	const fixture = await createFixture(backend);
-	await fixture.storage.commit([{ type: "conversation", value: { id: 1 } }], BACKGROUND_CONTEXT);
-	await fixture.storage.commit(
-		await Promise.all(
-			Array.from({ length: 100 }, async (_, index) => ({
-				type: "entry" as const,
-				value: {
-					id: await fixture.storage.mintId(),
-					conversationId: 1,
-					kind: "benchmark.baseline",
-					data: { index },
-				},
-			})),
-		),
-		BACKGROUND_CONTEXT,
-	);
+	await seedStorageWriteBenchmark(fixture.storage);
 	return fixture;
 }
 
@@ -117,41 +114,74 @@ for (const scenario of STORAGE_WRITE_BENCHMARKS) {
 	});
 }
 
-const reopenDirectory = await mkdtemp(join(tmpdir(), "pi-durable-reopen-benchmark-"));
-directories.push(reopenDirectory);
-const reopenPath = join(reopenDirectory, "storage.sqlite");
-const reopenSeed = await openNodeSqliteStorage(reopenPath);
-const reopenDataset = await seedStorageBenchmark(reopenSeed);
-await reopenSeed.close(BACKGROUND_CONTEXT);
-const reopenPaths = await Promise.all(
-	Array.from({ length: REOPEN_OPTIONS.iterations + REOPEN_OPTIONS.warmupIterations }, async () => {
-		const directory = await mkdtemp(join(tmpdir(), "pi-durable-reopen-sample-"));
-		directories.push(directory);
-		const path = join(directory, "storage.sqlite");
-		await copyFile(reopenPath, path);
-		return path;
-	}),
-);
+type PersistentBackend = Exclude<StorageBenchmarkBackend, "memory">;
+type ReopenFixture = {
+	readonly backend: PersistentBackend;
+	readonly path: string;
+	readonly firstEntryId: EntryId;
+	readonly samples: string[];
+};
+
+async function openPersistentStorage(backend: PersistentBackend, path: string): Promise<Storage> {
+	return backend === "sqlite" ? openNodeSqliteStorage(path) : openNodeJsonlStorage(path, BACKGROUND_CONTEXT);
+}
+
+async function copyPersistentStorage(backend: PersistentBackend, source: string, destination: string): Promise<void> {
+	if (backend === "sqlite") await copyFile(source, destination);
+	else await cp(source, destination, { recursive: true });
+}
+
+const reopenFixtures: ReopenFixture[] = [];
+for (const backend of STORAGE_BENCHMARK_BACKENDS) {
+	if (backend === "memory") continue;
+	const seedDirectory = await mkdtemp(join(tmpdir(), `pi-durable-${backend}-reopen-benchmark-`));
+	directories.push(seedDirectory);
+	const seedPath = join(seedDirectory, backend === "sqlite" ? "storage.sqlite" : "storage");
+	const seed = await openPersistentStorage(backend, seedPath);
+	const dataset = await seedStorageBenchmark(seed);
+	await seed.close(BACKGROUND_CONTEXT);
+	const samples = await Promise.all(
+		Array.from({ length: REOPEN_OPTIONS.iterations + REOPEN_OPTIONS.warmupIterations }, async () => {
+			const directory = await mkdtemp(join(tmpdir(), `pi-durable-${backend}-reopen-sample-`));
+			directories.push(directory);
+			const path = join(directory, backend === "sqlite" ? "storage.sqlite" : "storage");
+			await copyPersistentStorage(backend, seedPath, path);
+			return path;
+		}),
+	);
+	reopenFixtures.push({ backend, path: seedPath, firstEntryId: dataset.firstEntryId, samples });
+}
+
 const reopenedStorages: Storage[] = [];
-async function reopenAndRead(path: string): Promise<{ readonly id: number; readonly storage: Storage }> {
-	const storage = await openNodeSqliteStorage(path);
-	const id = (await storage.entry(reopenDataset.firstEntryId, BACKGROUND_CONTEXT))?.entry.id ?? -1;
+async function reopenAndRead(
+	backend: PersistentBackend,
+	path: string,
+	firstEntryId: EntryId,
+): Promise<{ readonly id: number; readonly storage: Storage }> {
+	const storage = await openPersistentStorage(backend, path);
+	const id = (await storage.entry(firstEntryId, BACKGROUND_CONTEXT))?.entry.id ?? -1;
 	return { id, storage };
 }
-const reopenValidation = await reopenAndRead(reopenPath);
-strictEqual(reopenValidation.id, reopenDataset.firstEntryId);
-await reopenValidation.storage.close(BACKGROUND_CONTEXT);
-describe("SQLite reopen and first exact read", () => {
-	bench(
-		"sqlite",
-		async () => {
-			const path = reopenPaths.shift();
-			if (path === undefined) throw new Error("Reopen benchmark fixture pool was exhausted");
-			const result = await reopenAndRead(path);
-			reopenedStorages.push(result.storage);
-		},
-		REOPEN_OPTIONS,
-	);
+
+for (const fixture of reopenFixtures) {
+	const reopenValidation = await reopenAndRead(fixture.backend, fixture.path, fixture.firstEntryId);
+	strictEqual(reopenValidation.id, fixture.firstEntryId);
+	await reopenValidation.storage.close(BACKGROUND_CONTEXT);
+}
+
+describe("reopen and first exact read", () => {
+	for (const fixture of reopenFixtures) {
+		bench(
+			fixture.backend,
+			async () => {
+				const path = fixture.samples.shift();
+				if (path === undefined) throw new Error("Reopen benchmark fixture pool was exhausted");
+				const result = await reopenAndRead(fixture.backend, path, fixture.firstEntryId);
+				reopenedStorages.push(result.storage);
+			},
+			REOPEN_OPTIONS,
+		);
+	}
 });
 
 afterAll(async () => {

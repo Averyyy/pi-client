@@ -11,13 +11,15 @@ const pkgRoot = join(__dirname, "..");
 const repoRoot = resolve(pkgRoot, "../..");
 const wrapperPath = join(pkgRoot, "bin", "pi-server.js");
 const sourcePath = join(pkgRoot, "src", "cli.ts");
-const tsxLoaderPath = pathToFileURL(join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs")).href;
+const sourceResolverUrl = pathToFileURL(
+	join(repoRoot, "packages", "coding-agent", "src", "experimental", "source-resolver.ts"),
+).href;
 const packageVersion = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8")).version;
 
 function runCli(script, args, environment) {
-	const commandArgs = script === sourcePath ? ["--import", tsxLoaderPath, script, ...args] : [script, ...args];
+	const commandArgs = script === sourcePath ? ["--import", sourceResolverUrl, script, ...args] : [script, ...args];
 	return spawnSync(process.execPath, commandArgs, {
-		env: { ...process.env, TSX_TSCONFIG_PATH: join(repoRoot, "tsconfig.json"), ...environment },
+		env: { ...process.env, ...environment },
 		encoding: "utf-8",
 		timeout: 2_000,
 	});

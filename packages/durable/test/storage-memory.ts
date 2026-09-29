@@ -1,23 +1,25 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { MemoryStorage } from "../src/storage/memory.ts";
-import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
-import type { Storage } from "../src/types.ts";
 import {
-	STORAGE_BENCHMARK_BACKENDS,
 	STORAGE_MEMORY_SCALES,
 	STORAGE_READ_BENCHMARKS,
-	type StorageBenchmarkBackend,
 	type StorageBenchmarkScale,
 	seedStorageBenchmark,
 	storageBenchmarkPrimaryRecordCount,
-} from "./storage-benchmark.ts";
+} from "@earendil-works/pi-durable/testing";
+import { openNodeJsonlStorage } from "../src/storage/jsonl/node.ts";
+import { MemoryStorage } from "../src/storage/memory.ts";
+import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import type { Storage } from "../src/types.ts";
+
+const STORAGE_BENCHMARK_BACKENDS = ["memory", "sqlite", "jsonl"] as const;
+type StorageBenchmarkBackend = (typeof STORAGE_BENCHMARK_BACKENDS)[number];
 
 type MemorySnapshot = {
 	readonly heapUsed: number;
@@ -25,12 +27,23 @@ type MemorySnapshot = {
 	readonly external: number;
 };
 
-type SqliteFootprint = {
-	readonly mainBytes: number;
-	readonly walBytes: number;
-	readonly pageCount: number;
-	readonly freelistCount: number;
-};
+type DiskFootprint =
+	| {
+			readonly kind: "sqlite";
+			readonly mainBytes: number;
+			readonly auxiliaryBytes: number;
+			readonly fileCount: number;
+			readonly pageCount: number;
+			readonly freelistCount: number;
+	  }
+	| {
+			readonly kind: "jsonl";
+			readonly mainBytes: number;
+			readonly auxiliaryBytes: number;
+			readonly fileCount: number;
+			readonly documentFiles: number;
+			readonly taskFiles: number;
+	  };
 
 type StorageMemoryResult = {
 	readonly backend: StorageBenchmarkBackend;
@@ -39,7 +52,7 @@ type StorageMemoryResult = {
 	readonly baseline: MemorySnapshot;
 	readonly postSeed: MemorySnapshot;
 	readonly postRead: MemorySnapshot;
-	readonly sqlite?: SqliteFootprint;
+	readonly disk?: DiskFootprint;
 };
 
 const execFileAsync = promisify(execFile);
@@ -63,7 +76,7 @@ async function fileSize(path: string): Promise<number> {
 	}
 }
 
-function sqliteMetrics(path: string): SqliteFootprint {
+function sqliteMetrics(path: string): Extract<DiskFootprint, { readonly kind: "sqlite" }> {
 	const database = new DatabaseSync(path, { readOnly: true });
 	try {
 		const pageCount = database.prepare("SELECT page_count AS value FROM pragma_page_count()").get() as {
@@ -72,10 +85,36 @@ function sqliteMetrics(path: string): SqliteFootprint {
 		const freelistCount = database.prepare("SELECT freelist_count AS value FROM pragma_freelist_count()").get() as {
 			readonly value: number;
 		};
-		return { mainBytes: 0, walBytes: 0, pageCount: pageCount.value, freelistCount: freelistCount.value };
+		return {
+			kind: "sqlite",
+			mainBytes: 0,
+			auxiliaryBytes: 0,
+			fileCount: 0,
+			pageCount: pageCount.value,
+			freelistCount: freelistCount.value,
+		};
 	} finally {
 		database.close();
 	}
+}
+
+async function jsonlMetrics(directory: string): Promise<Extract<DiskFootprint, { readonly kind: "jsonl" }>> {
+	const entries = await readdir(directory, { withFileTypes: true });
+	let mainBytes = 0;
+	let auxiliaryBytes = 0;
+	let fileCount = 0;
+	let documentFiles = 0;
+	let taskFiles = 0;
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const bytes = await fileSize(join(directory, entry.name));
+		fileCount++;
+		if (entry.name === "main.jsonl") mainBytes += bytes;
+		else auxiliaryBytes += bytes;
+		if (entry.name.startsWith("doc-") && entry.name.endsWith(".jsonl")) documentFiles++;
+		if (entry.name.startsWith("task-") && entry.name.endsWith(".jsonl")) taskFiles++;
+	}
+	return { kind: "jsonl", mainBytes, auxiliaryBytes, fileCount, documentFiles, taskFiles };
 }
 
 async function runWorker(backend: StorageBenchmarkBackend, scale: StorageBenchmarkScale): Promise<void> {
@@ -85,9 +124,12 @@ async function runWorker(backend: StorageBenchmarkBackend, scale: StorageBenchma
 	if (backend === "memory") {
 		storage = new MemoryStorage();
 	} else {
-		directory = await mkdtemp(join(tmpdir(), "pi-durable-memory-"));
-		path = join(directory, "storage.sqlite");
-		storage = await openNodeSqliteStorage(path);
+		directory = await mkdtemp(join(tmpdir(), `pi-durable-${backend}-memory-`));
+		path = join(directory, backend === "sqlite" ? "storage.sqlite" : "storage");
+		storage =
+			backend === "sqlite"
+				? await openNodeSqliteStorage(path)
+				: await openNodeJsonlStorage(path, BACKGROUND_CONTEXT);
 	}
 
 	try {
@@ -108,17 +150,19 @@ async function runWorker(backend: StorageBenchmarkBackend, scale: StorageBenchma
 		if (!Number.isFinite(checksum)) throw new Error("Storage memory read checksum is invalid");
 		collectGarbage();
 		const postRead = snapshot();
-		let sqlite: SqliteFootprint | undefined;
-		if (path !== undefined) {
-			sqlite = sqliteMetrics(path);
-			sqlite = {
-				...sqlite,
+		let disk: DiskFootprint | undefined;
+		if (path !== undefined && backend === "sqlite") {
+			disk = {
+				...sqliteMetrics(path),
 				mainBytes: await fileSize(path),
-				walBytes: await fileSize(`${path}-wal`),
+				auxiliaryBytes: (await fileSize(`${path}-wal`)) + (await fileSize(`${path}-shm`)),
+				fileCount: 3,
 			};
+		} else if (path !== undefined) {
+			disk = await jsonlMetrics(path);
 		}
 		const recordCount = storageBenchmarkPrimaryRecordCount(scale);
-		console.log(JSON.stringify({ backend, scale: scale.name, recordCount, baseline, postSeed, postRead, sqlite }));
+		console.log(JSON.stringify({ backend, scale: scale.name, recordCount, baseline, postSeed, postRead, disk }));
 	} finally {
 		await storage.close(BACKGROUND_CONTEXT);
 		if (directory !== undefined) await rm(directory, { recursive: true, force: true });
@@ -167,10 +211,17 @@ async function runDriver(): Promise<void> {
 			"JS heap bytes/primary record": Math.round(
 				delta(result.postSeed, result.baseline, "heapUsed") / result.recordCount,
 			),
-			"live SQLite main MiB": result.sqlite === undefined ? "-" : mebibytes(result.sqlite.mainBytes),
-			"live SQLite WAL MiB": result.sqlite === undefined ? "-" : mebibytes(result.sqlite.walBytes),
-			"SQLite pages/free":
-				result.sqlite === undefined ? "-" : `${result.sqlite.pageCount}/${result.sqlite.freelistCount}`,
+			"disk main MiB": result.disk === undefined ? "-" : mebibytes(result.disk.mainBytes),
+			"disk auxiliary MiB": result.disk === undefined ? "-" : mebibytes(result.disk.auxiliaryBytes),
+			"disk total MiB":
+				result.disk === undefined ? "-" : mebibytes(result.disk.mainBytes + result.disk.auxiliaryBytes),
+			"disk files": result.disk?.fileCount ?? "-",
+			"disk detail":
+				result.disk === undefined
+					? "-"
+					: result.disk.kind === "sqlite"
+						? `pages/free ${result.disk.pageCount}/${result.disk.freelistCount}`
+						: `documents/tasks ${result.disk.documentFiles}/${result.disk.taskFiles}`,
 		})),
 	);
 }

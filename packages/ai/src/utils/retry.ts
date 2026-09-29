@@ -21,6 +21,10 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	"out of budget",
 	"quota exceeded",
 	"billing",
+
+	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
+	// after hours rather than seconds.
+	"subscription_sharing_usage_limit_exceeded",
 ]);
 
 /**
@@ -178,6 +182,8 @@ export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	// Azure peak-load responses mention usage size while still representing a
 	// transient capacity failure (upstream regression #9669).
 	if (/currently experiencing high demand|peak load/i.test(errorMessage)) return true;
+	// Sign in with ChatGPT: usage or user data temporarily unavailable, possibly mid-stream without an HTTP 503.
+	if (/subscription_sharing_(?:usage|user)_unavailable/i.test(errorMessage)) return true;
 	if (/usage|quota|balance/i.test(errorMessage)) return false;
 	return true;
 }

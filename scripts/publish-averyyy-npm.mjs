@@ -15,6 +15,8 @@ const buildWorkspaces = [
 	"packages/telemetry",
 	"packages/ai",
 	"packages/chord",
+	"packages/codemode",
+	"packages/mcp",
 	"packages/agent",
 	"packages/protocol",
 	"packages/client",

@@ -22,13 +22,26 @@ async function sourceGraph(entry: string): Promise<Set<string>> {
 }
 
 describe("durable storage runtime boundaries", () => {
-	it("keeps the package root free of SQLite and Node imports", async () => {
+	it("keeps the package root limited to portable core storage", async () => {
 		const graph = await sourceGraph("index.ts");
+		expect([...graph].some((path) => path.includes("/env/"))).toBe(false);
+		expect([...graph].some((path) => path.includes("/storage/jsonl/"))).toBe(false);
 		expect([...graph].some((path) => path.includes("/storage/sqlite/"))).toBe(false);
 	});
 
 	it("keeps the portable SQLite subpath free of Node imports", async () => {
 		const graph = await sourceGraph("storage/sqlite/index.ts");
 		expect([...graph].some((path) => path.endsWith("/storage/sqlite/node.ts"))).toBe(false);
+	});
+
+	it("keeps the portable environment subpath free of Node imports", async () => {
+		const graph = await sourceGraph("env/index.ts");
+		expect([...graph].some((path) => path.endsWith("/env/node.ts"))).toBe(false);
+	});
+
+	it("keeps the portable JSONL subpath free of Node imports", async () => {
+		const graph = await sourceGraph("storage/jsonl/index.ts");
+		expect([...graph].some((path) => path.endsWith("/storage/jsonl/node.ts"))).toBe(false);
+		expect([...graph].some((path) => path.endsWith("/env/node.ts"))).toBe(false);
 	});
 });

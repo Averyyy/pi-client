@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
+// --import takes a module specifier, not a filesystem path.
 const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
 const tempDirs: string[] = [];
 
@@ -26,20 +26,15 @@ function createTempDir(): string {
 async function runCli(args: string[], cwd: string, agentDir: string): Promise<{ code: number | null; stderr: string }> {
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
-		const child = spawn(
-			process.execPath,
-			["--import", tsxLoaderUrl, "--import", sourceResolverUrl, cliPath, ...args],
-			{
-				cwd,
-				env: {
-					...process.env,
-					[ENV_AGENT_DIR]: agentDir,
-					PI_OFFLINE: "1",
-					TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
-				},
-				stdio: ["ignore", "ignore", "pipe"],
+		const child = spawn(process.execPath, ["--import", sourceResolverUrl, cliPath, ...args], {
+			cwd,
+			env: {
+				...process.env,
+				[ENV_AGENT_DIR]: agentDir,
+				PI_OFFLINE: "1",
 			},
-		);
+			stdio: ["ignore", "ignore", "pipe"],
+		});
 		child.stderr.on("data", (chunk) => {
 			stderr += chunk.toString();
 		});
