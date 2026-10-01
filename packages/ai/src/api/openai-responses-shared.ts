@@ -294,16 +294,13 @@ export function convertResponsesMessages<TApi extends Api>(
 					let itemId: string | undefined = itemIdRaw;
 
 					// For different-model messages, set id to undefined to avoid pairing validation.
-					// OpenAI tracks which fc_xxx IDs were paired with rs_xxx reasoning items.
+					// OpenAI tracks which item IDs were paired with rs_xxx reasoning items.
 					// By omitting the id, we avoid triggering that validation (like cross-provider does).
-					// A tool can also change between function and custom grammar representations across
-					// resume. Drop item ids whose prefix does not match the representation being replayed;
-					// call_id remains the stable tool-call/output pairing key.
-					const expectedItemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
-					if (
-						(isDifferentModel && itemId?.startsWith("fc_")) ||
-						(itemId !== undefined && !itemId.startsWith(expectedItemIdPrefix))
-					) {
+					// Also drop ids that do not match the replayed item type: function_call ids must be fc_*
+					// and custom_tool_call ids must be ctc_*. Foreign tool call ids are normalized to fc_*, and
+					// a call can switch between the two types when grammar tool support differs.
+					const itemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
+					if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
 						itemId = undefined;
 					}
 

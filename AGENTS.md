@@ -288,6 +288,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 - Provider adapters must resolve system instructions and tools from `TranscriptContext` with `getCurrentSystemPrompt()` and `getCurrentTools()`. Cover normalized public dispatch in protocol tests; calling an adapter with legacy top-level fields can hide dropped system messages and tool declarations.
 - Cache-warming `UsageEntry` records are local metadata, not legacy pi-server tree entries. Before sending a legacy tree, omit them and reconnect parent and leaf IDs across omitted usage entries.
 - When upstream removes an old eval harness or native dependency, accept the deletion only after checking fork-specific references; regenerate the root lockfile afterward so retained fork workspaces and aliases are represented.
+- Restoring modify/delete conflicts under `packages/agent/src/harness` alone does not restore legacy pi-server APIs after upstream's v1.0.0 package split; verify the complete import graph and runtime dependency declarations before treating the merge as release-ready.
 
 ## User Override
 
