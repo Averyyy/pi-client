@@ -141,7 +141,6 @@ function pendingTask(id: TaskId<JsonValue>, phase = "ready"): StoredTask {
 		version: 1,
 		input: null,
 		state: { status: "pending", checkpoint: { phase } },
-		after: [],
 		background: false,
 		abortRequested: false,
 	};
@@ -155,7 +154,6 @@ function terminalTask(id: TaskId<JsonValue>): StoredTask {
 		version: 1,
 		input: null,
 		state: { status: "terminal", outcome: { status: "completed", result: null } },
-		after: [],
 		background: false,
 		abortRequested: false,
 	};

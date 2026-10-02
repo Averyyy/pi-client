@@ -144,7 +144,6 @@ function pendingTask(id: TaskId<JsonValue>): TaskRecord<JsonValue, JsonValue, Js
 		version: 1,
 		input: null,
 		state: { status: "pending", checkpoint: { phase: "ready" } },
-		after: [],
 		background: false,
 		abortRequested: false,
 	};
