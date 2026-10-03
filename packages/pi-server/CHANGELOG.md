@@ -4,6 +4,7 @@
 
 ### Added
 
+- Reported the resolved cache-retention policy before provider dispatch and retained it for same-run recovery and replay, without returning server credentials or environment values.
 - Added an authenticated mixed model catalog and image/classifier endpoints with heartbeat streaming, completed-run recovery, and acknowledged cancellation.
 - Added correlated provider lifecycle callbacks so client extensions can inspect responses and replace request payloads before provider dispatch.
 - Added remote deferred response fetch and cancellation with server credentials and the same callback and recovery transport.
@@ -25,6 +26,7 @@
 
 ### Fixed
 
+- Preserved native provider authentication and raw/simple dispatch through the request adapter, including server-side bearer and federation credentials.
 - Preserved sampling parameters, tool choice, deferred controls, environment overrides, API-specific options, parsed provider events, and authoritative failed assistant messages in proxy streams.
 - Included constrained tool sampling declarations in static-context hashes and registered operation payloads with the chunk transport for bounded request bodies.
 - Made compaction of an active compaction leaf idempotent and exposed completed compaction results for same-run recovery after response interruption.

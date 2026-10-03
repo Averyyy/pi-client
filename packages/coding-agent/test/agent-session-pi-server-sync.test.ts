@@ -142,6 +142,7 @@ describe("AgentSession pi-server sync", () => {
 					if (url.endsWith("/api/stream")) {
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
@@ -234,6 +235,7 @@ describe("AgentSession pi-server sync", () => {
 						if (streamCount === 2) {
 							return new Response(
 								[
+									'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 									'data: {"type":"start"}\n\n',
 									'data: {"type":"text_start","contentIndex":0}\n\n',
 									'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
@@ -397,6 +399,7 @@ describe("AgentSession pi-server sync", () => {
 						}
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
@@ -508,6 +511,7 @@ describe("AgentSession pi-server sync", () => {
 						}
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',
@@ -617,6 +621,7 @@ describe("AgentSession pi-server sync", () => {
 					if (url.endsWith("/api/stream")) {
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
@@ -734,6 +739,7 @@ describe("AgentSession pi-server sync", () => {
 					if (url.endsWith("/api/stream")) {
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
@@ -767,7 +773,8 @@ describe("AgentSession pi-server sync", () => {
 						}
 						if (target === "/api/stream") {
 							return new Response(
-								'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n' +
+									'data: {"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}\n\n',
 								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
 							);
 						}
@@ -941,6 +948,7 @@ describe("AgentSession pi-server sync", () => {
 					if (url.endsWith("/api/stream")) {
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
@@ -1015,6 +1023,7 @@ describe("AgentSession pi-server sync", () => {
 						streamCount++;
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"ok"}\n\n',
@@ -1119,6 +1128,7 @@ describe("AgentSession pi-server sync", () => {
 						if (streamCount === 1) {
 							return new Response(
 								[
+									'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 									'data: {"type":"start"}\n\n',
 									'data: {"type":"text_start","contentIndex":0}\n\n',
 									'data: {"type":"text_delta","contentIndex":0,"delta":"first ok"}\n\n',
@@ -1130,12 +1140,14 @@ describe("AgentSession pi-server sync", () => {
 						}
 						if (streamCount === 2) {
 							return new Response(
-								'data: {"type":"done","reason":"length","usage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100}}\n\n',
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n' +
+									'data: {"type":"done","reason":"length","usage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100}}\n\n',
 								{ status: 200, headers: { "Content-Type": "text/event-stream" } },
 							);
 						}
 						return new Response(
 							[
+								'event: cache_policy\ndata: {"cacheRetention":"short"}\n\n',
 								'data: {"type":"start"}\n\n',
 								'data: {"type":"text_start","contentIndex":0}\n\n',
 								'data: {"type":"text_delta","contentIndex":0,"delta":"recovered"}\n\n',

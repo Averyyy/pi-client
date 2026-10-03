@@ -18,6 +18,7 @@ import {
 	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type CacheRetention,
 	type ClassifierApi,
 	type ClassifierContext,
 	type ClassifierModel,
@@ -35,6 +36,7 @@ import {
 	type Message,
 	type Model,
 	type Models,
+	type ModelsSimpleStreamOptions,
 	type ProviderClassifier,
 	type ProviderRequestOptions,
 	type ProviderStreamOptions,
@@ -44,8 +46,15 @@ import {
 import { cloudflareWorkersAISystemOneApi } from "@earendil-works/pi-ai/api/cloudflare-workers-ai-system-one.lazy";
 import { llamaCppClassifyApi } from "@earendil-works/pi-ai/api/llama-cpp-classify.lazy";
 import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
-import { getEnvApiKey, getImagesApiProvider, stream as streamApi, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	getBuiltinProviderForModel,
+	getEnvApiKey,
+	getImagesApiProvider,
+	stream as streamApi,
+	streamSimple,
+} from "@earendil-works/pi-ai/compat";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
@@ -141,24 +150,53 @@ interface SessionCompactBody {
 
 function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 	const models = createModels();
-	const requestStream: ProviderStreams["streamSimple"] = (requestModel, context, streamOptions) =>
-		streamSimple(requestModel, context, {
+	const builtin = getBuiltinProviderForModel(model);
+	const requestApiStream: ProviderStreams["stream"] = (requestModel, context, streamOptions) =>
+		builtin
+			? builtin.stream(requestModel, context, streamOptions)
+			: streamApi(requestModel, context, streamOptions as ProviderStreamOptions | undefined);
+	const requestStream: ProviderStreams["streamSimple"] = (requestModel, context, streamOptions) => {
+		const requestOptions = {
 			...streamOptions,
 			...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-		});
+		};
+		return builtin
+			? builtin.streamSimple(requestModel, context, requestOptions)
+			: streamSimple(requestModel, context, requestOptions);
+	};
 	models.setProvider(
 		createProvider({
 			id: model.provider,
 			name: model.provider,
 			models: [model],
-			auth: {
-				apiKey: {
-					name: "pi-server request auth",
-					resolve: async () => ({ auth: { apiKey: options.apiKey, headers: options.headers } }),
-				},
-			},
+			auth: builtin
+				? {
+						...builtin.auth,
+						apiKey: {
+							name: builtin.auth.apiKey?.name ?? "pi-server request auth",
+							resolve: async (request) => {
+								const resolved = await builtin.auth.apiKey?.resolve(request);
+								if (resolved) return resolved;
+								// Declared request credentials are validated by the native provider.
+								if (
+									options.apiKey !== undefined ||
+									options.headers !== undefined ||
+									model.headers !== undefined
+								) {
+									return { auth: { apiKey: options.apiKey, headers: options.headers }, env: options.env };
+								}
+								return undefined;
+							},
+						},
+					}
+				: {
+						apiKey: {
+							name: "pi-server request auth",
+							resolve: async () => ({ auth: { apiKey: options.apiKey, headers: options.headers } }),
+						},
+					},
 			api: {
-				stream: requestStream,
+				stream: requestApiStream,
 				streamSimple: requestStream,
 			},
 		}),
@@ -174,6 +212,7 @@ interface StreamRunRecord {
 	kind: "stream" | "compact" | "image" | "classifier" | "deferred-cancel";
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
+	cacheRetention?: CacheRetention;
 	compactResult?: SessionCompactSuccessBody;
 	operationResult?:
 		| AssistantImages
@@ -295,6 +334,7 @@ function startStreamRun(sessionId: string, runId: string, kind: StreamRunRecord[
 	if (existing) {
 		run.callbackConnectionClosed = false;
 		run.message = undefined;
+		run.cacheRetention = undefined;
 		run.errorMessage = undefined;
 		run.cancelRequested = false;
 		run.controller = new AbortController();
@@ -319,6 +359,7 @@ function streamRunResponseBody(run: StreamRunRecord) {
 		createdAt: run.createdAt,
 		updatedAt: run.updatedAt,
 		...(run.message ? { message: run.message } : {}),
+		...(run.cacheRetention !== undefined ? { cacheRetention: run.cacheRetention } : {}),
 		...(run.compactResult ? { compactResult: run.compactResult } : {}),
 		...(run.operationResult ? { operationResult: run.operationResult } : {}),
 		...(run.errorMessage ? { errorMessage: run.errorMessage } : {}),
@@ -1254,6 +1295,9 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		});
 		res.flushHeaders();
 		res.write(STREAM_HEARTBEAT);
+		if (existingRun.cacheRetention !== undefined) {
+			writeServerSentEvent(res, "cache_policy", { cacheRetention: existingRun.cacheRetention });
+		}
 		for (const event of replayStreamRun(existingRun)) {
 			writeStreamEvent(res, event);
 		}
@@ -1270,8 +1314,20 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	}
 
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
-	const streamOptions: SimpleStreamOptions = {
+	const streamOptions: ModelsSimpleStreamOptions = {
 		...(body.options ?? {}),
+		transformPreparedStreamOptions: (prepared) => {
+			// Resolve after auth env merging, then pin the same policy for native dispatch.
+			const cacheRetention =
+				prepared.cacheRetention ??
+				(getProviderEnvValue("PI_CACHE_RETENTION", prepared.env) === "long" ? "long" : "short");
+			if (cacheRetention !== "none" && cacheRetention !== "short" && cacheRetention !== "long") {
+				throw new Error("Invalid cache retention policy");
+			}
+			if (run) run.cacheRetention = cacheRetention;
+			writeServerSentEvent(res, "cache_policy", { cacheRetention });
+			return { ...prepared, cacheRetention };
+		},
 		...(run ? { signal: run.controller.signal } : {}),
 		...(run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {}),
 		...(body.observeProviderStreamEvents
@@ -1308,16 +1364,12 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 		if (body.requestKind === "deferred") {
 			if (!body.deferredHandle) throw new Error("deferredHandle is required for deferred fetch");
 			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle, streamOptions);
-		} else if (models) {
-			stream =
-				body.requestKind === "api"
-					? models.stream(resolvedModel, context, streamOptions as ProviderStreamOptions)
-					: models.streamSimple(resolvedModel, context, streamOptions);
 		} else {
+			const requestModels = models ?? createRequestModels(resolvedModel, streamOptions);
 			stream =
 				body.requestKind === "api"
-					? streamApi(resolvedModel, context, streamOptions as ProviderStreamOptions)
-					: streamSimple(resolvedModel, context, streamOptions);
+					? requestModels.stream(resolvedModel, context, streamOptions)
+					: requestModels.streamSimple(resolvedModel, context, streamOptions);
 		}
 	} catch (err) {
 		clearInterval(heartbeat);

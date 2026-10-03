@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added authenticated stream option transforms for raw, simple, and deferred provider dispatch without repeating auth resolution.
 - Added native Devin Pro OAuth, account model discovery, and Connect/protobuf inference with tool calls, images, and signed thinking replay. No Devin CLI or external Pi extension is required.
 - Added static startup fallbacks for the four known Devin model IDs used by configured scopes; successful account discovery remains authoritative.
 

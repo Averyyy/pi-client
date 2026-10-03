@@ -111,6 +111,12 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		let startTool: () => void;
 		let summaryEntered = false;
 		let abortEntered = false;
+		let holdMetadata = false;
+		let metadataEntered = false;
+		let releaseMetadata: () => void;
+		const metadataGate = new Promise<void>((resolve) => {
+			releaseMetadata = resolve;
+		});
 		let releaseSummary: () => void;
 		let releaseAbort: () => void;
 		const abortGate = new Promise<void>((resolve) => {
@@ -230,6 +236,11 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 					signal: controller.signal,
 				});
 				response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "" });
+				if (holdMetadata && upstream.headers.get("content-type")?.startsWith("text/event-stream")) {
+					holdMetadata = false;
+					metadataEntered = true;
+					await metadataGate;
+				}
 				if (upstream.body) for await (const chunk of upstream.body) response.write(chunk);
 				response.end();
 			} catch (error) {
@@ -357,6 +368,11 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			toolStarted,
 			summaryEntered: () => summaryEntered,
 			abortEntered: () => abortEntered,
+			metadataEntered: () => metadataEntered,
+			holdMetadata: () => {
+				holdMetadata = true;
+			},
+			releaseMetadata: () => releaseMetadata(),
 			releaseAbort: () => releaseAbort(),
 			allowAborts: () => {
 				failAbort = false;
@@ -628,11 +644,55 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			expect(calls[1].context).toEqual(calls[0].context);
 			for (const call of calls) {
 				expect(call.options.env).toEqual({ PI_CACHE_RETENTION: callerEnv ?? "long" });
-				expect(call.options.cacheRetention).toBe(retention);
+				expect(call.options.cacheRetention).toBe(expected);
 			}
 			expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
 		},
 	);
+
+	it("clears the old remote schedule and waits for authoritative metadata before starting the new prefix", async () => {
+		const { session, calls, requests, holdMetadata, metadataEntered, releaseMetadata } = await fixture({
+			mode: "idle",
+		});
+		await session.prompt(largeText);
+		expect(session.cacheWarmingStatus?.state).toBe("scheduled");
+		holdMetadata();
+		const run = session.prompt("second request awaiting server metadata");
+		try {
+			await vi.waitFor(() => expect(metadataEntered()).toBe(true));
+			expect(session.cacheWarmingStatus?.state).toBe("inactive");
+			expect(calls.filter((call) => call.warm)).toHaveLength(0);
+		} finally {
+			releaseMetadata();
+			await run;
+		}
+		expect(session.cacheWarmingStatus?.state).toBe("scheduled");
+		await warmNow(session);
+		expect(calls[2].context).toEqual(calls[1].context);
+		expect(calls[2].options.cacheRetention).toBe("long");
+		expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
+	});
+
+	it("does not start a remote schedule when metadata delivery is cancelled", async () => {
+		const { session, calls, requests, holdMetadata, metadataEntered, releaseMetadata } = await fixture({
+			mode: "idle",
+		});
+		holdMetadata();
+		const run = session.prompt(largeText);
+		try {
+			await vi.waitFor(() => expect(metadataEntered()).toBe(true));
+			expect(session.cacheWarmingStatus?.state).toBe("inactive");
+			await session.abort();
+		} finally {
+			releaseMetadata();
+			await run;
+		}
+		expect(session.cacheWarmingStatus?.state).toBe("inactive");
+		expect(calls.filter((call) => call.warm)).toHaveLength(0);
+		expect(session.sessionManager.getEntries().some((entry) => entry.type === "usage")).toBe(false);
+		expect(requests.some((request) => request.path.endsWith("/abort"))).toBe(true);
+		expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
+	});
 
 	it("continues idle warming and records only local usage entries", async () => {
 		const { session, calls, requests } = await fixture({ mode: "idle" });

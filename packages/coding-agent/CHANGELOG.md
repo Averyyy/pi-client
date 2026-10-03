@@ -17,6 +17,7 @@
 - Enabled prompt-cache warming through pi-server during active runs and idle mode, preserving request prefixes, cache options, cancellation, and local usage accounting.
 - Awaited remote cache-warming cancellation before automatic compaction and retained queued messages when cancellation could not be confirmed.
 - Corrected prompt-cache warming decisions for one-hour Anthropic and Bedrock cache-write costs.
+- Scheduled remote cache warming from the server's actual per-request retention policy, including interrupted-run recovery, rather than client environment defaults.
 - Fixed startup resolution of configured Devin model scopes so an initially empty account catalog does not leave all discovered Devin models in model cycling.
 - Preserved native provider model discovery instead of replacing it with the public static catalog overlay.
 

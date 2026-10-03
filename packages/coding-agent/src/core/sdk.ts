@@ -427,6 +427,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
 			const remote = process.env.PI_SERVER_MODE === "true";
+			const cacheIsCurrent =
+				options?.sessionId === sessionManager.getSessionId() ? cacheContextIsCurrent(model) : undefined;
+			if (remote && cacheIsCurrent) cacheWarmer.cancel();
 			const auth = remote
 				? await modelRuntime.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
 				: undefined;
@@ -447,8 +450,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const headerRunner = extensionRunnerRef.current;
 			// Only session requests replace the selected model's cache entry. Keep its
 			// exact request prefix warm while tools run, then apply the configured idle policy.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheContextIsCurrent(model));
+			if (!remote && cacheIsCurrent) {
+				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheIsCurrent);
 			}
 			if (remote) {
 				let headers = mergeProviderAttributionHeaders(
@@ -464,6 +467,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return streamPiServer(requestModel, context, {
 					...requestOptions,
+					requireCacheRetention: cacheIsCurrent !== undefined,
+					onCacheRetentionResolved: cacheIsCurrent
+						? (cacheRetention) => {
+								if (options?.signal?.aborted || !cacheIsCurrent()) return;
+								cacheWarmer.start(
+									{ model: requestModel, context, options: { ...requestOptions, cacheRetention } },
+									cacheIsCurrent,
+								);
+							}
+						: undefined,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
 					contextOverlay: piServerContext?.contextOverlay,
 					onHistoryReconciled: activeAgentSession

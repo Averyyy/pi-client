@@ -237,7 +237,7 @@ function hasResolvedCloudflareAuth(options: StreamOptions | undefined): boolean 
 	return hasExplicitApiKey(options?.apiKey) || typeof options?.headers?.["cf-aig-authorization"] === "string";
 }
 
-function getBuiltinProviderForModel(model: Model<Api>) {
+export function getBuiltinProviderForModel(model: Model<Api>) {
 	if (getApiProvider(model.api) !== builtinApiProviderInstances.get(model.api)) return undefined;
 	const provider = compatModels.getProvider(model.provider);
 	return provider?.getModels().some((candidate) => candidate.api === model.api) ? provider : undefined;

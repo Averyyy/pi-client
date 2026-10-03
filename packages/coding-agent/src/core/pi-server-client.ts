@@ -12,6 +12,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AuthOperationOptions,
+	type CacheRetention,
 	type ClassifierApi,
 	type ClassifierContext,
 	type ClassifierModel,
@@ -270,6 +271,8 @@ export interface PiServerHistorySnapshot {
 }
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
+	requireCacheRetention?: boolean;
+	onCacheRetentionResolved?: (retention: CacheRetention) => void | Promise<void>;
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	apiOptions?: StreamOptions;
@@ -378,6 +381,7 @@ class ServerSentEventParser {
 }
 
 interface PiServerRunResponse {
+	cacheRetention?: CacheRetention;
 	runId: string;
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
@@ -965,6 +969,9 @@ export function streamRawPiServer<TApi extends string>(
 	context: Context,
 	options?: ModelsApiStreamOptions<TApi>,
 ): Promise<PiServerEventStream> {
+	if (options?.transformPreparedStreamOptions) {
+		throw new Error("Prepared stream option transforms cannot execute on pi-server");
+	}
 	return streamPiServer(model, context, {
 		signal: options?.signal,
 		sessionId: options?.sessionId,
@@ -1159,6 +1166,27 @@ export async function streamPiServer(
 		let streamOpened = false;
 		let observerFailed = false;
 		let callbackFailed = false;
+		let cacheRetention: CacheRetention | undefined;
+		const requireCacheRetention = options?.requireCacheRetention || options?.onCacheRetentionResolved !== undefined;
+		const applyCachePolicy = async (retention: unknown): Promise<void> => {
+			try {
+				if (retention !== "none" && retention !== "short" && retention !== "long") {
+					throw new Error("pi-server cache policy has an invalid cacheRetention");
+				}
+				if (cacheRetention !== undefined) {
+					if (cacheRetention !== retention) throw new Error("pi-server cache policy changed during the same run");
+					return;
+				}
+				cacheRetention = retention;
+				await raceWithAbortSignal(
+					Promise.resolve().then(() => options?.onCacheRetentionResolved?.(retention)),
+					options?.signal,
+				);
+			} catch (error) {
+				observerFailed = true;
+				throw error;
+			}
+		};
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
@@ -1209,6 +1237,16 @@ export async function streamPiServer(
 
 			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
+					if (serverEvent.event === "cache_policy") {
+						try {
+							const policy = parseServerSentEventData(serverEvent, "pi-server cache policy");
+							await applyCachePolicy(isObject(policy) ? policy.cacheRetention : undefined);
+						} catch (error) {
+							observerFailed = true;
+							throw error;
+						}
+						continue;
+					}
 					if (serverEvent.event === "provider_callback") {
 						try {
 							await handleProviderCallback(
@@ -1229,6 +1267,10 @@ export async function streamPiServer(
 						serverEvent,
 						"pi-server stream",
 					) as ProxyAssistantMessageEvent;
+					if (requireCacheRetention && cacheRetention === undefined && proxyEvent.type !== "error") {
+						observerFailed = true;
+						throw new Error("pi-server stream is missing its resolved cache policy");
+					}
 					if (proxyEvent.type === "provider_stream_event") {
 						try {
 							await options?.onProviderStreamEvent?.(proxyEvent.data, proxyEvent.model);
@@ -1290,6 +1332,12 @@ export async function streamPiServer(
 						createPiServerRequest(options?.signal),
 						options,
 					);
+					if (
+						recoveredRun?.cacheRetention !== undefined ||
+						(requireCacheRetention && recoveredRun?.status === "completed")
+					) {
+						await applyCachePolicy(recoveredRun?.cacheRetention);
+					}
 					if (recoveredRun?.status === "completed" && recoveredRun.message) {
 						switch (recoveredRun.message.stopReason) {
 							case "stop":

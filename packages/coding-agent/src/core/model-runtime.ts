@@ -46,6 +46,7 @@ import {
 	type ModelsRequestTransforms,
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
+	type ModelsStreamRequestTransforms,
 	type ModelThinkingLevel,
 	type ModelType,
 	type ModelTypeMap,
@@ -55,7 +56,6 @@ import {
 	type ProviderHeaders,
 	type ProviderRequestOptions,
 	type SimpleStreamOptions,
-	type StreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
@@ -883,6 +883,12 @@ export class ModelRuntime implements Models {
 	>(model: TModel, options: TOptions | undefined): Promise<{ model: TModel; options: TOptions }> {
 		if (options?.fetch !== undefined)
 			throw new ModelsError("stream", "pi-server does not support custom fetch implementations");
+		if (
+			options &&
+			"transformPreparedStreamOptions" in options &&
+			options.transformPreparedStreamOptions !== undefined
+		)
+			throw new ModelsError("stream", "pi-server does not support client prepared stream option transforms");
 		const resolution = this.models.getProvider(model.provider)
 			? await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
 			: undefined;
@@ -897,6 +903,21 @@ export class ModelRuntime implements Models {
 				headers,
 				env: resolution?.env || options?.env ? { ...resolution?.env, ...options?.env } : undefined,
 			} as TOptions,
+		};
+	}
+
+	private async prepareStreamRequest<TOptions extends ProviderRequestOptions<Model<Api>>>(
+		model: Model<Api>,
+		options: (TOptions & ModelsStreamRequestTransforms<TOptions>) | undefined,
+	): Promise<{ provider: Provider; model: Model<Api>; options: TOptions }> {
+		const { transformPreparedStreamOptions, ...authOptions } = options ?? {};
+		const prepared = await this.prepareRequest(model, authOptions);
+		return {
+			provider: prepared.provider,
+			model: prepared.model,
+			options: transformPreparedStreamOptions
+				? await transformPreparedStreamOptions(prepared.options as TOptions, prepared.model)
+				: (prepared.options as TOptions),
 		};
 	}
 
@@ -917,10 +938,7 @@ export class ModelRuntime implements Models {
 				const prepared = await this.prepareRemoteRequest(model, options);
 				return streamRawPiServer(prepared.model, transcript, prepared.options);
 			}
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
+			const prepared = await this.prepareStreamRequest(model, options);
 			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 		});
 	}
@@ -960,7 +978,7 @@ export class ModelRuntime implements Models {
 				const prepared = await this.prepareRemoteRequest(model, options);
 				return streamPiServer(prepared.model, transcript, prepared.options);
 			}
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await this.prepareStreamRequest(model, options);
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 		});
 	}
@@ -980,7 +998,7 @@ export class ModelRuntime implements Models {
 				const prepared = await this.prepareRemoteRequest(model, options);
 				return fetchDeferredPiServer(prepared.model, handle, prepared.options);
 			}
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await this.prepareStreamRequest(model, options);
 			if (!prepared.provider.fetchDeferred) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 			}

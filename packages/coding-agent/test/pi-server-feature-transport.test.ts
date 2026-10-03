@@ -752,7 +752,11 @@ describe("upstream features over 64 KiB pi-server HTTP requests", () => {
 			if (chunk.done) throw new Error("Missing provider callback request");
 			data += new TextDecoder().decode(chunk.value);
 		}
-		const callbackLine = data.split("\n").find((line) => line.startsWith("data:"));
+		const callbackLine = data
+			.split("\n\n")
+			.find((event) => event.includes("event: provider_callback"))
+			?.split("\n")
+			.find((line) => line.startsWith("data:"));
 		if (!callbackLine) throw new Error("Missing provider callback data");
 		const callback = JSON.parse(callbackLine.slice(5).trim()) as { callbackId: string };
 		await reader.cancel();
@@ -807,7 +811,11 @@ describe("upstream features over 64 KiB pi-server HTTP requests", () => {
 				if (chunk.done) throw new Error("Missing provider callback request");
 				data += new TextDecoder().decode(chunk.value);
 			}
-			const callbackLine = data.split("\n").find((line) => line.startsWith("data:"));
+			const callbackLine = data
+				.split("\n\n")
+				.find((event) => event.includes("event: provider_callback"))
+				?.split("\n")
+				.find((line) => line.startsWith("data:"));
 			if (!callbackLine) throw new Error("Missing provider callback data");
 			const callback = JSON.parse(callbackLine.slice(5).trim()) as { callbackId: string };
 			let deletionSettled = false;

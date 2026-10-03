@@ -66,7 +66,7 @@ Cache warming replays eligible requests through pi-server with the original prom
 }
 ```
 
-The model must declare a prompt-cache lifetime, and the expected savings must reach $0.05. `/session` shows the warming decision. Set `cacheWarming` to `"off"` to disable it. Refresh usage counts toward session totals without adding model messages; cancellation and changed model/context stop warming. Requests use the same 64 KiB transport limit.
+The server confirms the cache retention used by each request, and the client uses that policy for refresh timing and cost decisions. The model must declare a prompt-cache lifetime, and the expected savings must reach $0.05. `/session` shows the warming decision. Set `cacheWarming` to `"off"` to disable it. Refresh usage counts toward session totals without adding model messages; cancellation and changed model/context stop warming. Requests use the same 64 KiB transport limit.
 
 ## Devin Pro
 

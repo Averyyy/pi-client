@@ -108,9 +108,15 @@ export interface ModelsRequestTransforms {
 	transformHeaders?: (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>;
 }
 
-export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsRequestTransforms;
-export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsRequestTransforms;
-export type ModelsDeferredFetchOptions = DeferredFetchOptions & ModelsRequestTransforms;
+export interface ModelsStreamRequestTransforms<TOptions> extends ModelsRequestTransforms {
+	/** Transform authenticated stream options once, immediately before provider dispatch. */
+	transformPreparedStreamOptions?: (options: TOptions, model: Model<Api>) => TOptions | Promise<TOptions>;
+}
+
+export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> &
+	ModelsStreamRequestTransforms<ApiStreamOptions<TApi>>;
+export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamRequestTransforms<SimpleStreamOptions>;
+export type ModelsDeferredFetchOptions = DeferredFetchOptions & ModelsStreamRequestTransforms<DeferredFetchOptions>;
 export type ModelsDeferredCancelOptions = DeferredCancelOptions & ModelsRequestTransforms;
 export type ModelsImagesOptions = ImagesOptions & ModelsRequestTransforms;
 export type ModelsClassifierOptions = ClassifierOptions & ModelsRequestTransforms;
@@ -868,6 +874,21 @@ class ModelsImpl implements MutableModels {
 		return { requestModel, requestOptions };
 	}
 
+	private async prepareStreamRequest<TOptions extends ProviderRequestOptions<Model<Api>>>(
+		model: Model<Api>,
+		options: (TOptions & ModelsStreamRequestTransforms<TOptions>) | undefined,
+	): Promise<{ requestModel: Model<Api>; requestOptions: TOptions }> {
+		const { transformPreparedStreamOptions, ...authOptions } = options ?? {};
+		const { requestModel, requestOptions } = await this.applyAuth(model, authOptions);
+		const prepared = requestOptions as TOptions;
+		return {
+			requestModel,
+			requestOptions: transformPreparedStreamOptions
+				? await transformPreparedStreamOptions(prepared, requestModel)
+				: prepared,
+		};
+	}
+
 	stream<TApi extends Api>(
 		model: Model<TApi>,
 		context: Context,
@@ -876,10 +897,7 @@ class ModelsImpl implements MutableModels {
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async () => {
 			const provider = this.requireChatProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(
-				model,
-				options as ModelsApiStreamOptions<Api> | undefined,
-			);
+			const { requestModel, requestOptions } = await this.prepareStreamRequest(model, options);
 			return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
 		});
 	}
@@ -896,7 +914,7 @@ class ModelsImpl implements MutableModels {
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async () => {
 			const provider = this.requireChatProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
+			const { requestModel, requestOptions } = await this.prepareStreamRequest(model, options);
 			return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
 		});
 	}
@@ -919,7 +937,7 @@ class ModelsImpl implements MutableModels {
 			if (!provider.fetchDeferred) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 			}
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
+			const { requestModel, requestOptions } = await this.prepareStreamRequest(model, options);
 			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
 		});
 	}
