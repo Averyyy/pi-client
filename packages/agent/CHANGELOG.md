@@ -6,6 +6,8 @@
 
 - Preserved uncommitted steering and follow-up messages when next-turn preparation fails, keeping queue order and explicit queue clears.
 
+## [1.0.1] - 2026-10-03
+
 ## [1.0.0] - 2026-10-01
 
 ### Breaking Changes
