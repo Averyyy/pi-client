@@ -403,7 +403,7 @@ describe("inbox", () => {
 
 	it("leaves queued items after a failed run until the next submission places them in order", async () => {
 		const setup = chatSetup();
-		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid request" }));
+		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" }));
 		setup.faux.setResponses([failing.step, answer("for f"), answer("for g")]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const input = await root.submit({ type: "input", content: "a" }, context);
@@ -451,7 +451,7 @@ describe("inbox", () => {
 	it("commits inbox changes as positional Chord operations and a base when empty", async () => {
 		const setup = chatSetup();
 		const first = gated(answer("first"));
-		setup.faux.setResponses([first.step, answer("second")]);
+		setup.faux.setResponses([first.step, answer("second"), answer("third")]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const ops: Op[][] = [];
 		harness.subscribeCommits((publication) => {
@@ -474,18 +474,20 @@ describe("inbox", () => {
 			[["p", ["items"], 4, 0, [{ id: w3.id, mode: "write", entry: { kind: "note" } }]]],
 		]);
 		first.release();
-		await input.wait(context);
+		expect(await input.wait(context)).toMatchObject({ status: "done" });
 		// Every write and the first follow-up leave; only f2 at index 3 remains. No retained value is carried.
 		expect(ops[5]!.every((op) => op[0] === "p" && (op[4] as unknown[]).length === 0)).toBe(true);
 		expect(ops[5]).toContainEqual(["p", ["items"], 4, 1, []]);
 		expect(JSON.stringify(ops[5])).not.toContain("f2");
-		await f2.wait(context);
+		expect(await f1.wait(context)).toMatchObject({ status: "done" });
+		expect(await f2.wait(context)).toMatchObject({ status: "done" });
+		expect(setup.faux.state.callCount).toBe(3);
 		await harness.close(context);
 	});
 
 	it("settles a stale write at once while idle, and a queued one behind waiting items", async () => {
 		const setup = chatSetup();
-		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid request" }));
+		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" }));
 		setup.faux.setResponses([failing.step, answer("for f")]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const old = await root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), context);
@@ -585,7 +587,7 @@ describe("inbox", () => {
 
 	it("queues an idle steer behind waiting items and places it with the first follow-up in ID order", async () => {
 		const setup = chatSetup();
-		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid request" }));
+		const failing = gated(fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" }));
 		setup.faux.setResponses([failing.step, answer("both")]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const input = await root.submit({ type: "input", content: "a" }, context);
@@ -738,7 +740,7 @@ describe("inbox", () => {
 		}
 		const setup = chatSetup();
 		const first = gated(answer("first"));
-		setup.faux.setResponses([first.step, answer("second")]);
+		setup.faux.setResponses([first.step, answer("second"), answer("third")]);
 		const { harness, root } = await openChat(new RecordingStorage(), setup);
 		harness.subscribeCommits((publication) => {
 			for (const change of documentChanges(publication))
@@ -746,11 +748,13 @@ describe("inbox", () => {
 		});
 		const input = await root.submit({ type: "input", content: "a" }, context);
 		await first.reached;
-		await root.submit({ type: "input", content: "f1" }, context);
+		const f1 = await root.submit({ type: "input", content: "f1" }, context);
 		const f2 = await root.submit({ type: "input", content: "f2" }, context);
 		first.release();
-		await input.wait(context);
-		await f2.wait(context);
+		expect(await input.wait(context)).toMatchObject({ status: "done" });
+		expect(await f1.wait(context)).toMatchObject({ status: "done" });
+		expect(await f2.wait(context)).toMatchObject({ status: "done" });
+		expect(setup.faux.state.callCount).toBe(3);
 		// The inbox ID is learned from the f1 push; later writes: the f2 push, removing f1, and emptying the inbox.
 		expect(written).toEqual([
 			{ kind: "delta", empty: false },

@@ -1,5 +1,6 @@
 import {
 	type Api,
+	type CacheRetention,
 	type Context,
 	calculateCost,
 	type Model,
@@ -31,15 +32,19 @@ export function getCacheWarmingDelayMs(ttlMs: number): number | undefined {
 	return Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000)));
 }
 
+function resolveCacheRetention(options: SimpleStreamOptions | undefined): CacheRetention {
+	return (
+		options?.cacheRetention ?? (getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short")
+	);
+}
+
 /**
  * Lifetime of the prompt cache entry a request writes, from the model's
  * `promptCache` tier for the retention the request used. Undefined when the
  * model has no lifetime for that tier or caching is off.
  */
 export function getPromptCacheTtlMs(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
-	const retention =
-		options?.cacheRetention ??
-		(getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short");
+	const retention = resolveCacheRetention(options);
 	if (retention === "none") return undefined;
 	const seconds = model.promptCache?.[retention];
 	return seconds === undefined ? undefined : seconds * 1000;
@@ -71,7 +76,7 @@ function lastPromptTokens(entries: SessionEntry[]): number {
 
 function price(
 	model: Model<Api>,
-	tokens: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">>,
+	tokens: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "cacheWrite1h">>,
 ): number {
 	const usage: Usage = {
 		input: 0,
@@ -379,9 +384,16 @@ export class CacheWarmer {
 		const model = run.model;
 		const promptTokens = lastPromptTokens(this.sessionManager.getBranch());
 		const cacheHitCost = price(model, { cacheRead: promptTokens });
+		const oneHourWrite =
+			resolveCacheRetention(run.options) === "long" &&
+			(model.api === "bedrock-converse-stream" ||
+				(model.api === "anthropic-messages" &&
+					(model as Model<"anthropic-messages">).compat?.supportsLongCacheRetention !== false));
 		const cacheMissCost = price(
 			model,
-			model.cost.cacheWrite > 0 ? { cacheWrite: promptTokens } : { input: promptTokens },
+			model.cost.cacheWrite > 0
+				? { cacheWrite: promptTokens, ...(oneHourWrite ? { cacheWrite1h: promptTokens } : {}) }
+				: { input: promptTokens },
 		);
 		const warmCost = price(model, { cacheRead: promptTokens, output: 1 });
 		const missCost = Math.max(0, cacheMissCost - cacheHitCost);

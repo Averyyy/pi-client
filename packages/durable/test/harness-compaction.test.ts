@@ -463,7 +463,7 @@ describe("manual compaction", () => {
 		await history(chat);
 		const gate = deferred();
 		const reached = deferred();
-		chat.faux.agent.push(gated(gate, failure("bad request"), reached));
+		chat.faux.agent.push(gated(gate, failure("insufficient_quota"), reached));
 		const failed = await chat.root.submit({ type: "input", content: "fails" }, context);
 		await reached.promise;
 		const followUp = await chat.root.submit({ type: "input", content: "follow-up" }, context);
@@ -857,7 +857,7 @@ describe("compaction outcomes", () => {
 
 	for (const [name, response, message] of [
 		["retries run out", failure("overloaded"), "Summarization failed: overloaded"],
-		["a non-retryable error", failure("bad request"), "Summarization failed: bad request"],
+		["a non-retryable error", failure("insufficient_quota"), "Summarization failed: insufficient_quota"],
 		[
 			"a length stop",
 			fauxAssistantMessage("partial", { stopReason: "length" }),
@@ -1035,7 +1035,7 @@ describe("blocking threshold compaction", () => {
 			"declines",
 			(chat: Chat) => addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) }),
 		],
-		["fails", (chat: Chat) => chat.faux.summaries.push(failure("bad request"))],
+		["fails", (chat: Chat) => chat.faux.summaries.push(failure("insufficient_quota"))],
 	] as const) {
 		it(`sends the request anyway when its compaction ${name}`, async () => {
 			const chat = await open({ contextWindow: 1000 });
@@ -1191,7 +1191,7 @@ describe("overflow compaction", () => {
 			(chat: Chat) => addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) }),
 			0,
 		],
-		["fails", (chat: Chat) => chat.faux.summaries.push(failure("bad request")), 1],
+		["fails", (chat: Chat) => chat.faux.summaries.push(failure("insufficient_quota")), 1],
 		// Classification finds no cut, so no compaction starts and the ordinary failure carries the text.
 		[
 			"cannot cut",
@@ -1373,7 +1373,7 @@ describe("compaction estimates and interactions", () => {
 		await history(chat);
 		const gate = deferred();
 		const reached = deferred();
-		chat.faux.agent.push(gated(gate, failure("bad request"), reached));
+		chat.faux.agent.push(gated(gate, failure("insufficient_quota"), reached));
 		const failed = await chat.root.submit({ type: "input", content: "fails" }, context);
 		await reached.promise;
 		chat.faux.summaries.push(summary("OLDER"));
@@ -1562,7 +1562,7 @@ describe("compaction recovery", () => {
 		});
 		await chat.harness.close(context);
 		chat = await reopen(path, chat.setup, chat.faux);
-		chat.faux.summaries.push(failure("bad request"));
+		chat.faux.summaries.push(failure("insufficient_quota"));
 		const settled = await (await chat.harness.submission(input.id, context))!.wait(context);
 		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: OVERFLOW });
 		await chat.harness.close(context);
@@ -1721,7 +1721,7 @@ describe("compaction and the inbox", () => {
 	it("places a summary left queued by a failed run at the next submission, before its input", async () => {
 		const chat = await open();
 		await history(chat);
-		const run = await busy(chat, failure("bad request"));
+		const run = await busy(chat, failure("insufficient_quota"));
 		const submission = await queuedSummary(chat);
 		run.release();
 		expect((await run.input.wait(context)).status).toBe("unanswered");

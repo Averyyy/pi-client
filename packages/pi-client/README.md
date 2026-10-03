@@ -56,6 +56,18 @@ The authenticated model catalog includes chat, image, and classifier models with
 
 `PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
 
+## Prompt Cache Warming
+
+Cache warming replays eligible requests through pi-server with the original prompt, tools, model, and cache options, limiting output to one token. The default `streaming` mode warms during active agent runs. To also warm while waiting for input, set this in your global Pi settings:
+
+```json
+{
+  "cacheWarming": "idle"
+}
+```
+
+The model must declare a prompt-cache lifetime, and the expected savings must reach $0.05. `/session` shows the warming decision. Set `cacheWarming` to `"off"` to disable it. Refresh usage counts toward session totals without adding model messages; cancellation and changed model/context stop warming. Requests use the same 64 KiB transport limit.
+
 ## Devin Pro
 
 Update both `@averyyy/pi-client` and `@averyyy/pi-server` to a version with native Devin support. Start `pi-client` with your server connection configured, then:

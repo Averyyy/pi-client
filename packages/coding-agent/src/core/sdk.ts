@@ -337,6 +337,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const headerRunner = extensionRunnerRef.current;
 		return {
 			...options,
+			onPayload:
+				process.env.PI_SERVER_MODE === "true" &&
+				options.onPayload === transformProviderPayload &&
+				!headerRunner?.hasHandlers("before_provider_request")
+					? undefined
+					: options.onPayload,
+			onResponse:
+				process.env.PI_SERVER_MODE === "true" &&
+				options.onResponse === handleProviderResponse &&
+				!headerRunner?.hasHandlers("after_provider_response")
+					? undefined
+					: options.onResponse,
+			onProviderStreamEvent:
+				process.env.PI_SERVER_MODE === "true" &&
+				options.onProviderStreamEvent === handleProviderStreamEvent &&
+				!headerRunner?.hasHandlers("provider_stream_event")
+					? undefined
+					: options.onProviderStreamEvent,
 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
@@ -408,58 +426,53 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
+			const remote = process.env.PI_SERVER_MODE === "true";
+			const auth = remote
+				? await modelRuntime.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
+				: undefined;
+			const requestModel = auth?.auth.baseUrl ? { ...model, baseUrl: auth.auth.baseUrl } : model;
+			const requestOptions = buildRequestOptions(
+				requestModel,
+				remote
+					? {
+							...options,
+							env: auth?.env || options?.env ? { ...(auth?.env ?? {}), ...(options?.env ?? {}) } : undefined,
+						}
+					: options,
+			);
 			const activeAgentSession = agentSession;
 			const piServerContext = activeAgentSession
 				? buildPiServerContextSync(context.messages as Message[])
 				: undefined;
 			const headerRunner = extensionRunnerRef.current;
-			if (process.env.PI_SERVER_MODE === "true") {
-				const auth = await modelRuntime.getAuth(model, { apiKey: options?.apiKey, env: options?.env });
+			// Only session requests replace the selected model's cache entry. Keep its
+			// exact request prefix warm while tools run, then apply the configured idle policy.
+			if (options?.sessionId === sessionManager.getSessionId()) {
+				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheContextIsCurrent(model));
+			}
+			if (remote) {
 				let headers = mergeProviderAttributionHeaders(
-					model,
+					requestModel,
 					settingsManager,
 					options?.sessionId,
-					auth?.auth.headers ?? model.headers,
+					model.headers,
+					auth?.auth.headers,
 					options?.headers,
 				);
 				if (headerRunner?.hasHandlers("before_provider_headers")) {
 					headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
 				}
-				return streamPiServer(model, context, {
+				return streamPiServer(requestModel, context, {
 					...requestOptions,
-					onPayload:
-						requestOptions.onPayload === transformProviderPayload &&
-						!headerRunner?.hasHandlers("before_provider_request")
-							? undefined
-							: requestOptions.onPayload,
-					onResponse:
-						requestOptions.onResponse === handleProviderResponse &&
-						!headerRunner?.hasHandlers("after_provider_response")
-							? undefined
-							: requestOptions.onResponse,
-					onProviderStreamEvent:
-						requestOptions.onProviderStreamEvent === handleProviderStreamEvent &&
-						!headerRunner?.hasHandlers("provider_stream_event")
-							? undefined
-							: requestOptions.onProviderStreamEvent,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
 					contextOverlay: piServerContext?.contextOverlay,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,
-					apiKey: auth?.auth.apiKey ?? options?.apiKey,
-					env: auth?.env || options?.env ? { ...(auth?.env ?? {}), ...(options?.env ?? {}) } : undefined,
+					apiKey: options?.apiKey ?? auth?.auth.apiKey,
+					env: requestOptions.env,
 					headers,
 				});
-			}
-			// Compaction and summaries use their own routing ids; only session requests
-			// replace the cache entry, so warming restarts from them. Keep warming while
-			// the current transcript still extends the request's prefix. Agent state may
-			// shallow-copy the messages array or refresh the model object without changing
-			// the provider request, so top-level object identity is not a valid cache key.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
 			}
 			return modelRuntime.streamSimple(model, context, requestOptions);
 		},
@@ -511,6 +524,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		autoSessionName: options.autoSessionName,
 	});
 	agentSession = session;
+	session.subscribe((event) => {
+		if (event.type === "abort_start") cacheWarmer.cancel();
+	});
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

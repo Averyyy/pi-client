@@ -14,6 +14,9 @@
 - Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.
 - Preserved provider sampling options, parsed stream events, payload transformations, and response callbacks across pi-server requests.
 - Kept help, version, and invalid provider selections independent of server connectivity while preserving extension help flags.
+- Enabled prompt-cache warming through pi-server during active runs and idle mode, preserving request prefixes, cache options, cancellation, and local usage accounting.
+- Awaited remote cache-warming cancellation before automatic compaction and retained queued messages when cancellation could not be confirmed.
+- Corrected prompt-cache warming decisions for one-hour Anthropic and Bedrock cache-write costs.
 - Fixed startup resolution of configured Devin model scopes so an initially empty account catalog does not leave all discovered Devin models in model cycling.
 - Preserved native provider model discovery instead of replacing it with the public static catalog overlay.
 

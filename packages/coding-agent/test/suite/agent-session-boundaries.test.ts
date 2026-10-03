@@ -506,7 +506,9 @@ describe("AgentSession actionable boundaries", () => {
 
 	it("preserves boundary metadata when pi-server omits a failed assistant", async () => {
 		const previousPiServerMode = process.env.PI_SERVER_MODE;
-		process.env.PI_SERVER_MODE = "true";
+		// The faux runtime is local; remote mode controls failed-assistant boundary omission.
+		delete process.env.PI_SERVER_MODE;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request"));
 		try {
 			const harness = await createHarness({
 				settings: { retry: { enabled: false } },
@@ -520,6 +522,7 @@ describe("AgentSession actionable boundaries", () => {
 				],
 			});
 			harnesses.push(harness);
+			process.env.PI_SERVER_MODE = "true";
 			harness.session.agent.prepareRequest = () => {
 				throw new Error("request preparation failed");
 			};
@@ -539,7 +542,9 @@ describe("AgentSession actionable boundaries", () => {
 							entry.message.stopReason === "error",
 					),
 			).toBe(true);
+			expect(fetchSpy).not.toHaveBeenCalled();
 		} finally {
+			fetchSpy.mockRestore();
 			if (previousPiServerMode === undefined) delete process.env.PI_SERVER_MODE;
 			else process.env.PI_SERVER_MODE = previousPiServerMode;
 		}

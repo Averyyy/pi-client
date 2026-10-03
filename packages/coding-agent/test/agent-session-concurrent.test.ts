@@ -223,13 +223,16 @@ describe("AgentSession concurrent prompt guard", () => {
 
 	it("keeps queued intent when cancellation fails and resumes after retry", async () => {
 		const previousPiServerMode = process.env.PI_SERVER_MODE;
-		process.env.PI_SERVER_MODE = "true";
+		// The custom stream owns inference; only cancellation uses the remote lifecycle.
+		delete process.env.PI_SERVER_MODE;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request"));
 		const cancelSpy = vi
 			.spyOn(piServerClient, "cancelPiServerOperations")
 			.mockRejectedValueOnce(new Error("remote cancellation failed"))
 			.mockResolvedValueOnce(undefined);
 		try {
 			const created = await createSession({ completeAfterAbort: true });
+			process.env.PI_SERVER_MODE = "true";
 			const abortErrors: string[] = [];
 			session.subscribe((event) => {
 				if (event.type === "abort_error") abortErrors.push(event.errorMessage);
@@ -253,8 +256,10 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(session.isAborting).toBe(false);
 			expect(session.pendingMessageCount).toBe(0);
 			expect(created.getCallCount()).toBe(2);
+			expect(fetchSpy).not.toHaveBeenCalled();
 		} finally {
 			cancelSpy.mockRestore();
+			fetchSpy.mockRestore();
 			if (previousPiServerMode === undefined) {
 				delete process.env.PI_SERVER_MODE;
 			} else {

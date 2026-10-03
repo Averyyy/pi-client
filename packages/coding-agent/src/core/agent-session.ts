@@ -2890,6 +2890,7 @@ export class AgentSession {
 		}
 
 		if (this._isAborting) {
+			this._continueAfterAbortRequested ||= this.agent.hasQueuedMessages();
 			this._abortError = undefined;
 		} else {
 			this._isAborting = true;
@@ -3699,6 +3700,7 @@ export class AgentSession {
 		let started = false;
 		let fromExtension = false;
 		let cancelledByExtension = false;
+		let warmCancellationPending = false;
 		if (externalSignal?.aborted) return false;
 		const abortExternal = () => abortController?.abort();
 		externalSignal?.addEventListener("abort", abortExternal, { once: true });
@@ -3707,6 +3709,7 @@ export class AgentSession {
 			if (!model) {
 				return false;
 			}
+			this._cacheWarmer?.cancel();
 
 			if (isPiServerMode()) {
 				abortController = new AbortController();
@@ -3714,6 +3717,14 @@ export class AgentSession {
 				started = true;
 				this._emit({ type: "compaction_start", reason });
 				abortController.signal.throwIfAborted();
+				if (this._cacheWarmer) {
+					// A warm replay can update static context. Confirm its remote cancellation
+					// before compaction captures the session revision and synchronizes the tree.
+					warmCancellationPending = true;
+					await cancelPiServerOperations(this.sessionId);
+					warmCancellationPending = false;
+					abortController.signal.throwIfAborted();
+				}
 
 				const {
 					model: requestModel,
@@ -3920,6 +3931,17 @@ export class AgentSession {
 					willRetry: false,
 					fromExtension,
 				});
+			}
+			if (warmCancellationPending) {
+				// Agent core records thrown preparation failures as assistant errors.
+				// Keep unconfirmed cancellation terminal until an explicit abort retry.
+				this._agentRunAbortRequested = true;
+				this._isAborting = true;
+				this._continueAfterAbortRequested ||= this.agent.hasQueuedMessages();
+				this._abortError = message;
+				this._abortPromise = undefined;
+				this._emit({ type: "abort_error", errorMessage: message });
+				throw error;
 			}
 			return false;
 		} finally {

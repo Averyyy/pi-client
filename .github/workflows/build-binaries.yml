@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+      # Scoped fork releases use publish-averyyy-npm.yml.
+      - '!v*-piclient.*'
   workflow_dispatch:
     inputs:
       tag:

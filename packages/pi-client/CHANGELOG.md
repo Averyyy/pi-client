@@ -4,6 +4,7 @@
 
 - Reported upstream Pi 1.0.0 and its full source commit in package metadata.
 - Documented remote model operations, server-side credentials, and the 64 KiB UTF-8 request limit.
+- Enabled remote prompt-cache warming with streaming and idle modes, bounded request bodies, and session usage accounting.
 - Fixed automatic update checks to compare the installed `pi-client` version instead of the upstream `pi` version.
 - Used `pi-client` in fork help and documented `web`, `send`, server configuration, global package updates, and `/reload` without changing upstream Pi help.
 - Reported upload HTTP and connection failures with the target, response metadata, and a bounded, token-redacted body excerpt instead of JSON or network stack traces.

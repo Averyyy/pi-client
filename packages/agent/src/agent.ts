@@ -140,8 +140,17 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
+const queuedMessageLease = Symbol("queuedMessageLease");
+
+interface PendingMessageLease {
+	message: AgentMessage;
+}
+
+type QueuedDispatchMessage = AgentMessage & { [queuedMessageLease]?: PendingMessageLease };
+
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
+	private readonly selected = new Set<PendingMessageLease>();
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -165,11 +174,29 @@ class PendingMessageQueue {
 	drain(): AgentMessage[] {
 		const drained = this.peek();
 		this.messages = this.messages.slice(drained.length);
-		return drained;
+		return drained.map((message) => {
+			const lease = { message };
+			this.selected.add(lease);
+			// The loop may spread a system message while declaring tool changes.
+			// An exact lease survives that transform without modifying the caller's object.
+			return { ...message, [queuedMessageLease]: lease };
+		});
+	}
+
+	commit(lease: PendingMessageLease | undefined): void {
+		if (lease) this.selected.delete(lease);
+	}
+
+	restoreSelected(): void {
+		if (this.selected.size === 0) return;
+		this.messages = [...Array.from(this.selected, (lease) => lease.message), ...this.messages];
+		this.selected.clear();
 	}
 
 	clear(): void {
 		this.messages = [];
+		// Clearing a queue also invalidates selected input that has not committed.
+		this.selected.clear();
 	}
 }
 
@@ -190,6 +217,7 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
+	private readonly messageLeases = new WeakMap<AgentMessage, PendingMessageLease>();
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -548,6 +576,8 @@ export class Agent {
 	}
 
 	private finishRun(): void {
+		this.steeringQueue.restoreSelected();
+		this.followUpQueue.restoreSelected();
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -563,6 +593,14 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
+		if (event.type === "message_start" || event.type === "message_end") {
+			const queued = event.message as QueuedDispatchMessage;
+			const lease = queued[queuedMessageLease];
+			if (lease) {
+				this.messageLeases.set(event.message, lease);
+				delete queued[queuedMessageLease];
+			}
+		}
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
@@ -572,10 +610,15 @@ export class Agent {
 				this._state.streamingMessage = event.message;
 				break;
 
-			case "message_end":
+			case "message_end": {
+				const lease = this.messageLeases.get(event.message);
+				this.steeringQueue.commit(lease);
+				this.followUpQueue.commit(lease);
+				this.messageLeases.delete(event.message);
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
 				break;
+			}
 
 			case "tool_execution_start": {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
@@ -598,6 +641,8 @@ export class Agent {
 				break;
 
 			case "agent_end":
+				this.steeringQueue.restoreSelected();
+				this.followUpQueue.restoreSelected();
 				this._state.streamingMessage = undefined;
 				break;
 		}

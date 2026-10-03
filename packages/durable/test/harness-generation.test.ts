@@ -183,24 +183,31 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
-	it("retries a retryable error after a durable backoff and then answers", async () => {
-		const setup = chatSetup();
-		addSection(setup.registry, "preamble", () => "p", { tag: false });
-		setup.faux.setResponses([ERROR_503, fauxAssistantMessage("recovered")]);
-		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
-		const { harness, root } = await openChat(new MemoryStorage(), setup);
-		const values = livePublications(harness);
-		harness.resume();
-		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
-		expect(settled.status).toBe("done");
-		const entries = await allEntries(root);
-		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.system", "pi.assistant", "pi.assistant"]);
-		expect((entries[2]!.model![0] as AssistantMessage).stopReason).toBe("error");
-		expect(values.some((value) => value.generation?.retry?.error === "503 Service Unavailable")).toBe(true);
-		expect(values.some((value) => value.generation?.attempt === 2)).toBe(true);
-		expect(await live(harness, root)).toEqual({});
-		await harness.close(context);
-	});
+	it.each(["503 Service Unavailable", "Invalid request"])(
+		"retries %s after a durable backoff and then answers",
+		async (errorMessage) => {
+			const setup = chatSetup();
+			addSection(setup.registry, "preamble", () => "p", { tag: false });
+			setup.faux.setResponses([
+				fauxAssistantMessage([], { stopReason: "error", errorMessage }),
+				fauxAssistantMessage("recovered"),
+			]);
+			setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			const values = livePublications(harness);
+			harness.resume();
+			const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+			expect(settled.status).toBe("done");
+			const entries = await allEntries(root);
+			expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.system", "pi.assistant", "pi.assistant"]);
+			expect((entries[2]!.model![0] as AssistantMessage).stopReason).toBe("error");
+			expect(values.some((value) => value.generation?.retry?.error === errorMessage)).toBe(true);
+			expect(values.some((value) => value.generation?.attempt === 2)).toBe(true);
+			expect(setup.faux.state.callCount).toBe(2);
+			expect(await live(harness, root)).toEqual({});
+			await harness.close(context);
+		},
+	);
 
 	it("fails with model_error once retries are exhausted", async () => {
 		const setup = chatSetup();
@@ -253,17 +260,19 @@ describe("generation", () => {
 	it("fails a non-retryable error without retrying", async () => {
 		const setup = chatSetup();
 		setup.faux.setResponses([
-			fauxAssistantMessage([], { stopReason: "error", errorMessage: "Invalid request" }),
+			fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" }),
 			fauxAssistantMessage("never"),
 		]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		harness.resume();
 		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
-		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: "Invalid request" });
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: "insufficient_quota" });
 		const tasks = await harness.commit((tx) => tx.scanTasks({ conversationId: root.id }, 10), context);
 		expect(tasks.items[0]!.state).toMatchObject({
-			outcome: { status: "failed", error: { message: "Invalid request", detail: { reason: "model_error" } } },
+			outcome: { status: "failed", error: { message: "insufficient_quota", detail: { reason: "model_error" } } },
 		});
+		expect(setup.faux.state.callCount).toBe(1);
+		expect(setup.faux.getPendingResponseCount()).toBe(1);
 		await harness.close(context);
 	});
 

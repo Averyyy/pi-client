@@ -121,7 +121,10 @@ function request(model: Model<Api> = adaptiveModel, options: ModelsSimpleStreamO
 
 const current = () => true;
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+	vi.useRealTimers();
+	vi.unstubAllEnvs();
+});
 
 describe("cache warming", () => {
 	it("derives eligibility and timing from retention and provider behavior", () => {
@@ -178,6 +181,134 @@ describe("cache warming", () => {
 		expect(calls).toHaveLength(2);
 		warmer.cancel();
 	});
+
+	it.each<{
+		name: string;
+		api?: Api;
+		options: ModelsSimpleStreamOptions;
+		promptTokens: number;
+		longTtl?: number;
+		supportsLong?: boolean;
+		action: CacheWarmingAction;
+		missCost: number;
+	}>([
+		{
+			name: "short below threshold",
+			options: { cacheRetention: "short" },
+			promptTokens: 6000,
+			action: "stop",
+			missCost: 0.0345,
+		},
+		{
+			name: "short above threshold",
+			options: { cacheRetention: "short" },
+			promptTokens: 9600,
+			action: "warm",
+			missCost: 0.0552,
+		},
+		{
+			name: "long below threshold",
+			options: { cacheRetention: "long" },
+			promptTokens: 5500,
+			action: "stop",
+			missCost: 0.05225,
+		},
+		{
+			name: "long above threshold",
+			options: { cacheRetention: "long" },
+			promptTokens: 6000,
+			action: "warm",
+			missCost: 0.057,
+		},
+		{
+			name: "scoped long retention",
+			options: { env: { PI_CACHE_RETENTION: "long" } },
+			promptTokens: 6000,
+			action: "warm",
+			missCost: 0.057,
+		},
+		{
+			name: "explicit short overrides scoped long",
+			options: { cacheRetention: "short", env: { PI_CACHE_RETENTION: "long" } },
+			promptTokens: 6000,
+			action: "stop",
+			missCost: 0.0345,
+		},
+		{
+			name: "explicit long overrides scoped short",
+			options: { cacheRetention: "long", env: { PI_CACHE_RETENTION: "short" } },
+			promptTokens: 6000,
+			action: "warm",
+			missCost: 0.057,
+		},
+		{
+			name: "scoped short overrides process long",
+			options: { env: { PI_CACHE_RETENTION: "short" } },
+			promptTokens: 6000,
+			action: "stop",
+			missCost: 0.0345,
+		},
+		{
+			name: "conservative lifetime keeps Anthropic one-hour billing",
+			options: { cacheRetention: "long" },
+			promptTokens: 6000,
+			longTtl: 2700,
+			action: "warm",
+			missCost: 0.057,
+		},
+		{
+			name: "Anthropic compatibility disables one-hour billing",
+			options: { cacheRetention: "long" },
+			promptTokens: 6000,
+			supportsLong: false,
+			action: "stop",
+			missCost: 0.0345,
+		},
+		{
+			name: "Bedrock one-hour writes with conservative lifetime",
+			api: "bedrock-converse-stream",
+			options: { cacheRetention: "long" },
+			promptTokens: 6000,
+			longTtl: 2700,
+			action: "warm",
+			missCost: 0.057,
+		},
+		{
+			name: "other APIs retain published cache-write rates",
+			api: "openai-responses",
+			options: { cacheRetention: "long" },
+			promptTokens: 6000,
+			action: "stop",
+			missCost: 0.0345,
+		},
+	])(
+		"prices cache misses for $name",
+		async ({ api, options, promptTokens, longTtl, supportsLong, action, missCost }) => {
+			vi.useFakeTimers();
+			vi.stubEnv("PI_CACHE_RETENTION", "long");
+			const model: Model<Api> = {
+				...adaptiveModel,
+				api: api ?? "anthropic-messages",
+				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+				promptCache: { short: 300, long: longTtl ?? 3600 },
+				compat: { supportsLongCacheRetention: supportsLong },
+			};
+			const { warmer, calls, events } = fakeRuntime({ branch: branchWithPrompt(promptTokens) });
+			warmer.start(request(model, options), current);
+			const decision = warmer.status.decision;
+			expect(decision?.missCost).toBeCloseTo(missCost, 10);
+			expect(decision?.warmCost).toBeCloseTo((promptTokens * 0.5 + 25) / 1_000_000, 10);
+			expect(decision?.action).toBe(action);
+			if (action === "warm") expect(decision!.expectedSavings).toBeGreaterThanOrEqual(0.05);
+			else expect(decision!.expectedSavings).toBeLessThan(0.05);
+			const ttl = getPromptCacheTtlMs(model, options);
+			if (ttl === undefined) throw new Error("Expected declared cache lifetime");
+			await vi.advanceTimersByTimeAsync(getCacheWarmingDelayMs(ttl)!);
+			expect(events[0]?.action).toBe(action);
+			expect(calls).toHaveLength(action === "warm" ? 1 : 0);
+			warmer.cancel();
+		},
+	);
 
 	it("does not issue refreshes after their safe deadline", async () => {
 		vi.useFakeTimers();
