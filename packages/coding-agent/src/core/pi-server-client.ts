@@ -7,19 +7,41 @@ import type {
 	SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
+	type AnyModel,
+	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AuthOperationOptions,
+	type ClassifierApi,
+	type ClassifierContext,
+	type ClassifierModel,
+	type ClassifierOptions,
+	type ClassifierResult,
 	type Context,
+	type DeferredCancelOptions,
+	type DeferredFetchOptions,
+	type DeferredHandle,
 	EventStream,
+	getModelType,
+	type ImageApi,
+	type ImageModel,
+	type ImagesContext,
+	type ImagesOptions,
 	type Message,
 	type Model,
+	type ModelsApiStreamOptions,
+	type ProviderRequestOptions,
+	type ProviderStreamOptions,
 	parseStreamingJson,
 	type SimpleStreamOptions,
+	type StreamOptions,
 } from "@earendil-works/pi-ai";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import {
 	buildPiServerTreePrefixHashes,
 	hashPiServerSessionEntries,
 	hashPiServerStaticContext,
+	type PiServerProviderCallbackRequest,
 } from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
 
@@ -248,6 +270,9 @@ export interface PiServerHistorySnapshot {
 }
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
+	requestKind?: "api" | "simple" | "deferred";
+	deferredHandle?: DeferredHandle;
+	apiOptions?: StreamOptions;
 	ownerSessionId?: string;
 	sessionTree?: PiServerTreeSnapshot;
 	ephemeralMessages?: Message[];
@@ -357,6 +382,10 @@ interface PiServerRunResponse {
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
 	compactResult?: PiServerCompactionResponse;
+	operationResult?:
+		| AssistantImages
+		| ClassifierResult
+		| { cancelled: true; stopReason: "stop" | "aborted"; errorMessage?: string };
 	errorMessage?: string;
 }
 
@@ -453,11 +482,6 @@ function getServerSentEventFieldValue(line: string, field: string): string {
 	return value.startsWith(" ") ? value.slice(1) : value;
 }
 
-function parseServerSentEvents(bodyText: string): ServerSentEvent[] {
-	const parser = new ServerSentEventParser();
-	return [...parser.feed(bodyText), ...parser.finish()];
-}
-
 function parseServerSentEventData(event: ServerSentEvent, errorPrefix: string): unknown {
 	try {
 		return JSON.parse(event.data) as unknown;
@@ -471,19 +495,45 @@ function formatServerSentEventError(response: Response, payload: unknown): strin
 	return `${getResponseStatus(response)}; content-type: ${getResponseContentType(response)}; body excerpt: ${getBodyExcerpt(message)}`;
 }
 
-async function readPiServerEventStreamJson<T>(response: Response, errorPrefix: string): Promise<T> {
-	const bodyText = await response.text();
-	for (const event of parseServerSentEvents(bodyText)) {
-		if (event.event === "error") {
-			throw new Error(
-				`${errorPrefix} (${formatServerSentEventError(response, parseServerSentEventData(event, errorPrefix))})`,
+async function readPiServerEventStreamJson<T>(
+	response: Response,
+	errorPrefix: string,
+	onCallback?: (request: PiServerProviderCallbackRequest) => Promise<void>,
+): Promise<T> {
+	if (!response.body) throw new Error(`${errorPrefix} (missing event stream body)`);
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	const parser = new ServerSentEventParser();
+	const processEvents = async (events: ServerSentEvent[]): Promise<{ value: T } | undefined> => {
+		for (const event of events) {
+			if (event.event === "provider_callback") {
+				if (!onCallback) throw new Error(`${errorPrefix} (unexpected provider callback)`);
+				await onCallback(parseServerSentEventData(event, errorPrefix) as PiServerProviderCallbackRequest);
+			} else if (event.event === "error") {
+				throw new Error(
+					`${errorPrefix} (${formatServerSentEventError(response, parseServerSentEventData(event, errorPrefix))})`,
+				);
+			} else if (event.event === "result") {
+				return { value: parseServerSentEventData(event, errorPrefix) as T };
+			}
+		}
+		return undefined;
+	};
+	try {
+		for (;;) {
+			const chunk = await reader.read();
+			const result = await processEvents(
+				chunk.done
+					? [...parser.feed(decoder.decode()), ...parser.finish()]
+					: parser.feed(decoder.decode(chunk.value, { stream: true })),
 			);
+			if (result) return result.value;
+			if (chunk.done) break;
 		}
-		if (event.event === "result") {
-			return parseServerSentEventData(event, errorPrefix) as T;
-		}
+		throw new Error(`${errorPrefix} (expected result event)`);
+	} finally {
+		await reader.cancel().catch(() => {});
 	}
-	throw new Error(`${errorPrefix} (${formatResponseDetails(response, bodyText)}; expected result event)`);
 }
 
 async function readPiServerCompactResponse<T>(response: Response, errorPrefix: string): Promise<T> {
@@ -891,6 +941,10 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 	return {
 		temperature: options?.temperature,
 		maxTokens: options?.maxTokens,
+		samplingParams: options?.samplingParams,
+		toolChoice: options?.toolChoice,
+		deferred: options?.deferred,
+		env: options?.env,
 		reasoning: options?.reasoning,
 		cacheRetention: options?.cacheRetention,
 		sessionId: options?.sessionId,
@@ -904,6 +958,56 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 		maxRetries: options?.maxRetries,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 	};
+}
+
+export function streamRawPiServer<TApi extends string>(
+	model: Model<TApi>,
+	context: Context,
+	options?: ModelsApiStreamOptions<TApi>,
+): Promise<PiServerEventStream> {
+	return streamPiServer(model, context, {
+		signal: options?.signal,
+		sessionId: options?.sessionId,
+		onProviderStreamEvent: options?.onProviderStreamEvent,
+		onPayload: options?.onPayload,
+		onResponse: options?.onResponse,
+		fetch: options?.fetch,
+		requestKind: "api",
+		apiOptions: options ?? {},
+	});
+}
+
+export function fetchDeferredPiServer(
+	model: Model<string>,
+	handle: DeferredHandle,
+	options?: DeferredFetchOptions,
+): Promise<PiServerEventStream> {
+	return streamPiServer(
+		model,
+		{ messages: [] },
+		{
+			...options,
+			requestKind: "deferred",
+			deferredHandle: handle,
+			apiOptions: options,
+		},
+	);
+}
+
+export async function cancelDeferredPiServer(
+	model: Model<string>,
+	handle: DeferredHandle,
+	options?: DeferredCancelOptions,
+): Promise<void> {
+	assertNoCustomPiServerFetch(options);
+	const result = await postPiServerModelOperation<{ cancelled: true; stopReason: "stop" }, Model<string>>(
+		"/api/cancel-deferred",
+		{ model, handle, options: serializeApiOptions(options ?? {}) },
+		model,
+		options,
+	);
+	if (result.cancelled !== true || result.stopReason !== "stop")
+		throw new Error("pi-server deferred cancellation did not complete");
 }
 
 export interface PiServerCompactOptions extends SimpleStreamOptions {
@@ -1024,6 +1128,8 @@ export async function streamPiServer(
 	context: Context,
 	options?: PiServerStreamOptions,
 ): Promise<PiServerEventStream> {
+	assertNoCustomPiServerFetch(options);
+	assertNoCustomPiServerFetch(options?.apiOptions);
 	const sessionId = options?.sessionId ?? randomUUID();
 	const runId = randomUUID();
 	const isEphemeralSession = options?.sessionId === undefined;
@@ -1051,6 +1157,8 @@ export async function streamPiServer(
 	(async () => {
 		let phase: PiServerFailurePhase = "session_init";
 		let streamOpened = false;
+		let observerFailed = false;
+		let callbackFailed = false;
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
@@ -1059,7 +1167,14 @@ export async function streamPiServer(
 				sessionId,
 				runId,
 				model,
-				options: serializeOptions(options),
+				options:
+					options?.requestKind === "api" || options?.requestKind === "deferred"
+						? serializeApiOptions(options.apiOptions ?? {})
+						: serializeOptions(options),
+				requestKind: options?.requestKind,
+				deferredHandle: options?.deferredHandle,
+				observeProviderStreamEvents: options?.onProviderStreamEvent !== undefined,
+				callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 				contextOverlay: options?.contextOverlay ?? [
 					...(context.messages as Message[]),
 					...(options?.ephemeralMessages ?? []),
@@ -1092,12 +1207,37 @@ export async function streamPiServer(
 			const parser = new ServerSentEventParser();
 			let terminalReceived = false;
 
-			const consumeEvents = (events: ServerSentEvent[]): void => {
+			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
+					if (serverEvent.event === "provider_callback") {
+						try {
+							await handleProviderCallback(
+								parseServerSentEventData(serverEvent, "pi-server callback") as PiServerProviderCallbackRequest,
+								model,
+								options,
+								sessionId,
+								runId,
+								request,
+							);
+						} catch (error) {
+							callbackFailed = true;
+							throw error;
+						}
+						continue;
+					}
 					const proxyEvent = parseServerSentEventData(
 						serverEvent,
 						"pi-server stream",
 					) as ProxyAssistantMessageEvent;
+					if (proxyEvent.type === "provider_stream_event") {
+						try {
+							await options?.onProviderStreamEvent?.(proxyEvent.data, proxyEvent.model);
+						} catch (error) {
+							observerFailed = true;
+							throw error;
+						}
+						continue;
+					}
 					const event = processProxyEvent(proxyEvent, partial);
 					if (!event) continue;
 					if (event.type === "done" || event.type === "error") terminalReceived = true;
@@ -1113,10 +1253,10 @@ export async function streamPiServer(
 					throw new Error("Request aborted by user");
 				}
 
-				consumeEvents(parser.feed(decoder.decode(value, { stream: true })));
+				await consumeEvents(parser.feed(decoder.decode(value, { stream: true })));
 			}
-			consumeEvents(parser.feed(decoder.decode()));
-			consumeEvents(parser.finish());
+			await consumeEvents(parser.feed(decoder.decode()));
+			await consumeEvents(parser.finish());
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request aborted by user");
@@ -1136,7 +1276,13 @@ export async function streamPiServer(
 			// failures before the stream starts (502/504/fetch failed) never opened a run
 			// we can poll; attempting recovery against a down proxy reclassifies the error
 			// as history_reconcile and blocks session auto-retry.
-			if (!options?.signal?.aborted && phase === "provider_stream" && streamOpened) {
+			if (
+				!options?.signal?.aborted &&
+				phase === "provider_stream" &&
+				streamOpened &&
+				!observerFailed &&
+				!callbackFailed
+			) {
 				try {
 					const recoveredRun = await waitForPiServerRunCompletion(
 						sessionId,
@@ -1167,6 +1313,11 @@ export async function streamPiServer(
 						return;
 					}
 					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
+						if (recoveredRun.message) {
+							stream.push({ type: "error", reason: "error", error: recoveredRun.message });
+							stream.end();
+							return;
+						}
 						errorMessage = recoveredRun.errorMessage;
 					}
 					if (recoveredRun?.status === "aborted") {
@@ -1177,7 +1328,11 @@ export async function streamPiServer(
 					errorMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
 				}
 			}
-			if (options?.signal?.aborted && operation && !operation.cancelConfirmed) {
+			if (
+				(options?.signal?.aborted || callbackFailed || observerFailed) &&
+				operation &&
+				!operation.cancelConfirmed
+			) {
 				try {
 					await cancelPiServerOperation(operation);
 				} catch (cancelError) {
@@ -1198,7 +1353,7 @@ export async function streamPiServer(
 					details: {
 						phase,
 						source: "pi-server",
-						retryable: isRetryablePiServerFailure(phase, error),
+						retryable: !callbackFailed && !observerFailed && isRetryablePiServerFailure(phase, error),
 					},
 				},
 			];
@@ -1210,7 +1365,10 @@ export async function streamPiServer(
 			stream.end();
 		} finally {
 			try {
-				await finishPiServerOperation(operation, options?.signal?.aborted === true);
+				await finishPiServerOperation(
+					operation,
+					options?.signal?.aborted === true || callbackFailed || observerFailed,
+				);
 			} catch {
 				// The owning session's cancellation helper reports the failure and keeps
 				// this operation registered for a retry.
@@ -1226,6 +1384,8 @@ function processProxyEvent(
 	partial: AssistantMessage,
 ): AssistantMessageEvent | undefined {
 	switch (proxyEvent.type) {
+		case "provider_stream_event":
+			return undefined;
 		case "start":
 			return { type: "start", partial };
 		case "text_start":
@@ -1301,6 +1461,7 @@ function processProxyEvent(
 			partial.deferred = proxyEvent.deferred;
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 		case "error":
+			if (proxyEvent.message) return { type: "error", reason: proxyEvent.reason, error: proxyEvent.message };
 			partial.stopReason = proxyEvent.reason;
 			partial.errorMessage = proxyEvent.errorMessage;
 			partial.usage = proxyEvent.usage;
@@ -1314,3 +1475,195 @@ function processProxyEvent(
 }
 
 export { getServerUrl, getAuthToken };
+
+function serializeApiOptions(options: StreamOptions): ProviderStreamOptions {
+	const {
+		signal: _signal,
+		fetch: _fetch,
+		onPayload: _onPayload,
+		onResponse: _onResponse,
+		onProviderStreamEvent: _onProviderStreamEvent,
+		telemetryContext: _telemetryContext,
+		...serialized
+	} = options;
+	return serialized;
+}
+
+export interface PiServerModelCatalog {
+	models: AnyModel[];
+	available: AnyModel[];
+	providers: { id: string; fetchDeferred: boolean; cancelDeferred: boolean }[];
+}
+
+export async function fetchPiServerModels(options?: AuthOperationOptions): Promise<PiServerModelCatalog> {
+	const response = await createPiServerRequest(options?.signal).getJson("/api/models");
+	return readPiServerJson<PiServerModelCatalog>(response, "pi-server model catalog failed");
+}
+
+export async function generateImagesPiServer(
+	model: ImageModel<ImageApi>,
+	context: ImagesContext,
+	options?: ImagesOptions,
+): Promise<AssistantImages> {
+	assertNoCustomPiServerFetch(options);
+	return postPiServerModelOperation<AssistantImages, ImageModel<ImageApi>>(
+		"/api/generate-images",
+		{
+			model,
+			context,
+			options: {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				headers: options?.headers,
+				metadata: options?.metadata,
+				timeoutMs: options?.timeoutMs,
+				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
+			},
+		},
+		model,
+		options,
+	);
+}
+
+export async function classifyPiServer(
+	model: ClassifierModel<ClassifierApi>,
+	context: ClassifierContext,
+	options?: ClassifierOptions,
+): Promise<ClassifierResult> {
+	assertNoCustomPiServerFetch(options);
+	return postPiServerModelOperation<ClassifierResult, ClassifierModel<ClassifierApi>>(
+		"/api/classify",
+		{
+			model,
+			context,
+			options: {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				headers: options?.headers,
+				temperature: options?.temperature,
+				timeoutMs: options?.timeoutMs,
+				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
+			},
+		},
+		model,
+		options,
+	);
+}
+
+function assertNoCustomPiServerFetch(options?: Pick<ProviderRequestOptions<AnyModel>, "fetch">): void {
+	if (options?.fetch) throw new Error("Custom fetch functions cannot execute on pi-server");
+}
+
+async function handleProviderCallback<TModel extends AnyModel>(
+	callback: PiServerProviderCallbackRequest,
+	model: TModel,
+	options: ProviderRequestOptions<TModel> | undefined,
+	sessionId: string,
+	runId: string,
+	request: ChunkRequest,
+): Promise<void> {
+	if (
+		!callback ||
+		typeof callback.callbackId !== "string" ||
+		!callback.model ||
+		callback.model.provider !== model.provider ||
+		callback.model.id !== model.id ||
+		callback.model.api !== model.api ||
+		getModelType(callback.model) !== getModelType(model)
+	) {
+		throw new Error("pi-server provider callback has an invalid model or callback identity");
+	}
+	const remoteModel = callback.model as TModel;
+	let result: unknown;
+	let failure: unknown;
+	let failed = false;
+	try {
+		if (callback.kind === "payload") {
+			if (!options?.onPayload) throw new Error("Unexpected pi-server payload callback");
+			const replacement = await raceWithAbortSignal(
+				Promise.resolve().then(() => options.onPayload!(callback.payload, remoteModel)),
+				options.signal,
+			);
+			result = replacement === undefined ? callback.payload : replacement;
+		} else if (callback.kind === "response") {
+			if (!options?.onResponse) throw new Error("Unexpected pi-server response callback");
+			await raceWithAbortSignal(
+				Promise.resolve().then(() => options.onResponse!(callback.response, remoteModel)),
+				options.signal,
+			);
+		} else {
+			throw new Error("Unknown pi-server provider callback kind");
+		}
+	} catch (error) {
+		if (options?.signal?.aborted) throw error;
+		failure = error;
+		failed = true;
+	}
+	const response = await request.postJson("/api/provider-callback", {
+		sessionId,
+		runId,
+		callbackId: callback.callbackId,
+		result,
+		error: !failed
+			? undefined
+			: {
+					name: failure instanceof Error ? failure.name : "Error",
+					message: failure instanceof Error ? failure.message : String(failure),
+				},
+	});
+	const reply = await readPiServerJson<{ accepted: boolean; callbackId: string; runId: string }>(
+		response,
+		"pi-server callback reply failed",
+	);
+	if (!reply.accepted || reply.callbackId !== callback.callbackId || reply.runId !== runId) {
+		throw new Error("pi-server callback reply did not acknowledge the pending callback");
+	}
+	if (failed) throw failure;
+}
+
+async function postPiServerModelOperation<T, TModel extends AnyModel>(
+	endpoint: "/api/generate-images" | "/api/classify" | "/api/cancel-deferred",
+	body: Record<string, unknown>,
+	model: TModel,
+	options?: ProviderRequestOptions<TModel>,
+): Promise<T> {
+	const signal = options?.signal;
+	const sessionId = randomUUID();
+	const runId = randomUUID();
+	const operation = registerPiServerOperation(sessionId, sessionId, runId, signal);
+	const request = createPiServerRequest(signal);
+	let callbackFailed = false;
+	try {
+		const response = await request.postJson(endpoint, {
+			...body,
+			sessionId,
+			runId,
+			callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
+		});
+		if (!response.ok) return await readPiServerJson<T>(response, "pi-server model operation failed");
+		await ensurePiServerEventStream(response);
+		try {
+			return await readPiServerEventStreamJson<T>(response, "pi-server model operation failed", async (callback) => {
+				try {
+					await handleProviderCallback(callback, model, options, sessionId, runId, request);
+				} catch (error) {
+					callbackFailed = true;
+					throw error;
+				}
+			});
+		} catch (error) {
+			if (signal?.aborted || callbackFailed) throw error;
+			const recovered = await waitForPiServerRunCompletion(sessionId, runId, request, { signal });
+			if (recovered?.operationResult) return recovered.operationResult as T;
+			throw error;
+		}
+	} catch (error) {
+		if ((signal?.aborted || callbackFailed) && operation && !operation.cancelConfirmed)
+			await cancelPiServerOperation(operation);
+		throw error;
+	} finally {
+		await finishPiServerOperation(operation, signal?.aborted === true || callbackFailed);
+	}
+}

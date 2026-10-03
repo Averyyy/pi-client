@@ -29,6 +29,7 @@ import {
 	type ImageModel,
 	type ImagesContext,
 	type ImagesOptions,
+	isModelType,
 	type LoginOptions,
 	lazyStream,
 	type Message,
@@ -55,6 +56,7 @@ import {
 	type ProviderRequestOptions,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import {
@@ -69,6 +71,15 @@ import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
+import {
+	cancelDeferredPiServer,
+	classifyPiServer,
+	fetchDeferredPiServer,
+	fetchPiServerModels,
+	generateImagesPiServer,
+	streamPiServer,
+	streamRawPiServer,
+} from "./pi-server-client.ts";
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
@@ -172,6 +183,7 @@ export class ModelRuntime implements Models {
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
+	private readonly nativeCatalogProviders: ReadonlySet<string>;
 	private readonly builtins = new Map<string, Provider>();
 	private readonly nativeExtensionProviders = new Map<string, Provider>();
 	private readonly extensionProviders = new Map<string, ProviderConfigInput>();
@@ -180,6 +192,19 @@ export class ModelRuntime implements Models {
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
+	private readonly piServerMode = process.env.PI_SERVER_MODE === "true";
+	private remoteCatalog: { models: readonly AnyModel[]; available: readonly AnyModel[] } = {
+		models: [],
+		available: [],
+	};
+	private remoteProviderCapabilities: readonly { id: string; fetchDeferred: boolean; cancelDeferred: boolean }[] = [];
+	private remoteCatalogError: string | undefined;
+	private registrationRefresh: Promise<void> = Promise.resolve();
+	private readonly registrationRefreshErrors = new Map<string, string>();
+	private remoteCatalogRefreshSeq = 0;
+	private remoteCatalogLoaded = false;
+	private localOperationAvailable: readonly AnyModel[] = [];
+	private remoteProjection: { models: readonly AnyModel[]; available: readonly AnyModel[] } | undefined;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -201,11 +226,13 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		nativeCatalogProviders: ReadonlySet<string>,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
+		this.nativeCatalogProviders = nativeCatalogProviders;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -223,13 +250,12 @@ export class ModelRuntime implements Models {
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog
-			.builtinProviders()
-			.map((provider) =>
-				provider.refreshModels !== undefined
-					? provider
-					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
-			);
+		const builtinProviders = builtinProviderCatalog.builtinProviders();
+		const providers = builtinProviders.map((provider) =>
+			provider.refreshModels !== undefined
+				? provider
+				: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
+		);
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -237,6 +263,9 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			new Set(
+				builtinProviders.filter((provider) => provider.refreshModels !== undefined).map((provider) => provider.id),
+			),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -251,7 +280,10 @@ export class ModelRuntime implements Models {
 			: options.signal;
 		try {
 			if (options.refreshOnCreate !== false) {
-				await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
+				const result = await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
+				const remoteError = result.errors.get("pi-server");
+				if (remoteError) throw remoteError;
+				if (runtime.piServerMode && result.aborted) signal?.throwIfAborted();
 			}
 		} finally {
 			if (timeout) clearTimeout(timeout);
@@ -323,6 +355,7 @@ export class ModelRuntime implements Models {
 	}
 
 	private updateModelSnapshot(): void {
+		this.remoteProjection = undefined;
 		const all = [...this.models.getModels()];
 		this.snapshot = {
 			...this.snapshot,
@@ -333,8 +366,8 @@ export class ModelRuntime implements Models {
 
 	private async runAvailabilityRefresh(seq: number, errorSeq: number, signal: AbortSignal): Promise<void> {
 		const providers = this.models.getProviders();
-		const [available, checks, credentials] = await Promise.all([
-			this.models.getAvailable(undefined, { signal }),
+		const [allAvailable, checks, credentials] = await Promise.all([
+			this.models.getAllAvailable(undefined, { signal }),
 			Promise.all(
 				providers.map(
 					async (provider): Promise<[string, AuthCheck | undefined]> => [
@@ -346,6 +379,8 @@ export class ModelRuntime implements Models {
 			this.credentials.list({ signal }),
 		]);
 		if (seq !== this.availabilityRefreshSeq) return;
+		this.localOperationAvailable = allAvailable;
+		this.remoteProjection = undefined;
 		const auth = new Map(checks);
 		const configuredProviders = new Set(
 			checks
@@ -354,7 +389,7 @@ export class ModelRuntime implements Models {
 		);
 		this.snapshot = {
 			all: [...this.models.getModels()],
-			available: [...available],
+			available: allAvailable.filter((model) => isModelType(model, "chat")),
 			configuredProviders,
 			storedProviders: new Set(credentials.map((entry) => entry.providerId)),
 			auth,
@@ -384,13 +419,19 @@ export class ModelRuntime implements Models {
 		this.providerAvailabilitySeq.set(providerId, providerSeq);
 		const errorSeq = ++this.availabilityErrorSeq;
 		try {
-			const [available, auth, credential] = await Promise.all([
-				this.models.getAvailable(providerId, { signal }),
+			const [allAvailable, auth, credential] = await Promise.all([
+				this.models.getAllAvailable(providerId, { signal }),
 				this.models.checkAuth(providerId, { signal }),
 				this.credentials.read(providerId, { signal }),
 			]);
 			signal.throwIfAborted();
 			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
+			this.localOperationAvailable = [
+				...this.localOperationAvailable.filter((model) => model.provider !== providerId),
+				...allAvailable,
+			];
+			this.remoteProjection = undefined;
+			const available = allAvailable.filter((model) => isModelType(model, "chat"));
 			const configuredProviders = new Set(this.snapshot.configuredProviders);
 			const storedProviders = new Set(this.snapshot.storedProviders);
 			const authByProvider = new Map(this.snapshot.auth);
@@ -431,22 +472,63 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviders(): readonly Provider[] {
+		if (this.piServerMode) {
+			const ids = new Set([
+				...this.models.getProviders().map((provider) => provider.id),
+				...this.getAllModels().map((model) => model.provider),
+			]);
+			return [...ids].flatMap((id) => this.getProvider(id) ?? []);
+		}
 		return this.models.getProviders();
 	}
 
 	getProvider(providerId: string): Provider | undefined {
-		return this.models.getProvider(providerId);
+		const local = this.models.getProvider(providerId);
+		if (!this.piServerMode) return local;
+		const catalog = this.getAllModels(providerId);
+		if (!local && catalog.length === 0) return undefined;
+		const capabilities = this.remoteProviderCapabilities.find((provider) => provider.id === providerId);
+		return {
+			...local,
+			id: providerId,
+			name: local?.name ?? providerId,
+			auth: local?.auth ?? {},
+			getModels: () => this.getModels(providerId),
+			getAllModels: () => this.getAllModels(providerId),
+			stream: <TApi extends Api>(model: Model<TApi>, context: TranscriptContext, options?: ApiStreamOptions<TApi>) =>
+				this.stream(model, context, options as ModelsApiStreamOptions<TApi> | undefined),
+			streamSimple: (model, context, options) => this.streamSimple(model, context, options),
+			generateImages:
+				local?.generateImages || catalog.some((model) => isModelType(model, "image"))
+					? (model, context, options) => this.generateImages(model, context, options)
+					: undefined,
+			classify:
+				local?.classify || catalog.some((model) => isModelType(model, "classifier"))
+					? (model, context, options) => this.classify(model, context, options)
+					: undefined,
+			fetchDeferred:
+				local?.fetchDeferred || capabilities?.fetchDeferred
+					? (model, handle, options) => this.streamDeferred(model, handle, options)
+					: undefined,
+			cancelDeferred:
+				local?.cancelDeferred || capabilities?.cancelDeferred
+					? (model, handle, options) => this.cancelDeferred(model, handle, options)
+					: undefined,
+		};
 	}
 
 	getModels(providerId?: string): readonly Model<Api>[] {
+		if (this.piServerMode) return this.getModelsOfType("chat", providerId);
 		return this.models.getModels(providerId);
 	}
 
 	getModel(providerId: string, modelId: string): Model<Api> | undefined {
+		if (this.piServerMode) return this.getModelOfType("chat", providerId, modelId);
 		return this.models.getModel(providerId, modelId);
 	}
 
 	getModelsOfType<TType extends ModelType>(type: TType, providerId?: string): readonly ModelTypeMap[TType][] {
+		if (this.piServerMode) return this.getRemoteModels(false, providerId).filter((model) => isModelType(model, type));
 		return this.models.getModelsOfType(type, providerId);
 	}
 
@@ -455,23 +537,124 @@ export class ModelRuntime implements Models {
 		providerId: string,
 		modelId: string,
 	): ModelTypeMap[TType] | undefined {
+		if (this.piServerMode) return this.getModelsOfType(type, providerId).find((model) => model.id === modelId);
 		return this.models.getModelOfType(type, providerId, modelId);
 	}
 
 	getAllModels(providerId?: string): readonly AnyModel[] {
+		if (this.piServerMode) return this.getRemoteModels(false, providerId);
 		return this.models.getAllModels(providerId);
 	}
 
-	getAvailableOfType<TType extends ModelType>(
+	async getAvailableOfType<TType extends ModelType>(
 		type: TType,
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
+		if (this.piServerMode) {
+			options?.signal?.throwIfAborted();
+			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
+			if (!this.remoteCatalogLoaded) await this.refreshRemoteCatalog(options?.signal);
+			return this.getRemoteModels(true, providerId).filter((model) => isModelType(model, type));
+		}
 		return this.models.getAvailableOfType(type, providerId, options);
 	}
 
-	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+		if (this.piServerMode) {
+			options?.signal?.throwIfAborted();
+			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
+			if (!this.remoteCatalogLoaded) await this.refreshRemoteCatalog(options?.signal);
+			return this.getRemoteModels(true, providerId);
+		}
 		return this.models.getAllAvailable(providerId, options);
+	}
+
+	private getRemoteModels(available: boolean, providerId?: string): readonly AnyModel[] {
+		if (this.remoteProjection) {
+			const models = available ? this.remoteProjection.available : this.remoteProjection.models;
+			return providerId === undefined ? models : models.filter((model) => model.provider === providerId);
+		}
+		const catalog = new Map(
+			this.remoteCatalog.models.map((model) => [`${model.type ?? "chat"}\0${model.provider}\0${model.id}`, model]),
+		);
+		for (const model of this.localOperationAvailable) {
+			const key = `${model.type ?? "chat"}\0${model.provider}\0${model.id}`;
+			if (!catalog.has(key)) catalog.set(key, model);
+		}
+		const localAvailableKeys = new Set(
+			this.localOperationAvailable.map((model) => `${model.type ?? "chat"}\0${model.provider}\0${model.id}`),
+		);
+		for (const id of this.nativeCatalogProviders) {
+			for (const model of this.models.getAllModels(id)) {
+				const key = `${model.type ?? "chat"}\0${model.provider}\0${model.id}`;
+				if (!catalog.has(key) || localAvailableKeys.has(key)) catalog.set(key, model);
+			}
+		}
+		const availableKeys = new Set(
+			this.remoteCatalog.available.map((model) => `${model.type ?? "chat"}\0${model.provider}\0${model.id}`),
+		);
+		for (const model of this.localOperationAvailable) {
+			availableKeys.add(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`);
+		}
+		const overlayProviders = new Set([...this.config.getProviderIds(), ...this.getRegisteredProviderIds()]);
+		for (const id of overlayProviders) {
+			const native = this.nativeExtensionProviders.get(id);
+			const base = native ?? this.builtins.get(id);
+			const baseModels = native
+				? (native.getAllModels?.() ?? native.getModels())
+				: [...catalog.values()].filter((model) => model.provider === id);
+			const provider = composeModelProvider(
+				id,
+				base && {
+					...base,
+					getModels: () => baseModels.filter((model) => isModelType(model, "chat")),
+					getAllModels: () => baseModels,
+				},
+				this.config,
+				this.extensionProviders.get(id),
+			);
+			for (const [key, model] of catalog) if (model.provider === id) catalog.delete(key);
+			for (const model of provider.getAllModels?.() ?? provider.getModels()) {
+				catalog.set(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`, model);
+			}
+		}
+		const models = [...catalog.values()];
+		const availableProviders = new Set(
+			models
+				.filter((model) => availableKeys.has(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`))
+				.map((model) => model.provider),
+		);
+		const virtualModels = [...this.virtualModels.values()].flatMap((models) =>
+			[...models.values()].map((entry) => entry.model),
+		);
+		const virtualIds = new Set(virtualModels.map((model) => `${model.provider}\0${model.id}`));
+		const physical = models.filter(
+			(model) => !isModelType(model, "chat") || !virtualIds.has(`${model.provider}\0${model.id}`),
+		);
+		const eligibleVirtual = virtualModels.filter(
+			(model) =>
+				!models.some((entry) => entry.provider === model.provider) || availableProviders.has(model.provider),
+		);
+		this.remoteProjection = {
+			models: [...physical, ...virtualModels],
+			available: [
+				...physical.filter((model) => availableKeys.has(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`)),
+				...eligibleVirtual,
+			],
+		};
+		return this.getRemoteModels(available, providerId);
+	}
+
+	private async refreshRemoteCatalog(signal?: AbortSignal): Promise<void> {
+		const seq = ++this.remoteCatalogRefreshSeq;
+		const catalog = await fetchPiServerModels({ signal });
+		if (seq !== this.remoteCatalogRefreshSeq) return;
+		this.remoteCatalog = catalog;
+		this.remoteProviderCapabilities = catalog.providers;
+		this.remoteCatalogLoaded = true;
+		this.remoteCatalogError = undefined;
+		this.remoteProjection = undefined;
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
@@ -479,6 +662,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
+		if (this.piServerMode) return this.getAvailableOfType("chat", providerId, options);
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
@@ -497,6 +681,7 @@ export class ModelRuntime implements Models {
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
+		if (this.piServerMode) return this.getRemoteModels(true).filter((model) => isModelType(model, "chat"));
 		return this.snapshot.available;
 	}
 
@@ -508,6 +693,9 @@ export class ModelRuntime implements Models {
 			errors.push(`Provider "${providerId}": ${error}`);
 		}
 		if (this.availabilityError) errors.push(`Availability refresh: ${this.availabilityError}`);
+		if (this.remoteCatalogError) errors.push(`pi-server model catalog: ${this.remoteCatalogError}`);
+		for (const [providerId, error] of this.registrationRefreshErrors)
+			errors.push(`Provider "${providerId}" refresh: ${error}`);
 		return errors.length > 0 ? errors.join("\n\n") : undefined;
 	}
 
@@ -541,6 +729,7 @@ export class ModelRuntime implements Models {
 	}
 
 	hasConfiguredAuth(providerId: string): boolean {
+		if (this.piServerMode) return this.getRemoteModels(true, providerId).length > 0;
 		return this.snapshot.configuredProviders.has(providerId);
 	}
 
@@ -688,6 +877,29 @@ export class ModelRuntime implements Models {
 		};
 	}
 
+	private async prepareRemoteRequest<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(model: TModel, options: TOptions | undefined): Promise<{ model: TModel; options: TOptions }> {
+		if (options?.fetch !== undefined)
+			throw new ModelsError("stream", "pi-server does not support custom fetch implementations");
+		const resolution = this.models.getProvider(model.provider)
+			? await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
+			: undefined;
+		let headers = mergeHeaders(mergeHeaders(model.headers, resolution?.auth.headers), options?.headers);
+		const { transformHeaders, ...remoteOptions } = options ?? {};
+		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		return {
+			model: resolution?.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
+			options: {
+				...remoteOptions,
+				apiKey: options?.apiKey ?? resolution?.auth.apiKey,
+				headers,
+				env: resolution?.env || options?.env ? { ...resolution?.env, ...options?.env } : undefined,
+			} as TOptions,
+		};
+	}
+
 	stream<TApi extends Api>(
 		model: Model<TApi>,
 		context: Context,
@@ -696,6 +908,15 @@ export class ModelRuntime implements Models {
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async () => {
 			assertChatModel(model);
+			if (this.piServerMode) {
+				if (isVirtualModel(model))
+					throw new ModelsError(
+						"stream",
+						`Virtual model ${model.provider}/${model.id} must be routed before streaming`,
+					);
+				const prepared = await this.prepareRemoteRequest(model, options);
+				return streamRawPiServer(prepared.model, transcript, prepared.options);
+			}
 			const prepared = await this.prepareRequest(
 				model,
 				options as (StreamOptions & ModelsRequestTransforms) | undefined,
@@ -735,6 +956,10 @@ export class ModelRuntime implements Models {
 		}
 		return lazyStream(model, async () => {
 			assertChatModel(model);
+			if (this.piServerMode) {
+				const prepared = await this.prepareRemoteRequest(model, options);
+				return streamPiServer(prepared.model, transcript, prepared.options);
+			}
 			const prepared = await this.prepareRequest(model, options);
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 		});
@@ -751,6 +976,10 @@ export class ModelRuntime implements Models {
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
 			assertChatModel(model);
+			if (this.piServerMode) {
+				const prepared = await this.prepareRemoteRequest(model, options);
+				return fetchDeferredPiServer(prepared.model, handle, prepared.options);
+			}
 			const prepared = await this.prepareRequest(model, options);
 			if (!prepared.provider.fetchDeferred) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
@@ -773,6 +1002,11 @@ export class ModelRuntime implements Models {
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
 		assertChatModel(model);
+		if (this.piServerMode) {
+			const prepared = await this.prepareRemoteRequest(model, options);
+			await cancelDeferredPiServer(prepared.model, handle, prepared.options);
+			return;
+		}
 		const prepared = await this.prepareRequest(model, options);
 		if (!prepared.provider.cancelDeferred) {
 			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
@@ -787,6 +1021,10 @@ export class ModelRuntime implements Models {
 	): Promise<AssistantImages> {
 		try {
 			assertImageModel(model);
+			if (this.piServerMode) {
+				const prepared = await this.prepareRemoteRequest(model, options);
+				return await generateImagesPiServer(prepared.model, context, prepared.options);
+			}
 			const prepared = await this.prepareRequest(model, options);
 			if (!prepared.provider.generateImages) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
@@ -804,6 +1042,10 @@ export class ModelRuntime implements Models {
 	): Promise<ClassifierResult> {
 		try {
 			assertClassifierModel(model);
+			if (this.piServerMode) {
+				const prepared = await this.prepareRemoteRequest(model, options);
+				return await classifyPiServer(prepared.model, context, prepared.options);
+			}
 			const prepared = await this.prepareRequest(model, options);
 			if (!prepared.provider.classify) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
@@ -837,6 +1079,54 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+		if (options.signal?.aborted) return { aborted: true, errors: new Map() };
+		try {
+			await raceWithAbortSignal(this.registrationRefresh, options.signal);
+		} catch (error) {
+			if (options.signal?.aborted) return { aborted: true, errors: new Map() };
+			throw error;
+		}
+		if (this.piServerMode) {
+			this.config = await ModelConfig.load(this.modelsPath);
+			this.configureRadiusProviders();
+			this.rebuildProviders();
+			let result = await this.models.refresh({ ...options, allowNetwork: false });
+			const nativeProviders = [
+				...new Set([...this.nativeCatalogProviders, ...this.nativeExtensionProviders.keys()]),
+			].filter((id) => options.providers === undefined || options.providers.includes(id));
+			if ((options.allowNetwork ?? this.modelNetworkEnabled) && nativeProviders.length > 0) {
+				const nativeResult = await this.models.refresh({
+					...options,
+					providers: nativeProviders,
+					allowNetwork: true,
+				});
+				result = {
+					aborted: result.aborted || nativeResult.aborted,
+					errors: new Map([...result.errors, ...nativeResult.errors]),
+				};
+			}
+			const errors = new Map(result.errors);
+			try {
+				await this.queueAvailabilityRefresh(options.signal);
+			} catch (error) {
+				if (!options.signal?.aborted)
+					errors.set("availability", error instanceof Error ? error : new Error(String(error)));
+			}
+			try {
+				if (!options.signal?.aborted) await this.refreshRemoteCatalog(options.signal);
+			} catch (error) {
+				if (!options.signal?.aborted) {
+					const remoteError = error instanceof Error ? error : new Error(String(error));
+					this.remoteCatalogError = remoteError.message;
+					errors.set("pi-server", remoteError);
+				}
+			}
+			for (const id of this.registrationRefreshErrors.keys()) {
+				if (!errors.has(id) && (options.providers === undefined || options.providers.includes(id)))
+					this.registrationRefreshErrors.delete(id);
+			}
+			return { aborted: result.aborted || options.signal?.aborted === true, errors };
+		}
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -849,12 +1139,7 @@ export class ModelRuntime implements Models {
 			...options,
 			allowNetwork: options.allowNetwork ?? this.modelNetworkEnabled,
 		};
-		// Published pi-ai builds before ModelsStore returned void and accepted a provider ID.
-		// The fallback keeps source-mode CLI tests working without rebuilding workspace dependencies.
-		const result = ((await this.models.refresh(refreshOptions)) as ModelsRefreshResult | undefined) ?? {
-			aborted: refreshOptions.signal?.aborted ?? false,
-			errors: new Map(),
-		};
+		const result = await this.models.refresh(refreshOptions);
 		const errors = new Map(result.errors);
 		this.updateModelSnapshot();
 		if (options.providers) {
@@ -879,6 +1164,21 @@ export class ModelRuntime implements Models {
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}
 
+	private queueRegistrationRefresh(providerId: string): void {
+		this.registrationRefresh = this.registrationRefresh
+			.then(async () => {
+				const result = await this.models.refresh({ allowNetwork: false, providers: [providerId] });
+				const error = result.errors.get(providerId);
+				if (error) throw error;
+				this.updateModelSnapshot();
+				await this.refreshProviderAvailability(providerId, operationSignal());
+				this.registrationRefreshErrors.delete(providerId);
+			})
+			.catch((error: unknown) => {
+				this.registrationRefreshErrors.set(providerId, error instanceof Error ? error.message : String(error));
+			});
+	}
+
 	registerNativeProvider(provider: Provider): void {
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
@@ -890,7 +1190,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(provider.id), undefined),
 			provider.auth.oauth && !provider.auth.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.queueRegistrationRefresh(provider.id);
 	}
 
 	/**
@@ -936,7 +1236,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(providerId), effective),
 			effective.oauth && !effective.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.queueRegistrationRefresh(providerId);
 	}
 
 	unregisterProvider(providerId: string): void {
@@ -944,7 +1244,7 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.queueRegistrationRefresh(providerId);
 	}
 
 	/**
@@ -955,7 +1255,7 @@ export class ModelRuntime implements Models {
 	registerVirtualModel(definition: VirtualModelDefinition): void {
 		const { provider: providerId, id } = definition;
 		if (!providerId.trim() || !id.trim()) throw new Error("Virtual model provider and id must not be empty.");
-		const existing = this.models.getModel(providerId, id);
+		const existing = this.getModel(providerId, id);
 		if (existing && !isVirtualModel(existing)) {
 			throw new Error(`Virtual model ${providerId}/${id} conflicts with a physical model.`);
 		}
@@ -970,7 +1270,7 @@ export class ModelRuntime implements Models {
 			this.snapshot = { ...this.snapshot, auth, configuredProviders };
 		}
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.queueRegistrationRefresh(providerId);
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
@@ -979,7 +1279,7 @@ export class ModelRuntime implements Models {
 		if (models.size === 0) this.virtualModels.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.queueRegistrationRefresh(providerId);
 	}
 
 	/**
@@ -1026,7 +1326,7 @@ export class ModelRuntime implements Models {
 
 	/** A catalog chat model that is not virtual. */
 	getPhysicalModel(providerId: string, modelId: string): Model<Api> | undefined {
-		const model = this.models.getModel(providerId, modelId);
+		const model = this.getModel(providerId, modelId);
 		return model && !isVirtualModel(model) ? model : undefined;
 	}
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	mcpStructuredContentSchema,
 	renderDeclarations,
+	renderToolOutputType,
 	renderToolSample,
 	renderToolSignature,
 	schemaToType,
@@ -123,6 +124,25 @@ describe("schemaToType", () => {
 });
 
 describe("tool declarations", () => {
+	it("exports result types for plain and MCP output schemas", () => {
+		expect(renderToolOutputType(undefined)).toBe("unknown");
+		expect(renderToolOutputType({ type: "string" })).toBe("string");
+		expect(renderToolOutputType(false)).toBe("never");
+		expect(renderToolOutputType(mcpResultSchema())).toBe("CallToolResult");
+		expect(renderToolOutputType(mcpResultSchema(true))).toBe("CallToolResult");
+		expect(renderToolOutputType(mcpResultSchema(false))).toBe("CallToolResult<never>");
+		expect(
+			renderToolOutputType(
+				mcpResultSchema({
+					type: "object",
+					properties: { id: { type: "string" } },
+					required: ["id"],
+					additionalProperties: false,
+				}),
+			),
+		).toBe("CallToolResult<{ id: string; }>");
+	});
+
 	it("renders signatures with normalized identifiers", () => {
 		expect(
 			renderToolSignature({

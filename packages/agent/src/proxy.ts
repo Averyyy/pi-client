@@ -5,6 +5,7 @@
 
 // Internal import for JSON parsing utility
 import {
+	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
@@ -35,6 +36,7 @@ class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, Assista
  */
 export type ProxyAssistantMessageEvent =
 	| { type: "start" }
+	| { type: "provider_stream_event"; data: unknown; model: Model<Api> }
 	| { type: "text_start"; contentIndex: number }
 	| { type: "text_delta"; contentIndex: number; delta: string }
 	| { type: "text_end"; contentIndex: number; contentSignature?: string }
@@ -56,6 +58,7 @@ export type ProxyAssistantMessageEvent =
 			type: "error";
 			reason: Extract<StopReason, "aborted" | "error">;
 			errorMessage?: string;
+			message?: AssistantMessage;
 			usage: AssistantMessage["usage"];
 			providerThinkingLevel?: string;
 	  };
@@ -274,6 +277,8 @@ function processProxyEvent(
 	partial: AssistantMessage,
 ): AssistantMessageEvent | undefined {
 	switch (proxyEvent.type) {
+		case "provider_stream_event":
+			return undefined;
 		case "start":
 			return { type: "start", partial };
 
@@ -393,6 +398,7 @@ function processProxyEvent(
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 
 		case "error":
+			if (proxyEvent.message) return { type: "error", reason: proxyEvent.reason, error: proxyEvent.message };
 			partial.stopReason = proxyEvent.reason;
 			partial.errorMessage = proxyEvent.errorMessage;
 			partial.usage = proxyEvent.usage;

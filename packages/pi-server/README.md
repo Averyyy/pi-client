@@ -5,7 +5,7 @@ Server for `@averyyy/pi-client`. It stores session state and forwards client req
 ## Install
 
 ```bash
-npm i -g @averyyy/pi-server
+npm i -g --ignore-scripts --legacy-peer-deps @averyyy/pi-server
 ```
 
 ## Start
@@ -47,3 +47,7 @@ With auth:
 ```bash
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
+
+Use the same release version for client and server. The authenticated `/api/models` catalog reports chat, image, and classifier models with their precise availability. `/api/stream`, `/api/generate-images`, and `/api/classify` resolve server-side provider credentials or use credentials explicitly supplied by the client.
+
+Image generation and classification stream heartbeat responses and journal completed results for recovery without repeating the provider operation. Cancellation is acknowledged after provider cleanup finishes. Oversized operation payloads use `/api/request/chunk`, including when clients set a 64 KiB request-body limit.

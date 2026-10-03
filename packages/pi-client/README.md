@@ -12,22 +12,22 @@ npm i -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client
 
 ## Use
 
-Connect to the hosted server:
+Connect to your server:
 
 ```bash
-PI_SERVER_URL=https://pi.yreva.asia pi-client
+PI_SERVER_URL=https://pi-server.example.com pi-client
 ```
 
 Send one prompt and exit:
 
 ```bash
-PI_SERVER_URL=https://pi.yreva.asia pi-client -p "Say exactly: ok"
+PI_SERVER_URL=https://pi-server.example.com pi-client -p "Say exactly: ok"
 ```
 
 Send a file or folder to the server:
 
 ```bash
-PI_SERVER_URL=https://pi.yreva.asia pi-client send /path/to/file-or-folder
+PI_SERVER_URL=https://pi-server.example.com pi-client send /path/to/file-or-folder
 ```
 
 The server saves it under its configured upload directory, which defaults to `~/.pi/upload_files`.
@@ -37,7 +37,7 @@ Start the browser UI:
 ```bash
 pi-client install npm:@averyyy/pi-tau-codex
 # or: pi install npm:@averyyy/pi-tau-codex
-PI_SERVER_URL=https://pi.yreva.asia pi-client web
+PI_SERVER_URL=https://pi-server.example.com pi-client web
 ```
 
 The web command starts `pi-client` in Tau mirror mode. Install the standalone `@averyyy/pi-tau-codex` extension into the shared `~/.pi/agent` settings first. Tau listens on `http://127.0.0.1:1838` by default.
@@ -50,6 +50,12 @@ If your server uses an auth token, set it on the client:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
+Use matching client and server releases. Provider credentials configured on the server are sufficient for chat, image generation, classifiers, and compaction. Client-side credentials, environment overrides, and request headers are forwarded when supplied.
+
+The authenticated model catalog includes chat, image, and classifier models with availability tracked separately for each model type. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and provider login remain in the client process.
+
+`PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
+
 ## Devin Pro
 
 Update both `@averyyy/pi-client` and `@averyyy/pi-server` to a version with native Devin support. Start `pi-client` with your server connection configured, then:
@@ -59,7 +65,7 @@ Update both `@averyyy/pi-client` and `@averyyy/pi-server` to a version with nati
 /model devin/swe-2-medium
 ```
 
-Login opens Devin's browser OAuth flow and saves the session token in Pi's normal credential store. The account catalog loads after login; `pi-client --list-models swe-2` lists the discovered SWE-2 variants. Choose the exact variant (for example `swe-2-high` or `swe-2-max`) to change effort. Available models and limits come from Devin; there is no hardcoded fallback catalog.
+Login opens Devin's browser OAuth flow and saves the session token in Pi's normal credential store. The account catalog loads after login; `pi-client --list-models swe-2` lists the discovered SWE-2 variants. Choose the exact variant (for example `swe-2-high` or `swe-2-max`) to change effort. Known configured SWE-2 IDs remain selectable before account discovery finishes; successful discovery supplies the account's models and limits, and discovery failures are reported.
 
 Authentication and model discovery may contact Devin from the client. Model inference, including compaction, goes through `pi-client → pi-server → Devin`. Direct Devin inference rejects `PI_SERVER_MODE=true`. Pi continues to own tools, agent loops, session history, and subagents. No Devin CLI installation or provider extension is needed. Remove conflicting Devin extensions before enabling the native provider.
 

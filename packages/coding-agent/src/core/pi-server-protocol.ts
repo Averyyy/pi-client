@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { Message, Tool } from "@earendil-works/pi-ai";
+import type { AnyModel, Message, ProviderResponse, Tool } from "@earendil-works/pi-ai";
+
+export type PiServerProviderCallbackRequest =
+	| { callbackId: string; kind: "payload"; model: AnyModel; payload: unknown }
+	| { callbackId: string; kind: "response"; model: AnyModel; response: ProviderResponse };
 
 export interface PiServerStaticContext {
 	systemPrompt?: string;
@@ -15,6 +19,7 @@ export function hashPiServerStaticContext(context: PiServerStaticContext | undef
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
+			constrainedSampling: tool.constrainedSampling,
 		})),
 	};
 	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");

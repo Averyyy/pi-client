@@ -37,6 +37,7 @@ import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir,
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
+	type CreateAgentSessionServicesOptions,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.ts";
@@ -50,6 +51,7 @@ import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { installPiClientCliAdapter } from "./core/pi-client-cli-adapter.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
+import { DefaultResourceLoader } from "./core/resource-loader.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
 import {
 	formatMissingSessionCwdPrompt,
@@ -467,12 +469,6 @@ function buildSessionOptions(
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
-	if (parsed.provider && !parsed.model) {
-		diagnostics.push({
-			type: "error",
-			message: `--provider requires --model (for example: --provider ${parsed.provider} --model <pattern>)`,
-		});
-	}
 	if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
@@ -635,6 +631,12 @@ export async function main(args: string[], options?: MainOptions) {
 		console.log(VERSION);
 		process.exit(0);
 	}
+	if (!parsed.help && parsed.provider && !parsed.model) {
+		console.error(
+			chalk.red(`Error: --provider requires --model (for example: --provider ${parsed.provider} --model <pattern>)`),
+		);
+		process.exit(1);
+	}
 
 	if (parsed.export) {
 		let result: string;
@@ -748,7 +750,7 @@ export async function main(args: string[], options?: MainOptions) {
 				parsed.projectTrustOverride ??
 				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
-		const services = await createAgentSessionServices({
+		const serviceOptions: CreateAgentSessionServicesOptions = {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
@@ -792,7 +794,23 @@ export async function main(args: string[], options?: MainOptions) {
 				appendSystemPrompt: parsed.appendSystemPrompt,
 				extensionFactories,
 			},
-		});
+		};
+		if (parsed.help) {
+			const resourceLoader = new DefaultResourceLoader({
+				...serviceOptions.resourceLoaderOptions,
+				cwd,
+				agentDir,
+				settingsManager: runtimeSettingsManager,
+			});
+			await resourceLoader.reload(serviceOptions.resourceLoaderReloadOptions);
+			reportDiagnostics(startupSettingsDiagnostics);
+			const extensionFlags = resourceLoader
+				.getExtensions()
+				.extensions.flatMap((extension) => Array.from(extension.flags.values()));
+			printHelp(extensionFlags);
+			process.exit(0);
+		}
+		const services = await createAgentSessionServices(serviceOptions);
 		const { settingsManager, modelRuntime, resourceLoader } = services;
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,
@@ -868,19 +886,10 @@ export async function main(args: string[], options?: MainOptions) {
 	});
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
-	const { settingsManager, modelRuntime, resourceLoader } = services;
+	const { settingsManager, modelRuntime } = services;
 	setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
 	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
-
-	if (parsed.help) {
-		reportDiagnostics(startupSettingsDiagnostics);
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
-		process.exit(0);
-	}
 
 	if (parsed.listModels !== undefined) {
 		reportDiagnostics(startupSettingsDiagnostics);

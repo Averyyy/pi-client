@@ -10,6 +10,10 @@
 
 ### Fixed
 
+- Routed model-registry and provider image generation, classification, direct streams, and deferred response fetch/cancel through pi-server, including codemode usage and virtual-model routing.
+- Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.
+- Preserved provider sampling options, parsed stream events, payload transformations, and response callbacks across pi-server requests.
+- Kept help, version, and invalid provider selections independent of server connectivity while preserving extension help flags.
 - Fixed startup resolution of configured Devin model scopes so an initially empty account catalog does not leave all discovered Devin models in model cycling.
 - Preserved native provider model discovery instead of replacing it with the public static catalog overlay.
 

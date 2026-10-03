@@ -683,6 +683,7 @@ export class AgentSession {
 				env: result.env,
 			};
 		}
+		if (isPiServerMode()) return { model };
 
 		const isOAuth = this._modelRuntime.isUsingOAuth(model.provider);
 		if (isOAuth) {
@@ -713,7 +714,7 @@ export class AgentSession {
 					signal,
 				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
-		if (this.agent.streamFunction === streamSimple) {
+		if (isPiServerMode() || this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
 
@@ -2931,7 +2932,10 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+		const hasAuth = isPiServerMode()
+			? this._modelRuntime.hasConfiguredAuth(model.provider)
+			: await this._modelRuntime.checkAuth(model.provider);
+		if (!hasAuth) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 

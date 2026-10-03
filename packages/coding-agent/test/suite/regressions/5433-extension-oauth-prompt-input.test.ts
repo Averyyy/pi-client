@@ -116,4 +116,19 @@ describe("LoginDialogComponent OAuth prompts", () => {
 		dialog.handleInput("\n");
 		await expect(prompt).resolves.toBe("second-secret-demo");
 	});
+
+	test("accepts a copied Anthropic authorization code without losing the remote-browser instructions", async () => {
+		const dialog = createDialog();
+		const url = "https://example.invalid/anthropic/authorize";
+		dialog.showAuth(url, "Open this link on another machine and copy the authorization code.");
+		const input = dialog.showManualInput("Paste authorization code:");
+		dialog.handleInput("\x1b[200~fixture-code#fixture-state\x1b[201~");
+		dialog.handleInput("\n");
+		await expect(input).resolves.toBe("fixture-code#fixture-state");
+		const output = renderDialog(dialog).join("\n");
+		expect(output).toContain(url);
+		expect(output).toContain("Open this link on another machine");
+		expect(output).toContain("Paste authorization code:");
+		expect(output).toContain("fixture-code#fixture-state");
+	});
 });

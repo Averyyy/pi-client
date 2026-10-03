@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -29,6 +29,11 @@ describe("coding-agent bins", () => {
 	it("source pi-client entry renders fork help without installing anything", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-client-help-"));
 		try {
+			const extensionPath = join(root, "help-extension.ts");
+			writeFileSync(
+				extensionPath,
+				'export default function (pi) { pi.registerFlag("remote-help-fixture", { type: "boolean", description: "Offline extension help" }); }',
+			);
 			const stdoutPath = join(root, "stdout");
 			const stderrPath = join(root, "stderr");
 			const stdoutFd = openSync(stdoutPath, "w");
@@ -41,6 +46,8 @@ describe("coding-agent bins", () => {
 						"--import",
 						pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href,
 						join(pkgRoot, "src", "pi-client-cli.ts"),
+						"-e",
+						extensionPath,
 						"--help",
 					],
 					{
@@ -49,6 +56,7 @@ describe("coding-agent bins", () => {
 							HOME: join(root, "home"),
 							PI_CODING_AGENT_DIR: join(root, "agent"),
 							PI_OFFLINE: "true",
+							PI_SERVER_URL: "http://127.0.0.1:1",
 						},
 						stdio: ["ignore", stdoutFd, stderrFd],
 						timeout: 5_000,
@@ -69,6 +77,7 @@ describe("coding-agent bins", () => {
 			expect(stdout).toContain("PI_SERVER_AUTH_TOKEN");
 			expect(stdout).toContain("PI_CLIENT_MAX_REQUEST_KB");
 			expect(stdout).toContain("/reload");
+			expect(stdout).toContain("--remote-help-fixture");
 			expect(`${stdout}\n${stderr}`).not.toMatch(/npm (install|update)|Installing|Updating/);
 			expect(existsSync(join(root, "agent", "node_modules"))).toBe(false);
 		} finally {
@@ -81,5 +90,36 @@ describe("coding-agent bins", () => {
 
 		expect(pkg.piConfig?.configDir).toBe(".pi");
 		expect(pkg.piConfig?.name).toBeUndefined();
+	});
+
+	it("rejects a provider selection without a model in the pi-client entrypoint", () => {
+		// #10236: an incomplete provider selection must not run another provider's default model.
+		const root = mkdtempSync(join(tmpdir(), "pi-client-provider-"));
+		try {
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--import",
+					pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href,
+					join(pkgRoot, "src", "pi-client-cli.ts"),
+					"--provider",
+					"anthropic",
+				],
+				{
+					env: {
+						...process.env,
+						PI_CODING_AGENT_DIR: join(root, "agent"),
+						PI_OFFLINE: "true",
+						PI_SERVER_URL: "http://127.0.0.1:1",
+					},
+					encoding: "utf8",
+					timeout: 5_000,
+				},
+			);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("--provider requires --model");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

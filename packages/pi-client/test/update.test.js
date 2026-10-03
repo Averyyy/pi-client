@@ -6,15 +6,13 @@ import { describe, expect, it } from "vitest";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(__dirname, "..");
+const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
 
 describe("pi-client update", () => {
 	it("declares the upstream Pi version this fork is based on", () => {
-		const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
-
-		expect(pkg.piClient).toEqual({
-		basePiVersion: "0.80.6",
-		basePiCommit: "0e6909f0",
-		});
+		const codingAgent = JSON.parse(readFileSync(join(pkgRoot, "../coding-agent/package.json"), "utf-8"));
+		expect(pkg.piClient.basePiVersion).toBe(codingAgent.version);
+		expect(pkg.piClient.basePiCommit).toMatch(/^[0-9a-f]{40}$/);
 	});
 
 	it("routes pi-client update through the local update helper", () => {
@@ -44,7 +42,7 @@ describe("pi-client update", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(output.join("")).toContain("based on pi 0.80.6");
+		expect(output.join("")).toContain(`based on pi ${pkg.piClient.basePiVersion}, upstream ${pkg.piClient.basePiCommit}`);
 		expect(output.join("")).toContain("Run /reload in each session");
 		expect(calls).toEqual([
 			{

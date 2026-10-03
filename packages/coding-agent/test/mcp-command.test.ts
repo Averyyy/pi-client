@@ -31,7 +31,7 @@ describe("pi mcp", () => {
 
 	const servers = {
 		fixture: { command: process.execPath, args: [FIXTURE] },
-		broken: { command: "pi-test-missing-mcp-server" },
+		broken: { command: process.execPath, args: [join(FIXTURE, "missing-server.mjs")] },
 		parked: { command: process.execPath, args: [FIXTURE], enabled: false },
 		bad: { args: ["no command"] },
 	};
@@ -42,8 +42,9 @@ describe("pi mcp", () => {
 		expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
 		expect(output).toContain("  tools: echo");
 		expect(output).toContain(
-			"broken: failed (codemode, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT",
+			`broken: failed (codemode, global)\n  ${process.execPath} ${join(FIXTURE, "missing-server.mjs")}\n  MCP connection closed`,
 		);
+		expect(output).toContain("Cannot find module");
 		expect(output).toContain("parked: disabled (codemode, global)");
 		expect(output).toContain("config error: ");
 		expect(output).toContain('server "bad" needs either "command"');

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import {
@@ -13,22 +14,43 @@ import {
 	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
+	type AnyModel,
+	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type ClassifierApi,
+	type ClassifierContext,
+	type ClassifierModel,
+	type ClassifierOptions,
+	type ClassifierResult,
 	type Context,
 	createModels,
 	createProvider,
+	type DeferredCancelOptions,
+	type DeferredHandle,
+	type ImageApi,
+	type ImageModel,
+	type ImagesContext,
+	type ImagesOptions,
 	type Message,
 	type Model,
+	type Models,
+	type ProviderClassifier,
+	type ProviderRequestOptions,
+	type ProviderStreamOptions,
 	type ProviderStreams,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
+import { cloudflareWorkersAISystemOneApi } from "@earendil-works/pi-ai/api/cloudflare-workers-ai-system-one.lazy";
+import { llamaCppClassifyApi } from "@earendil-works/pi-ai/api/llama-cpp-classify.lazy";
+import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
+import { getEnvApiKey, getImagesApiProvider, stream as streamApi, streamSimple } from "@earendil-works/pi-ai/compat";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
-import { hashPiServerProviderMessages } from "./pi-server-protocol.ts";
+import { hashPiServerProviderMessages, type PiServerProviderCallbackRequest } from "./pi-server-protocol.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
@@ -71,6 +93,10 @@ interface StreamRequestBody {
 	staticContext?: SessionStaticContext;
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
+	observeProviderStreamEvents?: boolean;
+	requestKind?: "api" | "simple" | "deferred";
+	deferredHandle?: DeferredHandle;
+	callbacks?: { onPayload?: boolean; onResponse?: boolean };
 }
 
 interface SessionSyncBody {
@@ -141,12 +167,18 @@ function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 }
 
 interface StreamRunRecord {
+	callbacks: Map<string, { resolve: (result: unknown) => void; reject: (error: Error) => void }>;
+	callbackConnectionClosed: boolean;
 	sessionId: string;
 	runId: string;
-	kind: "stream" | "compact";
+	kind: "stream" | "compact" | "image" | "classifier" | "deferred-cancel";
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
 	compactResult?: SessionCompactSuccessBody;
+	operationResult?:
+		| AssistantImages
+		| ClassifierResult
+		| { cancelled: true; stopReason: "stop" | "aborted"; errorMessage?: string };
 	errorMessage?: string;
 	createdAt: number;
 	updatedAt: number;
@@ -233,6 +265,8 @@ function createRunRecord(sessionId: string, runId: string, kind: StreamRunRecord
 		resolveSettled = resolve;
 	});
 	return {
+		callbacks: new Map(),
+		callbackConnectionClosed: false,
 		sessionId,
 		runId,
 		kind,
@@ -248,6 +282,7 @@ function createRunRecord(sessionId: string, runId: string, kind: StreamRunRecord
 
 function settleRun(run: StreamRunRecord | undefined): void {
 	if (!run) return;
+	rejectProviderCallbacks(run, new Error("Provider run settled before callback reply"));
 	const resolve = run.resolveSettled;
 	run.resolveSettled = undefined;
 	resolve?.();
@@ -258,6 +293,7 @@ function startStreamRun(sessionId: string, runId: string, kind: StreamRunRecord[
 	if (existing?.status === "completed" || existing?.status === "aborted") return existing;
 	const run = existing ?? createRunRecord(sessionId, runId, kind);
 	if (existing) {
+		run.callbackConnectionClosed = false;
 		run.message = undefined;
 		run.errorMessage = undefined;
 		run.cancelRequested = false;
@@ -284,6 +320,7 @@ function streamRunResponseBody(run: StreamRunRecord) {
 		updatedAt: run.updatedAt,
 		...(run.message ? { message: run.message } : {}),
 		...(run.compactResult ? { compactResult: run.compactResult } : {}),
+		...(run.operationResult ? { operationResult: run.operationResult } : {}),
 		...(run.errorMessage ? { errorMessage: run.errorMessage } : {}),
 	};
 }
@@ -351,7 +388,7 @@ function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantM
 	run.updatedAt = Date.now();
 }
 
-function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): void {
+function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string, message?: AssistantMessage): void {
 	if (!run) return;
 	if (run.cancelRequested) {
 		run.status = "aborted";
@@ -360,12 +397,118 @@ function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string): 
 		return;
 	}
 	run.status = "failed";
+	run.message = message;
 	run.errorMessage = errorMessage;
 	run.updatedAt = Date.now();
 }
 
 function touchStreamRun(run: StreamRunRecord | undefined): void {
 	if (run) run.updatedAt = Date.now();
+}
+
+function rejectProviderCallbacks(run: StreamRunRecord, error: Error): void {
+	const pending = [...run.callbacks.values()];
+	run.callbacks.clear();
+	for (const callback of pending) callback.reject(error);
+}
+
+function createProviderCallbacks<TModel extends AnyModel>(
+	run: StreamRunRecord,
+	res: ServerResponse,
+	callbacks: { onPayload?: boolean; onResponse?: boolean } | undefined,
+): Pick<ProviderRequestOptions<TModel>, "onPayload" | "onResponse"> {
+	if (!callbacks?.onPayload && !callbacks?.onResponse) return {};
+	res.once("close", () => {
+		run.callbackConnectionClosed = true;
+		rejectProviderCallbacks(run, new Error("Provider callback connection closed"));
+	});
+	run.controller.signal.addEventListener(
+		"abort",
+		() => rejectProviderCallbacks(run, new DOMException("Provider run aborted", "AbortError")),
+		{ once: true },
+	);
+	const requestCallback = (request: PiServerProviderCallbackRequest): Promise<unknown> => {
+		if (run.controller.signal.aborted) return Promise.reject(new DOMException("Provider run aborted", "AbortError"));
+		if (run.callbackConnectionClosed || res.destroyed || res.writableEnded)
+			return Promise.reject(new Error("Provider callback connection closed"));
+		return new Promise<unknown>((resolve, reject) => {
+			run.callbacks.set(request.callbackId, { resolve, reject });
+			try {
+				writeServerSentEvent(res, "provider_callback", request);
+			} catch (error) {
+				run.callbacks.delete(request.callbackId);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	};
+	return {
+		...(callbacks.onPayload
+			? {
+					onPayload: (payload: unknown, model: TModel) =>
+						requestCallback({
+							callbackId: randomUUID(),
+							kind: "payload",
+							model: { ...model, headers: undefined },
+							payload,
+						}),
+				}
+			: {}),
+		...(callbacks.onResponse
+			? {
+					onResponse: async (response, model) => {
+						await requestCallback({
+							callbackId: randomUUID(),
+							kind: "response",
+							model: { ...model, headers: undefined },
+							response,
+						});
+					},
+				}
+			: {}),
+	};
+}
+
+function handleProviderCallbackReply(body: unknown, res: ServerResponse): void {
+	if (!body || typeof body !== "object") {
+		sendError(res, 400, "Provider callback reply must be an object", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	const reply = body as {
+		sessionId?: unknown;
+		runId?: unknown;
+		callbackId?: unknown;
+		result?: unknown;
+		error?: unknown;
+	};
+	if (typeof reply.sessionId !== "string" || typeof reply.runId !== "string" || typeof reply.callbackId !== "string") {
+		sendError(res, 400, "sessionId, runId and callbackId are required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		return;
+	}
+	const run = getStreamRun(reply.sessionId, reply.runId);
+	const pending = run?.callbacks.get(reply.callbackId);
+	if (!run || run.status !== "running" || !pending) {
+		sendError(res, 409, "Provider callback is no longer pending", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	let error: Error | undefined;
+	if (reply.error !== undefined) {
+		const remoteError = reply.error as { name?: unknown; message?: unknown } | null;
+		if (!remoteError || typeof remoteError.name !== "string" || typeof remoteError.message !== "string") {
+			sendError(
+				res,
+				400,
+				"Provider callback error requires string name and message",
+				PiServerErrorCode.INVALID_REQUEST,
+			);
+			return;
+		}
+		error = new Error(remoteError.message);
+		error.name = remoteError.name;
+	}
+	run.callbacks.delete(reply.callbackId);
+	sendJson(res, 200, { accepted: true, callbackId: reply.callbackId, runId: reply.runId });
+	if (error) pending.reject(error);
+	else pending.resolve(reply.result);
 }
 
 function writeStreamEvent(res: ServerResponse, event: ProxyAssistantMessageEvent): void {
@@ -394,9 +537,18 @@ function cleanupExpiredStreamRuns(nowMs: number): void {
 	}
 }
 
-function deleteStreamRunsForSession(sessionId: string): void {
-	for (const [key, run] of streamRuns) {
-		if (run.sessionId === sessionId) streamRuns.delete(key);
+async function deleteStreamRunsForSession(sessionId: string): Promise<void> {
+	const runs = [...streamRuns.entries()].filter(([, run]) => run.sessionId === sessionId);
+	for (const [, run] of runs) {
+		if (run.status !== "running") continue;
+		run.cancelRequested = true;
+		run.updatedAt = Date.now();
+		run.controller.abort();
+		rejectProviderCallbacks(run, new DOMException("Provider session deleted", "AbortError"));
+	}
+	await Promise.all(runs.map(([, run]) => run.settled));
+	for (const [key, run] of runs) {
+		if (streamRuns.get(key) === run) streamRuns.delete(key);
 	}
 }
 
@@ -449,6 +601,7 @@ function sessionTreePatchResponseBody(
 type PreparedCompaction = Parameters<typeof compactLegacy>[0];
 
 interface PreparedSessionCompact {
+	models: Models;
 	session: SessionState;
 	sessionId: string;
 	revision: number;
@@ -619,7 +772,10 @@ function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBo
 	}
 }
 
-function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact | SessionCompactHttpResponse {
+function prepareSessionCompact(
+	body: SessionCompactBody,
+	models?: Models,
+): PreparedSessionCompact | SessionCompactHttpResponse {
 	if (!body.sessionId) {
 		return { status: 400, body: { error: "sessionId is required" } };
 	}
@@ -703,6 +859,7 @@ function prepareSessionCompact(body: SessionCompactBody): PreparedSessionCompact
 		}
 	}
 	return {
+		models: models ?? createRequestModels(body.model, options),
 		session,
 		sessionId: session.sessionId,
 		revision: session.revision,
@@ -747,7 +904,7 @@ async function completeSessionCompact(
 ): Promise<SessionCompactHttpResponse> {
 	const result = await compactLegacy(
 		prepared.preparation,
-		createRequestModels(body.model, prepared.options),
+		prepared.models,
 		body.model,
 		body.customInstructions,
 		run?.controller.signal,
@@ -923,6 +1080,7 @@ async function handleSessionCompact(
 	config: ServerConfig,
 	body: SessionCompactBody,
 	res: ServerResponse,
+	models?: Models,
 ): Promise<void> {
 	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 	if (existingRun?.status === "aborted") {
@@ -933,7 +1091,7 @@ async function handleSessionCompact(
 		sendJson(res, 200, existingRun.compactResult);
 		return;
 	}
-	const prepared = prepareSessionCompact(body);
+	const prepared = prepareSessionCompact(body, models);
 	if ("status" in prepared) {
 		sendJson(res, prepared.status, prepared.body);
 		return;
@@ -1024,6 +1182,7 @@ async function handleSessionRunAbort(sessionId: string, runId: string, res: Serv
 	run.cancelRequested = true;
 	run.updatedAt = Date.now();
 	run.controller.abort();
+	rejectProviderCallbacks(run, new DOMException("Provider run aborted", "AbortError"));
 	await run.settled;
 	sendJson(res, 200, streamRunResponseBody(run));
 }
@@ -1040,13 +1199,17 @@ export function buildStreamContext(
 	};
 }
 
-function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse): void {
+function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse, models?: Models): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 	if (!body.model) {
 		sendError(res, 400, "model is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		return;
+	}
+	if ((body.callbacks?.onPayload || body.callbacks?.onResponse) && !body.runId) {
+		sendError(res, 400, "runId is required for provider callbacks", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 
@@ -1110,6 +1273,18 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 	const streamOptions: SimpleStreamOptions = {
 		...(body.options ?? {}),
 		...(run ? { signal: run.controller.signal } : {}),
+		...(run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {}),
+		...(body.observeProviderStreamEvents
+			? {
+					onProviderStreamEvent: (data: unknown, model: Model<string>) => {
+						writeStreamEvent(res, {
+							type: "provider_stream_event",
+							data,
+							model: { ...model, headers: undefined },
+						});
+					},
+				}
+			: {}),
 	};
 
 	res.writeHead(200, {
@@ -1130,7 +1305,20 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 
 	let stream: AsyncIterable<AssistantMessageEvent>;
 	try {
-		stream = streamSimple(resolvedModel, context, streamOptions);
+		if (body.requestKind === "deferred") {
+			if (!body.deferredHandle) throw new Error("deferredHandle is required for deferred fetch");
+			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle, streamOptions);
+		} else if (models) {
+			stream =
+				body.requestKind === "api"
+					? models.stream(resolvedModel, context, streamOptions as ProviderStreamOptions)
+					: models.streamSimple(resolvedModel, context, streamOptions);
+		} else {
+			stream =
+				body.requestKind === "api"
+					? streamApi(resolvedModel, context, streamOptions as ProviderStreamOptions)
+					: streamSimple(resolvedModel, context, streamOptions);
+		}
 	} catch (err) {
 		clearInterval(heartbeat);
 		const message = err instanceof Error ? err.message : String(err);
@@ -1152,7 +1340,7 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 				if (event.type === "done") {
 					completeStreamRun(run, event.message);
 				} else if (event.type === "error") {
-					failStreamRun(run, event.error.errorMessage ?? event.reason);
+					failStreamRun(run, event.error.errorMessage ?? event.reason, event.error);
 				}
 			}
 		} catch (err) {
@@ -1175,7 +1363,25 @@ async function handlePostRequest(
 	pathname: string,
 	body: unknown,
 	res: ServerResponse,
+	models: Models,
+	streamModels?: Models,
 ): Promise<boolean> {
+	if (pathname === "/api/provider-callback") {
+		handleProviderCallbackReply(body, res);
+		return true;
+	}
+	if (pathname === "/api/generate-images") {
+		await handleModelOperation(models, { ...(body as ImageOperationBody), kind: "image" }, res);
+		return true;
+	}
+	if (pathname === "/api/classify") {
+		await handleModelOperation(models, { ...(body as ClassifierOperationBody), kind: "classifier" }, res);
+		return true;
+	}
+	if (pathname === "/api/cancel-deferred") {
+		await handleModelOperation(models, { ...(body as DeferredCancelBody), kind: "deferred-cancel" }, res);
+		return true;
+	}
 	if (pathname === "/api/receive") {
 		try {
 			sendJson(res, 200, receiveUpload(config.uploadDir, body));
@@ -1222,20 +1428,182 @@ async function handlePostRequest(
 	}
 
 	if (pathname === "/api/session/compact") {
-		await handleSessionCompact(config, body as SessionCompactBody, res);
+		await handleSessionCompact(config, body as SessionCompactBody, res, streamModels);
 		return true;
 	}
 
 	if (pathname === "/api/stream") {
-		handleStream(config, body as StreamRequestBody, res);
+		handleStream(config, body as StreamRequestBody, res, streamModels);
 		return true;
 	}
 
 	return false;
 }
 
-export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServer {
+const CLASSIFIER_APIS: Record<string, ProviderClassifier> = {
+	"typesafe-system-one": typesafeSystemOneApi(),
+	"cloudflare-workers-ai-system-one": cloudflareWorkersAISystemOneApi(),
+	"llama-cpp-classify": llamaCppClassifyApi(),
+};
+
+interface ImageOperationBody {
+	callbacks?: { onPayload?: boolean; onResponse?: boolean };
+	sessionId: string;
+	runId: string;
+	model: ImageModel<ImageApi>;
+	context: ImagesContext;
+	options?: ImagesOptions;
+}
+
+interface ClassifierOperationBody {
+	callbacks?: { onPayload?: boolean; onResponse?: boolean };
+	sessionId: string;
+	runId: string;
+	model: ClassifierModel<ClassifierApi>;
+	context: ClassifierContext;
+	options?: ClassifierOptions;
+}
+
+interface DeferredCancelBody {
+	callbacks?: { onPayload?: boolean; onResponse?: boolean };
+	sessionId: string;
+	runId: string;
+	model: Model<string>;
+	handle: DeferredHandle;
+	options?: DeferredCancelOptions;
+}
+
+async function handleModelOperation(
+	models: Models,
+	body:
+		| (ImageOperationBody & { kind: "image" })
+		| (ClassifierOperationBody & { kind: "classifier" })
+		| (DeferredCancelBody & { kind: "deferred-cancel" }),
+	res: ServerResponse,
+): Promise<void> {
+	if (
+		!body.sessionId ||
+		!body.runId ||
+		!body.model ||
+		(body.kind === "deferred-cancel" ? !body.handle : !body.context)
+	) {
+		sendError(
+			res,
+			400,
+			"sessionId, runId, model and operation input are required",
+			PiServerErrorCode.REQUIRED_FIELD_MISSING,
+		);
+		return;
+	}
+	const existing = getStreamRun(body.sessionId, body.runId);
+	if (existing && existing.kind !== body.kind) {
+		sendError(res, 409, "runId belongs to a different operation", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	if (existing?.status === "running") {
+		sendError(res, 409, "A run with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
+		return;
+	}
+	if (existing?.status === "aborted") {
+		sendError(res, 409, "Model operation was aborted", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	const run = existing?.operationResult ? existing : startStreamRun(body.sessionId, body.runId, body.kind);
+	res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+	res.flushHeaders();
+	res.write(STREAM_HEARTBEAT);
+	const heartbeat = setInterval(() => {
+		touchStreamRun(run);
+		if (!res.destroyed && !res.writableEnded) res.write(STREAM_HEARTBEAT);
+	}, STREAM_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+	try {
+		if (!run.operationResult) {
+			const requestModels =
+				body.kind === "deferred-cancel" ? models : resolveOperationModels(models, body.model, body.options);
+			const result =
+				body.kind === "deferred-cancel"
+					? await requestModels
+							.cancelDeferred(body.model, body.handle, {
+								...body.options,
+								...createProviderCallbacks<Model<string>>(run, res, body.callbacks),
+								signal: run.controller.signal,
+							})
+							.then(() => ({ cancelled: true as const, stopReason: "stop" as const }))
+					: body.kind === "image"
+						? await requestModels.generateImages(body.model, body.context, {
+								...body.options,
+								...createProviderCallbacks<ImageModel<ImageApi>>(run, res, body.callbacks),
+								signal: run.controller.signal,
+							})
+						: await requestModels.classify(body.model, body.context, {
+								...body.options,
+								...createProviderCallbacks<ClassifierModel<ClassifierApi>>(run, res, body.callbacks),
+								signal: run.controller.signal,
+							});
+			run.operationResult = run.cancelRequested
+				? { ...result, stopReason: "aborted", errorMessage: "Model operation aborted" }
+				: result;
+			run.status =
+				run.cancelRequested || result.stopReason === "aborted"
+					? "aborted"
+					: result.stopReason === "error"
+						? "failed"
+						: "completed";
+			run.errorMessage = "errorMessage" in result ? result.errorMessage : undefined;
+			run.updatedAt = Date.now();
+		}
+		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "result", run.operationResult);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		failStreamRun(run, message);
+		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "error", { error: message });
+	} finally {
+		clearInterval(heartbeat);
+		settleRun(run);
+		endStreamResponse(res);
+	}
+}
+
+function resolveOperationModels(models: Models, model: AnyModel, options?: ImagesOptions | ClassifierOptions): Models {
+	const provider = models.getProvider(model.provider);
+	const hasDeclaredApi = provider
+		?.getAllModels?.()
+		.some((candidate) => candidate.type === model.type && candidate.api === model.api);
+	if (
+		hasDeclaredApi &&
+		((model.type === "image" && provider?.generateImages) || (model.type === "classifier" && provider?.classify))
+	)
+		return models;
+	const requestModels = createModels();
+	const apiKey = options?.apiKey ?? getEnvApiKey(model.provider, options?.env);
+	const auth = provider?.auth ?? {
+		apiKey: {
+			name: "pi-server request auth",
+			resolve: async () => ({ auth: { apiKey, headers: options?.headers } }),
+		},
+	};
+	if (model.type === "image") {
+		const api = getImagesApiProvider(model.api);
+		if (!api) throw new Error(`No image API registered on pi-server: ${model.api}`);
+		requestModels.setProvider(
+			createProvider({ id: model.provider, models: [model], auth, images: { [model.api]: api } }),
+		);
+	} else if (model.type === "classifier") {
+		const api = CLASSIFIER_APIS[model.api];
+		if (!api) throw new Error(`No classifier API registered on pi-server: ${model.api}`);
+		requestModels.setProvider(
+			createProvider({ id: model.provider, models: [model], auth, classifiers: { [model.api]: api } }),
+		);
+	} else {
+		throw new Error("Image generation and classification require an operation-specific model type");
+	}
+	return requestModels;
+}
+
+export function createPiServer(configOverride?: Partial<ServerConfig>, streamModels?: Models): HttpServer {
 	const config = loadConfig(configOverride);
+	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(config.sessionStoreDir);
 
 	const server = createServer(async (req, res) => {
@@ -1257,6 +1625,28 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 
 		if (req.method === "GET" && url.pathname === "/api/sessions") {
 			sendJson(res, 200, { sessions: listSessions() });
+			return;
+		}
+		if (req.method === "GET" && url.pathname === "/api/models") {
+			try {
+				const stripHeaders = <T extends { headers?: unknown }>(model: T): T => ({ ...model, headers: undefined });
+				sendJson(res, 200, {
+					models: models.getAllModels().map(stripHeaders),
+					available: (await models.getAllAvailable()).map(stripHeaders),
+					providers: models.getProviders().map((provider) => ({
+						id: provider.id,
+						fetchDeferred: provider.fetchDeferred !== undefined,
+						cancelDeferred: provider.cancelDeferred !== undefined,
+					})),
+				});
+			} catch (error) {
+				sendError(
+					res,
+					500,
+					error instanceof Error ? error.message : String(error),
+					PiServerErrorCode.INTERNAL_ERROR,
+				);
+			}
 			return;
 		}
 
@@ -1317,6 +1707,8 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 					chunkResult.target,
 					JSON.parse(chunkResult.bodyJson) as unknown,
 					res,
+					models,
+					streamModels,
 				);
 				if (!handled && !res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
@@ -1336,7 +1728,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		if (req.method === "POST") {
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
-				if (await handlePostRequest(config, url.pathname, body, res)) return;
+				if (await handlePostRequest(config, url.pathname, body, res, models, streamModels)) return;
 				if (!res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
 					return;
@@ -1356,8 +1748,8 @@ export function createPiServer(configOverride?: Partial<ServerConfig>): HttpServ
 		if (req.method === "DELETE" && url.pathname.startsWith("/api/session/")) {
 			const sessionId = decodeURIComponent(url.pathname.slice("/api/session/".length));
 			deleteSessionFromStore(sessionId);
-			deleteStreamRunsForSession(sessionId);
 			deletePersistedSession(config.sessionStoreDir, sessionId);
+			await deleteStreamRunsForSession(sessionId);
 			sendJson(res, 200, { deleted: sessionId });
 			return;
 		}
@@ -1428,6 +1820,7 @@ function toProxyEvent(event: AssistantMessageEvent): ProxyAssistantMessageEvent 
 				type: "error",
 				reason: event.reason,
 				errorMessage: event.error.errorMessage,
+				message: event.error,
 				usage: event.error.usage,
 			};
 		default:

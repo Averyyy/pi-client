@@ -40,6 +40,12 @@
 
 ## pi-client / pi-server Request Sync
 
+- In `PI_SERVER_MODE`, chat, image, classifier, and deferred operations exposed by `ModelRuntime` and its `Provider` objects must use pi-server transport. Preserve optional client auth and header transforms; server-only credentials must also work for prompts, model selection, and summaries. MCP auth and provider login remain client-local.
+- Preserve model type and exact model availability in remote catalogs, including identical provider/id pairs across chat, image, and classifier operations. Ordinary model accessors reuse the initialized catalog; explicit refresh updates it and preserves native account discovery.
+- Provider lifecycle callbacks must execute in the client and return their result before the server continues the provider request. Route oversized callback replies through `ChunkRequest`; callback errors and cancellation must reject pending callbacks rather than recover a successful result. Reject unsupported executable transport options explicitly.
+- Omit SDK-internal provider callbacks from remote requests only by their exact function identity and absence of the corresponding extension handler. Preserve explicit caller callbacks and registered handlers; ordinary requests must not round-trip unused payloads or native stream events.
+- Test request limits with a real HTTP proxy that counts raw UTF-8 bytes and rejects bodies above 65,536 bytes. Cover Unicode payloads and chunk envelopes; successful provider fixtures without a byte-rejecting transport do not establish this limit.
+- Image/classifier operation endpoints need heartbeat streaming, completed-run recovery, and cancellation acknowledgment after provider cleanup. Register every new POST target in the chunk transport allowlist.
 - Treat ordinary `/api/stream` calls as stateless provider proxy requests: send the exact projected `context.messages` as `contextOverlay`; do not synchronize the durable session tree before or after provider calls. Full tree synchronization is reserved for operations that actually require tree state, such as server-side compaction.
 - Default to incremental sync. Client-to-`pi-server` requests should send only the new messages or other minimal deltas needed for the current operation.
 - If the server has messages the client does not have, the server may send those messages or the full server history back to the client. Client receive size is not constrained by the proxy POST-body limit.
@@ -134,6 +140,7 @@
 
 ## Commands
 
+- Help/version and invalid built-in CLI options must exit before model services contact the server. Help must still load trusted extension resources so their registered flags remain visible.
 - On Windows with Node 26, `spawnSync("npm.cmd", ...)` can fail with `EINVAL`; release scripts that spawn npm must invoke npm's CLI through `process.execPath` instead.
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - When merging upstream changes into forked interactive-mode handlers, rerun the compaction/status tests and preserve turn-start cleanup plus redraw behavior; merge conflict resolution can silently drop those fork-specific UI transitions.

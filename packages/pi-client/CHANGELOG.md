@@ -2,9 +2,13 @@
 
 ### Fixed
 
+- Reported upstream Pi 1.0.0 and its full source commit in package metadata.
+- Documented remote model operations, server-side credentials, and the 64 KiB UTF-8 request limit.
 - Fixed automatic update checks to compare the installed `pi-client` version instead of the upstream `pi` version.
 - Used `pi-client` in fork help and documented `web`, `send`, server configuration, global package updates, and `/reload` without changing upstream Pi help.
 - Reported upload HTTP and connection failures with the target, response metadata, and a bounded, token-redacted body excerpt instead of JSON or network stack traces.
+- Handled malformed `settings.json` when checking for the Tau Codex extension instead of crashing `pi-client web`.
+- Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 
 ### Added
 
@@ -15,11 +19,6 @@
 - npm global package updates during `pi-client update`.
 - `pi-client web` command that starts the client backend in Tau mirror mode on port `1838` by default.
 - `pi-client send <path>` command for chunked file and folder uploads to pi-server.
-
-### Fixed
-
-- Handled malformed `settings.json` when checking for the Tau Codex extension instead of crashing `pi-client web`.
-- Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
 
 ### Changed
 

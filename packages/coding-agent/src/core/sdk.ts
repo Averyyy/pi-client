@@ -416,14 +416,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const headerRunner = extensionRunnerRef.current;
 			if (process.env.PI_SERVER_MODE === "true") {
 				const auth = await modelRuntime.getAuth(model, { apiKey: options?.apiKey, env: options?.env });
-				if (!auth) {
-					throw new Error(`Provider is not configured: ${model.provider}`);
-				}
 				let headers = mergeProviderAttributionHeaders(
 					model,
 					settingsManager,
 					options?.sessionId,
-					auth.auth.headers,
+					auth?.auth.headers ?? model.headers,
 					options?.headers,
 				);
 				if (headerRunner?.hasHandlers("before_provider_headers")) {
@@ -431,13 +428,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return streamPiServer(model, context, {
 					...requestOptions,
+					onPayload:
+						requestOptions.onPayload === transformProviderPayload &&
+						!headerRunner?.hasHandlers("before_provider_request")
+							? undefined
+							: requestOptions.onPayload,
+					onResponse:
+						requestOptions.onResponse === handleProviderResponse &&
+						!headerRunner?.hasHandlers("after_provider_response")
+							? undefined
+							: requestOptions.onResponse,
+					onProviderStreamEvent:
+						requestOptions.onProviderStreamEvent === handleProviderStreamEvent &&
+						!headerRunner?.hasHandlers("provider_stream_event")
+							? undefined
+							: requestOptions.onProviderStreamEvent,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
 					contextOverlay: piServerContext?.contextOverlay,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,
-					apiKey: auth.auth.apiKey,
-					env: auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined,
+					apiKey: auth?.auth.apiKey ?? options?.apiKey,
+					env: auth?.env || options?.env ? { ...(auth?.env ?? {}), ...(options?.env ?? {}) } : undefined,
 					headers,
 				});
 			}

@@ -13,6 +13,10 @@ const ALLOWED_TARGETS = new Set([
 	"/api/session/tree/switch",
 	"/api/session/compact",
 	"/api/stream",
+	"/api/generate-images",
+	"/api/classify",
+	"/api/provider-callback",
+	"/api/cancel-deferred",
 	"/api/receive",
 ]);
 

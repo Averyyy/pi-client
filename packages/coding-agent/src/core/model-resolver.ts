@@ -567,7 +567,7 @@ export function resolveCliModel(options: {
 		}
 	}
 
-	if (provider) {
+	if (provider && process.env.PI_SERVER_MODE !== "true") {
 		// Parse thinking level suffix from the pattern before building the fallback model,
 		// but only when --thinking is not explicitly provided.
 		// e.g. "zai-org/GLM-5.1-FP8:high" → modelId="zai-org/GLM-5.1-FP8", fallbackThinking="high"
