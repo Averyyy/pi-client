@@ -14,6 +14,12 @@
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
 - Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.
 
+## [1.0.2] - 2026-10-04
+
+### Added
+
+- Added per-thinking-level sampling parameter overrides (`samplingParamsByThinkingLevel`) for `openai-completions`, `openai-responses`, and `azure-openai-responses` requests ([#9776](https://github.com/earendil-works/pi/pull/9776) by [@mrexodia](https://github.com/mrexodia))
+
 ## [1.0.1] - 2026-10-03
 
 ### Added
