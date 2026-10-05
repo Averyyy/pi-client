@@ -1062,7 +1062,7 @@ describe("upstream features over 64 KiB pi-server HTTP requests", () => {
 		["anthropic", "claude-sonnet-5-5"],
 		["xai", "grok-4.7"],
 		["openai", "gpt-6.1-sol"],
-		["azure-openai-responses", "gpt-6.1-sol"],
+		["azure", "gpt-6.1-sol"],
 		["openai-codex", "gpt-6.1-sol"],
 	] as const)("routes catalog feature %s/%s with complete model capabilities", async (provider, id) => {
 		const model = getAllBuiltinModels(provider).find(
