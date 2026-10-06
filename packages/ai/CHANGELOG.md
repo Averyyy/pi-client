@@ -14,6 +14,12 @@
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
 - Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.
 
+## [1.0.4] - 2026-10-05
+
+### Fixed
+
+- Fixed Bedrock requests that fail with `The pending stream has been canceled` after a stalled HTTP/2 connection not being retried automatically ([#10379](https://github.com/earendil-works/pi/issues/10379))
+
 ## [1.0.3] - 2026-10-05
 
 ### Breaking Changes
