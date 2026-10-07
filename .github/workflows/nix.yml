@@ -28,6 +28,8 @@ on:
       - 'packages/coding-agent/install-lock/**'
       - 'packages/ai/scripts/hydrate-model-catalog.ts'
       - 'scripts/update-model-catalog-pin.mjs'
+      - 'scripts/check-nix-version.mjs'
+      - 'scripts/check-nix-version.test.mjs'
   workflow_run:
     workflows:
       - Publish Model Catalog
@@ -124,12 +126,21 @@ jobs:
       - name: Build
         run: nix build -L .
 
+      - name: Setup Node.js for smoke checks
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
       - name: Smoke-test
         run: |
-          ./result/bin/pi --version
+          set -euo pipefail
+          version="$(./result/bin/pi --version)"
+          echo "${version}"
           ./result/bin/pi --help > /dev/null
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            test "$(./result/bin/pi --version)" = "${GITHUB_REF_NAME#v}"
+            node scripts/check-nix-version.mjs "${version}" "${GITHUB_REF_NAME}"
+          else
+            node scripts/check-nix-version.mjs "${version}"
           fi
 
   update-stable:

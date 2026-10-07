@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { getModel } from "../src/compat.ts";
+import { getModel, streamSimple } from "../src/compat.ts";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
+import { getSupportedThinkingLevels } from "../src/models.ts";
 
 const originalTogetherApiKey = process.env.TOGETHER_API_KEY;
 
@@ -63,17 +64,50 @@ describe("Together models", () => {
 			minimal: null,
 			low: null,
 			medium: null,
+			high: "high",
+			xhigh: null,
 		});
 		expect(deepSeekV4.compat).toMatchObject({
-			supportsReasoningEffort: false,
+			supportsReasoningEffort: true,
 			thinkingFormat: "together",
 		});
+		expect(getSupportedThinkingLevels(deepSeekV4)).toEqual(["off", "high"]);
 
 		const minimax = getModel("together", "MiniMaxAI/MiniMax-M2.7");
 		expect(minimax.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: null });
 		expect(minimax.compat?.thinkingFormat).toBeUndefined();
 		expect(minimax.compat?.supportsReasoningEffort).toBe(false);
 	});
+
+	it.each([undefined, "minimal", "low", "medium", "high", "xhigh", "max"] as const)(
+		"serializes Together DeepSeek V4 reasoning %s without unsupported effort values",
+		async (reasoning) => {
+			const model = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+			let payload: { reasoning?: { enabled: boolean }; reasoning_effort?: string } | undefined;
+			const result = await streamSimple(
+				model,
+				{ messages: [{ role: "user", content: "Hi", timestamp: 0 }] },
+				{
+					apiKey: "test-together-key",
+					reasoning,
+					onPayload: (request) => {
+						payload = request as typeof payload;
+						// Stop before the provider request; no API access or paid tokens are needed.
+						throw new Error("Together payload captured");
+					},
+				},
+			).result();
+
+			expect(result.errorMessage).toContain("Together payload captured");
+			expect(payload).toBeDefined();
+			expect(payload?.reasoning).toEqual({ enabled: reasoning !== undefined });
+			if (reasoning === undefined) {
+				expect(payload).not.toHaveProperty("reasoning_effort");
+			} else {
+				expect(payload?.reasoning_effort).toBe("high");
+			}
+		},
+	);
 
 	it("resolves TOGETHER_API_KEY from the environment", () => {
 		process.env.TOGETHER_API_KEY = "test-together-key";
