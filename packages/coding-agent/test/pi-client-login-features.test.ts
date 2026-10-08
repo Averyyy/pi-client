@@ -147,6 +147,7 @@ describe("pi-client interactive login features", () => {
 			showWarning: vi.fn(),
 			updateAvailableProviderCount: vi.fn(async () => {}),
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(async () => {}),
 			checkDaxnutsEasterEgg: vi.fn(),

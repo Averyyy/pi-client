@@ -61,6 +61,7 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import {
 	assertChatModel,
+	assertClassifierInputSupported,
 	assertClassifierModel,
 	assertImageModel,
 	classifierErrorResult,
@@ -1060,6 +1061,7 @@ export class ModelRuntime implements Models {
 	): Promise<ClassifierResult> {
 		try {
 			assertClassifierModel(model);
+			assertClassifierInputSupported(model, context);
 			if (this.piServerMode) {
 				const prepared = await this.prepareRemoteRequest(model, options);
 				return await classifyPiServer(prepared.model, context, prepared.options);

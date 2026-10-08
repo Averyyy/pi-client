@@ -49,6 +49,9 @@ export const AgentDoc = defineDoc<AgentState>({
 	checkpointWhen: () => true,
 });
 
+/** Default `settings.contextRetentionMs`: ten minutes. */
+const DEFAULT_CONTEXT_RETENTION_MS = 600_000;
+
 /** Resolve the host settings: every field over its built-in default, object fields merged. */
 export function resolveSettings(settings: HarnessSettings | undefined): Settings {
 	const extensions = settings?.extensions;
@@ -65,6 +68,7 @@ export function resolveSettings(settings: HarnessSettings | undefined): Settings
 		toolExecution: settings?.toolExecution ?? "parallel",
 		steeringMode: settings?.steeringMode ?? "one-at-a-time",
 		followUpMode: settings?.followUpMode ?? "one-at-a-time",
+		contextRetentionMs: settings?.contextRetentionMs ?? DEFAULT_CONTEXT_RETENTION_MS,
 	};
 }
 

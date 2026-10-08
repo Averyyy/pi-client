@@ -29,6 +29,7 @@ type TestMode = {
 		addInputListener?: (listener: (data: string) => unknown) => () => void;
 	};
 	footer?: { invalidate: ReturnType<typeof vi.fn> };
+	programStatus?: { handleEvent: ReturnType<typeof vi.fn>; setBlocked: ReturnType<typeof vi.fn> };
 	keybindings: { matches: ReturnType<typeof vi.fn> };
 	updatePendingMessagesDisplay: ReturnType<typeof vi.fn>;
 	showError: ReturnType<typeof vi.fn>;
@@ -68,6 +69,7 @@ describe("InteractiveMode cancellation boundary", () => {
 			runtimeHost: { session },
 			session,
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 			settingsManager: { getShowTerminalProgress: () => false },
 			pendingTools: new Map(),
 			streamingComponent: undefined,
@@ -109,6 +111,7 @@ describe("InteractiveMode cancellation boundary", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 			flushPendingBashComponents: vi.fn(),
 			isInteractiveCommand: vi.fn(() => false),
 		};
@@ -204,6 +207,7 @@ describe("InteractiveMode cancellation boundary", () => {
 			showAbortingStatusIndicator: vi.fn(),
 			showCancellationFailedStatusIndicator: vi.fn(),
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 		};
 		const handleEvent = getPrivateMethod<(event: unknown) => Promise<void>>("handleEvent");
 

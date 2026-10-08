@@ -11,6 +11,7 @@ import {
 	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
 	type AuthOperationOptions,
 	type CacheRetention,
 	type ClassifierApi,
@@ -19,10 +20,10 @@ import {
 	type ClassifierOptions,
 	type ClassifierResult,
 	type Context,
+	createAssistantMessageEventStream,
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
-	EventStream,
 	getModelType,
 	type ImageApi,
 	type ImageModel,
@@ -46,18 +47,7 @@ import {
 } from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
 
-class PiServerEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
+type PiServerEventStream = AssistantMessageEventStream;
 
 function getServerUrl(): string {
 	return process.env.PI_SERVER_URL ?? "http://127.0.0.1:4217";
@@ -1141,7 +1131,7 @@ export async function streamPiServer(
 	const runId = randomUUID();
 	const isEphemeralSession = options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
-	const stream = new PiServerEventStream();
+	const stream = createAssistantMessageEventStream();
 
 	const partial: AssistantMessage = {
 		role: "assistant",
