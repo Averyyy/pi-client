@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Registered the OpenAI Decisions API for custom classifier providers, including image inputs over chunked requests.
 - Preserved native provider authentication and raw/simple dispatch through the request adapter, including server-side bearer and federation credentials.
 - Preserved sampling parameters, tool choice, deferred controls, environment overrides, API-specific options, parsed provider events, and authoritative failed assistant messages in proxy streams.
 - Included constrained tool sampling declarations in static-context hashes and registered operation payloads with the chunk transport for bounded request bodies.

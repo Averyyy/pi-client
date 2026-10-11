@@ -689,6 +689,98 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(requests.every((request) => !request.path.startsWith("/api/models/providers/"))).toBe(true);
 	});
 
+	it("runs a registered OpenAI Decisions classifier remotely with oversized images and explicit auth", async () => {
+		const decisionRequests: { path: string; authorization: string | undefined; body: unknown }[] = [];
+		const decisions = createServer(async (req, res) => {
+			const chunks: Buffer[] = [];
+			for await (const chunk of req) chunks.push(Buffer.from(chunk));
+			decisionRequests.push({
+				path: req.url ?? "",
+				authorization: req.headers.authorization,
+				body: JSON.parse(Buffer.concat(chunks).toString()) as unknown,
+			});
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(
+				JSON.stringify({
+					answers: [{ type: "predicate", name: "approved", probability: 0.95 }],
+					usage: { input_tokens: 164, output_tokens: 0 },
+				}),
+			);
+		});
+		const decisionsUrl = await listen(decisions);
+		try {
+			const runtime = await createRuntime();
+			let localCalls = 0;
+			const model: ClassifierModel<"openai-decisions"> = {
+				...classifier,
+				provider: "decisions-fixture",
+				id: "gpt-6-luna",
+				api: "openai-decisions",
+				baseUrl: `${decisionsUrl}/v1`,
+				input: ["text", "image"],
+			};
+			runtime.registerNativeProvider(
+				createProvider({
+					id: model.provider,
+					models: [model],
+					auth: {
+						apiKey: { name: "Decisions fixture", resolve: async () => ({ auth: { apiKey: "client-key" } }) },
+					},
+					classifiers: {
+						"openai-decisions": {
+							classify: async () => {
+								localCalls++;
+								throw new Error("Local inference is forbidden");
+							},
+						},
+					},
+				}),
+			);
+			await runtime.refresh({ allowNetwork: false });
+			expect((await runtime.getAvailableOfType("classifier", model.provider))[0]).toEqual(model);
+			const context: ClassifierContext = {
+				state: { text: "Inspect the image" },
+				images: [{ type: "image", data: largePng, mimeType: "image/png" }],
+				questions,
+			};
+			const result = await runtime.classify(model, context, { apiKey: "decisions-caller-key" });
+			expect(result.stopReason, result.errorMessage).toBe("stop");
+			expect(result.answers.approved).toEqual({ type: "bool", probability: 0.95 });
+			expect(result.usage).toMatchObject({ input: 164, output: 0, totalTokens: 164 });
+			expect(localCalls).toBe(0);
+			expect(decisionRequests).toEqual([
+				{
+					path: "/v1/decisions",
+					authorization: "Bearer decisions-caller-key",
+					body: {
+						model: model.id,
+						input: [
+							{
+								role: "user",
+								content: [
+									{ type: "input_text", text: JSON.stringify(context.state) },
+									{ type: "input_image", image_url: `data:image/png;base64,${largePng}` },
+								],
+							},
+						],
+						questions: [
+							{
+								type: "predicate",
+								name: "approved",
+								instructions: "Approved?\n\nTrue means: yes\nFalse means: no",
+							},
+						],
+					},
+				},
+			]);
+			expect(largePng.length).toBeGreaterThan(65_536);
+			expect(requests.every((request) => request.bytes <= 65_536)).toBe(true);
+			expect(requests.some((request) => request.target === "/api/classify")).toBe(true);
+		} finally {
+			await close(decisions);
+		}
+	});
+
 	it.each(["local-llama-fixture", "openai", providerId])(
 		"runs an explicitly registered llama.cpp classifier API for %s at the supplied remote base URL",
 		async (llamaProviderId) => {

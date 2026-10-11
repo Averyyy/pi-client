@@ -45,6 +45,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { cloudflareWorkersAISystemOneApi } from "@earendil-works/pi-ai/api/cloudflare-workers-ai-system-one.lazy";
 import { llamaCppClassifyApi } from "@earendil-works/pi-ai/api/llama-cpp-classify.lazy";
+import { openAIDecisionsApi } from "@earendil-works/pi-ai/api/openai-decisions.lazy";
 import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import {
 	getBuiltinProviderForModel,
@@ -1496,6 +1497,7 @@ const CLASSIFIER_APIS: Record<string, ProviderClassifier> = {
 	"typesafe-system-one": typesafeSystemOneApi(),
 	"cloudflare-workers-ai-system-one": cloudflareWorkersAISystemOneApi(),
 	"llama-cpp-classify": llamaCppClassifyApi(),
+	"openai-decisions": openAIDecisionsApi(),
 };
 
 interface ImageOperationBody {
