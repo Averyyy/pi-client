@@ -1,10 +1,4 @@
-import {
-	type Context,
-	type Draft,
-	defineService,
-	type MutableReplicatedState,
-	type ReplicatedState,
-} from "@earendil-works/chord";
+import type { Context, Draft, MutableReplicatedState, ReplicatedState } from "@earendil-works/chord";
 import type { Op, Path, Seg } from "@earendil-works/chord/delta";
 import type { ConversationHandle, Harness } from "./harness.ts";
 import type {
@@ -38,9 +32,20 @@ export interface PicoConversationService {
 	entries(scan: EntryScan, ctx: Context): Promise<Entry[]>;
 }
 
+/** Typed service identifier; Chord no longer provides `defineService()`. */
+export interface PicoServiceId<T> {
+	readonly id: string;
+	readonly local: boolean;
+	/** Type-only marker for the service implementation. */
+	readonly __service?: T;
+}
+
 /** Local registration/control plane and remote keyed conversation contract used by Chord facets. */
-export const PicoHarnessService = defineService<Harness>("pi.harness", { local: true });
-export const PicoConversationService = defineService<PicoConversationService>("pi.conversation");
+export const PicoHarnessService: PicoServiceId<Harness> = Object.freeze({ id: "pi.harness", local: true });
+export const PicoConversationService: PicoServiceId<PicoConversationService> = Object.freeze({
+	id: "pi.conversation",
+	local: false,
+});
 
 export function createPicoConversationService<Cfg extends object>(
 	harness: Pick<Harness, "abortInput" | "entries">,

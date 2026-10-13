@@ -18,8 +18,6 @@ const buildWorkspaces = [
 	"packages/codemode",
 	"packages/mcp",
 	"packages/agent",
-	"packages/protocol",
-	"packages/client",
 	"packages/coding-agent",
 	"packages/pi-server",
 ];

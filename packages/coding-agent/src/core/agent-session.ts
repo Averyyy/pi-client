@@ -118,7 +118,7 @@ import {
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -508,6 +508,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	/** True while before_agent_start and pre-run compaction prepare a run that has sent no request yet. */
+	private _isPreparingRun = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1269,6 +1271,9 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent, _signal: AbortSignal): Promise<void> => {
+		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
+		// here. agent_start is awaited before the first request.
+		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1782,6 +1787,7 @@ export class AgentSession {
 			exposure: this._getToolExposure(definition.name),
 			...(definition.namespace ? { namespace: definition.namespace } : {}),
 			...(definition.annotations ? { annotations: { ...definition.annotations } } : {}),
+			...(definition.reachesTools ? { reachesTools: definition.reachesTools } : {}),
 			sourceInfo,
 		}));
 	}
@@ -2101,8 +2107,44 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
+	/**
+	 * Start a run from a user or custom message. The session counts as busy from here on, so
+	 * messages sent while before_agent_start handlers run are queued into this run instead of
+	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
+	 * @param onStarted Called once the run's messages are prepared, before the first request.
+	 */
+	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
+		let messages: AgentMessage[] | undefined;
+		this._isPreparingRun = true;
+		try {
+			messages = await this._prepareRun(trigger);
+		} catch (error) {
+			this._isAgentRunActive = false;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			this._resolveIdleWaitIfIdle();
+			throw error;
+		} finally {
+			this._isPreparingRun = false;
+		}
+		// Messages held while the run was starting go before its starting messages, as they would
+		// have while idle. No run exists yet, so they cannot split a tool call from its result.
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		if (!messages) {
+			// Aborted during pre-run compaction: no run was started.
+			this._isAgentRunActive = false;
+			this._resolveIdleWaitIfIdle();
+			return;
+		}
+		onStarted?.();
+		const startMessages = messages;
+		await this._runAgentOperation(() => this.agent.prompt(startMessages));
+	}
+
+	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
@@ -2145,10 +2187,6 @@ export class AgentSession {
 			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
 		}
-	}
-
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		await this._runAgentOperation(() => this.agent.prompt(messages));
 	}
 
 	private _sessionHasInfoEntry(): boolean {
@@ -2220,6 +2258,92 @@ export class AgentSession {
 		} finally {
 			this._sessionNameAbortController = undefined;
 		}
+	}
+
+	/**
+	 * Prepare a run and return its starting messages: compact first when needed, emit
+	 * before_agent_start, apply the run's prompt options and tool loadout, and build the starting
+	 * message followed by pending nextTurn messages (consumed here) and handler messages, with a
+	 * system patch first when the prompt changed.
+	 */
+	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[] | undefined> {
+		// Check if we need to compact before sending (catches aborted responses).
+		// The starting message is sent below, so do not call agent.continue() here.
+		if (this._isAborting) {
+			return undefined;
+		}
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) {
+			const prePromptAbortController = new AbortController();
+			let resolvePrePromptCompletion: (() => void) | undefined;
+			const prePromptCompletion = new Promise<void>((resolve) => {
+				resolvePrePromptCompletion = resolve;
+			});
+			this._prePromptAbortController = prePromptAbortController;
+			this._prePromptCompletionPromise = prePromptCompletion;
+			try {
+				await this._checkCompaction(lastAssistant, false, [], prePromptAbortController.signal);
+			} finally {
+				if (this._prePromptAbortController === prePromptAbortController) {
+					this._prePromptAbortController = undefined;
+				}
+				if (this._prePromptCompletionPromise === prePromptCompletion) {
+					this._prePromptCompletionPromise = undefined;
+				}
+				resolvePrePromptCompletion?.();
+			}
+			if (prePromptAbortController.signal.aborted || this._isAborting) {
+				return undefined;
+			}
+		}
+
+		if (isPiServerMode()) {
+			this._detachPiServerTerminalAssistantFailure();
+		}
+
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
+		// which updates the live loadout instead. An explicit edit wins; otherwise the live
+		// loadout is authoritative, so a setActiveTools() call is not undone here.
+		const handlerEditedTools =
+			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._normalizePromptImages(trigger.images);
+			const text =
+				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
+			messages.push({
+				role: "user",
+				content: [{ type: "text", text }, ...normalized.images],
+				timestamp: Date.now(),
+			});
+		}
+		// Inject any pending "nextTurn" messages as context alongside the starting message
+		messages.push(...this._pendingNextTurnMessages);
+		this._pendingNextTurnMessages = [];
+		for (const msg of result.messages) {
+			messages.push({
+				role: "custom",
+				customType: msg.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: msg.content ?? [],
+				display: msg.display,
+				details: msg.details,
+				timestamp: Date.now(),
+			});
+		}
+		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+		if (updateMessage) messages.unshift(updateMessage);
+		return messages;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -2410,10 +2534,6 @@ export class AgentSession {
 			return;
 		}
 
-		// Flush any pending bash and custom messages before the new prompt
-		this._flushPendingBashMessages();
-		this._flushPendingCustomMessages();
-
 		// Validate model
 		if (!this.model) {
 			throw new Error(formatNoModelSelectedMessage());
@@ -2434,92 +2554,9 @@ export class AgentSession {
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
 
-		// Check if we need to compact before sending (catches aborted responses).
-		// The user's new prompt is sent below, so do not call agent.continue() here.
-		if (this._isAborting) {
-			return;
-		}
-		const lastAssistant = this._findLastAssistantMessage();
-		if (lastAssistant) {
-			const prePromptAbortController = new AbortController();
-			let resolvePrePromptCompletion: (() => void) | undefined;
-			const prePromptCompletion = new Promise<void>((resolve) => {
-				resolvePrePromptCompletion = resolve;
-			});
-			this._prePromptAbortController = prePromptAbortController;
-			this._prePromptCompletionPromise = prePromptCompletion;
-			try {
-				await this._checkCompaction(lastAssistant, false, [], prePromptAbortController.signal);
-			} finally {
-				if (this._prePromptAbortController === prePromptAbortController) {
-					this._prePromptAbortController = undefined;
-				}
-				if (this._prePromptCompletionPromise === prePromptCompletion) {
-					this._prePromptCompletionPromise = undefined;
-				}
-				resolvePrePromptCompletion?.();
-			}
-			if (prePromptAbortController.signal.aborted || this._isAborting) {
-				return;
-			}
-		}
-
-		if (isPiServerMode()) {
-			this._detachPiServerTerminalAssistantFailure();
-		}
-
-		// Emit before_agent_start before normalizing images so extension-driven model
-		// selection determines the resize profile used for the request and history.
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(
-			expandedText,
-			currentImages,
-			this._baseSystemPromptOptions,
+		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
+			preflightResult?.("started"),
 		);
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
-		const normalized = await this._normalizePromptImages(currentImages);
-		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
-
-		// Build messages only after hooks and image normalization have completed.
-		const messages: AgentMessage[] = [];
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-		userContent.push(...normalized.images);
-		messages.push({
-			role: "user",
-			content: userContent,
-			timestamp: Date.now(),
-		});
-
-		// Inject any pending "nextTurn" messages as context alongside the user message
-		for (const msg of this._pendingNextTurnMessages) {
-			messages.push(msg);
-		}
-		this._pendingNextTurnMessages = [];
-
-		for (const msg of result.messages) {
-			messages.push({
-				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
-				timestamp: Date.now(),
-			});
-		}
-		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-		this._runSystemPromptOptions = result.systemPromptOptions;
-		if (updateMessage) messages.unshift(updateMessage);
-
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
 	}
 
 	/**
@@ -2741,10 +2778,10 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				this._deferredSettledActions.push(async () => await this.sendCustomMessage(message, options));
 				return;
 			}
-			await this._runAgentPrompt(appMessage);
+			await this._startRun({ messageType: "custom", message: appMessage });
 		} else if (this.isStreaming) {
 			// Appending now would put the message between an assistant tool call and its
 			// result, which providers that validate message order reject on replay. Defer
@@ -2861,6 +2898,7 @@ export class AgentSession {
 			return;
 		}
 
+		this._agentRunAbortRequested = false;
 		void this._runAgentOperation(() => this.agent.continue()).catch((error: unknown) => {
 			this._extensionRunner.emitError({
 				extensionPath: "<runtime>",
@@ -2987,7 +3025,8 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
-		if (this.isStreaming) {
+		// A run being prepared has sent no request, so the new model applies to its first request.
+		if (this.isStreaming && !this._isPreparingRun) {
 			await this.abort();
 		}
 
