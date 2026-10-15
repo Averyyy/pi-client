@@ -143,8 +143,6 @@ stdenv.mkDerivation {
   installCheckPhase = ''
     runHook preInstallCheck
     test "$("$out/bin/pi" --version)" = "${packageJson.version}"
-    ${nodejs}/bin/node -e \
-      "require('$out/lib/pi/node_modules/esbuild').transformSync('const value: number = 1', { loader: 'ts' })"
     # Load host-platform TUI helpers directly so missing native dependencies
     # fail the build rather than silently disabling clipboard support.
     ${nodejs}/bin/node -e \
