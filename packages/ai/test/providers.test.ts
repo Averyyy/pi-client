@@ -53,7 +53,7 @@ const DEFAULT_IMAGE_RESIZE = {
 };
 
 describe("builtin providers", () => {
-	it("builtinModels registers every builtin provider with models", async () => {
+	it("builtinModels registers every builtin provider with static or account-owned models", async () => {
 		const models = builtinModels();
 		const providers = models.getProviders();
 		expect(providers.length).toBe(builtinProviders().length);
@@ -67,7 +67,13 @@ describe("builtin providers", () => {
 
 		for (const provider of providers) {
 			const list = models.getAllModels(provider.id);
-			expect(list.length).toBeGreaterThan(0);
+			if (provider.id === "google-antigravity") {
+				expect(list).toEqual([]);
+				expect(provider.refreshModels).toBeTypeOf("function");
+				expect(provider.auth.oauth).toBeDefined();
+			} else {
+				expect(list.length).toBeGreaterThan(0);
+			}
 			expect(list.every((m) => m.provider === provider.id)).toBe(true);
 		}
 		expect(getBuiltinModel("radius", "balanced")).toMatchObject({

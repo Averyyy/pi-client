@@ -27,7 +27,7 @@ import { collapseSystemMessages, withoutInitialSystemMessage } from "../utils/tr
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { transformMessages } from "./transform-messages.ts";
 
-type GoogleApiType = "google-generative-ai" | "google-vertex";
+type GoogleApiType = "google-generative-ai" | "google-vertex" | "google-antigravity";
 
 /**
  * Thinking level for Gemini 3 models.

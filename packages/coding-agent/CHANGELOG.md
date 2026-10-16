@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
 - Added native Devin Pro login and account model selection while retaining pi-server inference routing.
 
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
