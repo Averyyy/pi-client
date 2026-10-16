@@ -292,6 +292,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 
 ## Upstream Sync
 
+- When a mixed-API catalog adds a protocol, update the provider's API type and runtime dispatch together. Cover the new path with a fixed model fixture so tests do not depend on live catalog contents.
 - When upstream adds a classifier API, register it in pi-server's `CLASSIFIER_APIS` as well as builtin provider dispatch. Cover a custom provider ID in remote tests so builtin dispatch cannot mask a missing API registration.
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
