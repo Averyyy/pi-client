@@ -240,40 +240,20 @@ export const googleAntigravityOAuth: OAuthAuth = {
 	},
 };
 
-const SUPPORTED_MODELS: Record<
-	string,
-	Pick<Model<"google-antigravity">, "reasoning" | "input" | "thinkingLevelMap">
-> = {
-	"gemini-3.1-pro-high": {
-		reasoning: true,
-		input: ["text", "image"],
-		thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
+const VARIANT_THINKING_LEVELS: Record<string, Model<"google-antigravity">["thinkingLevelMap"]> = {
+	"gemini-3.1-pro-high": { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
+	"gemini-3.1-pro-low": { off: null, minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null },
+	"gemini-3.8-flash-high": { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
+	"gemini-3.8-flash-medium": {
+		off: null,
+		minimal: null,
+		low: null,
+		medium: "medium",
+		high: null,
+		xhigh: null,
+		max: null,
 	},
-	"gemini-3.1-pro-low": {
-		reasoning: true,
-		input: ["text", "image"],
-		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null },
-	},
-	"gemini-3-flash": { reasoning: true, input: ["text", "image"] },
-	"gemini-3.8-flash": {
-		reasoning: true,
-		input: ["text", "image"],
-		thinkingLevelMap: {
-			off: null,
-			minimal: null,
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: null,
-			max: null,
-		},
-	},
-	"claude-sonnet-4-5": { reasoning: false, input: ["text", "image"] },
-	"claude-sonnet-4-5-thinking": { reasoning: true, input: ["text", "image"] },
-	"claude-opus-4-5-thinking": { reasoning: true, input: ["text", "image"] },
-	"claude-opus-4-6-thinking": { reasoning: true, input: ["text", "image"] },
-	"claude-sonnet-4-6": { reasoning: true, input: ["text", "image"] },
-	"gpt-oss-120b-medium": { reasoning: false, input: ["text"] },
+	"gemini-3.8-flash-low": { off: null, minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null },
 };
 
 export async function discoverGoogleAntigravityModels(
@@ -285,15 +265,30 @@ export async function discoverGoogleAntigravityModels(
 		throw new Error("Antigravity credentials are missing the project ID. Run /login google-antigravity.");
 	}
 	const catalog = await requestJson<{
-		models: Record<string, { displayName: string; maxTokens: number; maxOutputTokens: number }>;
+		agentModelSorts: { groups: { modelIds: string[] }[] }[];
+		models: Record<
+			string,
+			{
+				displayName: string;
+				maxTokens: number;
+				maxOutputTokens: number;
+				supportsImages?: boolean;
+				supportsThinking?: boolean;
+				disabled?: boolean;
+				isInternal?: boolean;
+			}
+		>;
 	}>(
 		`${baseUrl.replace(/\/$/, "")}/v1internal:fetchAvailableModels`,
 		authenticatedRequest(credential.access, { project: credential.projectId }, signal),
 	);
+	if (!catalog.agentModelSorts) throw new Error("Antigravity returned no agent model selections");
 	const models: Model<"google-antigravity">[] = [];
-	for (const [id, entry] of Object.entries(catalog.models)) {
-		const capabilities = SUPPORTED_MODELS[id];
-		if (!capabilities) continue;
+	const ids = new Set(catalog.agentModelSorts.flatMap((sort) => sort.groups.flatMap((group) => group.modelIds)));
+	for (const id of ids) {
+		const entry = catalog.models[id];
+		if (!entry) throw new Error(`Antigravity returned no model metadata for ${id}`);
+		if (entry.disabled || entry.isInternal) continue;
 		if (!entry.displayName || !(entry.maxTokens > 0) || !(entry.maxOutputTokens > 0)) {
 			throw new Error(`Antigravity returned incomplete model metadata for ${id}`);
 		}
@@ -303,12 +298,16 @@ export async function discoverGoogleAntigravityModels(
 			provider: "google-antigravity",
 			api: "google-antigravity",
 			baseUrl,
-			...capabilities,
+			reasoning: entry.supportsThinking === true,
+			input: entry.supportsImages ? ["text", "image"] : ["text"],
+			...(entry.supportsThinking && VARIANT_THINKING_LEVELS[id]
+				? { thinkingLevelMap: VARIANT_THINKING_LEVELS[id] }
+				: {}),
 			contextWindow: entry.maxTokens,
 			maxTokens: entry.maxOutputTokens,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 	}
-	if (!models.length) throw new Error("Antigravity returned no supported chat models for this account");
+	if (!models.length) throw new Error("Antigravity returned no available agent models for this account");
 	return models;
 }

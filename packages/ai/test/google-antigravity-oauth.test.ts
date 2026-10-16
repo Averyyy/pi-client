@@ -233,23 +233,40 @@ describe.sequential("Google Antigravity OAuth", () => {
 		await expect(googleAntigravityOAuth.refresh(credential, signal)).rejects.toThrow("HTTP 400");
 	});
 
-	it("uses only account-returned supported models and their native limits", async () => {
+	it("uses account-selected agent models in order and excludes disabled, internal, and unlisted models", async () => {
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			expect(String(input)).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels");
 			expect(JSON.parse(String(init?.body))).toEqual({ project: "account-project" });
 			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer access-token");
 			return json({
+				agentModelSorts: [
+					{ groups: [{ modelIds: ["new-account-model", "gemini-3.8-flash-high", "disabled", "internal"] }] },
+					{ groups: [{ modelIds: ["gemini-3.8-flash-high"] }] },
+				],
 				models: {
-					"gemini-3-flash": { displayName: "Account Gemini Flash", maxTokens: 1048576, maxOutputTokens: 65536 },
-					"unsupported-internal-model": { displayName: "Internal", maxTokens: 500, maxOutputTokens: 100 },
+					"gemini-3.8-flash-high": {
+						displayName: "Account Gemini Flash",
+						maxTokens: 1048576,
+						maxOutputTokens: 65536,
+						supportsImages: true,
+						supportsThinking: true,
+					},
+					"new-account-model": { displayName: "Account Model", maxTokens: 500, maxOutputTokens: 100 },
+					disabled: { disabled: true },
+					internal: { isInternal: true },
+					unlisted: { displayName: "Unlisted", maxTokens: 500, maxOutputTokens: 100 },
 				},
 			});
 		});
 		vi.stubGlobal("fetch", fetchMock);
 		const models = await discoverGoogleAntigravityModels(credential, signal);
-		expect(models).toHaveLength(1);
+		expect(models.map((model) => model.id)).toEqual(["new-account-model", "gemini-3.8-flash-high"]);
 		expect(models[0]).toMatchObject({
-			id: "gemini-3-flash",
+			reasoning: false,
+			input: ["text"],
+		});
+		expect(models[1]).toMatchObject({
+			id: "gemini-3.8-flash-high",
 			name: "Account Gemini Flash",
 			contextWindow: 1048576,
 			maxTokens: 65536,
@@ -257,39 +274,80 @@ describe.sequential("Google Antigravity OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("reports an account with no supported model instead of publishing fallback models", async () => {
+	it("reports an account with no selectable agent models", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => json({ models: {} })),
+			vi.fn(async () => json({ agentModelSorts: [], models: {} })),
 		);
-		await expect(discoverGoogleAntigravityModels(credential, signal)).rejects.toThrow("no supported chat models");
+		await expect(discoverGoogleAntigravityModels(credential, signal)).rejects.toThrow("no available agent models");
 	});
 
-	it("discovers Gemini 3.8 Flash with its supported reasoning levels and account limits", async () => {
+	it("discovers the exact Gemini 3.8 Flash account variants with their supported reasoning levels", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () =>
 				json({
+					agentModelSorts: [
+						{
+							groups: [
+								{ modelIds: ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"] },
+							],
+						},
+					],
 					models: {
-						"gemini-3.8-flash": {
-							displayName: "Gemini 3.8 Flash",
+						"gemini-3.8-flash-high": {
+							displayName: "Gemini 3.8 Flash High",
 							maxTokens: 1048576,
 							maxOutputTokens: 65536,
+							supportsImages: true,
+							supportsThinking: true,
+							thinkingBudget: -1,
+						},
+						"gemini-3.8-flash-medium": {
+							displayName: "Gemini 3.8 Flash Medium",
+							maxTokens: 1048576,
+							maxOutputTokens: 65536,
+							supportsImages: true,
+							supportsThinking: true,
+							thinkingBudget: 4000,
+						},
+						"gemini-3.8-flash-low": {
+							displayName: "Gemini 3.8 Flash Low",
+							maxTokens: 1048576,
+							maxOutputTokens: 65536,
+							supportsImages: true,
+							supportsThinking: true,
+							thinkingBudget: 1000,
 						},
 					},
 				}),
 			),
 		);
 		const models = await discoverGoogleAntigravityModels(credential, signal);
-		expect(models).toHaveLength(1);
+		expect(models).toHaveLength(3);
 		expect(models[0]).toMatchObject({
-			id: "gemini-3.8-flash",
+			id: "gemini-3.8-flash-high",
 			provider: "google-antigravity",
 			reasoning: true,
 			input: ["text", "image"],
 			contextWindow: 1048576,
 			maxTokens: 65536,
 		});
-		expect(getSupportedThinkingLevels(models[0])).toEqual(["low", "medium", "high"]);
+		expect(models.map((model) => getSupportedThinkingLevels(model))).toEqual([["high"], ["medium"], ["low"]]);
+	});
+
+	it("rejects account-selected model IDs without metadata", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				json({
+					agentModelSorts: [{ groups: [{ modelIds: ["missing-model"] }] }],
+					models: {},
+				}),
+			),
+		);
+		await expect(discoverGoogleAntigravityModels(credential, signal)).rejects.toThrow(
+			"no model metadata for missing-model",
+		);
 	});
 });

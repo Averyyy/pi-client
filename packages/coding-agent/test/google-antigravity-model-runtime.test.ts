@@ -69,7 +69,7 @@ describe("Google Antigravity ModelRuntime", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("discovers only supported account IDs through Cloud Code and persists their exact limits", async () => {
+	it("discovers the account chat picker IDs through Cloud Code and persists their exact limits", async () => {
 		const modelsStore = new InMemoryModelsStore();
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			expect(String(input)).toBe(`${model.baseUrl}/v1internal:fetchAvailableModels`);
@@ -77,11 +77,14 @@ describe("Google Antigravity ModelRuntime", () => {
 			expect(new Headers(init?.headers).get("authorization")).toBe("Bearer test");
 			expect(JSON.parse(String(init?.body))).toEqual({ project: "test-project" });
 			return Response.json({
+				agentModelSorts: [{ groups: [{ modelIds: [model.id] }] }],
 				models: {
 					[model.id]: {
 						displayName: model.name,
 						maxTokens: model.contextWindow,
 						maxOutputTokens: model.maxTokens,
+						supportsImages: true,
+						supportsThinking: true,
 					},
 					"unknown-account-model": { displayName: "Unknown", maxTokens: 200_000, maxOutputTokens: 8000 },
 				},
