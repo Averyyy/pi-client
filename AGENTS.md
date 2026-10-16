@@ -293,6 +293,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 
 - When upstream adds a classifier API, register it in pi-server's `CLASSIFIER_APIS` as well as builtin provider dispatch. Cover a custom provider ID in remote tests so builtin dispatch cannot mask a missing API registration.
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
+- Provider API maps must cover the APIs in their regenerated catalogs; OpenCode Go includes Google Generative AI alongside Anthropic and OpenAI.
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
 - Cross-platform tests for platform-specific behavior must set the simulated platform explicitly when asserting the opposite platform, instead of relying on the host OS.
 - Real Unix-domain socket integration tests must use an explicit non-Windows `runIf` guard, matching `packages/client`; keep option-validation and transport-neutral tests enabled on Windows.
