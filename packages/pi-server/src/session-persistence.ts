@@ -224,7 +224,6 @@ function applyWalRecord(session: PersistedSessionState, record: PersistedSession
 	}
 	if (record.revision <= session.revision) return;
 	if (record.baseEntryCount < session.entries.length) {
-		if (record.baseEntryCount + record.entries.length <= session.entries.length) return;
 		throw new Error(`Persisted session WAL overlaps snapshot for ${record.sessionId}`);
 	}
 	if (record.baseEntryCount !== session.entries.length) {

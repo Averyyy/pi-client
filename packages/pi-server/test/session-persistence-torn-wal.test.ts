@@ -146,4 +146,34 @@ describe("session-persistence WAL torn tail recovery", () => {
 		expect(getSession(sessionId)).toBeUndefined();
 		expect(readFileSync(walFile, "utf8")).toBe(JSON.stringify(invalidCompleteRecord));
 	});
+
+	it.each([1, 2, 3])("handles contained WAL overlap at revision %s against snapshot revision 2", (revision) => {
+		const sessionId = `test-session-overlap-${revision}`;
+		const entry1 = userEntry("entry-1", null, "one", 1000);
+		const entry2 = userEntry("entry-2", "entry-1", "two", 2000);
+		const sessionFile = sessionFilePath(testDir, sessionId);
+		const walFile = `${sessionFile}.wal`;
+		writeFileSync(sessionFile, JSON.stringify(snapshot(sessionId, [entry1, entry2], "entry-2")));
+		const wal = JSON.stringify({
+			version: 1,
+			sessionId,
+			baseEntryCount: 0,
+			entries: [entry1],
+			leafId: "entry-1",
+			revision,
+			updatedAt: 3000,
+			staticContext: { systemPrompt: "overlap", tools: [] },
+		});
+		writeFileSync(walFile, wal);
+
+		loadPersistedSessions(testDir);
+		if (revision > 2) {
+			expect(getSession(sessionId)).toBeUndefined();
+		} else {
+			expect(getSession(sessionId)?.leafId).toBe("entry-2");
+			expect(getSession(sessionId)?.revision).toBe(2);
+			expect(getSession(sessionId)?.staticContext?.systemPrompt).toBe("test");
+		}
+		expect(readFileSync(walFile, "utf8")).toBe(wal);
+	});
 });

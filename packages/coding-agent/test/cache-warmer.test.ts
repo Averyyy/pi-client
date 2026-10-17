@@ -438,6 +438,66 @@ describe("cache warming", () => {
 		failed.warmer.cancel();
 	});
 
+	it("stops warming when the extension decision fails", async () => {
+		vi.useFakeTimers();
+		const { warmer, calls } = fakeRuntime({
+			decide: () => {
+				throw new Error("warming policy unavailable");
+			},
+		});
+		warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+
+		expect(warmer.status).toMatchObject({ state: "inactive" });
+		expect(formatCacheWarmingStatus(warmer.status)).toContain("warming policy unavailable");
+		await vi.advanceTimersByTimeAsync(540_000);
+		expect(calls).toHaveLength(0);
+	});
+
+	it.each(["error", "aborted", "throw"] as const)("stops warming after a provider %s", async (failure) => {
+		vi.useFakeTimers();
+		const { warmer, calls, appendUsage } = fakeRuntime({
+			result: async (model) => {
+				if (failure === "throw") throw new Error("warming transport failed");
+				return { ...response(model, failure), errorMessage: "warming provider failed" };
+			},
+		});
+		warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+
+		expect(warmer.status).toMatchObject({ state: "inactive" });
+		expect(formatCacheWarmingStatus(warmer.status)).toContain(
+			failure === "throw" ? "warming transport failed" : "warming provider failed",
+		);
+		await vi.advanceTimersByTimeAsync(540_000);
+		expect(calls).toHaveLength(1);
+		expect(appendUsage).not.toHaveBeenCalled();
+	});
+
+	it.each(["decision", "request"])("keeps the replacement run when an old %s rejects", async (stage) => {
+		vi.useFakeTimers();
+		let rejectPending!: (error: Error) => void;
+		const pending = new Promise<never>((_resolve, reject) => {
+			rejectPending = reject;
+		});
+		let first = true;
+		const { warmer, calls } = fakeRuntime({
+			decide: (event) => (stage === "decision" && first ? pending : event.action),
+			result: async (model) => (stage === "request" && first ? pending : response(model)),
+		});
+		warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+		first = false;
+		warmer.start(request(), current);
+		rejectPending(new Error("old warming failure"));
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(warmer.status.state).toBe("scheduled");
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(calls).toHaveLength(stage === "request" ? 2 : 1);
+		warmer.cancel();
+	});
+
 	it("formats status and usage entries", () => {
 		const decision: CacheWarmingDecision = {
 			phase: "idle",
@@ -467,6 +527,34 @@ describe("cache warming", () => {
 });
 
 describe("ExtensionRunner.emitCacheWarmingDecision", () => {
+	it("reports a decision handler failure and stops warming without inference", async () => {
+		vi.useFakeTimers();
+		const failure = new Error("extension warming policy failed");
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("cache_warming_decision", () => {
+					throw failure;
+				});
+			},
+			process.cwd(),
+			createEventBus(),
+			runtime,
+		);
+		const modelRegistry = await createInMemoryModelRegistry(AuthStorage.inMemory());
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), modelRegistry);
+		const listener = vi.fn();
+		runner.onError(listener);
+		const { warmer, calls } = fakeRuntime({ decide: (event) => runner.emitCacheWarmingDecision(event) });
+		warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+
+		expect(listener).toHaveBeenCalledWith(expect.objectContaining({ error: failure.message }));
+		expect(formatCacheWarmingStatus(warmer.status)).toContain(failure.message);
+		await vi.advanceTimersByTimeAsync(540_000);
+		expect(calls).toHaveLength(0);
+	});
+
 	it("uses the last extension override", async () => {
 		const runtime = createExtensionRuntime();
 		const eventBus = createEventBus();

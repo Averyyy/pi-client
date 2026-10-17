@@ -105,6 +105,11 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { getCliBinName } from "../../core/pi-client-cli-adapter.ts";
+import {
+	PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE,
+	readPiClientUpdateMarker,
+	writePiClientRuntimeReloadState,
+} from "../../core/pi-client-runtime-update.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -425,6 +430,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
  * Options for InteractiveMode initialization.
  */
 export interface InteractiveModeOptions {
+	/** Canonical invocation options retained when the launcher restarts an updated runtime. */
+	runtimeReloadArgs?: string[];
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Diagnostics collected before the interactive TUI was initialized. */
@@ -4525,7 +4532,7 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+	private async shutdown(options?: { fromSignal?: boolean; exitCode?: number }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
 		// Keep signal handlers registered until terminal cleanup has completed.
@@ -4544,7 +4551,7 @@ export class InteractiveMode {
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
-			process.exit(0);
+			process.exit(options.exitCode ?? 0);
 		}
 
 		// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
@@ -4558,12 +4565,14 @@ export class InteractiveMode {
 		this.stop();
 		await this.runtimeHost.dispose();
 
-		const resumeCommand = formatResumeCommand(this.sessionManager);
-		if (resumeCommand) {
-			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+		if (options?.exitCode !== PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE) {
+			const resumeCommand = formatResumeCommand(this.sessionManager);
+			if (resumeCommand) {
+				process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+			}
 		}
 
-		process.exit(0);
+		process.exit(options?.exitCode ?? 0);
 	}
 
 	private emergencyTerminalExit(): never {
@@ -6682,6 +6691,54 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
+	private async reloadUpdatedPiClientRuntime(): Promise<boolean> {
+		if (process.env.PI_SERVER_MODE !== "true") return false;
+
+		try {
+			const agentDir = this.runtimeHost.services.agentDir;
+			const marker = readPiClientUpdateMarker(agentDir);
+			if (!marker) return false;
+			if (marker.updatedAt === process.env.PI_CLIENT_RUNTIME_UPDATED_AT) return false;
+			const statePath = process.env.PI_CLIENT_RELOAD_STATE_PATH;
+			if (!statePath) {
+				throw new Error("Runtime reload requires the pi-client launcher. Restart this session with pi-client.");
+			}
+			if (!this.sessionManager.isPersisted()) {
+				throw new Error(
+					"Runtime reload cannot resume a --no-session session. Start a persisted session to reload the runtime.",
+				);
+			}
+			if (
+				this.session.isAborting ||
+				this.session.isBashRunning ||
+				this.session.pendingMessageCount > 0 ||
+				this.pendingUserInputs.length > 0 ||
+				this.compactionQueuedMessages.length > 0
+			) {
+				throw new Error("Finish pending input, bash commands, and cancellation before reloading the runtime.");
+			}
+			const sessionFile = this.sessionManager.getSessionFile()!;
+			if (!fs.existsSync(sessionFile)) {
+				this.sessionManager.replaceTree(this.sessionManager.getEntries(), this.sessionManager.getLeafId());
+			}
+			await this.settingsManager.flush();
+			writePiClientRuntimeReloadState(statePath, {
+				sessionId: this.sessionManager.getSessionId(),
+				sessionDir: this.sessionManager.getSessionDir(),
+				leafId: this.sessionManager.getLeafId(),
+				args: this.options.runtimeReloadArgs ?? [],
+				updatedAt: marker.updatedAt,
+			});
+			this.showStatus(`Restarting pi-client on ${marker.version}`);
+		} catch (error) {
+			this.showError(`Runtime reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			return true;
+		}
+
+		await this.shutdown({ exitCode: PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE });
+		return true;
+	}
+
 	private async handleReloadCommand(): Promise<void> {
 		if (this.session.isStreaming) {
 			this.showWarning("Wait for the current response to finish before reloading.");
@@ -6691,6 +6748,7 @@ export class InteractiveMode {
 			this.showWarning("Wait for compaction to finish before reloading.");
 			return;
 		}
+		if (await this.reloadUpdatedPiClientRuntime()) return;
 
 		this.resetExtensionUI();
 

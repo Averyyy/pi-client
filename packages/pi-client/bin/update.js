@@ -12,10 +12,6 @@ function readPackageMetadata(packageRoot) {
 	return JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf-8"));
 }
 
-function runStep(runner, command, args, cwd, stdio = "inherit") {
-	return runner(command, args, { cwd, stdio, encoding: "utf-8" });
-}
-
 function defaultUpdateMarkerPath() {
 	return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-client-update.json");
 }
@@ -25,12 +21,13 @@ function writeUpdateMarker(path) {
 	writeFileSync(path, `${JSON.stringify({ version: "latest", updatedAt: new Date().toISOString() })}\n`);
 }
 
-function runNpmGlobalUpdate(runner, cwd, stdout, stderr, updateMarkerPath) {
+function runNpmGlobalUpdate(runner, cwd, stdout, stderr, updateMarkerPath, platform) {
 	stdout.write("Updating npm packages: @averyyy/pi-client@latest @averyyy/pi-server@latest\n");
-	const result = runStep(
-		runner,
-		"npm",
+	const command = platform === "win32" ? process.execPath : "npm";
+	const result = runner(
+		command,
 		[
+			...(platform === "win32" ? [join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")] : []),
 			"install",
 			"-g",
 			"--ignore-scripts",
@@ -39,7 +36,7 @@ function runNpmGlobalUpdate(runner, cwd, stdout, stderr, updateMarkerPath) {
 			"@averyyy/pi-client@latest",
 			"@averyyy/pi-server@latest",
 		],
-		cwd,
+		{ cwd, stdio: "inherit", encoding: "utf-8" },
 	);
 	if (result.status !== 0) {
 		stderr.write(
@@ -59,10 +56,11 @@ export async function runPiClientUpdate(_args = [], options = {}) {
 	const stdout = options.stdout ?? process.stdout;
 	const stderr = options.stderr ?? process.stderr;
 	const updateMarkerPath = options.updateMarkerPath ?? defaultUpdateMarkerPath();
+	const platform = options.platform ?? process.platform;
 	const pkg = readPackageMetadata(packageRoot);
-	const baseVersion = pkg.piClient?.basePiVersion ?? "unknown";
-	const baseCommit = pkg.piClient?.basePiCommit ?? "unknown";
+	const baseVersion = pkg.piClient.basePiVersion;
+	const baseCommit = pkg.piClient.basePiCommit;
 
 	stdout.write(`pi-client ${pkg.version} (based on pi ${baseVersion}, upstream ${baseCommit})\n`);
-	return runNpmGlobalUpdate(runner, process.cwd(), stdout, stderr, updateMarkerPath);
+	return runNpmGlobalUpdate(runner, process.cwd(), stdout, stderr, updateMarkerPath, platform);
 }

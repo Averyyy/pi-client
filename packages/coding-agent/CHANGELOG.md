@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Errors in input, context, agent preparation, and provider request/header transformation handlers stop the affected request instead of continuing with original or partially transformed data.
+- `pi.exec()` rejects command startup failures instead of returning an empty failed result.
+
 ### Added
 
 - Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
@@ -11,6 +16,14 @@
 
 ### Fixed
 
+- Preserved explicit pi-server operation errors without querying disconnected-run recovery, including compaction, image generation, and classification.
+- Stopped cache warming on failed extension decisions or provider requests and exposed the failure reason in `/session`.
+- Propagated system-prompt file read failures instead of using the file path as prompt text.
+- Reported extension tool and flag conflicts as warnings while applying the same first-registration precedence to CLI flag validation.
+- Kept model resolution errors inside the calling process and returned failed exit status for signal-terminated extension commands.
+- Connected `/reload` to updated pi-client runtime startup while preserving the session tree, selected branch, and startup options across active sessions.
+- Restored persisted model and thinking selections before the first prompt and applied runtime API keys to the exact selected provider before session model resolution.
+- Kept provider-only credential commands independent of server model catalog access.
 - Kept pi-client interactive startup usable when pi-server's model catalog is unavailable, reported catalog failures, and reused the current catalog until an explicit refresh.
 - Routed model-registry and provider image generation, classification, direct streams, and deferred response fetch/cancel through pi-server, including codemode usage and virtual-model routing.
 - Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.

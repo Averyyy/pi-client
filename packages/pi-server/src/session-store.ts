@@ -265,7 +265,6 @@ export function appendSessionEntries(
 		return session;
 	}
 	session.entries.push(...entriesToAppend);
-	assertValidLeaf(session.entries, leafId);
 	session.leafId = leafId;
 	appendTreeHashes(session, entriesToAppend);
 	session.revision++;

@@ -619,7 +619,7 @@ describe("ExtensionRunner", () => {
 			});
 
 			// Emit context event which will trigger the throwing handler
-			await runner.emitContext([]);
+			await expect(runner.emitContext([])).rejects.toThrow("Handler error!");
 
 			expect(errors.length).toBe(1);
 			expect(errors[0].error).toContain("Handler error!");
@@ -1384,6 +1384,85 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("request transform errors", () => {
+		it.each([
+			"input",
+			"context",
+			"context_with_system",
+			"before_agent_start",
+			"before_provider_request",
+			"before_provider_headers",
+		] as const)("stops %s with the original error before later handlers run", async (eventName) => {
+			const runtime = createExtensionRuntime();
+			const failure = new Error(`${eventName} failed`);
+			const laterHandler = vi.fn();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					const fail = () => {
+						throw failure;
+					};
+					switch (eventName) {
+						case "input":
+							pi.on("input", fail);
+							pi.on("input", laterHandler);
+							break;
+						case "context":
+							pi.on("context", fail);
+							pi.on("context", laterHandler);
+							break;
+						case "context_with_system":
+							pi.on("context_with_system", fail);
+							pi.on("context_with_system", laterHandler);
+							break;
+						case "before_agent_start":
+							pi.on("before_agent_start", fail);
+							pi.on("before_agent_start", laterHandler);
+							break;
+						case "before_provider_request":
+							pi.on("before_provider_request", fail);
+							pi.on("before_provider_request", laterHandler);
+							break;
+						case "before_provider_headers":
+							pi.on("before_provider_headers", fail);
+							pi.on("before_provider_headers", laterHandler);
+							break;
+					}
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors = vi.fn();
+			runner.onError(errors);
+			let operation: Promise<unknown>;
+			switch (eventName) {
+				case "input":
+					operation = runner.emitInput("hello", undefined, "interactive");
+					break;
+				case "context":
+				case "context_with_system":
+					operation = runner.emitContext([]);
+					break;
+				case "before_agent_start":
+					operation = runner.emitBeforeAgentStart({ messageType: "user", prompt: "hello" }, { cwd: tempDir });
+					break;
+				case "before_provider_request":
+					operation = runner.emitBeforeProviderRequest({ messages: [] });
+					break;
+				case "before_provider_headers":
+					operation = runner.emitBeforeProviderHeaders({});
+					break;
+			}
+
+			await expect(operation).rejects.toBe(failure);
+			expect(laterHandler).not.toHaveBeenCalled();
+			expect(errors).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ event: eventName, error: failure.message }),
+			);
+		});
+	});
+
 	describe("before_provider_headers", () => {
 		it("lets a handler mutate headers in place and preserves existing headers", async () => {
 			const extCode = `
@@ -1405,10 +1484,11 @@ describe("ExtensionRunner", () => {
 			expect(headers["User-Agent"]).toBe("kimchi/1.0");
 		});
 
-		it("isolates a throwing handler and still applies the others", async () => {
+		it("stops after a header handler mutates headers and then throws", async () => {
 			const throwing = `
 				export default function(pi) {
-					pi.on("before_provider_headers", () => {
+					pi.on("before_provider_headers", (event) => {
+						event.headers["X-Partial"] = "yes";
 						throw new Error("header handler boom");
 					});
 				}
@@ -1428,9 +1508,10 @@ describe("ExtensionRunner", () => {
 			const errors: Array<{ event: string; error: string }> = [];
 			runner.onError((err) => errors.push(err));
 
-			const headers = await runner.emitBeforeProviderHeaders({ "User-Agent": "x" });
+			const headers = { "User-Agent": "x" };
+			await expect(runner.emitBeforeProviderHeaders(headers)).rejects.toThrow("header handler boom");
 
-			expect(headers["X-Good"]).toBe("yes");
+			expect(headers).not.toHaveProperty("X-Good");
 			expect(headers["User-Agent"]).toBe("x");
 			expect(errors).toHaveLength(1);
 			expect(errors[0].event).toBe("before_provider_headers");

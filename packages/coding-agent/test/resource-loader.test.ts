@@ -925,7 +925,7 @@ Content`,
 	});
 
 	describe("extension conflict detection", () => {
-		it("should detect tool conflicts between extensions", async () => {
+		it("should warn about tool conflicts and keep both extensions loaded", async () => {
 			// Create two extensions that register the same tool
 			const ext1Dir = join(agentDir, "extensions", "ext1");
 			const ext2Dir = join(agentDir, "extensions", "ext2");
@@ -965,8 +965,13 @@ export default function(pi: ExtensionAPI) {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 			await loader.reload();
 
-			const { errors } = loader.getExtensions();
-			expect(errors.some((e) => e.error.includes("duplicate-tool") && e.error.includes("conflicts"))).toBe(true);
+			const { errors, warnings, extensions } = loader.getExtensions();
+			expect(errors).toEqual([]);
+			expect(extensions).toHaveLength(2);
+			expect(warnings).toContainEqual({
+				path: join(ext2Dir, "index.ts"),
+				warning: `Tool "duplicate-tool" conflicts with ${join(ext1Dir, "index.ts")}; first registration wins.`,
+			});
 		});
 
 		it("should prefer explicit CLI extensions over discovered extensions when commands and tools conflict", async () => {
@@ -1021,6 +1026,11 @@ export default function(pi: ExtensionAPI) {
 
 			const extensionsResult = loader.getExtensions();
 			expect(extensionsResult.extensions[0]?.path).toBe(explicitExtPath);
+			expect(extensionsResult.errors).toEqual([]);
+			expect(extensionsResult.warnings).toContainEqual({
+				path: join(globalExtDir, "global.ts"),
+				warning: `Tool "duplicate-tool" conflicts with ${explicitExtPath}; first registration wins.`,
+			});
 
 			const sessionManager = SessionManager.inMemory();
 			const authStorage = AuthStorage.create(join(tempDir, "auth-explicit.json"));
@@ -1036,6 +1046,37 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getCommand("deploy:1")?.description).toBe("explicit command");
 			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
+		});
+
+		it("should warn about flag conflicts while retaining the first flag and unrelated commands", async () => {
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				extensionFactories: [
+					{
+						name: "first",
+						factory: (pi) => pi.registerFlag("shared", { type: "boolean", default: true }),
+					},
+					{
+						name: "second",
+						factory: (pi) => {
+							pi.registerFlag("shared", { type: "boolean", default: false });
+							pi.registerCommand("unrelated", { handler: async () => {} });
+						},
+					},
+				],
+			});
+
+			await loader.reload();
+
+			const result = loader.getExtensions();
+			expect(result.errors).toEqual([]);
+			expect(result.warnings).toContainEqual({
+				path: "<inline:second>",
+				warning: 'Flag "--shared" conflicts with <inline:first>; first registration wins.',
+			});
+			expect(result.runtime.flagValues.get("shared")).toBe(true);
+			expect(result.extensions[1].commands.has("unrelated")).toBe(true);
 		});
 
 		it("should leave out replaceable extensions whose names another extension registers", async () => {

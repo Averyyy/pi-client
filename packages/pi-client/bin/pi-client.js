@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPiClientSend } from "./send.js";
@@ -33,6 +33,8 @@ function runPiClientCli(args) {
 	const reloadStatePath = join(reloadDir, "state.json");
 	let cliPath = getLocalCliPath();
 	let childArgs = args;
+	let reloadLeafId;
+	let runtimeUpdatedAt = readRuntimeUpdateGeneration();
 
 	try {
 		for (;;) {
@@ -43,6 +45,8 @@ function runPiClientCli(args) {
 					PI_SERVER_MODE: "true",
 					PI_CLIENT_VERSION: packageVersion,
 					PI_CLIENT_RELOAD_STATE_PATH: reloadStatePath,
+					PI_CLIENT_RELOAD_LEAF_ID: reloadLeafId,
+					PI_CLIENT_RUNTIME_UPDATED_AT: runtimeUpdatedAt,
 				},
 				stdio: "inherit",
 			});
@@ -53,14 +57,10 @@ function runPiClientCli(args) {
 			}
 
 			const state = readReloadState(reloadStatePath);
-			if (!state) {
-				console.error("pi-client reload failed: missing session state from the previous runtime.");
-				process.exitCode = 1;
-				return;
-			}
-			rmSync(state.updateMarkerPath, { force: true });
-			childArgs = state.sessionDir ? ["--session-dir", state.sessionDir, "--session", state.sessionId] : ["--session", state.sessionId];
-			cliPath = getUpdatedGlobalCliPath() ?? getLocalCliPath();
+			cliPath = getUpdatedGlobalCliPath();
+			reloadLeafId = state.leafId ?? "";
+			runtimeUpdatedAt = state.updatedAt;
+			childArgs = [...state.args, ...(state.sessionDir ? ["--session-dir", state.sessionDir] : []), "--session", state.sessionId];
 		}
 	} finally {
 		rmSync(reloadDir, { recursive: true, force: true });
@@ -72,24 +72,42 @@ function getLocalCliPath() {
 	return join(dirname(entry), "cli.js");
 }
 
+function readRuntimeUpdateGeneration() {
+	const markerPath = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-client-update.json");
+	try {
+		const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+		if (typeof marker?.updatedAt !== "string") throw new Error(`Invalid pi-client update marker: ${markerPath}`);
+		return marker.updatedAt;
+	} catch (error) {
+		if (error.code !== "ENOENT") console.error(`Could not read pi-client update marker: ${error.message}`);
+		return "";
+	}
+}
+
 function getUpdatedGlobalCliPath() {
 	const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-	const result = existsSync(npmCli)
+	const result = process.platform === "win32"
 		? spawnSync(process.execPath, [npmCli, "root", "-g"], { encoding: "utf-8" })
 		: spawnSync("npm", ["root", "-g"], { encoding: "utf-8" });
-	if (result.status !== 0) return undefined;
+	if (result.error) throw result.error;
+	if (result.status !== 0) {
+		throw new Error(`Could not locate the updated pi-client runtime: ${result.stderr.trim()}`);
+	}
 	const root = result.stdout.trim();
-	const cliPath = join(root, "@averyyy", "pi-client", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-	return existsSync(cliPath) ? cliPath : undefined;
+	return join(root, "@averyyy", "pi-client", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 }
 
 function readReloadState(path) {
-	try {
-		const value = JSON.parse(readFileSync(path, "utf-8"));
-		if (typeof value.sessionId !== "string" || typeof value.updateMarkerPath !== "string") return undefined;
-		if (value.sessionDir !== undefined && typeof value.sessionDir !== "string") return undefined;
-		return value;
-	} catch {
-		return undefined;
+	const value = JSON.parse(readFileSync(path, "utf-8"));
+	if (
+		typeof value?.sessionId !== "string" ||
+		typeof value?.updatedAt !== "string" ||
+		!Array.isArray(value.args) ||
+		!value.args.every((arg) => typeof arg === "string") ||
+		(value.leafId !== null && typeof value.leafId !== "string") ||
+		(value.sessionDir !== undefined && typeof value.sessionDir !== "string")
+	) {
+		throw new Error(`Invalid pi-client reload state: ${path}`);
 	}
+	return value;
 }
