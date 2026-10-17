@@ -2,7 +2,7 @@
 import { type ChildProcess, fork } from "node:child_process";
 import { createHash } from "node:crypto";
 import { unlinkSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { lstat, mkdir, rm } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,7 +86,7 @@ export async function processLock(name: string): Promise<() => Promise<void>> {
 		process.platform === "win32"
 			? `\\\\.\\pipe\\chord2-${key}`
 			: file
-				? join(tmpdir(), `chord2-${key}.sock`)
+				? await lockSocketPath(`chord2-${key}.sock`)
 				: `\0chord2-${key}`;
 	const server = createServer((socket) => socket.end());
 	for (;;) {
@@ -122,6 +122,27 @@ export async function processLock(name: string): Promise<() => Promise<void>> {
 		});
 }
 
+/** sun_path references 104 bytes on macOS and the BSDs, including the terminating NUL. */
+const MAX_SOCKET_PATH_BYTES = 103;
+
+/**
+ * The lock socket's path: in the temporary directory, or, when that path does not fit in sun_path (a deep TMPDIR,
+ * such as a test runner's below macOS's per-user one), in a private per-user directory under /tmp. Other users must
+ * not be able to create or remove sockets there, so the directory has to be ours and closed to everyone else.
+ */
+async function lockSocketPath(file: string): Promise<string> {
+	const preferred = join(tmpdir(), file);
+	if (Buffer.byteLength(preferred) <= MAX_SOCKET_PATH_BYTES) return preferred;
+	const uid = process.getuid?.() ?? 0;
+	const directory = `/tmp/chord2-${uid}`;
+	await mkdir(directory, { mode: 0o700, recursive: true });
+	const stats = await lstat(directory);
+	if (!stats.isDirectory() || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+		throw new ChordError("unavailable", `lock directory ${directory} must be a directory only its owner can access`);
+	}
+	return join(directory, file);
+}
+
 function accepting(address: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const socket = connect(address);
@@ -137,16 +158,20 @@ function accepting(address: string): Promise<boolean> {
 
 const LOCK_ENV = "CHORD2_LOCK";
 
+/** A control message to a peer process that is gone: dropped (its exit or `disconnect` is reported separately). */
+const ignoreSendError = (): void => {};
+
 export function forkDriver(options: ForkDriverOptions): Driver {
 	return {
 		spawn() {
+			// A lock this process inherited (e.g. as a child host itself) is not the child's: it gets only its own.
+			const env: NodeJS.ProcessEnv = { ...process.env };
+			delete env[LOCK_ENV];
+			Object.assign(env, options.env);
+			if (options.lock !== undefined) env[LOCK_ENV] = options.lock;
 			// Detached: the child leads a process group, so the whole tree can be killed.
 			const child: ChildProcess = fork(options.entry, [...(options.args ?? [])], {
-				env: {
-					...process.env,
-					...options.env,
-					...(options.lock === undefined ? {} : { [LOCK_ENV]: options.lock }),
-				},
+				env,
 				execArgv: [...(options.execArgv ?? [])],
 				detached: true,
 				stdio: ["ignore", options.onOutput ? "pipe" : "inherit", options.onOutput ? "pipe" : "inherit", "ipc"],
@@ -181,7 +206,8 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 				if (control !== undefined) for (const listener of listeners) listener(control);
 			});
 			const send = (message: ControlMessage): void => {
-				if (child.connected) child.send({ chord2control: message });
+				// A child that exited before the channel reported it fails the write (EPIPE): its exit is what counts.
+				if (child.connected) child.send({ chord2control: message }, ignoreSendError);
 			};
 			if (options.init !== undefined) send({ type: "init", value: options.init });
 			return {
@@ -378,7 +404,8 @@ export function childControl(channel: NodeJS.Process = process): {
 	onShutdown(handler: () => void | Promise<void>): void;
 } {
 	const send = (message: ControlMessage): void => {
-		if (channel.connected) channel.send?.({ chord2control: message });
+		// A parent that is gone fails the write (EPIPE); the `disconnect` that follows is how a child notices.
+		if (channel.connected) channel.send?.({ chord2control: message }, undefined, undefined, ignoreSendError);
 	};
 	let resolveInit: (value: unknown) => void = () => {};
 	const init = new Promise<unknown>((resolve) => {
