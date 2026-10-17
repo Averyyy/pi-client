@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Kept Google Antigravity inference runtime loading lazy when listing models or using other providers.
 - Fixed Devin losing system instructions and tool definitions after transcript normalization, which caused replies to stop without calling tools.
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
 - Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.

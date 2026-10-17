@@ -105,6 +105,7 @@ describe("pi-client interactive login features", () => {
 			settingsManager: { writable: true },
 		}) as LoginMethods;
 		const mode = Object.assign(context, {
+			runtimeHost: { services: { agentDir: dir } },
 			editor,
 			editorContainer,
 			ui: { requestRender: vi.fn(), setFocus: vi.fn() } as unknown as TUI,

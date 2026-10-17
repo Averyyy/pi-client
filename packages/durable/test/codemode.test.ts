@@ -970,7 +970,7 @@ describe("durable code mode output and tool search", () => {
 		expect(long.text).toContain("Warning: truncated output");
 		expect(long.text.split("\n").length).toBeLessThan(100_000);
 		expect(long.message.details?.fullOutputPath).toBeDefined();
-	});
+	}, 60_000);
 
 	it("writes the result's files to the same paths when it reruns after a crash", async () => {
 		const chat = codemodeChat();

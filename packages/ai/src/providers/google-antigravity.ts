@@ -1,7 +1,13 @@
-import * as googleAntigravityApi from "../api/google-antigravity.ts";
+import { lazyApi } from "../api/lazy.ts";
 import { lazyOAuth } from "../auth/helpers.ts";
-import { loadGoogleAntigravityCatalog, loadGoogleAntigravityOAuth } from "../auth/oauth/load.ts";
+import {
+	loadGoogleAntigravityCatalog,
+	loadGoogleAntigravityOAuth,
+	loadGoogleAntigravityRuntime,
+} from "../auth/oauth/load.ts";
 import { createProvider, type Provider } from "../models.ts";
+
+export const googleAntigravityApi = () => lazyApi(loadGoogleAntigravityRuntime);
 
 export function googleAntigravityProvider(): Provider<"google-antigravity"> {
 	return createProvider({
@@ -25,6 +31,6 @@ export function googleAntigravityProvider(): Provider<"google-antigravity"> {
 				context.baseUrl,
 			);
 		},
-		api: googleAntigravityApi,
+		api: googleAntigravityApi(),
 	});
 }

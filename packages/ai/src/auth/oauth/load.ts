@@ -17,6 +17,7 @@ type OAuthFlowLoaders = {
 	devinRuntime: () => DevinRuntime | Promise<DevinRuntime>;
 	googleAntigravity: () => OAuthAuth | Promise<OAuthAuth>;
 	googleAntigravityCatalog: () => GoogleAntigravityCatalog | Promise<GoogleAntigravityCatalog>;
+	googleAntigravityRuntime: () => ProviderStreams | Promise<ProviderStreams>;
 	anthropic: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiCodex: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiChatGPT: () => OAuthAuth | Promise<OAuthAuth>;
@@ -47,6 +48,11 @@ export const loadGoogleAntigravityOAuth = async (): Promise<OAuthAuth> => {
 export const loadGoogleAntigravityCatalog = async (): Promise<GoogleAntigravityCatalog> => {
 	if (bundledLoaders) return bundledLoaders.googleAntigravityCatalog();
 	return (await importOAuthModule("./google-antigravity.ts")) as GoogleAntigravityCatalog;
+};
+
+export const loadGoogleAntigravityRuntime = async (): Promise<ProviderStreams> => {
+	if (bundledLoaders) return bundledLoaders.googleAntigravityRuntime();
+	return (await importOAuthModule("./google-antigravity-runtime.ts")) as ProviderStreams;
 };
 
 export const loadDevinOAuth = async (): Promise<OAuthAuth> => {

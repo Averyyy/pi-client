@@ -185,6 +185,7 @@ const lazyEntryPoints = {
 	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
 	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
 	"google-antigravity": join(aiDistDir, "auth", "oauth", "google-antigravity.js"),
+	"google-antigravity-runtime": join(aiDistDir, "auth", "oauth", "google-antigravity-runtime.js"),
 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),
 	"kimi-coding": join(aiDistDir, "auth", "oauth", "kimi-coding.js"),
 	meta: join(aiDistDir, "auth", "oauth", "meta.js"),

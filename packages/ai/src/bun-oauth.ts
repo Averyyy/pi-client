@@ -1,4 +1,5 @@
 import * as devinRuntime from "./api/devin.ts";
+import * as googleAntigravityRuntime from "./api/google-antigravity.ts";
 import { anthropicOAuth } from "./auth/oauth/anthropic.ts";
 import { devinOAuth } from "./auth/oauth/devin.ts";
 import { githubCopilotOAuth } from "./auth/oauth/github-copilot.ts";
@@ -19,6 +20,7 @@ export function registerBunOAuthFlows(): void {
 		devinRuntime: () => devinRuntime,
 		googleAntigravity: () => googleAntigravity.googleAntigravityOAuth,
 		googleAntigravityCatalog: () => googleAntigravity,
+		googleAntigravityRuntime: () => googleAntigravityRuntime,
 		anthropic: () => anthropicOAuth,
 		openaiCodex: () => openaiCodexOAuth,
 		openaiChatGPT: () => openaiChatGPTOAuth,
