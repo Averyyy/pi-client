@@ -1153,30 +1153,38 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<void> {
 		await this.init();
+		const modelCatalogError = this.session.modelRuntime.getError();
+		const modelSelectionGuidance =
+			process.env.PI_SERVER_MODE === "true" && (!this.session.model || isUnknownModel(this.session.model))
+				? " Use /model to refresh catalogs and select a model."
+				: "";
 
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
-			const usesDevinModels =
-				this.session.model?.provider === "devin" ||
-				this.session.scopedModels.some(({ model }) => model.provider === "devin") ||
-				(this.settingsManager.getEnabledModels()?.some((pattern) => pattern.toLowerCase().startsWith("devin/")) ??
-					false);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
 				.then((result) => {
 					this.updateAvailableProviderCount();
-					if (!usesDevinModels) return;
-					if (result.errors.has("devin")) {
+					if (result.aborted) return;
+					for (const [provider, error] of result.errors) {
+						if (
+							provider === "pi-server" &&
+							modelCatalogError &&
+							this.session.modelRuntime.getError() === modelCatalogError
+						) {
+							continue;
+						}
 						this.showWarning(
-							"Could not refresh the Devin model catalog; cached or built-in fallback models remain available.",
-						);
-					} else if (result.aborted && controller.signal.aborted) {
-						this.showWarning(
-							"Devin model catalog refresh timed out; cached or built-in fallback models remain available.",
+							`Could not refresh ${provider} model catalog: ${error.message}${provider === "pi-server" ? modelSelectionGuidance : ""}`,
 						);
 					}
 				})
-				.catch(() => {})
+				.catch((error: unknown) => {
+					if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) return;
+					this.showWarning(
+						`Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}${modelSelectionGuidance}`,
+					);
+				})
 				.finally(() => clearTimeout(timeout));
 		}
 
@@ -1233,9 +1241,8 @@ export class InteractiveMode {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
 		}
 
-		const modelsJsonError = this.session.modelRuntime.getError();
-		if (modelsJsonError) {
-			this.showError(`models.json error: ${modelsJsonError}`);
+		if (modelCatalogError) {
+			this.showError(`Model catalog error: ${modelCatalogError}${modelSelectionGuidance}`);
 		}
 
 		if (modelFallbackMessage) {
@@ -6746,9 +6753,9 @@ export class InteractiveMode {
 				showDiagnosticsWhenQuiet: true,
 			});
 			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload();
-			const modelsJsonError = this.session.modelRuntime.getError();
-			if (modelsJsonError) {
-				this.showError(`models.json error: ${modelsJsonError}`);
+			const modelCatalogError = this.session.modelRuntime.getError();
+			if (modelCatalogError) {
+				this.showError(`Model catalog error: ${modelCatalogError}`);
 			}
 			this.showStatus(
 				savedImplicitProjectTrust

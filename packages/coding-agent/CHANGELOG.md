@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Kept pi-client interactive startup usable when pi-server's model catalog is unavailable, reported catalog failures, and reused the current catalog until an explicit refresh.
 - Routed model-registry and provider image generation, classification, direct streams, and deferred response fetch/cancel through pi-server, including codemode usage and virtual-model routing.
 - Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.
 - Preserved provider sampling options, parsed stream events, payload transformations, and response callbacks across pi-server requests.

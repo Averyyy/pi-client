@@ -480,7 +480,11 @@ function buildSessionOptions(
 			diagnostics.push({ type: "warning", message: resolved.warning });
 		}
 		if (resolved.error) {
-			diagnostics.push({ type: "error", message: resolved.error });
+			const runtimeError = modelRuntime.getError();
+			diagnostics.push({
+				type: "error",
+				message: runtimeError ? `Cannot resolve model "${parsed.model}": ${runtimeError}` : resolved.error,
+			});
 		}
 		if (resolved.model) {
 			options.model = resolved.model;
@@ -756,7 +760,6 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
-			modelRuntimeSignal: AbortSignal.timeout(15_000),
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
@@ -935,8 +938,12 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
-	if (appMode !== "interactive" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
+	if (
+		appMode !== "interactive" &&
+		(!session.model ||
+			(session.model.provider === "unknown" && session.model.id === "unknown" && session.model.api === "unknown"))
+	) {
+		console.error(chalk.red(modelRuntime.getError() ?? formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 
@@ -952,7 +959,21 @@ export async function main(args: string[], options?: MainOptions) {
 		const timeout = setTimeout(() => controller.abort(), 15_000);
 		void modelRuntime
 			.refresh({ signal: controller.signal })
-			.catch(() => {})
+			.then((result) => {
+				if (result.aborted) return;
+				for (const [providerId, error] of result.errors) {
+					console.error(chalk.yellow(`Model catalog refresh failed for ${providerId}: ${error.message}`));
+				}
+			})
+			.catch((error: unknown) => {
+				if (!controller.signal.aborted) {
+					console.error(
+						chalk.yellow(
+							`Model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					);
+				}
+			})
 			.finally(() => clearTimeout(timeout));
 	}
 

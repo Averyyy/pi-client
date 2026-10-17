@@ -33,7 +33,7 @@ export async function listModels(
 ): Promise<void> {
 	const loadError = modelRuntime.getError();
 	if (loadError) {
-		console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
+		console.error(chalk.yellow(`Warning: model catalog error:\n${loadError}`));
 	}
 
 	const models = [...(await modelRuntime.getAvailable(undefined, { signal }))];

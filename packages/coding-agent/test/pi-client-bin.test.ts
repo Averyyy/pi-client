@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(__dirname, "..");
+const sourceLoader = pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href;
 
 describe("coding-agent bins", () => {
 	it("package.json exposes only pi bin, not pi-client", () => {
@@ -42,14 +43,7 @@ describe("coding-agent bins", () => {
 			try {
 				result = spawnSync(
 					process.execPath,
-					[
-						"--import",
-						pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href,
-						join(pkgRoot, "src", "pi-client-cli.ts"),
-						"-e",
-						extensionPath,
-						"--help",
-					],
+					["--import", sourceLoader, join(pkgRoot, "src", "pi-client-cli.ts"), "-e", extensionPath, "--help"],
 					{
 						env: {
 							...process.env,
@@ -98,13 +92,7 @@ describe("coding-agent bins", () => {
 		try {
 			const result = spawnSync(
 				process.execPath,
-				[
-					"--import",
-					pathToFileURL(join(pkgRoot, "src", "experimental", "source-resolver.ts")).href,
-					join(pkgRoot, "src", "pi-client-cli.ts"),
-					"--provider",
-					"anthropic",
-				],
+				["--import", sourceLoader, join(pkgRoot, "src", "pi-client-cli.ts"), "--provider", "anthropic"],
 				{
 					env: {
 						...process.env,
@@ -118,6 +106,64 @@ describe("coding-agent bins", () => {
 			);
 			expect(result.status).toBe(1);
 			expect(result.stderr).toContain("--provider requires --model");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		{ selection: "without an explicit model", args: [] },
+		{ selection: "with an explicit model", args: ["--model", "unavailable/model"] },
+	])("reports an unavailable pi-server $selection without a startup stack trace", ({ args }) => {
+		const root = mkdtempSync(join(tmpdir(), "pi-client-unavailable-server-"));
+		try {
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--import",
+					sourceLoader,
+					join(pkgRoot, "src", "pi-client-cli.ts"),
+					"-p",
+					"--no-session",
+					"-ne",
+					"--no-mcp",
+					"--no-context-files",
+					...args,
+					"hello",
+				],
+				{
+					cwd: root,
+					env: {
+						PATH: process.env.PATH,
+						SystemRoot: process.env.SystemRoot,
+						WINDIR: process.env.WINDIR,
+						COMSPEC: process.env.COMSPEC,
+						PATHEXT: process.env.PATHEXT,
+						TEMP: process.env.TEMP,
+						TMP: process.env.TMP,
+						HOME: join(root, "home"),
+						USERPROFILE: join(root, "home"),
+						APPDATA: join(root, "appdata"),
+						PI_CODING_AGENT_DIR: join(root, "agent"),
+						PI_OFFLINE: "true",
+						PI_SERVER_URL: "http://127.0.0.1:0",
+					},
+					encoding: "utf8",
+					input: "",
+					timeout: 5_000,
+				},
+			);
+
+			expect(result.error, result.stderr).toBeUndefined();
+			expect(result.status).toBe(1);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain("pi-server model catalog:");
+			if (args.length > 0) {
+				expect(result.stderr).toContain('Cannot resolve model "unavailable/model"');
+			}
+			expect(result.stderr).not.toMatch(
+				/UnhandledPromiseRejection|node:internal|\n\s+at |models\.json|\/login|install/i,
+			);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
