@@ -62,6 +62,7 @@ let
       }
 
       mkdir -p "$out"
+      pack_package packages/chord chord
       pack_package packages/telemetry telemetry
       pack_package packages/ai ai
       pack_package packages/tui tui
@@ -79,6 +80,7 @@ let
     # The install lock points internal packages at registry releases. Replace
     # them with the packages built from this checkout.
     packageSourceOverrides = {
+      "node_modules/@earendil-works/chord" = workspacePackages + "/chord.tgz";
       "node_modules/@earendil-works/pi-agent-core" = workspacePackages + "/agent.tgz";
       "node_modules/@earendil-works/pi-ai" = workspacePackages + "/ai.tgz";
       "node_modules/@earendil-works/pi-codemode" = workspacePackages + "/codemode.tgz";
