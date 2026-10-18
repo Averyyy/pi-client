@@ -43,6 +43,8 @@
 
 - In `PI_SERVER_MODE`, chat, image, classifier, and deferred operations exposed by `ModelRuntime` and its `Provider` objects must use pi-server transport. Preserve optional client auth and header transforms; server-only credentials must also work for prompts, model selection, and summaries. MCP auth and provider login remain client-local.
 - Preserve model type and exact model availability in remote catalogs, including identical provider/id pairs across chat, image, and classifier operations. Ordinary model accessors reuse the initialized catalog; explicit refresh updates it and preserves native account discovery.
+- A pi-server catalog outage must remain a visible model-runtime diagnostic instead of aborting interactive startup. Bound the catalog request itself, preserve caller cancellation, reuse the last catalog for ordinary access and local-only refreshes, and retry through explicit catalog refresh.
+- An explicit terminal SSE error is a completed failure, not a disconnected stream. Preserve its error and skip run recovery; recover only streams that ended without a terminal result.
 - Provider lifecycle callbacks must execute in the client and return their result before the server continues the provider request. Route oversized callback replies through `ChunkRequest`; callback errors and cancellation must reject pending callbacks rather than recover a successful result. Reject unsupported executable transport options explicitly.
 - Omit SDK-internal provider callbacks from remote requests only by their exact function identity and absence of the corresponding extension handler. Preserve explicit caller callbacks and registered handlers; ordinary requests must not round-trip unused payloads or native stream events.
 - Manage cache warming in the shared SDK session-request path for local and remote transport. Replays retain the original prefix, route, session ID, and cache options; real and warm requests must share resolved auth base URL, environment, and model/auth/caller header precedence. Only usage entries are persisted, and session cancellation must also abort warming.
@@ -76,6 +78,9 @@
 - The compaction request's model adapter must forward `timeoutMs` into its provider stream options; serializing it on the HTTP body alone does not make the summarizer's SDK enforce the timeout.
 - Keep server update-command install-shape handling in its updater wrapper: git checkouts run `git pull` / `npm install`; npm global installs run `npm install -g --ignore-scripts --legacy-peer-deps @averyyy/pi-client@latest @averyyy/pi-server@latest`.
 - `pi-client update` must not reinstall a source checkout into the active global path: update the published global packages, leave active sessions running, and require `/reload` to restart a session on the new runtime.
+- Runtime reload handoff must preserve the current session leaf explicitly along with the full durable tree. Report failed handoff or updated-runtime lookup without silently launching the old runtime.
+- Keep update generations shared across active clients and compare each launcher's loaded generation. Preserve reusable startup options across runtime reload; do not replay consumed prompts or replace the session's current model/thinking selection with old CLI values.
+- Session model and thinking metadata remain authoritative before the first prompt. Resolve that selection before scope defaults and bind runtime API keys to its exact provider before SDK model restoration. Provider-only credential commands need no model catalog initialization.
 - Route `pi-client send <path>` through `ChunkRequest` to `/api/receive`; pi-server saves the basename under `PI_SERVER_UPLOAD_DIR` (default `~/.pi/upload_files`) and must reject path traversal and existing destinations.
 - Keep machine-specific pi-server public-access runbooks, credentials, Windows service paths, and tunnel details in the exact ignored file `docs/pi-server-public-access.local.md`; never copy those values into tracked documentation or external messages.
 
@@ -96,7 +101,7 @@
 - Structure pi-server failures with phase metadata (`session_init`, `tree_sync`, `provider_stream`, `history_reconcile`) and a `retryable` flag. Session auto-retry may re-run the whole stream path for `provider_stream` errors and transient session_init/tree_sync outages, except usage/quota/balance. Do not auto-retry `history_reconcile` recovery-transport failures or history-divergence stops, which can hide an in-flight server run or overwrite local state.
 - Session persistence should use append-only WAL records for append/switch/static-context mutations and periodic snapshots; avoid rewriting the full JSON session on every mutation.
 - Real static-context changes must increment the same monotonic session revision as tree mutations; identical context updates are no-ops. Keep recovery's old-revision WAL rejection intact.
-- WAL recovery may discard and truncate only a final JSON-syntax-torn record. Complete invalid records must still reject that session, and records whose revision is not newer than the snapshot must be ignored so a crash after snapshot rename but before WAL deletion cannot roll state backward.
+- WAL recovery may discard and truncate only a final JSON-syntax-torn record. Complete invalid records, including newer records that overlap snapshot entries, must reject that session. Ignore records whose revision is already included in the snapshot so a crash after snapshot rename but before WAL deletion cannot roll state backward.
 - Cache rolling tree hashes/prefix hashes in server session state. Append should update the hash from new entries, and leaf switches must not recompute the tree hash.
 - Reconstruct long parent chains with append plus one reverse, not repeated array prepends. Retain branch order and cycle detection, and compare raw benchmark samples before keeping performance changes.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
@@ -143,6 +148,7 @@
 - Exclude `v*-piclient.*` tags from the upstream binary/unscoped npm workflow. Fork versions are applied by the six-package scoped publisher, while the upstream source-archive gate requires the unchanged workspace version.
 - Nix builds the unchanged coding-agent source version. Its smoke gate must verify the runtime against that manifest and, for `vX.Y.Z-piclient.N` tags, verify the tag's base version too; do not apply the npm-only suffix to the Nix runtime expectation.
 - Nix install checks must follow the runtime install lock. Keep build-only dependencies such as esbuild out of installed-runtime assertions when upstream removes their runtime consumers.
+- Every runtime install-lock package without registry integrity needs a matching local Nix tarball and source override, including fork-retained workspace dependencies such as chord.
 - Scheduled Averyyy publishing lives in `.github/workflows/publish-averyyy-npm.yml`. Daily runs must derive the release prefix from the current upstream package version, increment the highest existing `v<base>-piclient.N` tag, and create the GitHub release only after npm publish succeeds so the next run can reliably skip when there are no commits since the latest release.
 - The remote workflow uses npm trusted publishing through environment `npm-publish` with `--provenance`. Configure each package, not just `@averyyy/pi-client`, for that trusted publisher:
   `npx --yes npm@11 trust github @averyyy/<package> --file publish-averyyy-npm.yml --repo Averyyy/pi-client --env npm-publish --allow-publish`.
@@ -163,7 +169,7 @@
 - Remote `ModelRuntime` initialization requires an explicit `/api/models` fixture. Tests limited to `AgentSession` cancellation or boundary rules may initialize a local faux/custom-stream runtime before enabling remote lifecycle behavior; assert zero fetch calls so they cannot depend on a running pi-server.
 - Terminal provider-error fixtures must use a documented non-retryable error such as `insufficient_quota`; unknown error text is retryable. Script a faux reply for every queued input rather than allowing an exhausted response queue to enter the retry loop.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
-- When coding-agent tests spawn `src/cli.ts` from source under Node 26, use `node --import <repo>/node_modules/tsx/dist/loader.mjs src/cli.ts` with `TSX_TSCONFIG_PATH` so workspace packages resolve through the repo TS path mappings instead of missing unbuilt `dist/*.js` files. Pass the loader through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
+- When coding-agent tests spawn source CLI entrypoints under Node 26, preload `src/experimental/source-resolver.ts` so workspace packages resolve through the repo TS path mappings. Pass the resolver through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
 - Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
 - Keep automatic session naming disabled in general faux-session harnesses; enable it only in tests that explicitly cover the extra first-turn provider request.
 - When regression tests fix a GitHub issue, add a comment with the GitHub issue number next to the test.
@@ -172,7 +178,7 @@
 
 ## Dependency and Install Security
 
-- Treat npm dep and lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
+- Treat npm dep and lockfile changes as reviewed code. Direct registry deps, including internal workspace deps, stay pinned to exact versions.
 - When updating `undici`, you MUST read its changelog/release notes for the target version and evaluate whether any changes may affect functionality before applying the update.
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
 - If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
@@ -292,9 +298,13 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 
 ## Upstream Sync
 
-- When a mixed-API catalog adds a protocol, update the provider's API type and runtime dispatch together. Cover the new path with a fixed model fixture so tests do not depend on live catalog contents.
+- Keep `packages/pi-client/package.json` `piClient.basePiVersion` and `basePiCommit` aligned with the merged formal release tag, and run the client wrapper's update tests.
+- Remote CLI model selection must stay within the pi-server catalog; shared model-reference resolution must not synthesize custom IDs in `PI_SERVER_MODE`.
+- The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
+- Builtin provider factories and the compatibility registry must use lazy API factories so model listing does not load provider SDKs. Runtime loaders need both a Node bundle entry and Bun static registration.
 - When upstream adds a classifier API, register it in pi-server's `CLASSIFIER_APIS` as well as builtin provider dispatch. Cover a custom provider ID in remote tests so builtin dispatch cannot mask a missing API registration.
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
+- Provider API maps must cover the APIs in their regenerated catalogs; OpenCode Go includes Google Generative AI alongside Anthropic and OpenAI.
 - Upstream model catalog values under `packages/ai/src/providers/data/` are intentionally ignored; after merging a release that updates generated model shards, run `npm run hydrate:model-data` and `npm --prefix packages/ai run check:model-data` before runtime tests.
 - Cross-platform tests for platform-specific behavior must set the simulated platform explicitly when asserting the opposite platform, instead of relying on the host OS.
 - Real Unix-domain socket integration tests must use an explicit non-Windows `runIf` guard, matching `packages/client`; keep option-validation and transport-neutral tests enabled on Windows.
@@ -307,6 +317,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 - Devin's account-owned model catalog may be empty before the interactive background refresh. Keep explicit fallback definitions for configured IDs available before scope resolution, merge them with restored cache, replace them only after successful discovery, and test that exact configured IDs remain the cycle scope when the live catalog expands. Report failed Devin discovery while those fallbacks remain active.
 - Upstream 0.86 moved provider calls to branded `TranscriptContext`; standalone coding-agent requests and fixtures must use `normalizeContext()` rather than adding the removed `systemPrompt` field to `AgentContext`.
 - Provider adapters must resolve system instructions and tools from `TranscriptContext` with `getCurrentSystemPrompt()` and `getCurrentTools()`. Cover normalized public dispatch in protocol tests; calling an adapter with legacy top-level fields can hide dropped system messages and tool declarations.
+- Antigravity uses its account project and exact account model IDs. Resolve the project through `loadCodeAssist`/`onboardUser`; select chat models from `agentModelSorts[].groups[].modelIds` and read capabilities from `supportsImages`/`supportsThinking`. Keep discovery and inference on the configured daily endpoint.
 - Cache-warming `UsageEntry` records are local metadata, not legacy pi-server tree entries. Before sending a legacy tree, omit them and reconnect parent and leaf IDs across omitted usage entries.
 - When upstream removes an old eval harness or native dependency, accept the deletion only after checking fork-specific references; regenerate the root lockfile afterward so retained fork workspaces and aliases are represented.
 

@@ -26,6 +26,8 @@
 
 ### Fixed
 
+- Rejected newer WAL records that overlap the session snapshot instead of silently dropping them, while continuing to ignore revisions already included in the snapshot.
+- Removed repeated leaf and compaction-run checks after the same synchronous checks had already succeeded.
 - Registered the OpenAI Decisions API for custom classifier providers, including image inputs over chunked requests.
 - Preserved native provider authentication and raw/simple dispatch through the request adapter, including server-side bearer and federation credentials.
 - Preserved sampling parameters, tool choice, deferred controls, environment overrides, API-specific options, parsed provider events, and authoritative failed assistant messages in proxy streams.

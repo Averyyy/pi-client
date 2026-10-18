@@ -107,12 +107,11 @@ describe("Input Event", () => {
 		expect((globalThis as any).testVar).toBeUndefined();
 	});
 
-	it("catches handler errors and continues", async () => {
+	it("reports handler errors and rejects the input", async () => {
 		const r = await createRunner(`export default p => p.on("input", async () => { throw new Error("boom"); });`);
 		const errs: string[] = [];
 		r.onError((e) => errs.push(e.error));
-		const result = await r.emitInput("x", undefined, "interactive");
-		expect(result.action).toBe("continue");
+		await expect(r.emitInput("x", undefined, "interactive")).rejects.toThrow("boom");
 		expect(errs).toContain("boom");
 	});
 

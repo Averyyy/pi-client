@@ -344,7 +344,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(requests.some((request) => request.target === "/api/generate-images")).toBe(true);
 		expect(requests.some((request) => request.target === "/api/classify")).toBe(true);
 		await runtime.refresh({ allowNetwork: false });
-		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(2);
+		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(1);
 	});
 
 	it("routes virtual models and direct extension streams remotely with exact API options", async () => {
@@ -944,7 +944,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(await runtime.getAvailable("registered-router")).toEqual([]);
 		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(initialReads);
 		expect(runtime.getError()).toBeUndefined();
-		const refresh = await runtime.refresh({ allowNetwork: false });
+		const refresh = await runtime.refresh({ allowNetwork: true });
 		expect(refresh.errors.get("pi-server")?.message).toContain("503");
 		expect(runtime.getError()).toContain("503");
 	});
@@ -961,7 +961,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 			catalogStarted = resolve;
 		});
 		try {
-			const refreshed = runtime.refresh({ allowNetwork: false, signal: controller.signal });
+			const refreshed = runtime.refresh({ allowNetwork: true, signal: controller.signal });
 			await started;
 			controller.abort();
 			expect(await refreshed).toEqual({ aborted: true, errors: new Map() });
@@ -1042,11 +1042,12 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("503");
 		expect(localCalls).toBe(0);
-		const refreshed = await runtime.refresh({ allowNetwork: false });
+		const refreshed = await runtime.refresh({ allowNetwork: true });
 		expect(refreshed.aborted).toBe(false);
 		expect(refreshed.errors.get("pi-server")?.message).toContain("503");
 		expect(runtime.getError()).toContain("503");
-		await expect(createRuntime()).rejects.toThrow("503");
+		const restarted = await createRuntime();
+		expect(restarted.getError()).toContain("503");
 	});
 
 	it("runs codemode image/classifier calls in a remote session and records their complete usage", async () => {

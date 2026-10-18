@@ -2,14 +2,30 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Errors in input, context, agent preparation, and provider request/header transformation handlers stop the affected request instead of continuing with original or partially transformed data.
+- `pi.exec()` rejects command startup failures instead of returning an empty failed result.
+
 ### Added
 
+- Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
 - Added native Devin Pro login and account model selection while retaining pi-server inference routing.
 
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 
 ### Fixed
 
+- Updated Xiaomi API and token-plan defaults to the available `mimo-v2.6-pro` model.
+- Preserved explicit pi-server operation errors without querying disconnected-run recovery, including compaction, image generation, and classification.
+- Stopped cache warming on failed extension decisions or provider requests and exposed the failure reason in `/session`.
+- Propagated system-prompt file read failures instead of using the file path as prompt text.
+- Reported extension tool and flag conflicts as warnings while applying the same first-registration precedence to CLI flag validation.
+- Kept model resolution errors inside the calling process and returned failed exit status for signal-terminated extension commands.
+- Connected `/reload` to updated pi-client runtime startup while preserving the session tree, selected branch, and startup options across active sessions.
+- Restored persisted model and thinking selections before the first prompt and applied runtime API keys to the exact selected provider before session model resolution.
+- Kept provider-only credential commands independent of server model catalog access.
+- Kept pi-client interactive startup usable when pi-server's model catalog is unavailable, reported catalog failures, and reused the current catalog until an explicit refresh.
 - Routed model-registry and provider image generation, classification, direct streams, and deferred response fetch/cancel through pi-server, including codemode usage and virtual-model routing.
 - Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.
 - Preserved provider sampling options, parsed stream events, payload transformations, and response callbacks across pi-server requests.
@@ -36,6 +52,52 @@
 - Fixed pi-client skipping auto-retry on pi-server HTTP 502/proxy failures. Same-run recovery now runs only after an event-stream has started, so a down proxy no longer reclassifies the original stream error as non-retryable.
 - Preserved oversized-session chunked summarization and pi-server compaction recovery while adopting upstream canonical context projection and extension boundaries.
 - Preserved eligible provider prompt prefixes during compaction summaries, with explicit reasons when the existing chunked path is required.
+
+## [1.3.0] - 2026-10-15
+
+### New Features
+
+- **Choose where `/share` uploads**: `sessionShareDestination` selects `auto`, `gist`, or `radius`. See [Sessions and context](docs/settings.md#sessions-and-context) and [Export or share a session](docs/sessions.md#export-or-share-a-session).
+- **Cache-preserving thinking level changes on OpenAI GPT-6**: changing the thinking level mid-session with an API key keeps the prompt cache.
+- **Kimi Code over Chat Completions**: tools added mid-conversation no longer invalidate the prompt cache. `models.json` base URL overrides must now include `/v1`. See [Providers](docs/providers.md).
+- **Clean model switching**: thinking from a previous model is dropped instead of being shown to the new model as text.
+- **Resumed sessions keep their active tools**: `--tools +name`/`-name` applies on top of them. See [Tools](docs/settings.md#tools).
+
+### Added
+
+- Changing the thinking level mid-session on OpenAI GPT-6 models (API key) now keeps the prompt cache ([#10853](https://github.com/earendil-works/pi/issues/10853))
+- Added the `sessionShareDestination` setting to choose automatic, GitHub gist, or Radius uploads for `/share` ([#10870](https://github.com/earendil-works/pi/issues/10870) by [@vegarsti](https://github.com/vegarsti))
+
+### Changed
+
+- Changed the `kimi-coding` provider to use OpenAI Chat Completions at `https://api.kimi.com/coding/v1`, the protocol used by the official Kimi Code client. K3, K3-256K, and Kimi For Coding now accept tools added mid-conversation without invalidating the prompt cache. `models.json` overrides of the `kimi-coding` base URL must now include `/v1` ([#10720](https://github.com/earendil-works/pi/issues/10720))
+- Changed model switching to drop thinking blocks from earlier assistant messages produced by a different model, instead of sending them as plain text. The new model previously saw the old model's reasoning as part of its replies and could start writing its own reasoning into the visible answer ([#10995](https://github.com/earendil-works/pi/issues/10995))
+
+### Fixed
+
+- Pinned internal Pi dependencies to exact release versions to prevent fresh installs from mixing incompatible packages ([#10865](https://github.com/earendil-works/pi/issues/10865))
+- Fixed resumed sessions dropping tools activated during the session. Resume now restores the session's active tools, with `--tools +name`/`-name` entries applied to them, unless `--tools` with tool names, `--no-tools`, or `--no-builtin-tools` selects tools explicitly ([#10785](https://github.com/earendil-works/pi/issues/10785))
+- Fixed stopping a codemode script or reaching its deadline waiting for a non-interruptible built-in to return on Bun ([#10748](https://github.com/earendil-works/pi/issues/10748))
+- Fixed repeated codemode timeouts or aborts accumulating surviving workers; admission now limits live workers to two across sessions, counting cancelled workers until actual exit ([#10748](https://github.com/earendil-works/pi/issues/10748))
+- Fixed `--model` choosing a provider by catalog order when several providers offer the match; Pi now prefers the provider with credentials and otherwise reports the ambiguity. `--models` and `enabledModels` add a model for each provider that offers it and warn about the ambiguity ([#10160](https://github.com/earendil-works/pi/issues/10160))
+- Fixed `read` line-range labels for numeric-string or null arguments in the TUI, session tree, HTML exports, and examples ([#9887](https://github.com/earendil-works/pi/issues/9887))
+- Fixed the Nix flake build failing when a provider switched APIs: the model catalog pin is now refreshed from the newest published catalog when its model API groups differ, and releases pin the newest catalog and build with it before tagging ([#10985](https://github.com/earendil-works/pi/issues/10985))
+- Fixed the Nix package putting its Node.js first on `PATH`, which made bash tool shells use Pi's Node instead of the user's `node`/`npm`. Pi's Node is now only a fallback ([#10519](https://github.com/earendil-works/pi/issues/10519))
+- Fixed prompt templates dropping empty quoted arguments (`""` or `''`), which shifted later positional arguments and prevented positional defaults from applying ([#10867](https://github.com/earendil-works/pi/issues/10867))
+- Fixed the Nix package build failing in its install check because it still expected chord and esbuild, which Pi no longer depends on
+- Fixed tool-call argument parsing dropping fields when a string contains an invalid `\u` escape such as `\usepackage` ([#10868](https://github.com/earendil-works/pi/issues/10868))
+- Fixed Anthropic and Bedrock Claude requests failing with a 400 when an error tool result contains images; the images are now sent after the tool results of the turn, so the model still sees them ([#10794](https://github.com/earendil-works/pi/issues/10794))
+- Fixed OpenCode Go Gemini models failing with a 404 by moving OpenCode Zen and OpenCode Go to the `opencode.ai/inference` endpoints, and added Google Generative AI support to the OpenCode Go provider
+- Fixed OpenCode Go MiniMax M2.7 failing with "Model does not support this protocol" by using the Anthropic Messages API
+- Fixed automatic retry not triggering for gateway `Unable to forward upstream stream` errors ([#10920](https://github.com/earendil-works/pi/issues/10920))
+- Fixed automatic retry not triggering for `The service is temporarily unavailable` errors, which also made compaction fail on the first attempt ([#10965](https://github.com/earendil-works/pi/issues/10965))
+- Fixed OpenAI-compatible responses showing thinking after the answer when a proxy such as LiteLLM sends reasoning and content in the same stream chunk ([#10926](https://github.com/earendil-works/pi/issues/10926))
+- Fixed Gemini 4 Argon requests on Google Vertex failing with "Thinking budget is not supported", and its thinking level being ignored on the Gemini API ([#10890](https://github.com/earendil-works/pi/issues/10890))
+- Fixed Xiaomi MiMo models failing with a 400 at the `minimal` thinking level; they now expose only the `off` and `high` levels ([#10818](https://github.com/earendil-works/pi/issues/10818))
+- Fixed `openai-codex/gpt-6.1-sol` using a 272K context window instead of the 500K window Codex now provides ([#10840](https://github.com/earendil-works/pi/issues/10840))
+- Fixed tool calls whose final arguments are malformed JSON silently running with only the fields parsed before the error; they now fail validation and show the model the raw arguments it sent ([#10897](https://github.com/earendil-works/pi/issues/10897))
+- Fixed Claude Haiku 5.5 and Claude Opus 5 not supporting the `off` thinking level ([#10753](https://github.com/earendil-works/pi/issues/10753))
+- Fixed `done()` of an extension's `ctx.ui.custom({ overlay: true })` closing the topmost overlay instead of its own, which left the finished overlay on screen and another extension's dialog unresolved ([#10648](https://github.com/earendil-works/pi/issues/10648), [#10999](https://github.com/earendil-works/pi/pull/10999) by [@masonc15](https://github.com/masonc15))
 
 ## [1.2.0] - 2026-10-12
 

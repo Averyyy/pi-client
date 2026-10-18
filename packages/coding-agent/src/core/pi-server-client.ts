@@ -504,7 +504,7 @@ async function readPiServerEventStreamJson<T>(
 				if (!onCallback) throw new Error(`${errorPrefix} (unexpected provider callback)`);
 				await onCallback(parseServerSentEventData(event, errorPrefix) as PiServerProviderCallbackRequest);
 			} else if (event.event === "error") {
-				throw new Error(
+				throw new PiServerResponseError(
 					`${errorPrefix} (${formatServerSentEventError(response, parseServerSentEventData(event, errorPrefix))})`,
 				);
 			} else if (event.event === "result") {
@@ -1087,7 +1087,12 @@ export async function compactPiServer(
 		try {
 			result = await readPiServerCompactResponse<PiServerCompactionResponse>(response, "Server compaction failed");
 		} catch (error) {
-			if (options?.signal?.aborted || !getResponseContentType(response).startsWith("text/event-stream")) throw error;
+			if (
+				options?.signal?.aborted ||
+				error instanceof PiServerResponseError ||
+				!getResponseContentType(response).startsWith("text/event-stream")
+			)
+				throw error;
 			const run = await waitForPiServerRunCompletion(sessionId, runId, request, options);
 			if (run?.status !== "completed" || !run.compactResult) {
 				if (run?.errorMessage) throw new Error(`Server compaction failed: ${run.errorMessage}`);
@@ -1692,7 +1697,7 @@ async function postPiServerModelOperation<T, TModel extends AnyModel>(
 				}
 			});
 		} catch (error) {
-			if (signal?.aborted || callbackFailed) throw error;
+			if (signal?.aborted || callbackFailed || error instanceof PiServerResponseError) throw error;
 			const recovered = await waitForPiServerRunCompletion(sessionId, runId, request, { signal });
 			if (recovered?.operationResult) return recovered.operationResult as T;
 			throw error;

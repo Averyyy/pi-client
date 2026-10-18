@@ -170,7 +170,7 @@ export class CacheWarmer {
 	private readonly models: Pick<ModelRuntime, "streamSimple">;
 	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
 	private readonly getMode: () => CacheWarmingMode;
-	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
+	/** Lets extensions override `event.action`; a failed decision stops warming. */
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
 	/** Called with the persisted usage entry after each successful refresh. */
 	onWarmed?: (entry: UsageEntry) => void;
@@ -317,8 +317,11 @@ export class CacheWarmer {
 				continuationProbability,
 				action,
 			});
-		} catch {
-			// Extension failures fall back to pi's own decision.
+		} catch (error) {
+			if (this.validateRun(run)) {
+				this.stop(`cache warming decision failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
 		}
 		if (!this.validateRun(run) || this.refreshDeadlineMissed(run)) return;
 		const extensionOverride = action !== decision.action;
@@ -343,18 +346,23 @@ export class CacheWarmer {
 				})
 				.result();
 			if (!this.validateRun(run)) return;
-			if (message.stopReason !== "error" && message.stopReason !== "aborted") {
-				const entry = this.sessionManager.appendUsage(
-					"cache_warm",
-					message.provider,
-					message.responseModel ?? message.model,
-					message.usage,
-					extensionOverride ? "extension override" : undefined,
-				);
-				this.onWarmed?.(entry);
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				this.stop(`cache warming request failed: ${message.errorMessage ?? message.stopReason}`);
+				return;
 			}
-		} catch {
-			// Cache warming is best-effort and must not affect the active agent run.
+			const entry = this.sessionManager.appendUsage(
+				"cache_warm",
+				message.provider,
+				message.responseModel ?? message.model,
+				message.usage,
+				extensionOverride ? "extension override" : undefined,
+			);
+			this.onWarmed?.(entry);
+		} catch (error) {
+			if (this.validateRun(run)) {
+				this.stop(`cache warming request failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
 		}
 		if (this.run === run) this.schedule(run);
 	}

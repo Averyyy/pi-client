@@ -231,8 +231,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRuntime.getModel(provider, modelId),
 	);
 
-	// If session has data, try to restore model from it
-	if (!model && hasExistingSession && sessionModel) {
+	// Restore the selected model from branch metadata, including sessions before their first prompt.
+	if (!model && sessionModel) {
 		const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
 		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
 			model = restoredModel;
@@ -263,8 +263,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let thinkingLevel = options.thinkingLevel;
 
-	// If session has data, restore thinking level from it
-	if (thinkingLevel === undefined && hasExistingSession) {
+	// Explicit branch metadata also applies before the first prompt.
+	if (thinkingLevel === undefined && (hasExistingSession || hasThinkingEntry)) {
 		thinkingLevel = hasThinkingEntry
 			? (existingSession.thinkingLevel as ThinkingLevel)
 			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);

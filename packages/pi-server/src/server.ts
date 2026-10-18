@@ -1141,11 +1141,6 @@ async function handleSessionCompact(
 
 	let run: StreamRunRecord | undefined;
 	if (body.runId) {
-		const existingRun = getStreamRun(body.sessionId, body.runId);
-		if (existingRun?.status === "aborted") {
-			sendJson(res, 409, { error: "Compaction run was aborted", code: PiServerErrorCode.INVALID_REQUEST });
-			return;
-		}
 		if (existingRun?.status === "running") {
 			sendError(res, 409, "A run with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
 			return;

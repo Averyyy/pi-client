@@ -119,7 +119,7 @@ Handlers are awaited in stream order, so slow handlers delay stream consumption.
 
 <a id="cache_warming_decision"></a>
 
-`cache_warming_decision` can override an idle prompt-cache refresh with `{ action: "warm" }` or `{ action: "stop" }`. The last handler that returns an action wins.
+`cache_warming_decision` can override an idle prompt-cache refresh with `{ action: "warm" }` or `{ action: "stop" }`. The last handler that returns an action wins. A failed handler stops cache warming and exposes the error in `/session`.
 
 Tool calls from one assistant message can run in parallel.
 Do not assume a sibling call or result exists when another tool event runs.
@@ -260,7 +260,9 @@ Keep tool and event behavior independent from rendering so non-interactive modes
 
 ### Errors and cleanup
 
-Pi reports handler errors and continues where possible. A `tool_call` handler failure blocks the tool as a fail-safe; a tool execution failure becomes an error result for the model.
+Errors in `input`, `context`, `context_with_system`, `before_agent_start`, `before_provider_request`, and `before_provider_headers` stop the affected request. Pi reports the original error and stops that handler chain before calling the provider. Notification handler errors are reported while notification dispatch continues.
+
+A `tool_call` handler failure blocks the tool; a tool execution failure becomes an error result for the model. `pi.exec()` rejects when the command cannot start and returns a nonzero exit code when a signal terminates the child.
 
 Release resources in `session_shutdown` even when normal operation attempted cleanup.
 Keep cleanup idempotent because cancellation, reload, session replacement, and process exit can converge on the same path.

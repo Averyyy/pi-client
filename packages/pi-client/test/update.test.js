@@ -22,7 +22,7 @@ describe("pi-client update", () => {
 		expect(binContent).toContain('import("./update.js")');
 	});
 
-	it("updates global packages without modifying the active checkout", async () => {
+	it.each(["win32", "linux"])("updates global packages without modifying the active checkout on %s", async (platform) => {
 		const { runPiClientUpdate } = await import("../bin/update.js");
 		const calls = [];
 		const output = [];
@@ -37,6 +37,7 @@ describe("pi-client update", () => {
 			packageRoot: pkgRoot,
 			updateMarkerPath,
 			runner,
+			platform,
 			stdout: { write: (value) => output.push(value) },
 			stderr: { write: (value) => output.push(value) },
 		});
@@ -46,8 +47,11 @@ describe("pi-client update", () => {
 		expect(output.join("")).toContain("Run /reload in each session");
 		expect(calls).toEqual([
 			{
-				command: "npm",
+				command: platform === "win32" ? process.execPath : "npm",
 				args: [
+					...(platform === "win32"
+						? [join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")]
+						: []),
 					"install",
 					"-g",
 					"--ignore-scripts",

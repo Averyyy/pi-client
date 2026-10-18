@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import type { ModelsRefreshResult } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as crashLog from "../src/core/crash-log.ts";
+import type { ModelRuntime } from "../src/core/model-runtime.ts";
+import { InteractiveMode, type InteractiveModeOptions } from "../src/modes/interactive/interactive-mode.ts";
+import * as versionCheck from "../src/utils/version-check.ts";
 
 type SubmitContext = {
 	defaultEditor: { onSubmit?: (text: string) => void };
@@ -28,10 +32,29 @@ type StartupSubmitContext = {
 	showStatus: (message: string) => void;
 };
 
+type StartupRunContext = {
+	init: () => Promise<void>;
+	session: {
+		model?: { provider: string; id: string; api: string };
+		modelRuntime: Pick<ModelRuntime, "refresh" | "getError">;
+	};
+	options: InteractiveModeOptions;
+	version: string;
+	checkForPackageUpdates: () => Promise<string[]>;
+	checkTmuxKeyboardSetup: () => Promise<string | undefined>;
+	maybeWarnAboutAnthropicSubscriptionAuth: () => Promise<void>;
+	updateTerminalTitle: () => void;
+	updateAvailableProviderCount: () => void;
+	showWarning: (message: string) => void;
+	showError: (message: string) => void;
+	getUserInput: () => Promise<string>;
+};
+
 type InteractiveModePrivate = {
 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	getUserInput(this: InputContext): Promise<string>;
+	run(this: StartupRunContext): Promise<void>;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
@@ -86,5 +109,94 @@ describe("InteractiveMode startup input", () => {
 		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("queued prompt");
 		expect(context.onInputCallback).toBeUndefined();
 		expect(context.pendingUserInputs).toEqual([]);
+	});
+});
+
+describe("InteractiveMode startup model catalog", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
+	});
+
+	async function runStartup(
+		refresh: () => Promise<ModelsRefreshResult>,
+		catalogError?: string,
+	): Promise<StartupRunContext> {
+		vi.stubEnv("PI_OFFLINE", "");
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.spyOn(versionCheck, "checkForNewPiVersion").mockResolvedValue(undefined);
+		vi.spyOn(crashLog, "takeUnnotifiedCrash").mockReturnValue(undefined);
+		const inputClosed = new Error("Input closed");
+		const context: StartupRunContext = {
+			init: async () => {},
+			session: {
+				model: { provider: "unknown", id: "unknown", api: "unknown" },
+				modelRuntime: { refresh: vi.fn(refresh), getError: () => catalogError },
+			},
+			options: {},
+			version: "1.0.0",
+			checkForPackageUpdates: async () => [],
+			checkTmuxKeyboardSetup: async () => undefined,
+			maybeWarnAboutAnthropicSubscriptionAuth: async () => {},
+			updateTerminalTitle: vi.fn(),
+			updateAvailableProviderCount: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+			getUserInput: async () => {
+				throw inputClosed;
+			},
+		};
+		await expect(interactiveModePrototype.run.call(context)).rejects.toBe(inputClosed);
+		return context;
+	}
+
+	it("reports every failed catalog and explains how to retry remote model selection", async () => {
+		const context = await runStartup(async () => ({
+			aborted: false,
+			errors: new Map([
+				["pi-server", new Error("503 Service Unavailable")],
+				["devin", new Error("Account unavailable")],
+			]),
+		}));
+
+		await vi.waitFor(() => expect(context.showWarning).toHaveBeenCalledTimes(2));
+		expect(context.showWarning).toHaveBeenCalledWith(
+			"Could not refresh pi-server model catalog: 503 Service Unavailable Use /model to refresh catalogs and select a model.",
+		);
+		expect(context.showWarning).toHaveBeenCalledWith("Could not refresh devin model catalog: Account unavailable");
+	});
+
+	it("shows the initial runtime catalog error once when the background refresh repeats it", async () => {
+		const context = await runStartup(
+			async () => ({ aborted: false, errors: new Map([["pi-server", new Error("Connection refused")]]) }),
+			"pi-server: Connection refused",
+		);
+
+		await vi.waitFor(() => expect(context.updateAvailableProviderCount).toHaveBeenCalledOnce());
+		expect(context.showError).toHaveBeenCalledExactlyOnceWith(
+			"Model catalog error: pi-server: Connection refused Use /model to refresh catalogs and select a model.",
+		);
+		expect(context.showWarning).not.toHaveBeenCalled();
+	});
+
+	it("reports a rejected background refresh", async () => {
+		const context = await runStartup(async () => {
+			throw new Error("Connection refused");
+		});
+
+		await vi.waitFor(() =>
+			expect(context.showWarning).toHaveBeenCalledExactlyOnceWith(
+				"Could not refresh model catalogs: Connection refused Use /model to refresh catalogs and select a model.",
+			),
+		);
+	});
+
+	it("keeps cancelled background refreshes quiet", async () => {
+		const context = await runStartup(async () => {
+			throw new DOMException("Cancelled", "AbortError");
+		});
+
+		expect(context.showWarning).not.toHaveBeenCalled();
+		expect(context.showError).not.toHaveBeenCalled();
 	});
 });

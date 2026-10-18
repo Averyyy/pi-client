@@ -2,6 +2,8 @@
 
 ### Fixed
 
+- Restarted updated runtimes through `/reload` with the current session, branch, and startup options. Shared update generations let each active session switch runtimes, and runtime lookup or handoff errors remain visible without relaunching the old runtime.
+- Invoked npm through Node on Windows so global updates can start without a shell.
 - Reported upstream Pi 1.0.0 and its full source commit in package metadata.
 - Documented remote model operations, server-side credentials, and the 64 KiB UTF-8 request limit.
 - Enabled remote prompt-cache warming with streaming and idle modes, bounded request bodies, and session usage accounting.

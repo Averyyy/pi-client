@@ -101,7 +101,9 @@ function mergeExtensionWarnings(
 	warnings: Array<{ path: string; warning: string }>,
 ): void {
 	result.warnings = [
-		...new Map([...(result.warnings ?? []), ...warnings].map((warning) => [warning.path, warning])).values(),
+		...new Map(
+			[...(result.warnings ?? []), ...warnings].map((warning) => [`${warning.path}\0${warning.warning}`, warning]),
+		).values(),
 	];
 }
 
@@ -164,18 +166,13 @@ export interface ResourceLoader {
 	reload(options?: ResourceLoaderReloadOptions): Promise<void>;
 }
 
-function resolvePromptInput(input: string | undefined, description: string): string | undefined {
+function resolvePromptInput(input: string | undefined): string | undefined {
 	if (!input) {
 		return undefined;
 	}
 
 	if (existsSync(input)) {
-		try {
-			return stripBom(readFileSync(input, "utf-8"));
-		} catch (error) {
-			console.error(chalk.yellow(`Warning: Could not read ${description} file ${input}: ${error}`));
-			return input;
-		}
+		return stripBom(readFileSync(input, "utf-8"));
 	}
 
 	return input;
@@ -655,7 +652,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.agentsFiles = resolvedAgentsFiles.agentsFiles;
 
 		const systemPromptSource = this.systemPromptSource ?? this.discoverSystemPromptFile();
-		const baseSystemPrompt = resolvePromptInput(systemPromptSource, "system prompt");
+		const baseSystemPrompt = resolvePromptInput(systemPromptSource);
 		this.systemPrompt = this.systemPromptOverride ? this.systemPromptOverride(baseSystemPrompt) : baseSystemPrompt;
 		this.systemPromptSourcePath =
 			systemPromptSource && existsSync(systemPromptSource) ? resolvePath(systemPromptSource) : undefined;
@@ -665,9 +662,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const discoveredAppendSystemPromptFile = this.discoverAppendSystemPromptFile();
 			appendSources = discoveredAppendSystemPromptFile ? [discoveredAppendSystemPromptFile] : [];
 		}
-		const baseAppend = appendSources
-			.map((s) => resolvePromptInput(s, "append system prompt"))
-			.filter((s): s is string => s !== undefined);
+		const baseAppend = appendSources.map((s) => resolvePromptInput(s)).filter((s): s is string => s !== undefined);
 		this.appendSystemPrompt = this.appendSystemPromptOverride
 			? this.appendSystemPromptOverride(baseAppend)
 			: baseAppend;
@@ -793,11 +788,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private addExtensionConflictDiagnostics(extensionsResult: LoadExtensionsResult): void {
-		// Detect extension conflicts (tools, commands, flags with same names from different extensions)
-		// Keep all extensions loaded. Conflicts are reported as diagnostics, and precedence is handled by load order.
+		// Tool and flag conflicts keep both extensions loaded with first-registration precedence.
 		const conflicts = this.detectExtensionConflicts(extensionsResult.extensions);
+		extensionsResult.warnings ??= [];
 		for (const conflict of conflicts) {
-			extensionsResult.errors.push({ path: conflict.path, error: conflict.message });
+			extensionsResult.warnings.push({ path: conflict.path, warning: conflict.message });
 		}
 	}
 
@@ -1261,7 +1256,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				if (existingOwner && existingOwner !== ext.path) {
 					conflicts.push({
 						path: ext.path,
-						message: `Tool "${toolName}" conflicts with ${existingOwner}`,
+						message: `Tool "${toolName}" conflicts with ${existingOwner}; first registration wins.`,
 					});
 				} else {
 					toolOwners.set(toolName, ext.path);
@@ -1274,7 +1269,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				if (existingOwner && existingOwner !== ext.path) {
 					conflicts.push({
 						path: ext.path,
-						message: `Flag "--${flagName}" conflicts with ${existingOwner}`,
+						message: `Flag "--${flagName}" conflicts with ${existingOwner}; first registration wins.`,
 					});
 				} else {
 					flagOwners.set(flagName, ext.path);

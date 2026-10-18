@@ -245,3 +245,13 @@ gcloud auth application-default login
 ```
 
 To use a service-account key file instead, set `GOOGLE_APPLICATION_CREDENTIALS` along with the project and location.
+
+### Google Antigravity
+
+Run `/login google-antigravity` and sign in with the Google account that has your Antigravity subscription. Pi saves the OAuth tokens and account project in `auth.json` and refreshes expired access tokens automatically.
+
+The browser returns to `http://localhost:51121/oauth-callback`. For a remote terminal, forward port 51121 or paste the complete redirect URL when prompted. If the port is reserved or occupied, Pi reports the bind error and prompts for the full redirect URL.
+
+After login, open `/model` to load the account's Antigravity model picker. Pi caches this catalog for offline startup. Model IDs, limits, image input, and thinking support come from Antigravity. Disabled and internal models are omitted. Gemini 3.8 Flash has separate `gemini-3.8-flash-low`, `gemini-3.8-flash-medium`, and `gemini-3.8-flash-high` variants, each with its matching reasoning level.
+
+In pi-client, login runs locally and inference uses pi-server. The pi-server deployment must include the `google-antigravity` provider. Authentication stored only on pi-server also works.

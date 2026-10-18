@@ -93,7 +93,7 @@ function applyExtensionFlagValues(
 	const registeredFlags = new Map<string, { type: "boolean" | "string" }>();
 	for (const extension of extensionsResult.extensions) {
 		for (const [name, flag] of extension.flags) {
-			registeredFlags.set(name, { type: flag.type });
+			if (!registeredFlags.has(name)) registeredFlags.set(name, { type: flag.type });
 		}
 	}
 

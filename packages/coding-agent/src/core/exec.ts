@@ -38,72 +38,45 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
-	return new Promise((resolve) => {
-		const invocation = rewritePiCliSpawn(command, args);
-		const proc = spawn(invocation.command, invocation.args, {
-			cwd,
-			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
-		let stdout = "";
-		let stderr = "";
-		let killed = false;
-		let timeoutId: NodeJS.Timeout | undefined;
-
-		const killProcess = () => {
-			if (!killed) {
-				killed = true;
-				proc.kill("SIGTERM");
-				// Force kill after 5 seconds if SIGTERM doesn't work
-				setTimeout(() => {
-					if (!proc.killed) {
-						proc.kill("SIGKILL");
-					}
-				}, 5000);
-			}
-		};
-
-		// Handle abort signal
-		if (options?.signal) {
-			if (options.signal.aborted) {
-				killProcess();
-			} else {
-				options.signal.addEventListener("abort", killProcess, { once: true });
-			}
-		}
-
-		// Handle timeout
-		if (options?.timeout && options.timeout > 0) {
-			timeoutId = setTimeout(() => {
-				killProcess();
-			}, options.timeout);
-		}
-
-		proc.stdout?.on("data", (data) => {
-			stdout += data.toString();
-		});
-
-		proc.stderr?.on("data", (data) => {
-			stderr += data.toString();
-		});
-
-		// Wait for process termination without hanging on inherited stdio handles
-		// held open by detached descendants.
-		waitForChildProcess(proc)
-			.then((code) => {
-				if (timeoutId) clearTimeout(timeoutId);
-				if (options?.signal) {
-					options.signal.removeEventListener("abort", killProcess);
-				}
-				resolve({ stdout, stderr, code: code ?? 0, killed });
-			})
-			.catch((_err) => {
-				if (timeoutId) clearTimeout(timeoutId);
-				if (options?.signal) {
-					options.signal.removeEventListener("abort", killProcess);
-				}
-				resolve({ stdout, stderr, code: 1, killed });
-			});
+	const invocation = rewritePiCliSpawn(command, args);
+	const proc = spawn(invocation.command, invocation.args, {
+		cwd,
+		shell: false,
+		stdio: ["ignore", "pipe", "pipe"],
 	});
+
+	let stdout = "";
+	let stderr = "";
+	let killed = false;
+	let timeoutId: NodeJS.Timeout | undefined;
+	let escalationId: NodeJS.Timeout | undefined;
+	const killProcess = () => {
+		if (killed) return;
+		killed = true;
+		proc.kill("SIGTERM");
+		escalationId = setTimeout(() => proc.kill("SIGKILL"), 5000);
+	};
+
+	if (options?.signal) {
+		if (options.signal.aborted) killProcess();
+		else options.signal.addEventListener("abort", killProcess, { once: true });
+	}
+	if (options?.timeout && options.timeout > 0) timeoutId = setTimeout(killProcess, options.timeout);
+
+	proc.stdout?.on("data", (data) => {
+		stdout += data.toString();
+	});
+	proc.stderr?.on("data", (data) => {
+		stderr += data.toString();
+	});
+
+	try {
+		// Wait for process termination without hanging on inherited stdio handles.
+		const code = await waitForChildProcess(proc);
+		return { stdout, stderr, code: code ?? 1, killed };
+	} finally {
+		if (timeoutId) clearTimeout(timeoutId);
+		if (escalationId) clearTimeout(escalationId);
+		options?.signal?.removeEventListener("abort", killProcess);
+	}
 }

@@ -105,6 +105,11 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { getCliBinName } from "../../core/pi-client-cli-adapter.ts";
+import {
+	PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE,
+	readPiClientUpdateMarker,
+	writePiClientRuntimeReloadState,
+} from "../../core/pi-client-runtime-update.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -425,6 +430,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
  * Options for InteractiveMode initialization.
  */
 export interface InteractiveModeOptions {
+	/** Canonical invocation options retained when the launcher restarts an updated runtime. */
+	runtimeReloadArgs?: string[];
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Diagnostics collected before the interactive TUI was initialized. */
@@ -1153,30 +1160,38 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<void> {
 		await this.init();
+		const modelCatalogError = this.session.modelRuntime.getError();
+		const modelSelectionGuidance =
+			process.env.PI_SERVER_MODE === "true" && (!this.session.model || isUnknownModel(this.session.model))
+				? " Use /model to refresh catalogs and select a model."
+				: "";
 
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
-			const usesDevinModels =
-				this.session.model?.provider === "devin" ||
-				this.session.scopedModels.some(({ model }) => model.provider === "devin") ||
-				(this.settingsManager.getEnabledModels()?.some((pattern) => pattern.toLowerCase().startsWith("devin/")) ??
-					false);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
 				.then((result) => {
 					this.updateAvailableProviderCount();
-					if (!usesDevinModels) return;
-					if (result.errors.has("devin")) {
+					if (result.aborted) return;
+					for (const [provider, error] of result.errors) {
+						if (
+							provider === "pi-server" &&
+							modelCatalogError &&
+							this.session.modelRuntime.getError() === modelCatalogError
+						) {
+							continue;
+						}
 						this.showWarning(
-							"Could not refresh the Devin model catalog; cached or built-in fallback models remain available.",
-						);
-					} else if (result.aborted && controller.signal.aborted) {
-						this.showWarning(
-							"Devin model catalog refresh timed out; cached or built-in fallback models remain available.",
+							`Could not refresh ${provider} model catalog: ${error.message}${provider === "pi-server" ? modelSelectionGuidance : ""}`,
 						);
 					}
 				})
-				.catch(() => {})
+				.catch((error: unknown) => {
+					if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) return;
+					this.showWarning(
+						`Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}${modelSelectionGuidance}`,
+					);
+				})
 				.finally(() => clearTimeout(timeout));
 		}
 
@@ -1233,9 +1248,8 @@ export class InteractiveMode {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
 		}
 
-		const modelsJsonError = this.session.modelRuntime.getError();
-		if (modelsJsonError) {
-			this.showError(`models.json error: ${modelsJsonError}`);
+		if (modelCatalogError) {
+			this.showError(`Model catalog error: ${modelCatalogError}${modelSelectionGuidance}`);
 		}
 
 		if (modelFallbackMessage) {
@@ -3104,12 +3118,14 @@ export class InteractiveMode {
 
 		return new Promise((resolve, reject) => {
 			let component: Component & { dispose?(): void };
+			let overlayHandle: OverlayHandle | undefined;
 			let closed = false;
 
 			const close = (result: T) => {
 				if (closed) return;
 				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
+				// Remove this overlay, not the topmost one: another overlay may have opened above it.
+				if (isOverlay) overlayHandle?.hide();
 				else restoreEditor();
 				// Note: both branches above already call requestRender
 				resolve(result);
@@ -3138,9 +3154,9 @@ export class InteractiveMode {
 							const w = (component as { width?: number }).width;
 							return w ? { width: w } : undefined;
 						};
-						const handle = this.ui.showOverlay(component, resolveOptions());
+						overlayHandle = this.ui.showOverlay(component, resolveOptions());
 						// Expose handle to caller for visibility control
-						options?.onHandle?.(handle);
+						options?.onHandle?.(overlayHandle);
 					} else {
 						this.disposeActiveSelector();
 						this.editorContainer.clear();
@@ -4518,7 +4534,7 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+	private async shutdown(options?: { fromSignal?: boolean; exitCode?: number }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
 		// Keep signal handlers registered until terminal cleanup has completed.
@@ -4537,7 +4553,7 @@ export class InteractiveMode {
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
-			process.exit(0);
+			process.exit(options.exitCode ?? 0);
 		}
 
 		// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
@@ -4551,12 +4567,14 @@ export class InteractiveMode {
 		this.stop();
 		await this.runtimeHost.dispose();
 
-		const resumeCommand = formatResumeCommand(this.sessionManager);
-		if (resumeCommand) {
-			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+		if (options?.exitCode !== PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE) {
+			const resumeCommand = formatResumeCommand(this.sessionManager);
+			if (resumeCommand) {
+				process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+			}
 		}
 
-		process.exit(0);
+		process.exit(options?.exitCode ?? 0);
 	}
 
 	private emergencyTerminalExit(): never {
@@ -5174,6 +5192,7 @@ export class InteractiveMode {
 					steeringMode: this.session.steeringMode,
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
+					sessionShareDestination: this.settingsManager.getSessionShareDestination(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					cacheWarmingMode: this.settingsManager.getCacheWarmingMode(),
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
@@ -5244,6 +5263,9 @@ export class InteractiveMode {
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
 						this.session.agent.transport = transport;
+					},
+					onSessionShareDestinationChange: (destination) => {
+						this.settingsManager.setSessionShareDestination(destination);
 					},
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -6675,6 +6697,54 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
+	private async reloadUpdatedPiClientRuntime(): Promise<boolean> {
+		if (process.env.PI_SERVER_MODE !== "true") return false;
+
+		try {
+			const agentDir = this.runtimeHost.services.agentDir;
+			const marker = readPiClientUpdateMarker(agentDir);
+			if (!marker) return false;
+			if (marker.updatedAt === process.env.PI_CLIENT_RUNTIME_UPDATED_AT) return false;
+			const statePath = process.env.PI_CLIENT_RELOAD_STATE_PATH;
+			if (!statePath) {
+				throw new Error("Runtime reload requires the pi-client launcher. Restart this session with pi-client.");
+			}
+			if (!this.sessionManager.isPersisted()) {
+				throw new Error(
+					"Runtime reload cannot resume a --no-session session. Start a persisted session to reload the runtime.",
+				);
+			}
+			if (
+				this.session.isAborting ||
+				this.session.isBashRunning ||
+				this.session.pendingMessageCount > 0 ||
+				this.pendingUserInputs.length > 0 ||
+				this.compactionQueuedMessages.length > 0
+			) {
+				throw new Error("Finish pending input, bash commands, and cancellation before reloading the runtime.");
+			}
+			const sessionFile = this.sessionManager.getSessionFile()!;
+			if (!fs.existsSync(sessionFile)) {
+				this.sessionManager.replaceTree(this.sessionManager.getEntries(), this.sessionManager.getLeafId());
+			}
+			await this.settingsManager.flush();
+			writePiClientRuntimeReloadState(statePath, {
+				sessionId: this.sessionManager.getSessionId(),
+				sessionDir: this.sessionManager.getSessionDir(),
+				leafId: this.sessionManager.getLeafId(),
+				args: this.options.runtimeReloadArgs ?? [],
+				updatedAt: marker.updatedAt,
+			});
+			this.showStatus(`Restarting pi-client on ${marker.version}`);
+		} catch (error) {
+			this.showError(`Runtime reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			return true;
+		}
+
+		await this.shutdown({ exitCode: PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE });
+		return true;
+	}
+
 	private async handleReloadCommand(): Promise<void> {
 		if (this.session.isStreaming) {
 			this.showWarning("Wait for the current response to finish before reloading.");
@@ -6684,6 +6754,7 @@ export class InteractiveMode {
 			this.showWarning("Wait for compaction to finish before reloading.");
 			return;
 		}
+		if (await this.reloadUpdatedPiClientRuntime()) return;
 
 		this.resetExtensionUI();
 
@@ -6746,9 +6817,9 @@ export class InteractiveMode {
 				showDiagnosticsWhenQuiet: true,
 			});
 			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload();
-			const modelsJsonError = this.session.modelRuntime.getError();
-			if (modelsJsonError) {
-				this.showError(`models.json error: ${modelsJsonError}`);
+			const modelCatalogError = this.session.modelRuntime.getError();
+			if (modelCatalogError) {
+				this.showError(`Model catalog error: ${modelCatalogError}`);
 			}
 			this.showStatus(
 				savedImplicitProjectTrust

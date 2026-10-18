@@ -64,6 +64,7 @@ import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/setti
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
+import { getBranchSelection } from "./core/virtual-models.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
@@ -164,7 +165,11 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 		}
 		if (command.kind !== "check") {
 			const signal = AbortSignal.timeout(15_000);
-			const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false, signal });
+			const modelRuntime = await ModelRuntime.create({
+				allowModelNetwork: false,
+				refreshOnCreate: parsed.model !== undefined,
+				signal,
+			});
 			const credential = await resolveCredentialForPrint(
 				parsed,
 				modelRuntime,
@@ -474,13 +479,18 @@ function buildSessionOptions(
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
 			cliThinking: parsed.thinking,
+			inlineApiKey: Boolean(parsed.apiKey),
 			modelRuntime,
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });
 		}
 		if (resolved.error) {
-			diagnostics.push({ type: "error", message: resolved.error });
+			const runtimeError = modelRuntime.getError();
+			diagnostics.push({
+				type: "error",
+				message: runtimeError ? `Cannot resolve model "${parsed.model}": ${runtimeError}` : resolved.error,
+			});
 		}
 		if (resolved.model) {
 			options.model = resolved.model;
@@ -551,6 +561,60 @@ function buildSessionOptions(
 
 function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | undefined {
 	return paths?.map((value) => (isLocalPath(value) ? resolvePath(value, cwd) : value));
+}
+
+export function buildRuntimeReloadArgs(
+	parsed: Args,
+	paths: Pick<Args, "extensions" | "skills" | "promptTemplates" | "themes">,
+): string[] {
+	const args: string[] = [];
+	for (const [flag, value] of [
+		["--api-key", parsed.apiKey],
+		["--system-prompt", parsed.systemPrompt],
+		["--mode", parsed.mode],
+		["--use-theme", parsed.useTheme],
+		["--tui-mode", parsed.tuiMode],
+	] as const) {
+		if (value !== undefined) args.push(flag, value);
+	}
+	for (const [flag, values] of [
+		["--models", parsed.models],
+		["--tools", parsed.tools],
+		["--exclude-tools", parsed.excludeTools],
+	] as const) {
+		if (values !== undefined) args.push(flag, values.join(","));
+	}
+	for (const [flag, values] of [
+		["--extension", paths.extensions],
+		["--skill", paths.skills],
+		["--prompt-template", paths.promptTemplates],
+		["--theme", paths.themes],
+		["--append-system-prompt", parsed.appendSystemPrompt],
+	] as const) {
+		for (const value of values ?? []) args.push(flag, value);
+	}
+	for (const [flag, enabled] of [
+		["--no-tools", parsed.noTools],
+		["--no-builtin-tools", parsed.noBuiltinTools],
+		["--no-extensions", parsed.noExtensions],
+		["--no-mcp", parsed.noMcp],
+		["--no-skills", parsed.noSkills],
+		["--no-prompt-templates", parsed.noPromptTemplates],
+		["--no-themes", parsed.noThemes],
+		["--no-context-files", parsed.noContextFiles],
+		["--print", parsed.print],
+		["--verbose", parsed.verbose],
+		["--offline", parsed.offline],
+	] as const) {
+		if (enabled) args.push(flag);
+	}
+	if (parsed.projectTrustOverride !== undefined) {
+		args.push(parsed.projectTrustOverride ? "--approve" : "--no-approve");
+	}
+	for (const [name, value] of parsed.unknownFlags) {
+		args.push(typeof value === "string" ? `--${name}=${value}` : `--${name}`);
+	}
+	return args;
 }
 
 async function promptForMissingSessionCwd(
@@ -697,6 +761,12 @@ export async function main(args: string[], options?: MainOptions) {
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	const reloadLeafId = process.env.PI_CLIENT_RELOAD_LEAF_ID;
+	delete process.env.PI_CLIENT_RELOAD_LEAF_ID;
+	if (reloadLeafId !== undefined) {
+		if (reloadLeafId) sessionManager.branch(reloadLeafId);
+		else sessionManager.resetLeaf();
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -733,6 +803,12 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+	const runtimeReloadArgs = buildRuntimeReloadArgs(parsed, {
+		extensions: resolvedExtensionPaths,
+		skills: resolvedSkillPaths,
+		promptTemplates: resolvedPromptTemplatePaths,
+		themes: resolvedThemePaths,
+	});
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -756,7 +832,6 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
-			modelRuntimeSignal: AbortSignal.timeout(15_000),
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
@@ -834,27 +909,32 @@ export async function main(args: string[], options?: MainOptions) {
 			modelPatterns && modelPatterns.length > 0
 				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
 				: [];
+		const recordedSelection = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
+			modelRuntime.getModel(provider, modelId),
+		);
+		const hasExistingSession =
+			sessionManager.buildSessionContext().messages.length > 0 || recordedSelection !== undefined;
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
 			diagnostics: sessionOptionDiagnostics,
-		} = buildSessionOptions(
-			parsed,
-			scopedModels,
-			sessionManager.buildSessionContext().messages.length > 0,
-			modelRuntime,
-			settingsManager,
-		);
+		} = buildSessionOptions(parsed, scopedModels, hasExistingSession, modelRuntime, settingsManager);
 		diagnostics.push(...sessionOptionDiagnostics);
 
 		if (parsed.apiKey) {
-			if (!sessionOptions.model) {
+			let keyModel = sessionOptions.model;
+			if (!keyModel && recordedSelection) {
+				keyModel = modelRuntime.getModel(recordedSelection.provider, recordedSelection.modelId);
+			}
+			if (!keyModel) {
 				diagnostics.push({
 					type: "error",
-					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
+					message: hasExistingSession
+						? "--api-key requires an available model selected in the resumed session"
+						: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
 				});
 			} else {
-				await modelRuntime.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+				await modelRuntime.setRuntimeApiKey(keyModel.provider, parsed.apiKey);
 			}
 		}
 
@@ -935,8 +1015,12 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
-	if (appMode !== "interactive" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
+	if (
+		appMode !== "interactive" &&
+		(!session.model ||
+			(session.model.provider === "unknown" && session.model.id === "unknown" && session.model.api === "unknown"))
+	) {
+		console.error(chalk.red(modelRuntime.getError() ?? formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 
@@ -952,7 +1036,21 @@ export async function main(args: string[], options?: MainOptions) {
 		const timeout = setTimeout(() => controller.abort(), 15_000);
 		void modelRuntime
 			.refresh({ signal: controller.signal })
-			.catch(() => {})
+			.then((result) => {
+				if (result.aborted) return;
+				for (const [providerId, error] of result.errors) {
+					console.error(chalk.yellow(`Model catalog refresh failed for ${providerId}: ${error.message}`));
+				}
+			})
+			.catch((error: unknown) => {
+				if (!controller.signal.aborted) {
+					console.error(
+						chalk.yellow(
+							`Model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					);
+				}
+			})
 			.finally(() => clearTimeout(timeout));
 	}
 
@@ -961,6 +1059,7 @@ export async function main(args: string[], options?: MainOptions) {
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
+			runtimeReloadArgs,
 			migratedProviders,
 			startupDiagnostics,
 			modelFallbackMessage,

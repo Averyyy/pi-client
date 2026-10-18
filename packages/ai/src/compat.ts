@@ -42,6 +42,7 @@ import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
 import { devinApi } from "./providers/devin.ts";
+import { googleAntigravityApi } from "./providers/google-antigravity.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
 
@@ -186,6 +187,7 @@ const BUILTIN_APIS: [Api, ProviderStreams][] = [
 	["openai-codex-responses", openAICodexResponsesApi()],
 	["azure-openai-responses", azureOpenAIResponsesApi()],
 	["google-generative-ai", googleGenerativeAIApi()],
+	["google-antigravity", googleAntigravityApi()],
 	["google-vertex", googleVertexApi()],
 	["mistral-conversations", mistralConversationsApi()],
 	["bedrock-converse-stream", bedrockConverseStreamApi()],

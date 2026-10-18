@@ -13,11 +13,9 @@ export interface PiClientUpdateMarker {
 export interface PiClientRuntimeReloadState {
 	sessionId: string;
 	sessionDir?: string;
-	updateMarkerPath: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
+	leafId: string | null;
+	args: string[];
+	updatedAt: string;
 }
 
 export function getPiClientUpdateMarkerPath(agentDir = getAgentDir()): string {
@@ -25,15 +23,19 @@ export function getPiClientUpdateMarkerPath(agentDir = getAgentDir()): string {
 }
 
 export function readPiClientUpdateMarker(agentDir = getAgentDir()): PiClientUpdateMarker | undefined {
+	const path = getPiClientUpdateMarkerPath(agentDir);
+	let content: string;
 	try {
-		const value: unknown = JSON.parse(readFileSync(getPiClientUpdateMarkerPath(agentDir), "utf-8"));
-		if (!isRecord(value) || typeof value.version !== "string" || typeof value.updatedAt !== "string") {
-			return undefined;
-		}
-		return { version: value.version, updatedAt: value.updatedAt };
-	} catch {
-		return undefined;
+		content = readFileSync(path, "utf-8");
+	} catch (error: unknown) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+		throw error;
 	}
+	const value = JSON.parse(content) as Partial<PiClientUpdateMarker> | null;
+	if (typeof value?.version !== "string" || typeof value?.updatedAt !== "string") {
+		throw new Error(`Invalid pi-client update marker: ${path}`);
+	}
+	return { version: value.version, updatedAt: value.updatedAt };
 }
 
 export function writePiClientRuntimeReloadState(path: string, state: PiClientRuntimeReloadState): void {

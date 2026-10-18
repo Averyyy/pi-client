@@ -204,7 +204,7 @@ export class ModelRuntime implements Models {
 	private registrationRefresh: Promise<void> = Promise.resolve();
 	private readonly registrationRefreshErrors = new Map<string, string>();
 	private remoteCatalogRefreshSeq = 0;
-	private remoteCatalogLoaded = false;
+	private remoteCatalogRequested = false;
 	private localOperationAvailable: readonly AnyModel[] = [];
 	private remoteProjection: { models: readonly AnyModel[]; available: readonly AnyModel[] } | undefined;
 	private config: ModelConfig;
@@ -291,8 +291,6 @@ export class ModelRuntime implements Models {
 		try {
 			if (options.refreshOnCreate !== false) {
 				const result = await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
-				const remoteError = result.errors.get("pi-server");
-				if (remoteError) throw remoteError;
 				if (runtime.piServerMode && result.aborted) signal?.throwIfAborted();
 			}
 		} finally {
@@ -564,7 +562,6 @@ export class ModelRuntime implements Models {
 		if (this.piServerMode) {
 			options?.signal?.throwIfAborted();
 			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-			if (!this.remoteCatalogLoaded) await this.refreshRemoteCatalog(options?.signal);
 			return this.getRemoteModels(true, providerId).filter((model) => isModelType(model, type));
 		}
 		return this.models.getAvailableOfType(type, providerId, options);
@@ -574,7 +571,6 @@ export class ModelRuntime implements Models {
 		if (this.piServerMode) {
 			options?.signal?.throwIfAborted();
 			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-			if (!this.remoteCatalogLoaded) await this.refreshRemoteCatalog(options?.signal);
 			return this.getRemoteModels(true, providerId);
 		}
 		return this.models.getAllAvailable(providerId, options);
@@ -658,11 +654,14 @@ export class ModelRuntime implements Models {
 
 	private async refreshRemoteCatalog(signal?: AbortSignal): Promise<void> {
 		const seq = ++this.remoteCatalogRefreshSeq;
-		const catalog = await fetchPiServerModels({ signal });
+		this.remoteCatalogRequested = true;
+		const timeoutSignal = AbortSignal.timeout(15_000);
+		const catalog = await fetchPiServerModels({
+			signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+		});
 		if (seq !== this.remoteCatalogRefreshSeq) return;
 		this.remoteCatalog = catalog;
 		this.remoteProviderCapabilities = catalog.providers;
-		this.remoteCatalogLoaded = true;
 		this.remoteCatalogError = undefined;
 		this.remoteProjection = undefined;
 	}
@@ -1142,7 +1141,9 @@ export class ModelRuntime implements Models {
 					errors.set("availability", error instanceof Error ? error : new Error(String(error)));
 			}
 			try {
-				if (!options.signal?.aborted) await this.refreshRemoteCatalog(options.signal);
+				if (!options.signal?.aborted && (!this.remoteCatalogRequested || options.allowNetwork !== false)) {
+					await this.refreshRemoteCatalog(options.signal);
+				}
 			} catch (error) {
 				if (!options.signal?.aborted) {
 					const remoteError = error instanceof Error ? error : new Error(String(error));
