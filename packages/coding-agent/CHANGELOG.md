@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Preserved configured model scopes across credential and catalog changes while excluding unavailable models from selection, autocomplete, and cycling; cycling uses current model metadata.
+- Identified remaining credential sources in logout feedback.
 - Updated Xiaomi API and token-plan defaults to the available `mimo-v2.6-pro` model.
 - Preserved explicit pi-server operation errors without querying disconnected-run recovery, including compaction, image generation, and classification.
 - Stopped cache warming on failed extension decisions or provider requests and exposed the failure reason in `/session`.

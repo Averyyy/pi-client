@@ -9,6 +9,7 @@ import {
 	Text,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import { getAvailableScopedModels } from "../../../core/model-resolver.ts";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
 import { refreshModelCatalogs } from "../model-catalog-refresh.ts";
 import { getModelSelectorSearchText } from "../model-search.ts";
@@ -159,20 +160,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private loadModelsFromSnapshot(): void {
-		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<any>) => ({
+		const availableModels = this.modelRuntime.getAvailableSnapshot();
+		const models = availableModels.map((model: Model<any>) => ({
 			provider: model.provider,
 			id: model.id,
 			model,
 		}));
 		this.allModels = this.sortModels(models);
-		this.scopedModels = this.scopedModels.map((scoped) => {
-			const refreshed = this.modelRuntime.getModel(scoped.model.provider, scoped.model.id);
-			return refreshed ? { ...scoped, model: refreshed } : scoped;
-		});
-		this.scopedModelItems = this.scopedModels.map((scoped) => ({
-			provider: scoped.model.provider,
-			id: scoped.model.id,
-			model: scoped.model,
+		this.scopedModelItems = getAvailableScopedModels(this.scopedModels, availableModels).map(({ model }) => ({
+			provider: model.provider,
+			id: model.id,
+			model,
 		}));
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
 		this.filteredModels = this.activeModels;
@@ -362,7 +360,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.input.tab")) {
-			if (this.scopedModelItems.length > 0) {
+			if (this.scopedModels.length > 0) {
 				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
 				this.setScope(nextScope);
 				if (this.scopeHintText) {

@@ -122,6 +122,7 @@ import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extens
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
+import { getAvailableScopedModels } from "./model-resolver.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import {
@@ -3086,12 +3087,7 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelMutationOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableIds = new Set(
-			this._modelRuntime.getAvailableSnapshot().map((model) => `${model.provider}\0${model.id}`),
-		);
-		const scopedModels = this._scopedModels.filter((scoped) =>
-			availableIds.has(`${scoped.model.provider}\0${scoped.model.id}`),
-		);
+		const scopedModels = getAvailableScopedModels(this._scopedModels, this._modelRuntime.getAvailableSnapshot());
 		if (scopedModels.length <= 1) return undefined;
 
 		const currentModel = this.model;

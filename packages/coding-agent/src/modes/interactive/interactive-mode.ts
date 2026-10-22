@@ -100,6 +100,7 @@ import { createCompactionSummaryMessage, createCustomMessage } from "../../core/
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
+	getAvailableScopedModels,
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
@@ -748,7 +749,10 @@ export class InteractiveMode {
 			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
 				const models =
 					this.session.scopedModels.length > 0
-						? this.session.scopedModels.map((s) => s.model)
+						? getAvailableScopedModels(
+								this.session.scopedModels,
+								this.session.modelRuntime.getAvailableSnapshot(),
+							).map((scoped) => scoped.model)
 						: this.session.modelRuntime.getAvailableSnapshot();
 
 				if (models.length === 0) return null;
@@ -5487,7 +5491,9 @@ export class InteractiveMode {
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
 		const cachedModels =
 			this.session.scopedModels.length > 0
-				? this.session.scopedModels.map((scoped) => scoped.model)
+				? getAvailableScopedModels(this.session.scopedModels, this.session.modelRuntime.getAvailableSnapshot()).map(
+						(scoped) => scoped.model,
+					)
 				: [...this.session.modelRuntime.getAvailableSnapshot()];
 		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
 		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
@@ -5522,7 +5528,9 @@ export class InteractiveMode {
 	private updateAvailableProviderCount(): void {
 		const models =
 			this.session.scopedModels.length > 0
-				? this.session.scopedModels.map((scoped) => scoped.model)
+				? getAvailableScopedModels(this.session.scopedModels, this.session.modelRuntime.getAvailableSnapshot()).map(
+						(scoped) => scoped.model,
+					)
 				: this.session.modelRuntime.getAvailableSnapshot();
 		const uniqueProviders = new Set(models.map((model) => model.provider));
 		this.footerDataProvider.setAvailableProviderCount(uniqueProviders.size);
@@ -5668,16 +5676,23 @@ export class InteractiveMode {
 
 		const updateSessionModels = (enabledIds: string[] | null): void => {
 			currentEnabledIds = enabledIds === null ? null : [...enabledIds];
-			const hasEnabledAvailableModel = enabledIds?.some((id) => availableModelIds.has(id)) ?? false;
 			const allAvailableModelsEnabled =
-				enabledIds !== null && [...availableModelIds].every((id) => enabledIds.includes(id));
-			if (enabledIds && hasEnabledAvailableModel && !allAvailableModelsEnabled) {
+				enabledIds !== null &&
+				enabledIds.length === availableModelIds.size &&
+				[...availableModelIds].every((id) => enabledIds.includes(id));
+			if (enabledIds && !allAvailableModelsEnabled) {
 				const newScopedModels = resolveModelScopeFromModels(enabledIds, availableModels).scopedModels;
+				const scopedById = new Map(
+					sessionScopedModels
+						.filter((scoped) => !availableModelIds.has(`${scoped.model.provider}/${scoped.model.id}`))
+						.map((scoped) => [`${scoped.model.provider}/${scoped.model.id}`, scoped]),
+				);
+				for (const scoped of newScopedModels) scopedById.set(`${scoped.model.provider}/${scoped.model.id}`, scoped);
 				this.session.setScopedModels(
-					newScopedModels.map((scoped) => ({
-						model: scoped.model,
-						thinkingLevel: scoped.thinkingLevel,
-					})),
+					enabledIds.flatMap((id) => {
+						const scoped = scopedById.get(id);
+						return scoped ? [scoped] : [];
+					}),
 				);
 			} else {
 				this.session.setScopedModels([]);
@@ -6310,10 +6325,28 @@ export class InteractiveMode {
 							signal: AbortSignal.timeout(15_000),
 						});
 						await this.updateAvailableProviderCount();
-						const message =
+						let message =
 							providerOption.authType === "oauth"
 								? `Logged out of ${providerOption.name}`
-								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
+								: `Removed stored API key for ${providerOption.name}`;
+						if (this.session.modelRuntime.hasConfiguredAuth(providerOption.id)) {
+							const authStatus = this.session.modelRuntime.getProviderAuthStatus(providerOption.id);
+							const sources = {
+								stored: "stored credentials",
+								runtime: "a runtime API key",
+								environment: authStatus.label ? `environment (${authStatus.label})` : "environment credentials",
+								fallback: "extension configuration",
+								models_json_key: "models.json configuration",
+								models_json_command: "a models.json credential command",
+							};
+							const source =
+								authStatus.configured && authStatus.source
+									? sources[authStatus.source]
+									: process.env.PI_SERVER_MODE === "true"
+										? "pi-server credentials"
+										: "configured authentication";
+							message += `. Models remain available through ${source}.`;
+						}
 						this.showStatus(message);
 					} catch (error: unknown) {
 						const message = error instanceof Error ? error.message : String(error);

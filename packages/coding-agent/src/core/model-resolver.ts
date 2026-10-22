@@ -67,6 +67,18 @@ export interface ScopedModel {
 	thinkingLevel?: ThinkingLevel;
 }
 
+/** Available models in configured scope order, using the current catalog metadata. */
+export function getAvailableScopedModels<T extends { model: Model<Api> }>(
+	scopedModels: readonly T[],
+	availableModels: readonly Model<Api>[],
+): T[] {
+	const availableById = new Map(availableModels.map((model) => [`${model.provider}\0${model.id}`, model]));
+	return scopedModels.flatMap((scoped) => {
+		const available = availableById.get(`${scoped.model.provider}\0${scoped.model.id}`);
+		return available ? [{ ...scoped, model: available }] : [];
+	});
+}
+
 /*
  * Model reference resolution. Candidates are collected before a provider is chosen, so catalog order
  * never decides the provider and an ambiguous match is reported instead of falling through to a

@@ -1799,7 +1799,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("uses OpenRouter reasoning object instead of reasoning_effort", async () => {
-		const model = getModel("openrouter", "deepseek/deepseek-r1")!;
+		const model = getModel("openrouter", "deepseek/deepseek-v4-pro")!;
 		let payload: unknown;
 
 		await streamSimple(

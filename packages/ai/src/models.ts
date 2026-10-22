@@ -825,6 +825,7 @@ class ModelsImpl implements MutableModels {
 			signal.throwIfAborted();
 			throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
 		}
+		this.supersedeProviderRefresh(providerId);
 		return credential;
 	}
 
@@ -837,6 +838,7 @@ class ModelsImpl implements MutableModels {
 			signal.throwIfAborted();
 			throw new ModelsError("auth", `Credential store delete failed for ${providerId}`, { cause: error });
 		}
+		this.supersedeProviderRefresh(providerId);
 	}
 
 	private requireProvider(model: AnyModel): Provider {
