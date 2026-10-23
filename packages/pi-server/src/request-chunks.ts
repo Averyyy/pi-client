@@ -18,6 +18,7 @@ const ALLOWED_TARGETS = new Set([
 	"/api/provider-callback",
 	"/api/cancel-deferred",
 	"/api/receive",
+	"/api/observer",
 ]);
 
 export interface RequestChunkBody {

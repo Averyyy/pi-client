@@ -51,3 +51,23 @@ PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 Use the same release version for client and server. The authenticated `/api/models` catalog reports chat, image, and classifier models with their precise availability. `/api/stream`, `/api/generate-images`, and `/api/classify` resolve server-side provider credentials or use credentials explicitly supplied by the client.
 
 Image generation and classification stream heartbeat responses and journal completed results for recovery without repeating the provider operation. Cancellation is acknowledged after provider cleanup finishes. Oversized operation payloads use `/api/request/chunk`, including when clients set a 64 KiB request-body limit.
+
+## Read-only Thread Viewer
+
+Open the server's root URL and sign in with `PI_SERVER_AUTH_TOKEN`. The home page groups threads by their client working directory and lists running threads first. Project folders expand five threads at a time. Thread pages show the latest five conversation rounds, with earlier rounds available on demand. Completed rounds expose the final answer; thinking and tool activity can be expanded separately, including while they stream.
+
+The browser receives a separate, 12-hour `HttpOnly`, `SameSite=Strict` session cookie scoped to `/viewer`. It cannot use that cookie to send prompts, change history, run tools, or cancel clients. Configure HTTPS at the reverse proxy for public access; the proxy must preserve the request host and HTTPS protocol. The viewer requires a configured server token.
+
+Ten failed token checks lock authenticated access, including correct tokens. The count persists across restarts and is shared by viewer login and requests that supply an incorrect API authorization header. Requests without API credentials do not consume attempts. A successful viewer login resets the count; ordinary client traffic does not. Unlock on the server, using the same configuration and session directory as the running process:
+
+```bash
+PI_SERVER_SESSION_STORE_DIR=/path/to/sessions pi-server viewer unlock
+```
+
+Unlocking takes effect without restarting the server. There is no HTTP unlock endpoint.
+
+Matching `pi-client` releases publish a separate observation stream containing the current branch's committed messages, project directory, title, and explicit run/tool state. Tool execution remains running between model requests. A disconnected client is shown as disconnected, rather than idle. The observer does not modify the server's inference tree or provider context. Its history and authentication state live under `.viewer` inside the session directory.
+
+Existing server trees remain readable as unassigned archives until their clients reconnect and supply project metadata. The viewer can only display history actually saved by the server or supplied by a connected client. Images are represented as attachment labels. Transcript Markdown does not execute HTML or load external images.
+
+The frontend is maintained in `viewer/` and ships as static assets in `dist/viewer/`. Build it with `npm run build:viewer`; `npm run build` includes that step. This viewer is independent of the interactive Tau interface launched by `pi-client web`.

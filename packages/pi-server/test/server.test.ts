@@ -42,7 +42,6 @@ vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
 
 interface ServerResponse {
 	status?: string;
-	version?: string;
 	sessionId?: string;
 	staticContextHash?: string;
 	treeHash?: string;
@@ -421,12 +420,17 @@ describe("pi-server HTTP", () => {
 		}
 	});
 
-	it("includes the package version with an unauthorized root response", async () => {
+	it("serves the public viewer shell or reports unavailable build assets", async () => {
 		const res = await fetch(`${baseUrl}/`);
-		expect(res.status).toBe(401);
-		const body = (await res.json()) as ServerResponse;
-		expect(body.error).toBe("Unauthorized");
-		expect(body.version).toMatch(/^\d+\.\d+\.\d+-piclient\.\d+$/);
+		expect(res.headers.get("cache-control")).toBe("no-store");
+		if (existsSync(new URL("../dist/viewer/index.html", import.meta.url))) {
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/html");
+			expect(await res.text()).toContain("/viewer/assets/app.js");
+		} else {
+			expect(res.status).toBe(503);
+			expect(await res.json()).toEqual({ error: "Viewer assets unavailable" });
+		}
 	});
 
 	it("rejects requests without auth token when configured", async () => {
@@ -448,6 +452,61 @@ describe("pi-server HTTP", () => {
 			body: JSON.stringify({ sessionId: "test-auth" }),
 		});
 		expect(res.status).toBe(200);
+	});
+
+	it("lets an established provider stream finish when viewer authentication becomes locked", async () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "provider result" }],
+			api: "cleanup-gate",
+			provider: "cleanup-gate-provider",
+			model: "cleanup-gate-model",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1000,
+		};
+		const stream = createAssistantMessageEventStream();
+		const provide = () => stream;
+		registerApiProvider({ api: "cleanup-gate", stream: provide, streamSimple: provide });
+		const model = { ...compactModel(), api: "cleanup-gate", provider: "cleanup-gate-provider" };
+		const response = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+			body: JSON.stringify({
+				sessionId: "provider-lock-isolation",
+				runId: "provider-lock-isolation",
+				model,
+				staticContext: { systemPrompt: "Test" },
+			}),
+		});
+		let ended = false;
+		const result = response.text().then((text) => {
+			ended = true;
+			return text;
+		});
+		try {
+			await Promise.all(
+				Array.from({ length: 10 }, () =>
+					fetch(`${baseUrl}/viewer/login`, {
+						method: "POST",
+						headers: { Origin: baseUrl, Authorization: "Bearer wrong" },
+					}),
+				),
+			);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(ended).toBe(false);
+		} finally {
+			stream.push({ type: "done", reason: "stop", message });
+			stream.end();
+		}
+		expect(await result).toContain("provider result");
 	});
 
 	it("initializes session with static context", async () => {

@@ -11,6 +11,7 @@ import type {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { resetSessionTracking } from "./pi-server-client.ts";
+import { closePiServerObserver } from "./pi-server-observer.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
@@ -175,6 +176,7 @@ export class AgentSessionRuntime {
 			targetSessionFile,
 		});
 		this.beforeSessionInvalidate?.();
+		await closePiServerObserver(this.session);
 		this.session.dispose();
 	}
 
@@ -411,6 +413,7 @@ export class AgentSessionRuntime {
 			reason: "quit",
 		});
 		this.beforeSessionInvalidate?.();
+		await closePiServerObserver(this.session);
 		this.session.dispose();
 	}
 }

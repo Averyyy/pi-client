@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
+import { loadConfig } from "./config.ts";
 import { startServer } from "./server.ts";
+import { unlockViewer } from "./viewer-auth.ts";
 
 interface PackageMetadata {
 	version: string;
@@ -10,7 +12,10 @@ const packageMetadata = createRequire(import.meta.url)("../package.json") as Pac
 const args = process.argv.slice(2);
 
 const unsupportedArgument = args.find((arg) => arg !== "--help" && arg !== "-h" && arg !== "--version" && arg !== "-v");
-if (unsupportedArgument !== undefined) {
+if (args.length === 2 && args[0] === "viewer" && args[1] === "unlock") {
+	unlockViewer(loadConfig().sessionStoreDir);
+	console.log("Viewer unlocked");
+} else if (unsupportedArgument !== undefined) {
 	console.error(`Unknown option "${unsupportedArgument}". Use "pi-server --help" for usage.`);
 	process.exitCode = 1;
 } else if (args.includes("--help") || args.includes("-h")) {
@@ -26,6 +31,7 @@ function printHelp(): void {
 
 Usage:
   pi-server
+  pi-server viewer unlock
 
 Options:
   --help, -h       Show this help

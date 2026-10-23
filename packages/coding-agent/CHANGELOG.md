@@ -9,6 +9,7 @@
 
 ### Added
 
+- Published pi-client project metadata, committed conversation history, and run/tool activity to the server's independent read-only viewer.
 - Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
 - Added native Devin Pro login and account model selection while retaining pi-server inference routing.
 

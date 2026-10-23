@@ -1,0 +1,424 @@
+import { randomUUID } from "node:crypto";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	renameSync,
+	rmSync,
+	statSync,
+	truncateSync,
+	writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import type { TextSignatureV1 } from "@earendil-works/pi-ai";
+import { getSession, getSessionBranch, listSessions } from "./session-store.ts";
+import type {
+	ObserverUpdate,
+	ThreadSummary,
+	ViewerContent,
+	ViewerMessage,
+	ViewerProject,
+	ViewerRound,
+	ViewerThread,
+	ViewerUpdate,
+} from "./viewer-types.ts";
+
+interface RoundOffset {
+	id: string;
+	start: number;
+	end: number;
+}
+interface StoredThread {
+	fileId: string;
+	logId: string;
+	thread: ViewerThread;
+	rounds: RoundOffset[];
+	length: number;
+}
+
+export class ViewerStore {
+	private readonly directory: string;
+	private readonly threads = new Map<string, StoredThread>();
+	private readonly connections = new Map<string, { id: string; sequence: number }>();
+	private readonly deletedConnections = new Set<string>();
+	private readonly legacyTitles = new Map<string, { revision: number; title: string }>();
+	readonly listeners = new Set<(id: string, update: ViewerUpdate) => void>();
+	readonly catalogListeners = new Set<() => void>();
+	readonly removedListeners = new Set<(id: string) => void>();
+
+	constructor(sessionStoreDir: string) {
+		this.directory = join(sessionStoreDir, ".viewer", "threads");
+		if (!existsSync(this.directory)) return;
+		for (const file of readdirSync(this.directory)) {
+			if (!/^[a-f0-9-]+\.json$/.test(file)) continue;
+			const stored = JSON.parse(readFileSync(join(this.directory, file), "utf8")) as StoredThread;
+			const log = join(this.directory, `${stored.logId}.jsonl`);
+			if (statSync(log).size < stored.length) throw new Error("Viewer log is shorter than committed index");
+			truncateSync(log, stored.length);
+			stored.thread.status = "disconnected";
+			stored.thread.live = { message: null, tools: [] };
+			this.threads.set(stored.thread.id, stored);
+		}
+	}
+
+	projects(): { projects: ViewerProject[]; running: ThreadSummary[] } {
+		const summaries = this.summaries();
+		const projects = new Map<string, ViewerProject>();
+		for (const thread of summaries) {
+			let project = projects.get(thread.projectId);
+			if (!project) {
+				const parts = thread.cwd?.split(/[\\/]/).filter(Boolean);
+				project = {
+					id: thread.projectId,
+					path: thread.cwd,
+					name: parts?.at(-1) ?? "Unassigned archives",
+					threadCount: 0,
+				};
+				projects.set(project.id, project);
+			}
+			project.threadCount++;
+		}
+		return {
+			projects: [...projects.values()].sort((a, b) => a.name.localeCompare(b.name)),
+			running: summaries.filter((thread) => thread.status === "running"),
+		};
+	}
+
+	page(project: string, cursor: string | null): { threads: ThreadSummary[]; nextCursor: string | null } {
+		let threads = this.summaries().filter((thread) => thread.projectId === project);
+		if (cursor !== null) {
+			const anchor = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
+				id: string;
+				updatedAt: number;
+			};
+			if (typeof anchor.id !== "string" || typeof anchor.updatedAt !== "number")
+				throw new Error("Invalid pagination cursor");
+			threads = threads.filter(
+				(thread) =>
+					thread.updatedAt < anchor.updatedAt ||
+					(thread.updatedAt === anchor.updatedAt && thread.id.localeCompare(anchor.id) > 0),
+			);
+		}
+		const page = threads.slice(0, 5);
+		const last = page.at(-1);
+		return {
+			threads: page,
+			nextCursor:
+				threads.length > 5 && last
+					? Buffer.from(JSON.stringify({ id: last.id, updatedAt: last.updatedAt })).toString("base64url")
+					: null,
+		};
+	}
+
+	get(id: string): ViewerThread | undefined {
+		const stored = this.threads.get(id);
+		if (stored) return structuredClone(stored.thread);
+		const session = getSession(id);
+		if (!session) return undefined;
+		return {
+			id,
+			title: this.legacyTitle(id),
+			projectId: "unassigned",
+			cwd: null,
+			status: "unknown",
+			updatedAt: session.updatedAt,
+			legacy: true,
+			live: { message: null, tools: [] },
+		};
+	}
+
+	remove(id: string): void {
+		const connection = this.connections.get(id);
+		if (connection) this.deletedConnections.add(connection.id);
+		this.connections.delete(id);
+		this.legacyTitles.delete(id);
+		const stored = this.threads.get(id);
+		if (stored) {
+			rmSync(join(this.directory, `${stored.fileId}.json`), { force: true });
+			rmSync(join(this.directory, `${stored.logId}.jsonl`), { force: true });
+			this.threads.delete(id);
+		}
+		for (const listener of this.removedListeners) listener(id);
+		for (const listener of this.catalogListeners) listener();
+	}
+
+	rounds(id: string, before: string | null): { rounds: ViewerRound[]; nextCursor: string | null } {
+		const stored = this.threads.get(id);
+		if (!stored) {
+			const session = getSession(id);
+			if (!session) throw new Error("Thread not found");
+			const branch = getSessionBranch(session).filter((entry) => entry.type === "message");
+			const boundaries: { id: string; offset: number }[] = [];
+			for (const [offset, entry] of branch.entries()) {
+				if (!boundaries.length || (entry.message as Record<string, unknown>).role === "user")
+					boundaries.push({ id: entry.id, offset });
+			}
+			const end = before === null ? boundaries.length : this.roundCursor(before, boundaries);
+			const start = Math.max(0, end - 5);
+			const rounds: ViewerRound[] = boundaries.slice(start, end).map((boundary, index) => ({
+				id: boundary.id,
+				messages: branch
+					.slice(boundary.offset, boundaries[start + index + 1]?.offset ?? branch.length)
+					.map((entry) =>
+						projectMessage({
+							...(entry.message as Record<string, unknown>),
+							id: entry.id,
+							timestamp: new Date(entry.timestamp).getTime(),
+						}),
+					),
+			}));
+			return { rounds, nextCursor: start > 0 ? boundaries[start].id : null };
+		}
+		const end = before === null ? stored.rounds.length : this.roundCursor(before, stored.rounds);
+		const start = Math.max(0, end - 5);
+		const offsets = stored.rounds.slice(start, end);
+		const fd = openSync(join(this.directory, `${stored.logId}.jsonl`), "r");
+		try {
+			const rounds = offsets.map((round) => {
+				const buffer = Buffer.alloc(round.end - round.start);
+				readSync(fd, buffer, 0, buffer.length, round.start);
+				return {
+					id: round.id,
+					messages: buffer
+						.toString("utf8")
+						.trimEnd()
+						.split("\n")
+						.map((line) => JSON.parse(line) as ViewerMessage),
+				};
+			});
+			return { rounds, nextCursor: start > 0 ? stored.rounds[start].id : null };
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	connect(id: string): { connectionId: string; close: () => void } {
+		const connectionId = randomUUID();
+		this.connections.set(id, { id: connectionId, sequence: 0 });
+		const stored = this.threads.get(id);
+		if (stored) {
+			stored.thread.status = "unknown";
+			stored.thread.live = { message: null, tools: [] };
+			this.emit(stored);
+		}
+		return {
+			connectionId,
+			close: () => {
+				if (this.connections.get(id)?.id !== connectionId) return;
+				this.connections.delete(id);
+				const thread = this.threads.get(id);
+				if (!thread) return;
+				thread.thread.status = "disconnected";
+				thread.thread.live = { message: null, tools: [] };
+				this.emit(thread);
+			},
+		};
+	}
+
+	update(body: ObserverUpdate): void {
+		if (this.deletedConnections.has(body.connectionId)) throw new Error("Observer session deleted");
+		const connection = this.connections.get(body.sessionId);
+		if (connection?.id !== body.connectionId) throw new Error("Observer connection expired");
+		if (body.sequence <= connection.sequence) return;
+		let stored = this.threads.get(body.sessionId);
+		const created = !stored;
+		if (!stored) {
+			if (!body.replace || !body.cwd) throw new Error("First observer update requires cwd and replace");
+			stored = {
+				fileId: randomUUID(),
+				logId: randomUUID(),
+				thread: {
+					id: body.sessionId,
+					title: body.title ?? body.sessionId,
+					cwd: body.cwd,
+					projectId: body.cwd,
+					status: "unknown",
+					updatedAt: Date.now(),
+					legacy: false,
+					live: { message: null, tools: [] },
+				},
+				rounds: [],
+				length: 0,
+			};
+			this.threads.set(body.sessionId, stored);
+		}
+		const metadataChanged =
+			(body.cwd !== undefined && body.cwd !== stored.thread.cwd) ||
+			(body.title !== undefined && body.title !== stored.thread.title);
+		const statusChanged = body.status !== undefined && body.status !== stored.thread.status;
+		if (body.cwd !== undefined) {
+			stored.thread.cwd = body.cwd;
+			stored.thread.projectId = body.cwd;
+		}
+		if (body.title !== undefined) stored.thread.title = body.title;
+		if (body.status !== undefined) stored.thread.status = body.status;
+		if (body.live !== undefined) stored.thread.live = body.live;
+		const messages = body.replace ?? body.append ?? [];
+		const oldLogId = stored.logId;
+		if (body.replace) {
+			stored.logId = randomUUID();
+			stored.rounds = [];
+			stored.length = 0;
+		}
+		const log = join(this.directory, `${stored.logId}.jsonl`);
+		if (created || body.replace || messages.length || metadataChanged) mkdirSync(this.directory, { recursive: true });
+		if (body.replace) writeFileSync(log, "");
+		for (const message of messages) {
+			if (!stored.rounds.length || message.role === "user")
+				stored.rounds.push({ id: message.id, start: stored.length, end: stored.length });
+			const line = `${JSON.stringify(message)}\n`;
+			appendFileSync(log, line);
+			stored.length += Buffer.byteLength(line);
+			stored.rounds[stored.rounds.length - 1].end = stored.length;
+		}
+		if (created || messages.length || body.replace || metadataChanged) {
+			stored.thread.updatedAt = Date.now();
+			const path = join(this.directory, `${stored.fileId}.json`);
+			writeFileSync(
+				`${path}.tmp`,
+				JSON.stringify({
+					...stored,
+					thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
+				}),
+			);
+			renameSync(`${path}.tmp`, path);
+			if (body.replace && oldLogId !== stored.logId)
+				rmSync(join(this.directory, `${oldLogId}.jsonl`), { force: true });
+		}
+		connection.sequence = body.sequence;
+		this.emit(
+			stored,
+			body.append,
+			body.replace !== undefined,
+			created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
+		);
+	}
+
+	private summaries(): ThreadSummary[] {
+		const summaries: ThreadSummary[] = [...this.threads.values()].map(({ thread }) => {
+			const { live: _live, legacy: _legacy, ...summary } = thread;
+			return summary;
+		});
+		for (const session of listSessions()) {
+			if (this.threads.has(session.sessionId)) continue;
+			summaries.push({
+				id: session.sessionId,
+				title: this.legacyTitle(session.sessionId),
+				cwd: null,
+				projectId: "unassigned",
+				status: "unknown",
+				updatedAt: session.updatedAt,
+			});
+		}
+		return summaries.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+	}
+
+	private emit(stored: StoredThread, append?: ViewerMessage[], replace = false, catalog = true): void {
+		if (this.listeners.size > 0) {
+			const thread = structuredClone(stored.thread);
+			const update: ViewerUpdate = replace
+				? { thread, replace: true, ...this.rounds(thread.id, null) }
+				: { thread, ...(append?.length ? { append } : {}) };
+			for (const listener of this.listeners) listener(stored.thread.id, update);
+		}
+		if (catalog) for (const listener of this.catalogListeners) listener();
+	}
+
+	private roundCursor(value: string, rounds: { id: string }[]): number {
+		const index = rounds.findIndex((round) => round.id === value);
+		if (index < 0) throw new Error("Round cursor is no longer available");
+		return index;
+	}
+
+	private legacyTitle(id: string): string {
+		const session = getSession(id);
+		if (!session) return id;
+		const cached = this.legacyTitles.get(id);
+		if (cached?.revision === session.revision) return cached.title;
+		let name: string | undefined;
+		let firstUser: string | undefined;
+		for (const entry of getSessionBranch(session)) {
+			if (entry.type === "session_info" && typeof entry.name === "string") name = entry.name;
+			if (firstUser !== undefined || entry.type !== "message" || !entry.message) continue;
+			const message = entry.message as Record<string, unknown>;
+			if (message.role !== "user") continue;
+			if (typeof message.content === "string") firstUser = message.content.slice(0, 120);
+			else if (Array.isArray(message.content))
+				firstUser = message.content
+					.map((part: Record<string, unknown>) =>
+						part.type === "text" && typeof part.text === "string" ? part.text : "",
+					)
+					.join("")
+					.slice(0, 120);
+		}
+		const title = name ?? firstUser ?? id;
+		this.legacyTitles.set(id, { revision: session.revision, title });
+		return title;
+	}
+}
+
+export function projectMessage(value: Record<string, unknown>): ViewerMessage {
+	if (
+		typeof value.id !== "string" ||
+		typeof value.role !== "string" ||
+		typeof value.timestamp !== "number" ||
+		!Number.isFinite(value.timestamp)
+	)
+		throw new Error("Invalid observer message identity");
+	let content: ViewerMessage["content"];
+	if (typeof value.content === "string") content = value.content;
+	else if (Array.isArray(value.content)) content = projectContent(value.content);
+	else throw new Error("Invalid observer message content");
+	let phase = typeof value.phase === "string" ? value.phase : undefined;
+	if (typeof content !== "string")
+		for (const part of content) if (part.type === "text" && part.phase) phase = part.phase;
+	return {
+		id: value.id,
+		role: value.role,
+		timestamp: value.timestamp,
+		content,
+		...(typeof value.stopReason === "string" ? { stopReason: value.stopReason } : {}),
+		...(phase !== undefined ? { phase } : {}),
+		...(typeof value.errorMessage === "string" ? { errorMessage: value.errorMessage } : {}),
+	};
+}
+
+export function projectContent(value: unknown): ViewerContent[] {
+	if (!Array.isArray(value)) throw new Error("Content must be an array");
+	return value.map((block: unknown): ViewerContent => {
+		if (!block || typeof block !== "object") throw new Error("Invalid message content");
+		const part = block as Record<string, unknown>;
+		if (part.type === "text" && typeof part.text === "string") {
+			let phase: TextSignatureV1["phase"] =
+				part.phase === "commentary" || part.phase === "final_answer" ? part.phase : undefined;
+			if (typeof part.textSignature === "string" && part.textSignature.startsWith("{")) {
+				try {
+					const signature = JSON.parse(part.textSignature) as Partial<TextSignatureV1>;
+					if (
+						signature.v === 1 &&
+						typeof signature.id === "string" &&
+						(signature.phase === "commentary" || signature.phase === "final_answer")
+					)
+						phase = signature.phase;
+				} catch {
+					/* Other provider signatures carry no display phase. */
+				}
+			}
+			return { type: "text", text: part.text, ...(phase ? { phase } : {}) };
+		}
+		if (part.type === "thinking" && typeof part.thinking === "string")
+			return { type: "thinking", thinking: part.thinking };
+		if (part.type === "toolCall" && typeof part.id === "string" && typeof part.name === "string")
+			return { type: "toolCall", id: part.id, name: part.name, arguments: part.arguments };
+		if (part.type === "attachment" && typeof part.label === "string")
+			return { type: "attachment", label: part.label };
+		if (part.type === "image" || part.type === "audio" || part.type === "video" || part.type === "file")
+			return { type: "attachment", label: part.type };
+		throw new Error("Unsupported observer content block");
+	});
+}

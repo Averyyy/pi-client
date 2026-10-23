@@ -56,6 +56,14 @@ The authenticated model catalog includes chat, image, and classifier models with
 
 `PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
 
+## Read-only Server Viewer
+
+Open the server URL in a browser and sign in with its Bearer token to browse saved threads by project. The client publishes committed conversation history and live thinking/tool activity through an independent observation channel. Observer connection errors are reported in the terminal and do not interrupt prompts or tools. Reconnecting refreshes the server's read-only projection of the current branch.
+
+The browser can view threads but cannot operate the client. Run and idle indicators follow the client lifecycle; an interrupted observation connection is shown explicitly. Both client and server must include the observer feature for live updates and project metadata.
+
+Normal runtime shutdown waits up to ten seconds for the final observation update. A delivery failure is reported without changing the prompt result or exit status.
+
 ## Prompt Cache Warming
 
 Cache warming replays eligible requests through pi-server with the original prompt, tools, model, and cache options, limiting output to one token. The default `streaming` mode warms during active agent runs. To also warm while waiting for input, set this in your global Pi settings:

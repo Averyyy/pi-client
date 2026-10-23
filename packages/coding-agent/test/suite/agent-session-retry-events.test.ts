@@ -275,17 +275,22 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("hi");
 
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"run_state_changed",
 			"agent_start",
 			"turn_start",
 			"message_start:system",
 			"message_end:system",
+			"message_committed",
 			"message_start:user",
 			"message_end:user",
+			"message_committed",
 			"message_start:assistant",
 			"message_update",
 			"message_end:assistant",
+			"message_committed",
 			"turn_end",
 			"agent_end",
+			"run_state_changed",
 			"agent_settled",
 		]);
 	});
@@ -314,26 +319,33 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(toolRuns).toEqual(["hello"]);
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"run_state_changed",
 			"agent_start",
 			"turn_start",
 			"message_start:system",
 			"message_end:system",
+			"message_committed",
 			"message_start:user",
 			"message_end:user",
+			"message_committed",
 			"message_start:assistant",
 			"message_update",
 			"message_end:assistant",
+			"message_committed",
 			"tool_execution_start:echo",
 			"tool_execution_end:echo",
 			"message_start:toolResult",
 			"message_end:toolResult",
+			"message_committed",
 			"turn_end",
 			"turn_start",
 			"message_start:assistant",
 			"message_update",
 			"message_end:assistant",
+			"message_committed",
 			"turn_end",
 			"agent_end",
+			"run_state_changed",
 			"agent_settled",
 		]);
 	});

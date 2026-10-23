@@ -219,6 +219,9 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 	  }
 	| { type: "agent_settled"; aborted: boolean }
+	| { type: "run_state_changed"; running: boolean }
+	| { type: "session_tree_changed" }
+	| { type: "session_disposed" }
 	| { type: "abort_start" }
 	| { type: "abort_end" }
 	| { type: "abort_error"; errorMessage: string }
@@ -229,6 +232,7 @@ export type AgentSessionEvent =
 	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "entry_appended"; entry: SessionEntry }
+	| { type: "message_committed"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "history_reconciled"; entryCount: number; messageCount: number }
@@ -1247,9 +1251,15 @@ export class AgentSession {
 		resolve();
 	}
 
+	private _setAgentRunActive(running: boolean): void {
+		if (this._isAgentRunActive === running) return;
+		this._isAgentRunActive = running;
+		this._emit({ type: "run_state_changed", running });
+	}
+
 	private async _emitAgentSettled(): Promise<void> {
 		this._cacheWarmer?.onAgentSettled();
-		this._isAgentRunActive = false;
+		this._setAgentRunActive(false);
 		this._isEmittingAgentSettled = true;
 		try {
 			const aborted = this._agentRunAbortRequested;
@@ -1336,7 +1346,11 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.sessionManager.appendMessage(event.message);
 			}
-			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+			if (entryId) {
+				this._entryIdsByMessage.set(event.message, entryId);
+				const entry = this.sessionManager.getEntry(entryId);
+				if (entry) this._emit({ type: "message_committed", entry });
+			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -1498,6 +1512,7 @@ export class AgentSession {
 				this.sessionManager.resetLeaf();
 			}
 			this._refreshFinalizedContext();
+			this._emit({ type: "session_tree_changed" });
 			return;
 		}
 
@@ -1540,6 +1555,7 @@ export class AgentSession {
 		}
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
+		this._emit({ type: "session_tree_changed" });
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1669,6 +1685,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._emit({ type: "session_disposed" });
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1698,6 +1715,7 @@ export class AgentSession {
 	/** Refresh the public finalized transcript from the canonical session projection. */
 	refreshContext(): void {
 		this._refreshFinalizedContext();
+		this._emit({ type: "session_tree_changed" });
 	}
 
 	/** Full agent state */
@@ -2120,14 +2138,14 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
-		this._isAgentRunActive = true;
+		this._setAgentRunActive(true);
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[] | undefined;
 		this._isPreparingRun = true;
 		try {
 			messages = await this._prepareRun(trigger);
 		} catch (error) {
-			this._isAgentRunActive = false;
+			this._setAgentRunActive(false);
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			this._resolveIdleWaitIfIdle();
@@ -2141,24 +2159,29 @@ export class AgentSession {
 		this._flushPendingCustomMessages();
 		if (!messages) {
 			// Aborted during pre-run compaction: no run was started.
-			this._isAgentRunActive = false;
+			this._setAgentRunActive(false);
 			this._resolveIdleWaitIfIdle();
 			return;
 		}
-		onStarted?.();
-		const startMessages = messages;
-		await this._runAgentOperation(() => this.agent.prompt(startMessages));
+		try {
+			onStarted?.();
+			const startMessages = messages;
+			await this._runAgentOperation(() => this.agent.prompt(startMessages));
+		} catch (error) {
+			this._setAgentRunActive(false);
+			throw error;
+		}
 	}
 
 	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
-		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
-		this._isAgentRunActive = true;
+		this._setAgentRunActive(true);
 		try {
+			this._recordSelection();
+			// The run records the loadout in the transcript; restored tools that did not register by now
+			// are dropped, so a tool that never registers does not stay pending.
+			this._pendingToolNames.clear();
 			await start();
 			while (!this._agentRunAbortRequested) {
 				const shouldContinue = await this._handlePostAgentRun();
@@ -2800,7 +2823,7 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
-		this.sessionManager.appendCustomMessageEntry(
+		const entryId = this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
@@ -2809,6 +2832,8 @@ export class AgentSession {
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry) this._emit({ type: "message_committed", entry });
 	}
 
 	/**
@@ -4815,8 +4840,10 @@ export class AgentSession {
 			// Queue for later - will be flushed on agent_end
 			this._pendingBashMessages.push(bashMessage);
 		} else {
-			this.sessionManager.appendMessage(bashMessage);
+			const entryId = this.sessionManager.appendMessage(bashMessage);
 			this._refreshFinalizedContext();
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "message_committed", entry });
 		}
 	}
 
@@ -4847,7 +4874,9 @@ export class AgentSession {
 		if (this._pendingBashMessages.length === 0) return;
 
 		for (const bashMessage of this._pendingBashMessages) {
-			this.sessionManager.appendMessage(bashMessage);
+			const entryId = this.sessionManager.appendMessage(bashMessage);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "message_committed", entry });
 		}
 		this._pendingBashMessages = [];
 		this._refreshFinalizedContext();
@@ -5062,6 +5091,7 @@ export class AgentSession {
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
 			this._restoreToolsFromTranscript();
+			this._emit({ type: "session_tree_changed" });
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

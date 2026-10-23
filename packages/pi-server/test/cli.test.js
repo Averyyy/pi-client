@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -50,6 +50,21 @@ function makeEnvironment(root, port) {
 }
 
 describe("pi-server CLI introspection", () => {
+	it("unlocks persisted viewer authentication without binding the HTTP port", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-server-unlock-"));
+		try {
+			await withOccupiedPort((port) => {
+				const directory = join(root, "sessions", ".viewer");
+				mkdirSync(directory, { recursive: true });
+				writeFileSync(join(directory, "auth.json"), JSON.stringify({ failures: 10, generation: 0 }));
+				const result = runCli(sourcePath, ["viewer", "unlock"], { ...makeEnvironment(root, port), PI_SERVER_CONFIG: "" });
+				expect(result.status).toBe(0);
+				expect(result.stdout.trim()).toBe("Viewer unlocked");
+				expect(result.stderr).toBe("");
+				expect(JSON.parse(readFileSync(join(directory, "auth.json"), "utf8"))).toEqual({ failures: 0, generation: 1 });
+			});
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
 	it.each([
 		[wrapperPath, ["--help"]],
 		[wrapperPath, ["--version"]],

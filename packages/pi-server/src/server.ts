@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createRequire } from "node:module";
 import {
 	type CompactionCacheRequestOptions,
 	type CompactionPreparationOptions,
@@ -80,15 +79,9 @@ import {
 	setStaticContext,
 	switchSessionLeaf,
 } from "./session-store.ts";
+import { ViewerHttp } from "./viewer-http.ts";
 
 export { loadConfig, type ServerConfig } from "./config.ts";
-
-interface PackageMetadata {
-	version: string;
-}
-
-const packageMetadata = createRequire(import.meta.url)("../package.json") as PackageMetadata;
-const PI_SERVER_VERSION = packageMetadata.version;
 
 interface SessionInitBody {
 	sessionId: string;
@@ -265,14 +258,6 @@ function sendError(
 function logRequestError(req: IncomingMessage, error: unknown): void {
 	const message = error instanceof Error ? error.stack || error.message : String(error);
 	console.error(`${req.method ?? "UNKNOWN"} ${req.url ?? "/"} failed: ${message}`);
-}
-
-function authenticate(config: ServerConfig, req: IncomingMessage): boolean {
-	if (!config.authToken) return true;
-	const header = req.headers.authorization;
-	if (!header) return false;
-	const token = header.startsWith("Bearer ") ? header.slice(7) : header;
-	return token === config.authToken;
 }
 
 function sessionResponseBody(session: SessionState) {
@@ -1654,6 +1639,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 	const config = loadConfig(configOverride);
 	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(config.sessionStoreDir);
+	const viewer = new ViewerHttp(config);
 
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", "http://localhost");
@@ -1662,13 +1648,15 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 			sendJson(res, 200, { status: "ok" });
 			return;
 		}
+		if (viewer.handle(req, res, url)) return;
 
-		if (!authenticate(config, req)) {
-			const body =
-				req.method === "GET" && url.pathname === "/"
-					? { error: "Unauthorized", version: PI_SERVER_VERSION }
-					: { error: "Unauthorized" };
-			sendJson(res, 401, body);
+		const authStatus = viewer.auth.authenticate(req);
+		if (authStatus !== 200) {
+			sendJson(res, authStatus, { error: authStatus === 423 ? "Viewer locked" : "Unauthorized" });
+			return;
+		}
+		if (req.method === "GET" && url.pathname === "/api/observer/connect") {
+			viewer.connect(req, res, url.searchParams.get("sessionId"));
 			return;
 		}
 
@@ -1751,6 +1739,10 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 					sendJson(res, 200, chunkResult.ack);
 					return;
 				}
+				if (chunkResult.target === "/api/observer") {
+					viewer.observe(JSON.parse(chunkResult.bodyJson) as unknown, res);
+					return;
+				}
 				const handled = await handlePostRequest(
 					config,
 					chunkResult.target,
@@ -1777,6 +1769,10 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 		if (req.method === "POST") {
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
+				if (url.pathname === "/api/observer") {
+					viewer.observe(body, res);
+					return;
+				}
 				if (await handlePostRequest(config, url.pathname, body, res, models, streamModels)) return;
 				if (!res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
@@ -1798,6 +1794,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 			const sessionId = decodeURIComponent(url.pathname.slice("/api/session/".length));
 			deleteSessionFromStore(sessionId);
 			deletePersistedSession(config.sessionStoreDir, sessionId);
+			viewer.store.remove(sessionId);
 			await deleteStreamRunsForSession(sessionId);
 			sendJson(res, 200, { deleted: sessionId });
 			return;
@@ -1806,6 +1803,11 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 		sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
 	});
 
+	const close = server.close;
+	server.close = function (callback) {
+		viewer.close();
+		return close.call(this, callback);
+	};
 	return server;
 }
 

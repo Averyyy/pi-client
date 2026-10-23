@@ -13,7 +13,9 @@ const modulePromise =
 				process.exitCode = code;
 			})
 		: args.length > 0
-			? runSelfCommand(args)
+			? args.length === 2 && args[0] === "viewer" && args[1] === "unlock"
+				? runPiServer(args)
+				: runSelfCommand(args)
 		: runPiServer(args);
 
 Promise.resolve(modulePromise).catch((e) => {
@@ -42,6 +44,7 @@ function runSelfCommand(args) {
 
 Usage:
   pi-server
+  pi-server viewer unlock
 
 Options:
   --help, -h       Show this help

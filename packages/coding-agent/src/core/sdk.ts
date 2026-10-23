@@ -14,6 +14,7 @@ import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { type PiServerHistorySnapshot, streamPiServer } from "./pi-server-client.ts";
+import { PiServerObserver } from "./pi-server-observer.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -562,6 +563,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		autoSessionName: options.autoSessionName,
 	});
 	agentSession = session;
+	if (process.env.PI_SERVER_MODE === "true") new PiServerObserver(session);
 	session.subscribe((event) => {
 		if (event.type === "abort_start") cacheWarmer.cancel();
 	});

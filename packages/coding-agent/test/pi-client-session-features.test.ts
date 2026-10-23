@@ -55,6 +55,8 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 		const requests: Array<{ path: string; bytes: number }> = [];
 		let rejected = 0;
 		const proxy = createServer(async (request, response) => {
+			const controller = new AbortController();
+			response.once("close", () => controller.abort());
 			try {
 				const chunks: Buffer[] = [];
 				for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -67,6 +69,7 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 				}
 				const upstream = await fetch(`${backendUrl}${request.url}`, {
 					method: request.method,
+					signal: controller.signal,
 					headers: { authorization: request.headers.authorization ?? "", "content-type": "application/json" },
 					...(body.byteLength > 0 ? { body } : {}),
 				});
@@ -76,7 +79,9 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 				}
 				response.end();
 			} catch (error) {
-				response.writeHead(500).end(String(error));
+				if (controller.signal.aborted) return;
+				if (response.headersSent) response.destroy(error instanceof Error ? error : new Error(String(error)));
+				else response.writeHead(500).end(String(error));
 			}
 		});
 		servers.push(proxy);

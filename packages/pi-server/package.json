@@ -22,13 +22,15 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsc -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"build": "tsc -p tsconfig.build.json && shx chmod +x dist/cli.js && npm run build:viewer",
+		"build:viewer": "npm run check:viewer && node scripts/build-viewer.mjs",
+		"check:viewer": "tsc --noEmit -p viewer/tsconfig.json",
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@0.84.2-piclient.1",
-		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@0.84.2-piclient.1"
+		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@0.84.2-piclient.1",
+		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@0.84.2-piclient.1"
 	},
 	"keywords": [
 		"pi-server",
@@ -48,6 +50,12 @@
 	},
 	"devDependencies": {
 		"@types/node": "24.12.4",
+		"@types/react": "19.3.0",
+		"@types/react-dom": "19.3.0",
+		"esbuild": "0.28.2",
+		"marked": "18.0.11",
+		"react": "19.3.1",
+		"react-dom": "19.3.1",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
 		"vitest": "4.1.9"
