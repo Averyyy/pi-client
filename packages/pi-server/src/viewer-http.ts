@@ -123,7 +123,8 @@ export class ViewerHttp {
 			if (url.pathname !== "/") {
 				res.setHeader("Cache-Control", "private, no-cache");
 				res.setHeader("ETag", this.assetTag);
-				if (req.headers["if-none-match"] === this.assetTag) {
+				const validator = req.headers["if-none-match"];
+				if (validator === this.assetTag || validator === `W/${this.assetTag}`) {
 					res.writeHead(304);
 					res.end();
 					return true;

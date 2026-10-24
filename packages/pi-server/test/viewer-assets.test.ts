@@ -66,6 +66,9 @@ describe("viewer asset caching", () => {
 		const cached = await fetch(`${base}/viewer/assets/${name}`, { headers: { "If-None-Match": tag } });
 		expect(cached.status).toBe(304);
 		expect(await cached.text()).toBe("");
+		const compressed = await fetch(`${base}/viewer/assets/${name}`, { headers: { "If-None-Match": `W/${tag}` } });
+		expect(compressed.status).toBe(304);
+		expect(await compressed.text()).toBe("");
 		const secondVisitor = await fetch(`${base}/viewer/assets/${name}`);
 		expect(await secondVisitor.text()).toBe("asset contents");
 		expect(readFileSync).toHaveBeenCalledTimes(1);
