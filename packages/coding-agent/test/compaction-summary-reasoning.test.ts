@@ -78,7 +78,7 @@ describe("generateSummary reasoning options", () => {
 		const result = await generateSummaryWithUsage(
 			messages,
 			createModel(true),
-			2000,
+			undefined,
 			"test-key",
 			undefined,
 			undefined,
@@ -95,17 +95,18 @@ describe("generateSummary reasoning options", () => {
 			reasoning: "medium",
 			apiKey: "test-key",
 		});
+		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("maxTokens");
 	});
 
 	it("preserves the string result from generateSummary", async () => {
-		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).resolves.toBe(
+		await expect(generateSummary(messages, createModel(false), undefined, "test-key")).resolves.toBe(
 			"## Goal\nTest summary",
 		);
 	});
 
 	it("uses fresh routing sessions without prompt caching", async () => {
-		await generateSummary(messages, createModel(false), 2000, "test-key");
-		await generateSummary(messages, createModel(false), 2000, "test-key");
+		await generateSummary(messages, createModel(false), undefined, "test-key");
+		await generateSummary(messages, createModel(false), undefined, "test-key");
 
 		const requestOptions = completeSimpleMock.mock.calls.map((call) => call[2]);
 		expect(requestOptions).toHaveLength(2);
@@ -151,6 +152,28 @@ describe("generateSummary reasoning options", () => {
 		// Regression test for #9652: clear boundaries and continuation wording avoid the reasoning-extraction false positive.
 		expect(prompt).toContain("# Conversation\\n[User]: Summarize this.");
 		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
+		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("maxTokens");
+	});
+
+	it("applies custom instructions to the turn prefix summary of a split turn", async () => {
+		// Regression test for #11058
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			cachePrefixMessages: [],
+			messagesToSummarize: [],
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			previousSummary: "previous checkpoint",
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await compact(preparation, createModel(false), "test-key", undefined, "keep migration decisions");
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(JSON.stringify(requestContext.messages)).toContain("Additional focus: keep migration decisions");
 	});
 
 	it("uses an exact normalized provider prefix and preserves cache routing options", async () => {
@@ -204,6 +227,7 @@ describe("generateSummary reasoning options", () => {
 			cacheRetention: "long",
 			transport: "sse",
 		});
+		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("maxTokens");
 		expect(result.details).toMatchObject({ cachePath: { mode: "exact_prefix", reason: "provider_prefix_request" } });
 	});
 
@@ -283,7 +307,7 @@ describe("generateSummary reasoning options", () => {
 	it("rejects tool calls from conversation summaries", async () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 
-		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
+		await expect(generateSummaryWithUsage(messages, createModel(false), undefined, "test-key")).rejects.toThrow(
 			"Summarization attempted to call a tool",
 		);
 	});
@@ -313,7 +337,7 @@ describe("generateSummary reasoning options", () => {
 			content: [{ type: "text", text: "partial" }],
 		});
 
-		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
+		await expect(generateSummaryWithUsage(messages, createModel(false), undefined, "test-key")).rejects.toThrow(
 			"generation hit the token cap",
 		);
 	});
@@ -346,7 +370,7 @@ describe("generateSummary reasoning options", () => {
 			content: "oversized input ".repeat(2_000),
 			timestamp: Date.now(),
 		};
-		const model = { ...createModel(false), contextWindow: 5_000 };
+		const model = { ...createModel(false, 1_000), contextWindow: 5_000 };
 
 		await expect(generateSummaryWithUsage([oversizedMessage], model, 1_000, "test-key")).resolves.toMatchObject({
 			text: "## Goal\nTest summary",
@@ -381,7 +405,7 @@ describe("generateSummary reasoning options", () => {
 		await generateSummary(
 			messages,
 			createModel(true),
-			2000,
+			undefined,
 			"test-key",
 			undefined,
 			undefined,
@@ -401,7 +425,7 @@ describe("generateSummary reasoning options", () => {
 		await generateSummary(
 			messages,
 			createModel(false),
-			2000,
+			undefined,
 			"test-key",
 			undefined,
 			undefined,
@@ -429,7 +453,7 @@ describe("generateSummary reasoning options", () => {
 					},
 				],
 			}),
-			2000,
+			undefined,
 			"test-key",
 		);
 
@@ -438,13 +462,13 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("does not set Anthropic refusal fallback for models without allowed fallback targets", async () => {
-		await generateSummary(messages, createModel(true), 2000, "test-key");
+		await generateSummary(messages, createModel(true), undefined, "test-key");
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("refusalFallbacks");
 	});
 
-	it("clamps compaction summary maxTokens to the model output cap", async () => {
+	it("combines usage from split-turn summaries", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			cachePrefixMessages: messages,
@@ -453,10 +477,10 @@ describe("generateSummary reasoning options", () => {
 			isSplitTurn: true,
 			tokensBefore: 600000,
 			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-			settings: { enabled: true, reserveTokens: 500000, keepRecentTokens: 20000 },
+			settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
 		};
 
-		const result = await compact(preparation, createModel(false, 128000), "test-key");
+		const result = await compact(preparation, createModel(false), "test-key");
 
 		expect(result.usage).toEqual({
 			...mockSummaryResponse.usage,
@@ -465,6 +489,5 @@ describe("generateSummary reasoning options", () => {
 			totalTokens: 40,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		});
-		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
 	});
 });

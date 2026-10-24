@@ -961,11 +961,12 @@ describe("Models runtime", () => {
 		await credentials.modify("p1", async () => ({ type: "api_key", key: "stored-key" }));
 		const models = createModels({ credentials });
 		const chat = testModel("p1", "model-a");
+		const { compat: _compat, ...baseModel } = chat;
 		models.setProvider(
 			createProvider({
 				id: "p1",
 				auth: { apiKey: envKeyAuth(ambientKey) },
-				models: [chat, { ...chat, type: "image", output: ["image"] }, { ...chat, type: "classifier" }],
+				models: [chat, { ...baseModel, type: "image", output: ["image"] }, { ...baseModel, type: "classifier" }],
 				api: {
 					stream: () => new AssistantMessageEventStream(),
 					streamSimple: () => new AssistantMessageEventStream(),

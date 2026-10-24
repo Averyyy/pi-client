@@ -46,5 +46,6 @@ plans/
 .pi/pi-server/
 # Local-only deployment notes; this file contains credentials and machine details.
 /docs/pi-server-public-access.local.md
+.pi/settings.json
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md

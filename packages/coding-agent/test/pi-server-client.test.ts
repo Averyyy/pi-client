@@ -1,16 +1,30 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Message, Model } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	ClassifierModel,
+	ClientIdentity,
+	Context,
+	ImageModel,
+	Message,
+	Model,
+} from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
+import { NOOP_TELEMETRY_CONTEXT } from "@earendil-works/pi-telemetry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../../ai/src/api/anthropic-messages.ts";
 import {
+	cancelDeferredPiServer,
 	cancelPiServerOperations,
+	classifyPiServer,
 	compactPiServer,
+	fetchDeferredPiServer,
+	generateImagesPiServer,
 	hashStaticContext,
 	resetAllSessionTracking,
 	resetSessionTracking,
 	streamPiServer,
+	streamRawPiServer,
 	syncPiServerTree,
 } from "../src/core/pi-server-client.ts";
 import { hashPiServerSessionEntries } from "../src/core/pi-server-protocol.ts";
@@ -156,6 +170,104 @@ describe("pi-server-client", () => {
 		resetSessionTracking("test-session");
 		expect(true).toBe(true);
 	});
+
+	it.each(["simple", "raw", "deferred"] as const)(
+		"preserves client identity in %s stream options without serializing local callbacks or telemetry",
+		async (kind) => {
+			let streamBody: JsonObject | undefined;
+			const message = assistantMessage("ok", 1000);
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (url: string, init?: RequestInit) => {
+					const body = parseJsonObject((init?.body as string | undefined) ?? "");
+					if (url.endsWith("/api/session/init")) return Response.json({ sessionId: body.sessionId });
+					if (url.endsWith("/api/stream")) {
+						streamBody = body;
+						return makeMockResponse([{ type: "done", reason: "stop", message }]);
+					}
+					throw new Error(`Unexpected request ${url}`);
+				}),
+			);
+			const identity: ClientIdentity = { userAgent: "detailed", version: "1.4.0", attribution: null };
+			const options = {
+				identity,
+				telemetry: NOOP_TELEMETRY_CONTEXT,
+				onPayload: vi.fn(),
+				onResponse: vi.fn(),
+				onProviderStreamEvent: vi.fn(),
+			};
+			const context: Context = { messages: [] };
+			const handle = { id: "response", modelId: testModel.id, provider: testModel.provider, api: testModel.api };
+			const stream =
+				kind === "simple"
+					? await streamPiServer(testModel, context, options)
+					: kind === "raw"
+						? await streamRawPiServer(testModel, context, options)
+						: await fetchDeferredPiServer(testModel, handle, { ...options, wait: 42 });
+			expect(await stream.result()).toEqual(message);
+			expect(streamBody).toMatchObject({
+				options: { identity },
+				callbacks: { onPayload: true, onResponse: true },
+			});
+			const serialized = streamBody?.options;
+			expect(serialized).not.toHaveProperty("telemetry");
+			expect(serialized).not.toHaveProperty("signal");
+			expect(serialized).not.toHaveProperty("onPayload");
+			expect(serialized).not.toHaveProperty("onResponse");
+			expect(serialized).not.toHaveProperty("onProviderStreamEvent");
+			if (kind === "deferred") expect(serialized).toHaveProperty("wait", 42);
+		},
+	);
+
+	it.each(["images", "classifier", "cancel-deferred"] as const)(
+		"preserves client identity in %s operation options without serializing local callbacks or telemetry",
+		async (kind) => {
+			let operationBody: JsonObject | undefined;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (_url: string, init?: RequestInit) => {
+					operationBody = parseJsonObject((init?.body as string | undefined) ?? "");
+					return makeCompactEventStreamResponse({ cancelled: true, stopReason: "stop" });
+				}),
+			);
+			const identity: ClientIdentity = { userAgent: "detailed", version: "1.4.0", attribution: null };
+			const options = {
+				identity,
+				telemetry: NOOP_TELEMETRY_CONTEXT,
+				onPayload: vi.fn(),
+				onResponse: vi.fn(),
+			};
+			const { compat: _compat, ...baseModel } = testModel;
+			if (kind === "images") {
+				const model: ImageModel<"openrouter-images"> = {
+					...baseModel,
+					type: "image",
+					api: "openrouter-images",
+					output: ["image"],
+				};
+				await generateImagesPiServer(model, { input: [{ type: "text", text: "circle" }] }, options);
+			} else if (kind === "classifier") {
+				const model: ClassifierModel<"typesafe-system-one"> = {
+					...baseModel,
+					type: "classifier",
+					api: "typesafe-system-one",
+				};
+				await classifyPiServer(model, { state: {}, questions: {} }, options);
+			} else {
+				const handle = { id: "response", modelId: testModel.id, provider: testModel.provider, api: testModel.api };
+				await cancelDeferredPiServer(testModel, handle, options);
+			}
+			expect(operationBody).toMatchObject({
+				options: { identity },
+				callbacks: { onPayload: true, onResponse: true },
+			});
+			const serialized = operationBody?.options;
+			expect(serialized).not.toHaveProperty("telemetry");
+			expect(serialized).not.toHaveProperty("signal");
+			expect(serialized).not.toHaveProperty("onPayload");
+			expect(serialized).not.toHaveProperty("onResponse");
+		},
+	);
 
 	it("preserves the authoritative toolCall namespace on toolcall_end", async () => {
 		const entries = baseTree().slice(0, 1);

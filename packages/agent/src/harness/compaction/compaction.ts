@@ -17,7 +17,7 @@ import {
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
-import { BACKGROUND_CONTEXT, type Context, getTelemetryContext, withAbortSignal } from "../context.ts";
+import { BACKGROUND_CONTEXT, type Context, withAbortSignal } from "../context.ts";
 import {
 	buildLegacySessionProjection,
 	type LegacyCompactionEntry,
@@ -168,7 +168,7 @@ export function createSummaryRequestOptions(
 	return {
 		...options,
 		signal: context.abortSignal,
-		telemetryContext: getTelemetryContext(context),
+		telemetry: context.telemetry,
 		...(!preservePromptCache ? { cacheRetention: "none" as const } : {}),
 		sessionId: preservePromptCache ? options.sessionId : (options.sessionId ?? uuidv7()),
 	};

@@ -944,6 +944,7 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 		sessionId: options?.sessionId,
 		apiKey: options?.apiKey,
 		headers: options?.headers,
+		identity: options?.identity,
 		metadata: options?.metadata,
 		transport: options?.transport,
 		thinkingBudgets: options?.thinkingBudgets,
@@ -1526,7 +1527,7 @@ function serializeApiOptions(options: StreamOptions): ProviderStreamOptions {
 		onPayload: _onPayload,
 		onResponse: _onResponse,
 		onProviderStreamEvent: _onProviderStreamEvent,
-		telemetryContext: _telemetryContext,
+		telemetry: _telemetry,
 		...serialized
 	} = options;
 	return serialized;
@@ -1558,6 +1559,7 @@ export async function generateImagesPiServer(
 				apiKey: options?.apiKey,
 				env: options?.env,
 				headers: options?.headers,
+				identity: options?.identity,
 				metadata: options?.metadata,
 				timeoutMs: options?.timeoutMs,
 				maxRetries: options?.maxRetries,
@@ -1584,6 +1586,7 @@ export async function classifyPiServer(
 				apiKey: options?.apiKey,
 				env: options?.env,
 				headers: options?.headers,
+				identity: options?.identity,
 				temperature: options?.temperature,
 				timeoutMs: options?.timeoutMs,
 				maxRetries: options?.maxRetries,

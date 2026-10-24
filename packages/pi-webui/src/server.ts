@@ -130,7 +130,7 @@ async function proxyPiRequest(req: IncomingMessage, res: ServerResponse, url: UR
 	const upstream = await fetch(targetUrl, {
 		method: req.method,
 		headers,
-		body,
+		body: body === undefined ? undefined : new Uint8Array(body),
 	});
 
 	res.writeHead(upstream.status, copyProxyResponseHeaders(upstream.headers));

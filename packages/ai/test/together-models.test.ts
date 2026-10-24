@@ -72,11 +72,6 @@ describe("Together models", () => {
 			thinkingFormat: "together",
 		});
 		expect(getSupportedThinkingLevels(deepSeekV4)).toEqual(["off", "high"]);
-
-		const minimax = getModel("together", "MiniMaxAI/MiniMax-M3");
-		expect(minimax.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: null });
-		expect(minimax.compat?.thinkingFormat).toBe("together");
-		expect(minimax.compat?.supportsReasoningEffort).toBe(false);
 	});
 
 	it.each([undefined, "minimal", "low", "medium", "high", "xhigh", "max"] as const)(

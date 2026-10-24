@@ -617,7 +617,6 @@ export function getSummarizationFailure(response: AssistantMessage, label: strin
 
 function createSummarizationOptions(
 	model: Model<any>,
-	maxTokens: number,
 	apiKey: string | undefined,
 	headers: Record<string, string> | undefined,
 	env: Record<string, string> | undefined,
@@ -625,15 +624,11 @@ function createSummarizationOptions(
 	thinkingLevel: ThinkingLevel | undefined,
 	sessionId: string | undefined,
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
+	const options: SimpleStreamOptions = { signal, apiKey, headers, env, sessionId };
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
 	return options;
-}
-
-function getSummaryMaxTokens(model: Model<any>, reserveTokens: number): number {
-	return Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
 }
 
 function estimateTextTokens(text: string): number {
@@ -648,15 +643,10 @@ function buildSummaryPrompt(conversationText: string, basePrompt: string, previo
 	return `${promptText}# Instructions\n${basePrompt}`;
 }
 
-function getSummaryInputBudget(
-	model: Model<any>,
-	maxTokens: number,
-	basePrompt: string,
-	previousSummary: string | undefined,
-): number {
+function getSummaryInputBudget(model: Model<any>, basePrompt: string, previousSummary: string | undefined): number {
 	if (model.contextWindow <= 0) return Number.POSITIVE_INFINITY;
 	const overheadTokens = estimateTextTokens(buildSummaryPrompt("", basePrompt, previousSummary));
-	return Math.max(1, Math.floor(model.contextWindow - maxTokens - overheadTokens));
+	return Math.max(1, Math.floor(model.contextWindow - Math.max(0, model.maxTokens) - overheadTokens));
 }
 
 function toSummarySegments(messages: AgentMessage[]): string[] {
@@ -722,7 +712,6 @@ export async function completeSummarization(
 async function summarizeCachePrefix(
 	cachePrefix: TranscriptContext,
 	model: Model<any>,
-	maxTokens: number,
 	apiKey: string | undefined,
 	headers: Record<string, string> | undefined,
 	env: Record<string, string> | undefined,
@@ -751,16 +740,7 @@ async function summarizeCachePrefix(
 		],
 	});
 	const options = {
-		...createSummarizationOptions(
-			model,
-			maxTokens,
-			apiKey,
-			headers,
-			env,
-			signal,
-			thinkingLevel,
-			cacheOptions.sessionId,
-		),
+		...createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, cacheOptions.sessionId),
 		...cacheOptions,
 	};
 	const response = await completeSummarization(model, context, options, streamFn, retry, callbacks, true);
@@ -779,7 +759,6 @@ async function summarizeCachePrefix(
 async function summarizeChunk(
 	conversationText: string,
 	model: Model<any>,
-	maxTokens: number,
 	apiKey: string | undefined,
 	headers: Record<string, string> | undefined,
 	env: Record<string, string> | undefined,
@@ -798,7 +777,7 @@ async function summarizeChunk(
 	const response = await completeSummarization(
 		model,
 		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,
 		callbacks,
@@ -809,7 +788,6 @@ async function summarizeChunk(
 		const leftSummary = await summarizeChunk(
 			conversationText.slice(0, middle),
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
@@ -826,7 +804,6 @@ async function summarizeChunk(
 		const rightSummary = await summarizeChunk(
 			conversationText.slice(middle),
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
@@ -860,7 +837,6 @@ async function summarizeChunk(
 export async function summarizeMessages(
 	messages: AgentMessage[],
 	model: Model<any>,
-	maxTokens: number,
 	apiKey: string | undefined,
 	headers: Record<string, string> | undefined,
 	env: Record<string, string> | undefined,
@@ -879,7 +855,6 @@ export async function summarizeMessages(
 		return summarizeChunk(
 			"",
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
@@ -898,11 +873,10 @@ export async function summarizeMessages(
 	let summaryUsage: Usage | undefined;
 	while (remaining.length > 0) {
 		const basePrompt = summary ? updatePrompt : initialPrompt;
-		const next = takeSummaryChunk(remaining, getSummaryInputBudget(model, maxTokens, basePrompt, summary));
+		const next = takeSummaryChunk(remaining, getSummaryInputBudget(model, basePrompt, summary));
 		const chunkSummary = await summarizeChunk(
 			next.chunk,
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
@@ -931,7 +905,8 @@ export async function summarizeMessages(
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	// Unused. Kept for existing callers; summaries use the model's output limit (#9512).
+	_reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -948,7 +923,7 @@ export async function generateSummary(
 		await generateSummaryWithUsage(
 			currentMessages,
 			model,
-			reserveTokens,
+			_reserveTokens,
 			apiKey,
 			headers,
 			signal,
@@ -981,7 +956,8 @@ function buildSummarizationContext(promptText: string): TranscriptContext {
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	// Unused. Kept for existing callers; summaries use the model's output limit (#9512).
+	_reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -994,8 +970,6 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = getSummaryMaxTokens(model, reserveTokens);
-
 	let initialPrompt = SUMMARIZATION_PROMPT;
 	let updatePrompt = UPDATE_SUMMARIZATION_PROMPT;
 	if (customInstructions) {
@@ -1006,7 +980,6 @@ export async function generateSummaryWithUsage(
 	return summarizeMessages(
 		currentMessages,
 		model,
-		maxTokens,
 		apiKey,
 		headers,
 		env,
@@ -1275,7 +1248,6 @@ export async function compact(
 		tokensBefore,
 		previousSummary,
 		fileOps,
-		settings,
 	} = preparation;
 
 	// Generate summaries and merge into one
@@ -1293,7 +1265,7 @@ export async function compact(
 			const historyResult = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				undefined,
 				apiKey,
 				headers,
 				signal,
@@ -1312,7 +1284,6 @@ export async function compact(
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
-			settings.reserveTokens,
 			apiKey,
 			headers,
 			env,
@@ -1322,6 +1293,7 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			customInstructions,
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -1336,7 +1308,6 @@ export async function compact(
 			prefixResult = await summarizeCachePrefix(
 				cachePrefixContext,
 				model,
-				getSummaryMaxTokens(model, settings.reserveTokens),
 				apiKey,
 				headers,
 				env,
@@ -1362,7 +1333,7 @@ export async function compact(
 			const result = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				undefined,
 				apiKey,
 				headers,
 				signal,
@@ -1406,7 +1377,6 @@ export async function compact(
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	env?: Record<string, string>,
@@ -1416,25 +1386,26 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	customInstructions?: string,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
-
+	let initialPrompt = TURN_PREFIX_SUMMARIZATION_PROMPT;
+	let updatePrompt = UPDATE_TURN_PREFIX_SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		initialPrompt = `${initialPrompt}\n\nAdditional focus: ${customInstructions}`;
+		updatePrompt = `${updatePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
 	try {
 		return await summarizeMessages(
 			messages,
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
 			signal,
 			thinkingLevel,
 			streamFn,
-			TURN_PREFIX_SUMMARIZATION_PROMPT,
-			UPDATE_TURN_PREFIX_SUMMARIZATION_PROMPT,
+			initialPrompt,
+			updatePrompt,
 			undefined,
 			retry,
 			callbacks,

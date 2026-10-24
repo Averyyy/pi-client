@@ -394,7 +394,7 @@ describe("pi-server observer", () => {
 				{ type: "text", text: "completed despite observer failure" },
 			]),
 		);
-		expect(diagnostic).toHaveBeenLastCalledWith("pi-server observer connected");
+		await vi.waitFor(() => expect(diagnostic).toHaveBeenLastCalledWith("pi-server observer connected"));
 	});
 
 	it("keeps cancellation running until tool cleanup finishes", async () => {

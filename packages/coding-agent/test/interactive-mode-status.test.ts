@@ -234,6 +234,15 @@ describe("InteractiveMode.showExtensionCustom", () => {
 		initTheme("dark");
 	});
 
+	// Inline custom components go through the extension dialog stack.
+	const extensionDialogState = () => ({
+		extensionDialogs: [],
+		programStatus: { setBlocked: vi.fn() },
+		pushExtensionDialog: (InteractiveMode as any).prototype.pushExtensionDialog,
+		removeExtensionDialog: (InteractiveMode as any).prototype.removeExtensionDialog,
+		showTopExtensionDialog: (InteractiveMode as any).prototype.showTopExtensionDialog,
+	});
+
 	test("overlay custom UI reclaims input after non-overlay custom UI closes", async () => {
 		const terminal = new VirtualTerminal(80, 24);
 		const ui: TUI = new TuiMainScreen(terminal);
@@ -254,6 +263,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			keybindings: {},
 			ui,
 			disposeActiveSelector: vi.fn(),
+			...extensionDialogState(),
 		};
 		const showExtensionCustom = <T>(
 			factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
@@ -326,6 +336,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 				keybindings: {},
 				ui,
 				disposeActiveSelector: vi.fn(),
+				...extensionDialogState(),
 			};
 			const showExtensionCustom = <T>(
 				factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
@@ -1244,6 +1255,20 @@ describe("InteractiveMode.showLoadedResources", () => {
     /tmp/agent/extensions/user-index
   path
     /tmp/temp/cli-extension.ts"`);
+	});
+
+	test.each(["/", "\\"])("shortens home paths with %s separators without matching sibling prefixes", (separator) => {
+		const home = homedir().replace(/[\\/]/g, separator);
+		const formatDisplayPath = (
+			InteractiveMode as unknown as {
+				prototype: { formatDisplayPath(path: string): string };
+			}
+		).prototype.formatDisplayPath;
+		expect(formatDisplayPath(`${home}${separator}.pi${separator}agent${separator}AGENTS.md`)).toBe(
+			"~/.pi/agent/AGENTS.md",
+		);
+		const siblingPath = `${home}-other${separator}AGENTS.md`;
+		expect(formatDisplayPath(siblingPath)).toBe(siblingPath);
 	});
 
 	test("shows context paths relative to cwd while preserving full external paths", () => {

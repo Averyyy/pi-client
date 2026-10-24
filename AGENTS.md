@@ -26,7 +26,7 @@
 - Always ask before removing functionality or code that appears intentional.
 - Do not preserve backward compatibility unless the user asks for it.
 - Never hardcode key checks (e.g. `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
-- Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes.
+- Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes. The generated model data in `packages/ai/src/providers/data/` is gitignored: never stage it, and don't look for it in git history.
 
 ## Agent Core Tool Scheduling
 
@@ -51,6 +51,7 @@
 - Omit SDK-internal provider callbacks from remote requests only by their exact function identity and absence of the corresponding extension handler. Preserve explicit caller callbacks and registered handlers; ordinary requests must not round-trip unused payloads or native stream events.
 - Manage cache warming in the shared SDK session-request path for local and remote transport. Replays retain the original prefix, route, session ID, and cache options; real and warm requests must share resolved auth base URL, environment, and model/auth/caller header precedence. Only usage entries are persisted, and session cancellation must also abort warming.
 - Remote warming must use the authenticated stream's server-resolved cache-retention enum, including run recovery/replay. Client process defaults cannot represent server defaults. Resolve authentication once, report only the non-sensitive enum, and use it for both the provider call and its warm replay.
+- Preserve JSON-safe `ClientIdentity` options through chat, compaction, image, classifier, and deferred pi-server requests. Keep process-local telemetry spans and executable callbacks out of serialized request options.
 - When adapting the compatibility stream registry through Models, preserve its exact registered API identity. A matching builtin provider owns auth resolution and dispatch; registered overrides and custom providers retain their configured API path. Do not resolve builtin auth twice or reduce it to API-key lookup, which drops bearer and federation credentials.
 - Before automatic compaction synchronizes the tree or captures its revision, cancel warming and await remote cancellation acknowledgement. An inactive status can still have an in-flight stale-prefix request. Unconfirmed cleanup must enter the existing terminal cancellation state, preserving queued intent until an explicit abort retry.
 - Queue selection is provisional until `message_end` commits the message. Restore uncommitted selections to their original steering/follow-up queues after preparation failure, before settlement observes pending intent; preserve source order and invalidate selections when that queue is explicitly cleared.
@@ -107,6 +108,7 @@
 - Cache rolling tree hashes/prefix hashes in server session state. Append should update the hash from new entries, and leaf switches must not recompute the tree hash.
 - Reconstruct long parent chains with append plus one reverse, not repeated array prepends. Retain branch order and cycle detection, and compare raw benchmark samples before keeping performance changes.
 - Compact summarization must handle histories larger than the active summarizer model window by chunking summary input and recursively splitting only context-overflow chunks, including a single oversized serialized message/tool result; if one chunk still overflows, surface the provider error instead of hiding it.
+- Summary requests use the model's output limit; reserve that limit when planning input chunks. `compaction.reserveTokens` controls the compaction threshold rather than imposing an output cap on exact-prefix, chunked, branch, or turn-prefix summaries.
 - A cache-preserving compaction request must use the authoritative provider-message prefix ending at the current cut point; repeat compaction includes the existing summary and its retained tail, while the new retained suffix stays out of the summary request. Keep system/tools, model route, session ID, and cache options identical, record why the prefix path was skipped or overflowed, and enter the existing chunker only after explicit provider context overflow. Rebuild cache prefixes from the session projection instead of persisting duplicate prefixes in structural WAL state.
 - Server-side compaction over Cloudflare must use a streaming response with heartbeat bytes; a plain long JSON response can hit Cloudflare 524 before compaction finishes.
 - Intra-turn tool-loop compaction must run before the next provider request from `prepareNextTurn`. When compacting a huge latest tool result, insert a hidden keep marker and force compaction to that marker so the next request carries the compaction summary plus marker, not the oversized tool-result tail.
@@ -177,6 +179,7 @@
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
 - When coding-agent tests spawn source CLI entrypoints under Node 26, preload `src/experimental/source-resolver.ts` so workspace packages resolve through the repo TS path mappings. Pass the resolver through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
 - Test debounce logic with direct scheduler calls and fake timers; keep real `fs.watch` tests for watcher wiring only, because OS watcher delivery is flaky under the full suite.
+- HTTP proxy tests that interrupt or delay inference SSE must match both the `/api/stream` target and its event-stream response, including chunk-envelope targets. Observer presence also uses SSE, and intermediate chunk acknowledgements are JSON.
 - Keep automatic session naming disabled in general faux-session harnesses; enable it only in tests that explicitly cover the extra first-turn provider request.
 - When regression tests fix a GitHub issue, add a comment with the GitHub issue number next to the test.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
@@ -307,6 +310,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 - Keep `packages/pi-client/package.json` `piClient.basePiVersion` and `basePiCommit` aligned with the merged formal release tag, and run the client wrapper's update tests.
 - Remote CLI model selection must stay within the pi-server catalog; shared model-reference resolution must not synthesize custom IDs in `PI_SERVER_MODE`.
 - The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
+- Provider telemetry requests accept the active span from `Context.telemetry`. Harness span factories derive native Chord `withTelemetry()` contexts; explicit root-parent values seed the outer span.
 - Builtin provider factories and the compatibility registry must use lazy API factories so model listing does not load provider SDKs. Runtime loaders need both a Node bundle entry and Bun static registration.
 - When upstream adds a classifier API, register it in pi-server's `CLASSIFIER_APIS` as well as builtin provider dispatch. Cover a custom provider ID in remote tests so builtin dispatch cannot mask a missing API registration.
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
@@ -316,6 +320,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 - Real Unix-domain socket integration tests must use an explicit non-Windows `runIf` guard, matching `packages/client`; keep option-validation and transport-neutral tests enabled on Windows.
 - Keep home-shortened image fallback text in the documented `~/...` form on every platform; OSC 8 `file://` links must still target the original absolute path.
 - Normalize both Windows and POSIX separators before comparing resource paths with the home directory; render matched paths in the documented `~/...` form and do not shorten sibling prefixes.
+- Resolve positive resource paths and tilde glob/exact overrides with the same home resolver, including explicit `HOME` settings on Windows.
 - On Windows with WSL or Git Bash, harness file names must split both path separators, and cwd tests should use a marker file instead of asserting shell `$PWD`, which may be translated to a POSIX path.
 - If hydration removes a retired direct-OpenAI model used only by API-key-gated e2e tests, update those tests to an explicit current catalog model; do not restore a removed stale-model fallback.
 - If hydration removes a catalog model used by provider unit tests, use a current catalog model for positive cases and an explicit compat fixture for negative behavior; do not let missing-model `undefined` accidentally satisfy the assertion.

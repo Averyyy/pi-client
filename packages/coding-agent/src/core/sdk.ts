@@ -1,12 +1,14 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
+import { getOpenCodeSessionHeaders } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
+import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { createToolNameMatcher } from "./mcp-servers.ts";
@@ -15,7 +17,6 @@ import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { type PiServerHistorySnapshot, streamPiServer } from "./pi-server-client.ts";
 import { PiServerObserver } from "./pi-server-observer.ts";
-import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
@@ -352,10 +353,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
-	const buildRequestOptions = (
-		requestModel: Model<any>,
-		options: ModelsSimpleStreamOptions = {},
-	): ModelsSimpleStreamOptions => {
+	const buildRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
@@ -384,17 +382,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-			transformHeaders: async (requestHeaders) => {
-				const headers = mergeProviderAttributionHeaders(
-					requestModel,
-					settingsManager,
-					options.sessionId,
-					requestHeaders,
-				);
-				return headerRunner?.hasHandlers("before_provider_headers")
-					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-					: (headers ?? {});
-			},
+			// Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+			identity: getClientIdentity(settingsManager),
+			transformHeaders: async (headers) =>
+				headerRunner?.hasHandlers("before_provider_headers")
+					? headerRunner.emitBeforeProviderHeaders(headers)
+					: headers,
 		};
 	};
 	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
@@ -460,7 +453,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				: undefined;
 			const requestModel = auth?.auth.baseUrl ? { ...model, baseUrl: auth.auth.baseUrl } : model;
 			const requestOptions = buildRequestOptions(
-				requestModel,
 				remote
 					? {
 							...options,
@@ -479,14 +471,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheIsCurrent);
 			}
 			if (remote) {
-				let headers = mergeProviderAttributionHeaders(
-					requestModel,
-					settingsManager,
-					options?.sessionId,
-					model.headers,
-					auth?.auth.headers,
-					options?.headers,
-				);
+				let headers = {
+					...getOpenCodeSessionHeaders(requestModel, options?.sessionId),
+					...model.headers,
+					...auth?.auth.headers,
+					...options?.headers,
+				};
 				if (headerRunner?.hasHandlers("before_provider_headers")) {
 					headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
 				}

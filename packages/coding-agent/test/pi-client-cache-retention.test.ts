@@ -247,6 +247,8 @@ server.listen(0,"127.0.0.1");await once(server,"listening");process.send({kind:"
 			for await (const chunk of request) chunks.push(Buffer.from(chunk));
 			const body = Buffer.concat(chunks);
 			const path = request.url ?? "/";
+			const target =
+				path === "/api/request/chunk" ? (JSON.parse(body.toString("utf8")) as { target: string }).target : path;
 			requests.push({ path, bytes: body.length });
 			if (body.length > 65536) {
 				rejected++;
@@ -263,7 +265,11 @@ server.listen(0,"127.0.0.1");await once(server,"listening");process.send({kind:"
 				response.writeHead(upstream.status, { "content-type": contentType });
 				response.flushHeaders();
 				const reply: Buffer[] = [];
-				const interrupt = options.disconnect && !disconnected && contentType.includes("text/event-stream");
+				const interrupt =
+					options.disconnect &&
+					!disconnected &&
+					target === "/api/stream" &&
+					contentType.includes("text/event-stream");
 				if (interrupt) disconnected = true;
 				if (upstream.body)
 					for await (const chunk of upstream.body) {

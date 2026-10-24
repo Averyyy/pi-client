@@ -270,8 +270,8 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 				res.end();
 			} catch (error) {
 				if (!res.destroyed) {
-					res.writeHead(502);
-					res.end(String(error));
+					if (res.headersSent) res.destroy(error instanceof Error ? error : new Error(String(error)));
+					else res.writeHead(502).end(String(error));
 				}
 			}
 		});

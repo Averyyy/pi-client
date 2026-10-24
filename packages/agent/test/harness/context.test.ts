@@ -3,6 +3,7 @@ import {
 	BACKGROUND_CONTEXT,
 	getTelemetryContext,
 	TODO_CONTEXT,
+	withTelemetry,
 	withTelemetryContext,
 } from "../../src/harness/context.ts";
 import { InMemoryTelemetryContext, NOOP_TELEMETRY_CONTEXT } from "../../src/index.ts";
@@ -22,6 +23,19 @@ describe("harness Context telemetry", () => {
 			await getTelemetryContext(childContext).startSpan({ name: "child" }, () => undefined);
 		});
 
+		const spans = telemetry.getSpans();
+		expect(spans.map((span) => span.name)).toEqual(["parent", "child"]);
+		expect(spans[1]?.parentId).toBe(spans[0]?.id);
+	});
+
+	it("uses the active native span before an attached root parent", async () => {
+		const telemetry = new InMemoryTelemetryContext();
+		const context = withTelemetryContext(telemetry, BACKGROUND_CONTEXT);
+		await telemetry.startSpan({ name: "parent" }, async (span) => {
+			const childContext = withTelemetry(span, context);
+			expect(getTelemetryContext(childContext)).toBe(span);
+			await getTelemetryContext(childContext).startSpan({ name: "child" }, () => undefined);
+		});
 		const spans = telemetry.getSpans();
 		expect(spans.map((span) => span.name)).toEqual(["parent", "child"]);
 		expect(spans[1]?.parentId).toBe(spans[0]?.id);

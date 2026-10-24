@@ -4,8 +4,8 @@
 	"description": "Lightweight CLI wrapper that connects to a pi-server instance",
 	"type": "module",
 	"piClient": {
-		"basePiVersion": "1.3.0",
-		"basePiCommit": "71023aec1546d6d677a65669c5665c0927ce0dd0"
+		"basePiVersion": "1.4.0",
+		"basePiCommit": "4a080252f06caf63a525d7873c5d94d3c23887e0"
 	},
 	"bin": {
 		"pi-client": "bin/pi-client.js"

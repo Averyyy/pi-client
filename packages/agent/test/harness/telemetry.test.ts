@@ -1,9 +1,16 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { createTypedSpanStarter, NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@earendil-works/pi-telemetry";
+import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import {
+	createTypedSpanStarter,
+	InMemoryTelemetryContext,
+	NOOP_TELEMETRY_CONTEXT,
+	type TelemetryContext,
+} from "@earendil-works/pi-telemetry";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { renderAgentTelemetrySchemaMarkdown } from "../../scripts/generate-telemetry-docs.ts";
-import { BACKGROUND_CONTEXT, withTelemetryContext } from "../../src/harness/context.ts";
+import { createSummaryRequestOptions } from "../../src/harness/compaction/compaction.ts";
+import { BACKGROUND_CONTEXT, type Context, withTelemetry, withTelemetryContext } from "../../src/harness/context.ts";
 import {
 	AGENT_TELEMETRY_SCHEMAS,
 	AI_TELEMETRY_SCHEMA,
@@ -17,6 +24,62 @@ import {
 } from "../../src/harness/telemetry.ts";
 
 describe("agent telemetry schemas", () => {
+	it.each([false, true])("records direct summary requests with native parent enabled=%s", async (activeParent) => {
+		const telemetry = new InMemoryTelemetryContext();
+		const faux = fauxProvider();
+		faux.setResponses([fauxAssistantMessage("summary")]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const context = withTelemetryContext(telemetry, BACKGROUND_CONTEXT);
+		const request = async (requestContext: Context) => {
+			const options = createSummaryRequestOptions({}, requestContext);
+			expect(options.telemetry?.metrics).toBe(telemetry.metrics);
+			expect(options.telemetry?.propagation).toBe(telemetry.propagation);
+			await models.completeSimple(faux.getModel(), { messages: [] }, options);
+		};
+		if (activeParent) {
+			await telemetry.startSpan({ name: "parent" }, (span) => request(withTelemetry(span, context)));
+		} else {
+			await request(context);
+		}
+		const spans = telemetry.getSpans();
+		expect(spans.map((span) => span.name)).toEqual(activeParent ? ["parent", "pi.ai.request"] : ["pi.ai.request"]);
+		expect(spans.at(-1)?.parentId).toBe(activeParent ? spans[0]?.id : null);
+		await expect.poll(() => telemetry.getSpans().every((span) => span.settled)).toBe(true);
+	});
+
+	it("preserves harness and AI span parents in provider request options", async () => {
+		const telemetry = new InMemoryTelemetryContext();
+		await startHarnessSpan(
+			"pi.harness.checkpoint",
+			{ "pi.lane.name": "main", "pi.operation.id": "operation", "pi.checkpoint.kind": "normal" },
+			async (checkpoint, context) => {
+				expect(context.telemetry).toBe(checkpoint);
+				await startAiSpan(
+					"pi.ai.request",
+					{
+						"pi.ai.operation": "stream",
+						"pi.ai.provider": "provider",
+						"pi.ai.model": "model",
+						"pi.ai.api": "api",
+						"pi.ai.streaming": true,
+					},
+					async (request, requestContext) => {
+						const options = createSummaryRequestOptions({}, requestContext);
+						expect(options.telemetry).toBe(request);
+						await requestContext.telemetry.startSpan({ name: "provider" }, () => undefined);
+					},
+					context,
+				);
+			},
+			withTelemetryContext(telemetry, BACKGROUND_CONTEXT),
+		);
+		const spans = telemetry.getSpans();
+		expect(spans.map((span) => span.name)).toEqual(["pi.harness.checkpoint", "pi.ai.request", "provider"]);
+		expect(spans[1]?.parentId).toBe(spans[0]?.id);
+		expect(spans[2]?.parentId).toBe(spans[1]?.id);
+	});
+
 	it("serializes both schemas and generates the checked-in reference", () => {
 		expect(() => JSON.stringify(AI_TELEMETRY_SCHEMA)).not.toThrow();
 		expect(() => JSON.stringify(HARNESS_TELEMETRY_SCHEMA)).not.toThrow();

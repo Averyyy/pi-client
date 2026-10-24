@@ -11,7 +11,7 @@ import type { BranchPreparation, BranchSummaryResult } from "../../compaction/br
 import { generateBranchSummaryWithRequest } from "../../compaction/branch-summarization.ts";
 import type { CompactionPreparation, CompactResult, SummaryRequest } from "../../compaction/compaction.ts";
 import { compactWithRequest, prepareCompaction, shouldCompact } from "../../compaction/compaction.ts";
-import { type Context, getTelemetryContext, withAbortSignal } from "../../context.ts";
+import { type Context, withAbortSignal } from "../../context.ts";
 import { AbortRequested } from "../../execution/effect-gate.ts";
 import { applyStreamOptionsPatch } from "../../hooks.ts";
 import { insertEntry, insertUsage } from "../../session/commit.ts";
@@ -788,7 +788,7 @@ function requestStreamOptions(
 		cacheRetention: "none",
 		deferred: false,
 		signal: context.abortSignal,
-		telemetryContext: getTelemetryContext(context),
+		telemetry: context.telemetry,
 		onPayload,
 	};
 }

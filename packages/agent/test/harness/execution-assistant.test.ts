@@ -2,17 +2,17 @@ import {
 	type Api,
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	createModels,
 	fauxAssistantMessage,
 	fauxProvider,
 	type Message,
 	type Model,
-	normalizeContext,
 	type SimpleStreamOptions,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
-import { NOOP_TELEMETRY_CONTEXT } from "@earendil-works/pi-telemetry";
+import { InMemoryTelemetryContext, NOOP_TELEMETRY_CONTEXT } from "@earendil-works/pi-telemetry";
 import { describe, expect, it } from "vitest";
-import { BACKGROUND_CONTEXT, withAbortSignal } from "../../src/harness/context.ts";
+import { BACKGROUND_CONTEXT, withAbortSignal, withTelemetryContext } from "../../src/harness/context.ts";
 import { type AssistantResponseMetadata, streamHarnessAssistant } from "../../src/harness/execution/assistant.ts";
 import { AbortRequested } from "../../src/harness/execution/effect-gate.ts";
 import type { AgentMessage } from "../../src/types.ts";
@@ -183,7 +183,7 @@ describe("streamHarnessAssistant", () => {
 			deferred: { window: "1h" },
 			reasoning: "high",
 			signal: controller.signal,
-			telemetryContext: NOOP_TELEMETRY_CONTEXT,
+			telemetry: NOOP_TELEMETRY_CONTEXT,
 		});
 		expect(responseMetadata).toEqual({ status: 201, headers: { "request-id": "r1" } });
 		expect(starts).toHaveLength(1);
@@ -207,6 +207,9 @@ describe("streamHarnessAssistant", () => {
 	it("runs against the faux provider request boundary", async () => {
 		const faux = fauxProvider({ tokenSize: { min: 1, max: 1 } });
 		faux.setResponses([fauxAssistantMessage("hello")]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const telemetry = new InMemoryTelemetryContext();
 		const lifecycle: string[] = [];
 		let seenContext: Message[] = [];
 
@@ -220,7 +223,7 @@ describe("streamHarnessAssistant", () => {
 				toProviderMessages,
 				request: (context, options) => {
 					seenContext = context.messages;
-					return faux.provider.streamSimple(faux.getModel(), normalizeContext(context), options);
+					return models.streamSimple(faux.getModel(), context, options);
 				},
 				observer: {
 					start() {
@@ -234,7 +237,7 @@ describe("streamHarnessAssistant", () => {
 					},
 				},
 			},
-			BACKGROUND_CONTEXT,
+			withTelemetryContext(telemetry, BACKGROUND_CONTEXT),
 		);
 
 		expect(seenContext).toEqual([user("prompt")]);
@@ -242,6 +245,9 @@ describe("streamHarnessAssistant", () => {
 		expect(lifecycle[0]).toBe("start");
 		expect(lifecycle.at(-1)).toBe("end");
 		expect(lifecycle.filter((event) => event === "update").length).toBeGreaterThan(0);
+		await expect
+			.poll(() => telemetry.getSpans())
+			.toMatchObject([{ name: "pi.ai.request", parentId: null, settled: true }]);
 	});
 
 	it("rejects a successful terminal event before start", async () => {

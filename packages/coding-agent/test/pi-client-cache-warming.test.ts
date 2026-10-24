@@ -208,6 +208,10 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			const chunks: Buffer[] = [];
 			for await (const chunk of request) chunks.push(Buffer.from(chunk));
 			const body = Buffer.concat(chunks);
+			const target =
+				request.url === "/api/request/chunk"
+					? (JSON.parse(body.toString("utf8")) as { target: string }).target
+					: request.url;
 			requests.push({ path: request.url ?? "/", bytes: body.length });
 			if (body.length > 65536) {
 				rejected++;
@@ -236,7 +240,11 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 					signal: controller.signal,
 				});
 				response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "" });
-				if (holdMetadata && upstream.headers.get("content-type")?.startsWith("text/event-stream")) {
+				if (
+					holdMetadata &&
+					target === "/api/stream" &&
+					upstream.headers.get("content-type")?.startsWith("text/event-stream")
+				) {
 					holdMetadata = false;
 					metadataEntered = true;
 					await metadataGate;

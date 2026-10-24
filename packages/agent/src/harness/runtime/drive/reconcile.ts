@@ -1,6 +1,5 @@
 import type { DeferredHandle } from "@earendil-works/pi-ai";
 import type { HarnessEvent } from "../../agent-harness.ts";
-import { getTelemetryContext } from "../../context.ts";
 import { SessionInvariantError } from "../../session/session.ts";
 import type {
 	DeferredEffectPendingOperation,
@@ -26,7 +25,7 @@ async function cancelDeferredBestEffort<TContext extends object | undefined>(
 	try {
 		await lane.models.cancelDeferred(model, handle, {
 			signal: drive.closeSignal,
-			telemetryContext: getTelemetryContext(drive.context),
+			telemetry: drive.context.telemetry,
 			timeoutMs: deferred.streamOptions.timeoutMs,
 			maxRetries: deferred.streamOptions.maxRetries,
 			maxRetryDelayMs: deferred.streamOptions.maxRetryDelayMs,

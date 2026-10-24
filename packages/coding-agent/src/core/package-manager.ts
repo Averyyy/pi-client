@@ -675,7 +675,7 @@ function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string
 	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
 
 	return patterns.some((pattern) => {
-		const normalizedPattern = toPosixPath(normalizePath(pattern));
+		const normalizedPattern = toPosixPath(normalizePath(pattern, { homeDir: getHomeDir() }));
 		if (
 			minimatch(rel, normalizedPattern) ||
 			minimatch(name, normalizedPattern) ||
@@ -694,7 +694,7 @@ function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string
 
 function normalizeExactPattern(pattern: string): string {
 	const normalized = pattern.startsWith("./") || pattern.startsWith(".\\") ? pattern.slice(2) : pattern;
-	return toPosixPath(normalizePath(normalized));
+	return toPosixPath(normalizePath(normalized, { homeDir: getHomeDir() }));
 }
 
 function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: string): boolean {

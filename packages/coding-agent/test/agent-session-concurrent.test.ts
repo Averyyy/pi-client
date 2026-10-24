@@ -195,7 +195,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await vi.waitFor(() => expect(created.getCallCount()).toBe(1));
 
 		const abortPromise = session.abort();
 		expect(session.isAborting).toBe(true);
@@ -232,7 +232,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			});
 
 			const firstPrompt = session.prompt("First message");
-			await new Promise((resolve) => setTimeout(resolve, 10));
+			await vi.waitFor(() => expect(created.getCallCount()).toBe(1));
 
 			await expect(session.abort()).rejects.toThrow("remote cancellation failed");
 			expect(session.isAborting).toBe(true);

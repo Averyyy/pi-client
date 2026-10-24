@@ -8,6 +8,7 @@ import {
 	withCancel,
 	withContextValue,
 	withoutAbortSignal,
+	withTelemetry,
 } from "@earendil-works/chord/context";
 import { NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@earendil-works/pi-telemetry";
 
@@ -21,17 +22,24 @@ export {
 	withAbortSignal,
 	withCancel,
 	withContextValue,
+	withTelemetry,
 	withoutAbortSignal,
 };
 
-const TELEMETRY_CONTEXT_KEY = createContextKey<TelemetryContext>("pi.telemetryContext");
-
 /** Return the telemetry parent attached to a context, or the shared no-op parent. */
 export function getTelemetryContext(context: Context): TelemetryContext {
-	return context.value(TELEMETRY_CONTEXT_KEY) ?? NOOP_TELEMETRY_CONTEXT;
+	return context.telemetry;
 }
 
 /** Derive a context whose telemetry children use the supplied parent or active span. */
 export function withTelemetryContext(telemetryContext: TelemetryContext, context: Context): Context {
-	return withContextValue(TELEMETRY_CONTEXT_KEY, telemetryContext, context);
+	return withTelemetry(
+		{
+			...NOOP_TELEMETRY_CONTEXT,
+			metrics: telemetryContext.metrics,
+			propagation: telemetryContext.propagation,
+			startSpan: telemetryContext.startSpan.bind(telemetryContext),
+		},
+		context,
+	);
 }

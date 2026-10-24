@@ -298,19 +298,8 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
-	const {
-		model,
-		apiKey,
-		headers,
-		env,
-		signal,
-		customInstructions,
-		replaceInstructions,
-		reserveTokens = 16384,
-		streamFn,
-		retry,
-		callbacks,
-	} = options;
+	const { model, apiKey, headers, env, signal, customInstructions, replaceInstructions, streamFn, retry, callbacks } =
+		options;
 
 	const { messages, fileOps } = prepareBranchEntries(entries);
 
@@ -330,19 +319,12 @@ export async function generateBranchSummary(
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
 
-	const maxTokens = Math.min(
-		4096,
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
-
 	let summary: string;
 	let summaryUsage: Usage;
 	try {
 		const result = await summarizeMessages(
 			messages,
 			model,
-			maxTokens,
 			apiKey,
 			headers,
 			env,
