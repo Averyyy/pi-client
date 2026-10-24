@@ -21,6 +21,7 @@ import { getSession, getSessionBranch, listSessions, type SessionState } from ".
 import type {
 	ObserverUpdate,
 	ThreadSummary,
+	ViewerCatalog,
 	ViewerContent,
 	ViewerMessage,
 	ViewerProject,
@@ -40,6 +41,34 @@ interface StoredThread {
 	thread: ViewerThread;
 	rounds: RoundOffset[];
 	length: number;
+}
+
+interface ProjectIndex {
+	project: ViewerProject;
+	threads: ThreadSummary[];
+}
+
+function compareThreads(
+	left: Pick<ThreadSummary, "id" | "updatedAt">,
+	right: Pick<ThreadSummary, "id" | "updatedAt">,
+): number {
+	return right.updatedAt - left.updatedAt || left.id.localeCompare(right.id);
+}
+
+function threadOffset(
+	threads: ThreadSummary[],
+	target: Pick<ThreadSummary, "id" | "updatedAt">,
+	after = false,
+): number {
+	let start = 0;
+	let end = threads.length;
+	while (start < end) {
+		const middle = (start + end) >>> 1;
+		const order = compareThreads(threads[middle], target);
+		if (order < 0 || (after && order === 0)) start = middle + 1;
+		else end = middle;
+	}
+	return start;
 }
 
 function normalizeProjectPath(path: string): string {
@@ -81,7 +110,14 @@ export class ViewerStore {
 		string,
 		{ revision: number; title: string | undefined; cwd: string | null }
 	>();
-	readonly listeners = new Set<(id: string, update: ViewerUpdate) => void>();
+	private readonly listeners = new Map<string, Set<(update: ViewerUpdate) => void>>();
+	private readonly catalogEpoch = randomUUID();
+	private catalogSequence = 0;
+	private catalogInitialized = false;
+	private catalog: ViewerCatalog | undefined;
+	private readonly indexedSummaries = new Map<string, ThreadSummary>();
+	private readonly projectIndex = new Map<string, ProjectIndex>();
+	private readonly running = new Map<string, ThreadSummary>();
 	readonly catalogListeners = new Set<() => void>();
 	readonly removedListeners = new Set<(id: string) => void>();
 
@@ -100,31 +136,22 @@ export class ViewerStore {
 		}
 	}
 
-	projects(): { projects: ViewerProject[]; running: ThreadSummary[] } {
-		const summaries = this.summaries();
-		const projects = new Map<string, ViewerProject>();
-		for (const thread of summaries) {
-			let project = projects.get(thread.projectId);
-			if (!project) {
-				const parts = thread.cwd?.split(/[\\/]/).filter(Boolean);
-				project = {
-					id: thread.projectId,
-					path: thread.cwd,
-					name: parts?.at(-1) ?? "Unassigned archives",
-					threadCount: 0,
-				};
-				projects.set(project.id, project);
-			}
-			project.threadCount++;
-		}
-		return {
-			projects: [...projects.values()].sort((a, b) => a.name.localeCompare(b.name)),
-			running: summaries.filter((thread) => thread.status === "running"),
+	projects(): ViewerCatalog {
+		this.initializeCatalog();
+		this.catalog ??= {
+			projects: [...this.projectIndex.values()]
+				.map(({ project }) => project)
+				.sort((a, b) => a.name.localeCompare(b.name)),
+			running: [...this.running.values()].sort(compareThreads),
+			revision: `${this.catalogEpoch}:${this.catalogSequence}`,
 		};
+		return this.catalog;
 	}
 
 	page(project: string, cursor: string | null): { threads: ThreadSummary[]; nextCursor: string | null } {
-		let threads = this.summaries().filter((thread) => thread.projectId === project);
+		this.initializeCatalog();
+		const threads = this.projectIndex.get(project)?.threads ?? [];
+		let start = 0;
 		if (cursor !== null) {
 			const anchor = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
 				id: string;
@@ -132,18 +159,14 @@ export class ViewerStore {
 			};
 			if (typeof anchor.id !== "string" || typeof anchor.updatedAt !== "number")
 				throw new Error("Invalid pagination cursor");
-			threads = threads.filter(
-				(thread) =>
-					thread.updatedAt < anchor.updatedAt ||
-					(thread.updatedAt === anchor.updatedAt && thread.id.localeCompare(anchor.id) > 0),
-			);
+			start = threadOffset(threads, anchor, true);
 		}
-		const page = threads.slice(0, 5);
+		const page = threads.slice(start, start + 5);
 		const last = page.at(-1);
 		return {
 			threads: page,
 			nextCursor:
-				threads.length > 5 && last
+				threads.length > start + 5 && last
 					? Buffer.from(JSON.stringify({ id: last.id, updatedAt: last.updatedAt })).toString("base64url")
 					: null,
 		};
@@ -162,14 +185,28 @@ export class ViewerStore {
 	}
 
 	refreshSession(id: string): void {
-		if (this.listeners.size > 0) {
+		this.refreshCatalog(id);
+		const listeners = this.listeners.get(id);
+		if (listeners?.size) {
 			const thread = this.get(id);
 			if (thread) {
 				const update: ViewerUpdate = { thread, replace: true, refresh: true, ...this.rounds(id, null) };
-				for (const listener of this.listeners) listener(id, update);
+				for (const listener of listeners) listener(update);
 			}
 		}
-		for (const listener of this.catalogListeners) listener();
+	}
+
+	subscribe(id: string, listener: (update: ViewerUpdate) => void): () => void {
+		let listeners = this.listeners.get(id);
+		if (!listeners) {
+			listeners = new Set();
+			this.listeners.set(id, listeners);
+		}
+		listeners.add(listener);
+		return () => {
+			listeners.delete(listener);
+			if (listeners.size === 0) this.listeners.delete(id);
+		};
 	}
 
 	remove(id: string): void {
@@ -184,7 +221,7 @@ export class ViewerStore {
 			this.threads.delete(id);
 		}
 		for (const listener of this.removedListeners) listener(id);
-		for (const listener of this.catalogListeners) listener();
+		this.refreshCatalog(id, true);
 	}
 
 	rounds(id: string, before: string | null): { rounds: ViewerRound[]; nextCursor: string | null } {
@@ -344,13 +381,77 @@ export class ViewerStore {
 		);
 	}
 
-	private summaries(): ThreadSummary[] {
+	private initializeCatalog(): void {
+		if (this.catalogInitialized) return;
+		this.catalogInitialized = true;
 		const ids = new Set([...listSessions().map((session) => session.sessionId), ...this.threads.keys()]);
-		const summaries: ThreadSummary[] = [];
 		for (const id of ids) {
-			summaries.push(this.summary(id)!);
+			const summary = this.summary(id)!;
+			this.indexedSummaries.set(id, summary);
+			let project = this.projectIndex.get(summary.projectId);
+			if (!project) {
+				project = this.createProjectIndex(summary);
+				this.projectIndex.set(summary.projectId, project);
+			}
+			project.threads.push(summary);
+			project.project.threadCount++;
+			if (summary.status === "running") this.running.set(id, summary);
 		}
-		return summaries.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+		for (const { threads } of this.projectIndex.values()) threads.sort(compareThreads);
+	}
+
+	private createProjectIndex(summary: ThreadSummary): ProjectIndex {
+		return {
+			project: {
+				id: summary.projectId,
+				path: summary.cwd,
+				name: summary.cwd?.split("/").filter(Boolean).at(-1) ?? "Unassigned archives",
+				threadCount: 0,
+				revision: `${this.catalogEpoch}:${this.catalogSequence}`,
+			},
+			threads: [],
+		};
+	}
+
+	private refreshCatalog(id: string, removed = false): void {
+		if (!this.catalogInitialized) {
+			if (this.catalogListeners.size === 0) return;
+			this.initializeCatalog();
+			for (const listener of this.catalogListeners) listener();
+			return;
+		}
+		const previous = this.indexedSummaries.get(id);
+		const next = removed ? undefined : this.summary(id);
+		if (
+			previous?.title === next?.title &&
+			previous?.projectId === next?.projectId &&
+			previous?.cwd === next?.cwd &&
+			previous?.status === next?.status &&
+			previous?.updatedAt === next?.updatedAt
+		)
+			return;
+		const revision = `${this.catalogEpoch}:${++this.catalogSequence}`;
+		if (previous) {
+			const project = this.projectIndex.get(previous.projectId)!;
+			project.threads.splice(threadOffset(project.threads, previous), 1);
+			project.project = { ...project.project, threadCount: project.threads.length, revision };
+			if (project.threads.length === 0) this.projectIndex.delete(previous.projectId);
+		}
+		this.indexedSummaries.delete(id);
+		this.running.delete(id);
+		if (next) {
+			this.indexedSummaries.set(id, next);
+			let project = this.projectIndex.get(next.projectId);
+			if (!project) {
+				project = this.createProjectIndex(next);
+				this.projectIndex.set(next.projectId, project);
+			}
+			project.threads.splice(threadOffset(project.threads, next), 0, next);
+			project.project = { ...project.project, threadCount: project.threads.length, revision };
+			if (next.status === "running") this.running.set(id, next);
+		}
+		this.catalog = undefined;
+		for (const listener of this.catalogListeners) listener();
 	}
 
 	private summary(id: string): ThreadSummary | undefined {
@@ -370,14 +471,15 @@ export class ViewerStore {
 	}
 
 	private emit(stored: StoredThread, append?: ViewerMessage[], replace = false, catalog = true): void {
-		if (this.listeners.size > 0) {
+		if (catalog) this.refreshCatalog(stored.thread.id);
+		const listeners = this.listeners.get(stored.thread.id);
+		if (listeners?.size) {
 			const thread = this.get(stored.thread.id)!;
 			const update: ViewerUpdate = replace
 				? { thread, replace: true, ...this.rounds(thread.id, null) }
 				: { thread, ...(append?.length ? { append } : {}) };
-			for (const listener of this.listeners) listener(stored.thread.id, update);
+			for (const listener of listeners) listener(update);
 		}
-		if (catalog) for (const listener of this.catalogListeners) listener();
 	}
 
 	private roundCursor(value: string, rounds: { id: string }[]): number {

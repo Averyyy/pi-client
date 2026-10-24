@@ -9,7 +9,7 @@ import { createPiServer } from "../src/server.ts";
 import * as persistence from "../src/session-persistence.ts";
 import { clearAllSessions } from "../src/session-store.ts";
 import { ViewerStore } from "../src/viewer-store.ts";
-import type { ViewerProject, ViewerRound, ViewerThread } from "../src/viewer-types.ts";
+import type { ViewerCatalog, ViewerProject, ViewerRound, ViewerThread } from "../src/viewer-types.ts";
 
 class Events {
 	private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -107,6 +107,31 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
+	it("uses the same catalog revision for GET and initial SSE and invalidates only changed projects", async () => {
+		const first = {
+			sessionId: "a",
+			staticContext: { systemPrompt: "Instructions\nCurrent working directory: D:/a" },
+		};
+		expect((await post("init", first)).status).toBe(200);
+		const initial = (await (await viewer("projects")).json()) as ViewerCatalog;
+		const catalog = await events("events");
+		expect(await catalog.next()).toEqual({ event: "catalog", data: { revision: initial.revision } });
+		expect((await post("init", first)).status).toBe(200);
+		expect(((await (await viewer("projects")).json()) as ViewerCatalog).revision).toBe(initial.revision);
+		expect(
+			(
+				await post("init", {
+					sessionId: "b",
+					staticContext: { systemPrompt: "Instructions\nCurrent working directory: D:/b" },
+				})
+			).status,
+		).toBe(200);
+		const updated = (await (await viewer("projects")).json()) as ViewerCatalog;
+		expect(updated.revision).not.toBe(initial.revision);
+		expect(await catalog.next()).toEqual({ event: "catalog", data: { revision: updated.revision } });
+		expect(updated.projects.find((project) => project.id === "D:/a")?.revision).toBe(initial.projects[0].revision);
+	});
+
 	it("publishes catalog and branch snapshots for init, sync, append and switch without an observer", async () => {
 		const catalog = await events("events");
 		expect((await catalog.next())?.event).toBe("catalog");
@@ -165,7 +190,9 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		expect((await catalog.next())?.event).toBe("catalog");
 		expect((await history.next())?.data.thread).toMatchObject({ cwd: "D:/changed" });
 		const projects = (await (await viewer("projects")).json()) as { projects: ViewerProject[] };
-		expect(projects.projects).toEqual([{ id: "D:/changed", path: "D:/changed", name: "changed", threadCount: 1 }]);
+		expect(projects.projects).toMatchObject([
+			{ id: "D:/changed", path: "D:/changed", name: "changed", threadCount: 1 },
+		]);
 		await stop();
 		clearAllSessions();
 		await start();

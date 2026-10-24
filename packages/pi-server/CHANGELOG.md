@@ -28,6 +28,7 @@
 
 ### Fixed
 
+- Cached the viewer's project index and static assets, loaded visible project folders on demand, and refreshed only changed project pages.
 - Grouped archived remote-client sessions by their saved working directory, including snapshot/WAL metadata and incremental system sections, without requiring an observer connection.
 - Refreshed viewer pages after successful session persistence and excluded system instructions from archived conversation content.
 - Rejected newer WAL records that overlap the session snapshot instead of silently dropping them, while continuing to ignore revisions already included in the snapshot.

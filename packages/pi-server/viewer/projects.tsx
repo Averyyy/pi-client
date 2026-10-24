@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { ThreadSummary, ViewerProject } from "../src/viewer-types.ts";
 import { Icon } from "./icons.tsx";
 import type { ProjectRows } from "./use-viewer.ts";
@@ -45,6 +46,7 @@ export function ProjectFolder({
 	toggle,
 	select,
 	more,
+	visibility,
 }: {
 	project: ViewerProject;
 	rows: ProjectRows | undefined;
@@ -54,11 +56,23 @@ export function ProjectFolder({
 	toggle: (id: string) => void;
 	select: (id: string) => void;
 	more: (id: string) => void;
+	visibility: (id: string, surface: string, visible: boolean) => void;
 }) {
 	const sidebar = surface === "sidebar";
+	const element = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const observer = new IntersectionObserver((entries) => {
+			visibility(project.id, surface, entries[0].isIntersecting && entries[0].intersectionRatio > 0);
+		});
+		observer.observe(element.current!);
+		return () => {
+			observer.disconnect();
+			visibility(project.id, surface, false);
+		};
+	}, [project.id, surface, visibility]);
 	const Container = sidebar ? "div" : "section";
 	return (
-		<Container className={sidebar ? "sidebar-project" : "project-card"}>
+		<Container ref={element} className={sidebar ? "sidebar-project" : "project-card"}>
 			<button
 				type="button"
 				className={sidebar ? "project-toggle" : "project-card-heading"}
@@ -92,8 +106,13 @@ export function ProjectFolder({
 					{rows?.threads.map((thread) => (
 						<ThreadRow key={thread.id} thread={thread} current={current} select={select} />
 					))}
-					{rows?.loading && !rows.threads.length ? (
-						<p className={sidebar ? "sidebar-empty" : "card-empty"}>正在加载…</p>
+					{!rows || (rows.loading && !rows.threads.length) ? (
+						<div
+							className="project-placeholder"
+							style={{ height: Math.min(5, project.threadCount) * (sidebar ? 35 : 39) }}
+						>
+							正在加载…
+						</div>
 					) : null}
 					{rows?.nextCursor ? (
 						<button

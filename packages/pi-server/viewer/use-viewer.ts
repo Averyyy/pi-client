@@ -11,6 +11,7 @@ import { ApiError, request } from "./api.ts";
 import { appendMessages, mergeRecentRounds } from "./rounds.ts";
 
 interface Catalog {
+	revision: string;
 	projects: ViewerProject[];
 	running: ThreadSummary[];
 }
@@ -54,8 +55,172 @@ interface Snapshot extends RoundPage {
 	thread: ViewerThread;
 }
 export interface ProjectRows extends ThreadPage {
+	revision: string;
 	loading: boolean;
 	pages: number;
+}
+
+export class CatalogRequest {
+	private active: { controller: AbortController; dirty: boolean; promise: Promise<void> } | null = null;
+
+	cancel() {
+		this.active?.controller.abort();
+		this.active = null;
+	}
+
+	load(apply: (catalog: Catalog) => void): Promise<void> {
+		if (this.active) {
+			this.active.dirty = true;
+			return this.active.promise;
+		}
+		const active = { controller: new AbortController(), dirty: false, promise: Promise.resolve() };
+		this.active = active;
+		active.promise = (async () => {
+			try {
+				do {
+					active.dirty = false;
+					const data = await request<Catalog>("projects", active.controller.signal);
+					if (active.controller.signal.aborted) return;
+					apply(data);
+				} while (active.dirty);
+			} finally {
+				if (this.active === active) this.active = null;
+			}
+		})();
+		return active.promise;
+	}
+}
+
+export class ProjectCache {
+	rows: Record<string, ProjectRows> = {};
+	readonly expanded = new Set<string>();
+	private revisions = new Map<string, string>();
+	private readonly visible = new Map<string, Set<string>>();
+	private readonly requests = new Map<
+		string,
+		{ controller: AbortController; revision: string; promise: Promise<void> }
+	>();
+	private readonly changed: (rows: Record<string, ProjectRows>) => void;
+	private readonly failed: (error: unknown) => void;
+
+	constructor(changed: (rows: Record<string, ProjectRows>) => void, failed: (error: unknown) => void) {
+		this.changed = changed;
+		this.failed = failed;
+	}
+
+	clear() {
+		for (const request of this.requests.values()) request.controller.abort();
+		this.requests.clear();
+		this.revisions.clear();
+		this.expanded.clear();
+		this.visible.clear();
+		this.rows = {};
+		this.changed(this.rows);
+	}
+
+	updateCatalog(projects: ViewerProject[]) {
+		const revisions = new Map(projects.map((project) => [project.id, project.revision]));
+		for (const project of projects) if (!this.revisions.has(project.id)) this.expanded.add(project.id);
+		for (const [id, request] of this.requests) {
+			if (request.revision === revisions.get(id)) continue;
+			request.controller.abort();
+			this.requests.delete(id);
+			if (this.rows[id]) this.rows = { ...this.rows, [id]: { ...this.rows[id], loading: false } };
+		}
+		for (const id of this.revisions.keys()) {
+			if (revisions.has(id)) continue;
+			this.expanded.delete(id);
+			this.visible.delete(id);
+			const { [id]: _removed, ...remaining } = this.rows;
+			this.rows = remaining;
+		}
+		this.revisions = revisions;
+		this.changed(this.rows);
+		for (const id of this.visible.keys()) this.ensure(id);
+	}
+
+	setVisible(id: string, surface: string, visible: boolean) {
+		const surfaces = this.visible.get(id) ?? new Set<string>();
+		if (visible) surfaces.add(surface);
+		else surfaces.delete(surface);
+		if (surfaces.size) this.visible.set(id, surfaces);
+		else this.visible.delete(id);
+		this.ensure(id);
+	}
+
+	toggle(id: string) {
+		if (this.expanded.has(id)) this.expanded.delete(id);
+		else this.expanded.add(id);
+		this.ensure(id);
+	}
+
+	private ensure(id: string) {
+		if (this.expanded.has(id) && this.visible.has(id) && this.rows[id]?.revision !== this.revisions.get(id))
+			void this.load(id);
+	}
+
+	load(id: string, more = false): Promise<void> {
+		const revision = this.revisions.get(id);
+		if (revision === undefined) return Promise.resolve();
+		const pending = this.requests.get(id);
+		if (pending?.revision === revision) return pending.promise;
+		const previous = this.rows[id];
+		const append = more && previous?.revision === revision;
+		if (append && !previous.nextCursor) return Promise.resolve();
+		const controller = new AbortController();
+		this.rows = {
+			...this.rows,
+			[id]: {
+				threads: previous?.threads ?? [],
+				nextCursor: previous?.nextCursor ?? null,
+				pages: previous?.pages ?? 0,
+				revision: previous?.revision ?? "",
+				loading: true,
+			},
+		};
+		this.changed(this.rows);
+		const promise = (async () => {
+			try {
+				let nextCursor = append ? previous.nextCursor : null;
+				const threads = append ? [...previous.threads] : [];
+				const pages = append ? 1 : Math.max(1, (previous?.pages ?? 0) + (more ? 1 : 0));
+				let loaded = 0;
+				for (; loaded < pages; loaded++) {
+					const data = await request<ThreadPage>(
+						`threads?project=${encodeURIComponent(id)}${nextCursor ? `&cursor=${encodeURIComponent(nextCursor)}` : ""}`,
+						controller.signal,
+					);
+					if (controller.signal.aborted) return;
+					threads.push(...data.threads);
+					nextCursor = data.nextCursor;
+					if (!nextCursor) {
+						loaded++;
+						break;
+					}
+				}
+				this.rows = {
+					...this.rows,
+					[id]: {
+						threads,
+						nextCursor,
+						revision,
+						pages: append ? previous.pages + loaded : loaded,
+						loading: false,
+					},
+				};
+				this.changed(this.rows);
+			} catch (error) {
+				if (controller.signal.aborted) return;
+				this.rows = { ...this.rows, [id]: { ...this.rows[id], loading: false } };
+				this.changed(this.rows);
+				this.failed(error);
+			} finally {
+				if (this.requests.get(id)?.controller === controller) this.requests.delete(id);
+			}
+		})();
+		this.requests.set(id, { controller, revision, promise });
+		return promise;
+	}
 }
 
 function selectedId() {
@@ -71,7 +236,7 @@ function selectedId() {
 export function useViewer() {
 	const [auth, setAuth] = useState<"loading" | "login" | "ready">("loading");
 	const [locked, setLocked] = useState(false);
-	const [catalog, setCatalog] = useState<Catalog>({ projects: [], running: [] });
+	const [catalog, setCatalog] = useState<Catalog>({ revision: "", projects: [], running: [] });
 	const [current, setCurrent] = useState(selectedId);
 	const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 	const [rows, setRows] = useState<Record<string, ProjectRows>>({});
@@ -84,109 +249,66 @@ export function useViewer() {
 	const [drawer, setDrawer] = useState(false);
 	const [connected, setConnected] = useState(true);
 	const [olderHistory] = useState(() => new OlderHistoryRequest());
-	const rowsRef = useRef(rows);
-	const expandedRef = useRef(expanded);
+	const failure = useRef<(error: unknown) => void>(() => {});
+	const [projects] = useState(() => new ProjectCache(setRows, (error) => failure.current(error)));
+	const catalogRef = useRef(catalog);
+	const [catalogRequest] = useState(() => new CatalogRequest());
 	const roundsRef = useRef(rounds);
-	const initializedProjects = useRef(new Set<string>());
-	const projectRequests = useRef(new Map<string, AbortController>());
 	const selectionController = useRef<AbortController | null>(null);
-	rowsRef.current = rows;
-	expandedRef.current = expanded;
 	roundsRef.current = rounds;
-	const fail = useCallback((caught: unknown) => {
-		if (caught instanceof DOMException && caught.name === "AbortError") return;
-		if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) {
-			setAuth("login");
-			setLocked(caught.status === 423);
-			setThread(null);
-			setRounds([]);
-			setCatalog({ projects: [], running: [] });
-			setRows({});
-			setExpanded(new Set());
-		} else setError(caught instanceof Error ? caught.message : "无法读取服务器数据");
-	}, []);
-	const refreshCatalog = useCallback(async (signal?: AbortSignal) => {
-		const data = await request<Catalog>("projects", signal);
-		if (signal?.aborted) return;
-		setCatalog(data);
-		setAuth("ready");
-		setError("");
-	}, []);
+	const fail = useCallback(
+		(caught: unknown) => {
+			if (caught instanceof DOMException && caught.name === "AbortError") return;
+			if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) {
+				setAuth("login");
+				setLocked(caught.status === 423);
+				setThread(null);
+				setRounds([]);
+				setCatalog({ revision: "", projects: [], running: [] });
+				catalogRef.current = { revision: "", projects: [], running: [] };
+				catalogRequest.cancel();
+				projects.clear();
+				setExpanded(new Set());
+			} else setError(caught instanceof Error ? caught.message : "无法读取服务器数据");
+		},
+		[projects, catalogRequest],
+	);
+	failure.current = fail;
+	const refreshCatalog = useCallback(
+		() =>
+			catalogRequest.load((data) => {
+				catalogRef.current = data;
+				projects.updateCatalog(data.projects);
+				setExpanded(new Set(projects.expanded));
+				setCatalog(data);
+				setAuth("ready");
+				setError("");
+			}),
+		[projects, catalogRequest],
+	);
 	useEffect(() => {
-		const controller = new AbortController();
-		refreshCatalog(controller.signal).catch(fail);
-		return () => controller.abort();
-	}, [refreshCatalog, fail]);
+		refreshCatalog().catch(fail);
+		return () => catalogRequest.cancel();
+	}, [refreshCatalog, fail, catalogRequest]);
 	useEffect(() => {
 		const change = () => setCurrent(selectedId());
 		window.addEventListener("hashchange", change);
 		return () => window.removeEventListener("hashchange", change);
 	}, []);
-	const loadProject = useCallback(
-		async (id: string, more = false, signal?: AbortSignal, pages = 1) => {
-			projectRequests.current.get(id)?.abort();
-			const controller = new AbortController();
-			projectRequests.current.set(id, controller);
-			const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
-			const previous = rowsRef.current[id];
-			setRows((old) => ({
-				...old,
-				[id]: {
-					threads: previous?.threads ?? [],
-					nextCursor: previous?.nextCursor ?? null,
-					pages: previous?.pages ?? 0,
-					loading: true,
-				},
-			}));
-			try {
-				let nextCursor = more ? previous?.nextCursor : undefined;
-				let threads = more ? [...(previous?.threads ?? [])] : [];
-				for (let page = 0; page < pages; page++) {
-					const data = await request<ThreadPage>(
-						`threads?project=${encodeURIComponent(id)}${nextCursor ? `&cursor=${encodeURIComponent(nextCursor)}` : ""}`,
-						requestSignal,
-					);
-					threads = [...threads, ...data.threads];
-					nextCursor = data.nextCursor;
-					if (!nextCursor) break;
-				}
-				if (requestSignal.aborted) return;
-				setRows((old) => ({
-					...old,
-					[id]: {
-						threads,
-						nextCursor: nextCursor ?? null,
-						pages: more ? (previous?.pages ?? 0) + 1 : pages,
-						loading: false,
-					},
-				}));
-			} catch (caught) {
-				if (requestSignal.aborted) return;
-				setRows((old) => (old[id] ? { ...old, [id]: { ...old[id], loading: false } } : old));
-				fail(caught);
-			}
+	useEffect(
+		() => () => {
+			projects.clear();
 		},
-		[fail],
+		[projects],
+	);
+	const projectVisibility = useCallback(
+		(id: string, surface: string, visible: boolean) => {
+			projects.setVisible(id, surface, visible);
+		},
+		[projects],
 	);
 	useEffect(() => {
-		if (auth === "ready") return;
-		for (const controller of projectRequests.current.values()) controller.abort();
-		projectRequests.current.clear();
-		initializedProjects.current.clear();
-	}, [auth]);
-	useEffect(() => {
 		if (auth !== "ready") return;
-		const added = catalog.projects.filter((project) => !initializedProjects.current.has(project.id));
-		if (!added.length) return;
-		for (const project of added) {
-			initializedProjects.current.add(project.id);
-			loadProject(project.id);
-		}
-		setExpanded((old) => new Set([...old, ...added.map((project) => project.id)]));
-	}, [catalog.projects, auth, loadProject]);
-	useEffect(() => {
-		if (auth !== "ready") return;
-		const controller = new AbortController();
 		const source = new EventSource("/viewer/api/events");
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let checking = false;
@@ -194,27 +316,27 @@ export function useViewer() {
 			setConnected(true);
 			checking = false;
 		};
-		source.addEventListener("catalog", () => {
-			if (timer) clearTimeout(timer);
+		source.addEventListener("catalog", (event: MessageEvent<string>) => {
+			const { revision } = JSON.parse(event.data) as { revision: string };
+			if (revision === catalogRef.current.revision) return;
+			if (timer) return;
 			timer = setTimeout(() => {
-				refreshCatalog(controller.signal).catch(fail);
-				for (const id of expandedRef.current)
-					loadProject(id, false, controller.signal, rowsRef.current[id]?.pages || 1);
+				timer = undefined;
+				refreshCatalog().catch(fail);
 			}, 120);
 		});
 		source.onerror = () => {
 			setConnected(false);
 			if (!checking) {
 				checking = true;
-				request<Catalog>("projects", controller.signal).catch(fail);
+				refreshCatalog().catch(fail);
 			}
 		};
 		return () => {
 			source.close();
-			controller.abort();
 			if (timer) clearTimeout(timer);
 		};
-	}, [auth, fail, refreshCatalog, loadProject]);
+	}, [auth, fail, refreshCatalog]);
 	useEffect(() => {
 		if (auth !== "ready" || !current) {
 			setThread(null);
@@ -295,7 +417,7 @@ export function useViewer() {
 				source.onerror = () => {
 					if (controller.signal.aborted) return;
 					setThread((old) => (old ? { ...old, status: "disconnected" } : old));
-					request<Catalog>("projects", controller.signal).catch(fail);
+					refreshCatalog().catch(fail);
 				};
 			})
 			.catch((caught) => {
@@ -321,13 +443,8 @@ export function useViewer() {
 		setDrawer(false);
 	}
 	function toggleProject(id: string) {
-		setExpanded((old) => {
-			const next = new Set(old);
-			if (next.has(id)) next.delete(id);
-			else next.add(id);
-			return next;
-		});
-		if (!expanded.has(id) && !rows[id]) loadProject(id);
+		projects.toggle(id);
+		setExpanded(new Set(projects.expanded));
 	}
 	async function loadOlder() {
 		if (!current || !cursor || !selectionController.current) return;
@@ -358,8 +475,10 @@ export function useViewer() {
 			setAuth("login");
 			setThread(null);
 			setRounds([]);
-			setCatalog({ projects: [], running: [] });
-			setRows({});
+			setCatalog({ revision: "", projects: [], running: [] });
+			catalogRef.current = { revision: "", projects: [], running: [] };
+			catalogRequest.cancel();
+			projects.clear();
 			setExpanded(new Set());
 		} catch (caught) {
 			fail(caught);
@@ -387,7 +506,8 @@ export function useViewer() {
 		toggleProject,
 		loadOlder,
 		logout,
-		more: (id: string) => loadProject(id, true),
+		projectVisibility,
+		more: (id: string) => projects.load(id, true),
 		login: () => {
 			refreshCatalog().catch(fail);
 		},

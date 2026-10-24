@@ -46,6 +46,13 @@ export interface ViewerProject {
 	path: string | null;
 	name: string;
 	threadCount: number;
+	revision: string;
+}
+
+export interface ViewerCatalog {
+	projects: ViewerProject[];
+	running: ThreadSummary[];
+	revision: string;
 }
 
 export interface ViewerRound {

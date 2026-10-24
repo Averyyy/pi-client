@@ -104,7 +104,7 @@ describe("server session archives in the viewer", () => {
 		loadPersistedSessions(directory);
 		const original = structuredClone(getSession("remote"));
 		const store = new ViewerStore(directory);
-		expect(store.projects().projects).toEqual([
+		expect(store.projects().projects).toMatchObject([
 			{ id: "D:/qhk/jev", path: "D:/qhk/jev", name: "jev", threadCount: 1 },
 		]);
 		expect(store.page("D:/qhk/jev", null).threads[0]).toMatchObject({
@@ -242,7 +242,7 @@ describe("server session archives in the viewer", () => {
 		expect(store.get("server")).toMatchObject({ cwd: "D:/qhk/jev", title: "Server conversation" });
 		expect(store.rounds("server", null).rounds[0].messages[0].content).toBe("Server conversation");
 		const updates: ViewerUpdate[] = [];
-		store.listeners.add((_id, update) => updates.push(update));
+		store.subscribe("server", (update) => updates.push(update));
 		store.update({
 			sessionId: "server",
 			connectionId: connection.connectionId,
@@ -253,7 +253,7 @@ describe("server session archives in the viewer", () => {
 		store.refreshSession("server");
 		expect(updates[1]).toMatchObject({ replace: true, rounds: [{ id: "observer" }] });
 		expect(store.rounds("server", null).rounds[0].messages[0].content).toBe("Observer history");
-		expect(store.projects().projects).toEqual([
+		expect(store.projects().projects).toMatchObject([
 			{ id: "D:/qhk/jev", path: "D:/qhk/jev", name: "jev", threadCount: 2 },
 		]);
 	});
@@ -269,7 +269,7 @@ describe("server session archives in the viewer", () => {
 		expect(catalog).toHaveBeenCalledTimes(1);
 		expect(rounds).not.toHaveBeenCalled();
 		const updates: ViewerUpdate[] = [];
-		store.listeners.add((_id, update) => updates.push(update));
+		store.subscribe("refresh", (update) => updates.push(update));
 		appendSessionEntries("refresh", [user("next", "u", "Next question")], "next");
 		savePersistedSession(directory, getSession("refresh")!);
 		store.refreshSession("refresh");
@@ -320,6 +320,7 @@ describe("server session archives in the viewer", () => {
 			"name",
 		);
 		expect(store.get("cached")).toMatchObject({ cwd: "D:/qhk/new", title: "Renamed" });
+		store.refreshSession("cached");
 		expect(store.projects().projects[0].id).toBe("D:/qhk/new");
 	});
 });

@@ -248,7 +248,9 @@ describe("read-only thread viewer", () => {
 			projects: ViewerProject[];
 			running: ThreadSummary[];
 		};
-		expect(catalog.projects).toEqual([{ id: "C:/project", path: "C:/project", name: "project", threadCount: 7 }]);
+		expect(catalog.projects).toMatchObject([
+			{ id: "C:/project", path: "C:/project", name: "project", threadCount: 7 },
+		]);
 		expect(catalog.running.map((thread) => thread.id)).toEqual(["thread-0"]);
 		const first = (await (
 			await viewer(`threads?project=${encodeURIComponent("C:/project")}`, authCookie)
@@ -529,7 +531,7 @@ describe("viewer projection persistence", () => {
 			store.catalogListeners.add(() => {
 				catalogs++;
 			});
-			store.listeners.add(() => {
+			store.subscribe("thread", () => {
 				updates++;
 			});
 			store.update({

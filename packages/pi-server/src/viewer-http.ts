@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -79,6 +80,8 @@ export class ViewerHttp {
 	readonly auth: ViewerAuth;
 	readonly store: ViewerStore;
 	private readonly streams = new Set<ServerResponse>();
+	private readonly assets = new Map<string, Buffer>();
+	private readonly assetTag = `"${randomUUID()}"`;
 
 	constructor(config: ServerConfig) {
 		this.auth = new ViewerAuth(config.sessionStoreDir, config.authToken);
@@ -107,13 +110,27 @@ export class ViewerHttp {
 				json(res, 404, { error: "Not found" });
 				return true;
 			}
-			const path = fileURLToPath(new URL(`../dist/viewer/${asset[0]}`, import.meta.url));
-			if (!existsSync(path)) {
-				json(res, 503, { error: "Viewer assets unavailable" });
-				return true;
+			let cached = this.assets.get(asset[0]);
+			if (!cached) {
+				const path = fileURLToPath(new URL(`../dist/viewer/${asset[0]}`, import.meta.url));
+				if (!existsSync(path)) {
+					json(res, 503, { error: "Viewer assets unavailable" });
+					return true;
+				}
+				cached = readFileSync(path);
+				this.assets.set(asset[0], cached);
+			}
+			if (url.pathname !== "/") {
+				res.setHeader("Cache-Control", "private, no-cache");
+				res.setHeader("ETag", this.assetTag);
+				if (req.headers["if-none-match"] === this.assetTag) {
+					res.writeHead(304);
+					res.end();
+					return true;
+				}
 			}
 			res.writeHead(200, { "Content-Type": asset[1] });
-			res.end(readFileSync(path));
+			res.end(cached);
 			return true;
 		}
 		if (req.method === "POST" && !sameOrigin(req)) {
@@ -156,10 +173,10 @@ export class ViewerHttp {
 				json(res, 200, this.store.page(url.searchParams.get("project") ?? "", url.searchParams.get("cursor")));
 			else if (url.pathname === "/viewer/api/events") {
 				const send = this.events(req, res);
-				const listener = () => send("catalog", {});
+				const listener = () => send("catalog", { revision: this.store.projects().revision });
 				this.store.catalogListeners.add(listener);
 				res.once("close", () => this.store.catalogListeners.delete(listener));
-				send("catalog", {});
+				listener();
 			} else {
 				const match = /^\/viewer\/api\/threads\/([^/]+)(?:\/(rounds|events))?$/.exec(url.pathname);
 				const id = match ? decodeURIComponent(match[1]) : "";
@@ -171,10 +188,9 @@ export class ViewerHttp {
 				if (match?.[2] === "rounds") json(res, 200, this.store.rounds(id, url.searchParams.get("before")));
 				else if (match?.[2] === "events") {
 					const send = this.events(req, res);
-					const listener = (updatedId: string, update: ViewerUpdate) => {
-						if (updatedId === id) send(update.replace && update.refresh ? "snapshot" : "update", update);
-					};
-					this.store.listeners.add(listener);
+					const unsubscribe = this.store.subscribe(id, (update: ViewerUpdate) => {
+						send(update.replace && update.refresh ? "snapshot" : "update", update);
+					});
 					const removed = (removedId: string) => {
 						if (removedId === id) {
 							send("deleted", { id });
@@ -183,7 +199,7 @@ export class ViewerHttp {
 					};
 					this.store.removedListeners.add(removed);
 					res.once("close", () => {
-						this.store.listeners.delete(listener);
+						unsubscribe();
 						this.store.removedListeners.delete(removed);
 					});
 					send("snapshot", { thread, ...this.store.rounds(id, null) });

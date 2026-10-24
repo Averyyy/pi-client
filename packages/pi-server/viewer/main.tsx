@@ -102,6 +102,7 @@ function Viewer() {
 		select,
 		home,
 		toggleProject,
+		projectVisibility,
 		loadOlder,
 		logout,
 		more,
@@ -201,6 +202,7 @@ function Viewer() {
 							toggle={toggleProject}
 							select={select}
 							more={more}
+							visibility={projectVisibility}
 						/>
 					))}
 				</div>
@@ -329,6 +331,7 @@ function Viewer() {
 											toggle={toggleProject}
 											select={select}
 											more={more}
+											visibility={projectVisibility}
 										/>
 									))}
 								</div>

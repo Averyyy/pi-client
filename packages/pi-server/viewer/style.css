@@ -1241,3 +1241,9 @@ output.terminal-state {
 		display: inline-flex;
 	}
 }
+
+.project-placeholder {
+	padding: 10px 11px;
+	font-size: 12px;
+	color: #787d86;
+}
