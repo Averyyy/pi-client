@@ -291,6 +291,16 @@ function persistSession(config: ServerRuntime, session: SessionState): void {
 	}
 }
 
+function recordSessionActivity(config: ServerRuntime, sessionId: string, deleteVersion: number): void {
+	if (config.deletingSessions.has(sessionId) || (config.sessionDeleteVersions.get(sessionId) ?? 0) !== deleteVersion)
+		return;
+	try {
+		config.viewer.store.recordActivity(sessionId);
+	} catch (error) {
+		console.error(`Failed to record viewer activity for session ${sessionId}:`, error);
+	}
+}
+
 function runKey(sessionId: string, runId: string): string {
 	return `${sessionId}\0${runId}`;
 }
@@ -1201,12 +1211,17 @@ async function handleSessionCompact(
 		run = startStreamRun(body.sessionId, body.runId, "compact");
 	}
 
-	if (body.streamResponse) {
-		await handleSessionCompactStream(config, body, prepared, res, run);
-		return;
+	const activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+	recordSessionActivity(config, body.sessionId, activityVersion);
+	try {
+		if (body.streamResponse) {
+			await handleSessionCompactStream(config, body, prepared, res, run);
+		} else {
+			await handleSessionCompactJsonStream(config, body, prepared, res, run);
+		}
+	} finally {
+		recordSessionActivity(config, body.sessionId, activityVersion);
 	}
-
-	await handleSessionCompactJsonStream(config, body, prepared, res, run);
 }
 
 function handleSessionHistory(
@@ -1300,6 +1315,10 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 	}
 	if ((body.callbacks?.onPayload || body.callbacks?.onResponse) && !body.runId) {
 		sendError(res, 400, "runId is required for provider callbacks", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		return;
+	}
+	if (body.requestKind === "deferred" && !body.deferredHandle) {
+		sendError(res, 400, "deferredHandle is required for deferred fetch", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
 	}
 
@@ -1409,10 +1428,11 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 	heartbeat.unref();
 
 	let stream: AsyncIterable<AssistantMessageEvent>;
+	const activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (body.requestKind === "deferred") {
-			if (!body.deferredHandle) throw new Error("deferredHandle is required for deferred fetch");
-			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle, streamOptions);
+			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle!, streamOptions);
 		} else {
 			const requestModels = models ?? createRequestModels(resolvedModel, streamOptions);
 			stream =
@@ -1424,6 +1444,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 		clearInterval(heartbeat);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
+		recordSessionActivity(config, body.sessionId, activityVersion);
 		settleRun(run);
 		writeStreamError(res, message);
 		endStreamResponse(res);
@@ -1453,6 +1474,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 			if (run?.status === "running") {
 				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
 			}
+			recordSessionActivity(config, body.sessionId, activityVersion);
 			settleRun(run);
 			endStreamResponse(res);
 		}
@@ -1474,15 +1496,15 @@ async function handlePostRequest(
 		return true;
 	}
 	if (pathname === "/api/generate-images") {
-		await handleModelOperation(models, { ...(body as ImageOperationBody), kind: "image" }, res);
+		await handleModelOperation(config, models, { ...(body as ImageOperationBody), kind: "image" }, res);
 		return true;
 	}
 	if (pathname === "/api/classify") {
-		await handleModelOperation(models, { ...(body as ClassifierOperationBody), kind: "classifier" }, res);
+		await handleModelOperation(config, models, { ...(body as ClassifierOperationBody), kind: "classifier" }, res);
 		return true;
 	}
 	if (pathname === "/api/cancel-deferred") {
-		await handleModelOperation(models, { ...(body as DeferredCancelBody), kind: "deferred-cancel" }, res);
+		await handleModelOperation(config, models, { ...(body as DeferredCancelBody), kind: "deferred-cancel" }, res);
 		return true;
 	}
 	if (pathname === "/api/receive") {
@@ -1578,6 +1600,7 @@ interface DeferredCancelBody {
 }
 
 async function handleModelOperation(
+	config: ServerRuntime,
 	models: Models,
 	body:
 		| (ImageOperationBody & { kind: "image" })
@@ -1621,8 +1644,11 @@ async function handleModelOperation(
 		if (!res.destroyed && !res.writableEnded) res.write(STREAM_HEARTBEAT);
 	}, STREAM_HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
+	let activityVersion: number | undefined;
 	try {
 		if (!run.operationResult) {
+			activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+			recordSessionActivity(config, body.sessionId, activityVersion);
 			const requestModels =
 				body.kind === "deferred-cancel" ? models : resolveOperationModels(models, body.model, body.options);
 			const result =
@@ -1664,6 +1690,7 @@ async function handleModelOperation(
 		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "error", { error: message });
 	} finally {
 		clearInterval(heartbeat);
+		if (activityVersion !== undefined) recordSessionActivity(config, body.sessionId, activityVersion);
 		settleRun(run);
 		endStreamResponse(res);
 	}

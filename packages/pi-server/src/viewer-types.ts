@@ -78,7 +78,6 @@ export interface ObserverUpdate {
 	sequence: number;
 	cwd?: string;
 	title?: string;
-	lastActiveAt?: number | null;
 	replace?: ViewerMessage[];
 	append?: ViewerMessage[];
 	status?: "running" | "idle";

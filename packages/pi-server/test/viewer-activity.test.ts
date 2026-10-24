@@ -9,6 +9,7 @@ import {
 	appendSessionEntries,
 	clearAllSessions,
 	deleteSession,
+	getSession,
 	restoreSessionState,
 	setStaticContext,
 	switchSessionLeaf,
@@ -210,19 +211,37 @@ describe("viewer activity timestamps", () => {
 		expect(new ViewerStore(directory).get("thread")?.lastActiveAt).toBe(80);
 	});
 
-	it("merges observer message and explicit activity without advancing on reconnect or metadata", () => {
+	it("records server activity without an observer and preserves archive history", () => {
+		archive("thread", "D:/a", [entry("u", 900000)], 999999);
+		const original = structuredClone(getSession("thread"));
+		const store = new ViewerStore(directory);
+		const rounds = vi.spyOn(store, "rounds");
+		store.projects();
+		vi.spyOn(Date, "now").mockReturnValue(100);
+		store.recordActivity("thread");
+		expect(store.get("thread")).toMatchObject({ lastActiveAt: 100, legacy: true });
+		expect(store.projects().projects[0].lastActiveAt).toBe(100);
+		expect(rounds).not.toHaveBeenCalled();
+		expect(getSession("thread")).toEqual(original);
+		expect(store.rounds("thread", null).rounds[0].messages[0].id).toBe("u");
+		expect(new ViewerStore(directory).get("thread")?.lastActiveAt).toBe(100);
+	});
+
+	it("keeps observer projections, metadata and reconnects from advancing server activity", () => {
 		const store = new ViewerStore(directory);
 		const first = store.connect("observer");
-		const messages: ViewerMessage[] = [{ id: "u", role: "user", content: "Question", timestamp: 30 }];
+		const messages: ViewerMessage[] = [{ id: "u", role: "user", content: "Question", timestamp: 900000 }];
 		store.update({
 			sessionId: "observer",
 			connectionId: first.connectionId,
 			sequence: 1,
 			cwd: "D:/a",
 			replace: messages,
-			lastActiveAt: 50,
 			status: "idle",
 		});
+		expect(store.get("observer")?.lastActiveAt).toBeNull();
+		vi.spyOn(Date, "now").mockReturnValue(100);
+		store.recordActivity("observer");
 		first.close();
 		const reconnected = store.connect("observer");
 		store.update({
@@ -231,17 +250,10 @@ describe("viewer activity timestamps", () => {
 			sequence: 1,
 			cwd: "D:/a",
 			replace: messages,
-			lastActiveAt: 50,
 			status: "idle",
 		});
 		const catalog = store.projects();
-		store.update({
-			sessionId: "observer",
-			connectionId: reconnected.connectionId,
-			sequence: 2,
-			replace: messages,
-			lastActiveAt: 50,
-		});
+		store.update({ sessionId: "observer", connectionId: reconnected.connectionId, sequence: 2, replace: messages });
 		expect(store.projects()).toBe(catalog);
 		store.update({
 			sessionId: "observer",
@@ -249,75 +261,78 @@ describe("viewer activity timestamps", () => {
 			sequence: 3,
 			title: "Renamed",
 			cwd: "D:/b",
-			lastActiveAt: null,
 		});
-		expect(store.get("observer")).toMatchObject({ title: "Renamed", cwd: "D:/b", lastActiveAt: 50 });
+		expect(store.get("observer")).toMatchObject({ title: "Renamed", cwd: "D:/b", lastActiveAt: 100 });
 		store.update({
 			sessionId: "observer",
 			connectionId: reconnected.connectionId,
 			sequence: 4,
-			append: [{ id: "a", role: "assistant", content: "Answer", timestamp: 70 }],
-			lastActiveAt: 60,
+			append: [{ id: "a", role: "assistant", content: "Answer", timestamp: 990000 }],
 		});
-		expect(store.get("observer")?.lastActiveAt).toBe(70);
-		const beforeActivity = store.projects();
-		store.update({ sessionId: "observer", connectionId: reconnected.connectionId, sequence: 5, lastActiveAt: 90 });
-		expect(store.projects()).not.toBe(beforeActivity);
-		expect(store.projects().projects[0].lastActiveAt).toBe(90);
-		expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(90);
+		expect(store.get("observer")?.lastActiveAt).toBe(100);
+		expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(100);
 	});
 
-	it("migrates observer log timestamps once and removes synchronization timestamps from the index", () => {
-		const store = new ViewerStore(directory);
-		const { connectionId } = store.connect("observer");
-		const messages: ViewerMessage[] = [
-			{ id: "u", role: "user", content: "Question", timestamp: 90 },
-			{ id: "a", role: "assistant", content: "Answer", timestamp: 30 },
-		];
-		store.update({ sessionId: "observer", connectionId, sequence: 1, cwd: "D:/a", replace: messages });
-		const metadataDir = join(directory, ".viewer", "threads");
-		const metadataPath = join(metadataDir, readdirSync(metadataDir).find((path) => path.endsWith(".json"))!);
-		const legacy = JSON.parse(readFileSync(metadataPath, "utf8")) as {
-			thread: { lastActiveAt?: number | null; updatedAt?: number };
-		};
-		delete legacy.thread.lastActiveAt;
-		legacy.thread.updatedAt = 999999;
-		writeFileSync(metadataPath, JSON.stringify(legacy));
-		const migrated = new ViewerStore(directory);
-		expect(migrated.get("observer")?.lastActiveAt).toBe(90);
-		expect(migrated.rounds("observer", null).rounds[0].messages).toEqual(messages);
-		const saved = readFileSync(metadataPath, "utf8");
-		expect(JSON.parse(saved).thread).toMatchObject({ lastActiveAt: 90 });
-		expect(saved).not.toContain("updatedAt");
-		expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(90);
-		expect(readFileSync(metadataPath, "utf8")).toBe(saved);
-	});
+	it.each([false, true])(
+		"migrates stored observer activity from historical records once with previous activity field %s",
+		(hasActivity) => {
+			archive("observer", "D:/a", [entry("archive", 80)], 9999999);
+			const store = new ViewerStore(directory);
+			const { connectionId } = store.connect("observer");
+			const messages: ViewerMessage[] = [
+				{ id: "u", role: "user", content: "Question", timestamp: 90 },
+				{ id: "a", role: "assistant", content: "Answer", timestamp: 30 },
+			];
+			store.update({ sessionId: "observer", connectionId, sequence: 1, cwd: "D:/a", replace: messages });
+			const metadataDir = join(directory, ".viewer", "threads");
+			const metadataPath = join(metadataDir, readdirSync(metadataDir).find((path) => path.endsWith(".json"))!);
+			const legacy = JSON.parse(readFileSync(metadataPath, "utf8")) as {
+				serverLastActiveAt?: number | null;
+				thread: { lastActiveAt?: number | null; updatedAt?: number };
+			};
+			delete legacy.serverLastActiveAt;
+			if (hasActivity) legacy.thread.lastActiveAt = 999999;
+			else delete legacy.thread.lastActiveAt;
+			legacy.thread.updatedAt = 9999999;
+			writeFileSync(metadataPath, JSON.stringify(legacy));
+			const migrated = new ViewerStore(directory);
+			expect(migrated.get("observer")?.lastActiveAt).toBe(90);
+			expect(migrated.rounds("observer", null).rounds[0].messages).toEqual(messages);
+			const saved = readFileSync(metadataPath, "utf8");
+			expect(JSON.parse(saved)).toMatchObject({ serverLastActiveAt: 90, thread: { lastActiveAt: 90 } });
+			expect(saved).not.toContain("updatedAt");
+			expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(90);
+			expect(readFileSync(metadataPath, "utf8")).toBe(saved);
+			vi.spyOn(Date, "now").mockReturnValue(10);
+			migrated.recordActivity("observer");
+			expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(10);
+		},
+	);
 
-	it("validates observer activity at the HTTP boundary", () => {
+	it("ignores observer activity fields at the HTTP boundary", () => {
 		const http = new ViewerHttp(loadConfig({ sessionStoreDir: directory, authToken: "test" }), async () => ({
 			deletedIds: [],
 			deletedCount: 0,
 			failed: [],
 		}));
 		const { connectionId } = http.store.connect("thread");
-		for (const lastActiveAt of ["10", true, {}, NaN, Infinity]) {
-			const writeHead = vi.fn();
-			const end = vi.fn();
-			http.observe({ sessionId: "thread", connectionId, sequence: 1, cwd: "D:/a", replace: [], lastActiveAt }, {
-				writeHead,
-				end,
-			} as unknown as ServerResponse);
-			expect(writeHead).toHaveBeenCalledWith(400, expect.anything());
-			expect(end).toHaveBeenCalledWith(JSON.stringify({ error: "lastActiveAt must be a finite number or null" }));
-		}
-		for (const [index, lastActiveAt] of [null, 0, 10].entries()) {
+		vi.spyOn(Date, "now").mockReturnValue(100);
+		http.store.recordActivity("thread");
+		for (const [index, lastActiveAt] of ["10", true, {}, NaN, Infinity, null, 9999999].entries()) {
 			const writeHead = vi.fn();
 			http.observe(
-				{ sessionId: "thread", connectionId, sequence: index + 1, cwd: "D:/a", replace: [], lastActiveAt },
+				{
+					sessionId: "thread",
+					connectionId,
+					sequence: index + 1,
+					cwd: "D:/a",
+					replace: [{ id: "u", role: "user", content: "Question", timestamp: 9999999 }],
+					lastActiveAt,
+				},
 				{ writeHead, end: vi.fn() } as unknown as ServerResponse,
 			);
 			expect(writeHead).toHaveBeenCalledWith(200, expect.anything());
-			expect(http.store.get("thread")?.lastActiveAt).toBe(lastActiveAt);
+			expect(http.store.get("thread")?.lastActiveAt).toBe(100);
 		}
 	});
 });

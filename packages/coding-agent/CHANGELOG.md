@@ -17,7 +17,7 @@
 
 ### Fixed
 
-- Published explicit viewer activity timestamps at run, tool, and compaction boundaries and used entry commit times for saved messages without treating reconnects or live deltas as new activity.
+- Used entry commit times for saved observer messages and isolated pending observer responses when switching sessions.
 - Stopped viewer observer reconnection when the server's presence handshake reports that the session was deleted.
 - Preserved client identity and attribution settings across pi-server chat, compaction, image, classifier, and deferred requests.
 - Normalized home-directory separators in resource displays and applied the configured home directory consistently to resource exclusion patterns.

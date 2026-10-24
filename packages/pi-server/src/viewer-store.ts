@@ -39,6 +39,7 @@ interface StoredThread {
 	fileId: string;
 	logId: string;
 	thread: ViewerThread;
+	serverLastActiveAt: number | null;
 	rounds: RoundOffset[];
 	length: number;
 }
@@ -145,11 +146,14 @@ export class ViewerStore {
 			truncateSync(log, stored.length);
 			stored.thread.status = "disconnected";
 			stored.thread.live = { message: null, tools: [] };
-			if (stored.thread.lastActiveAt === undefined) {
+			if (stored.serverLastActiveAt === undefined) {
 				const lines = readFileSync(log, "utf8").trimEnd();
-				stored.thread.lastActiveAt = messageActivity(
-					lines ? lines.split("\n").map((line) => JSON.parse(line) as ViewerMessage) : [],
+				const session = getSession(stored.thread.id);
+				stored.serverLastActiveAt = latestActivity(
+					session ? this.sessionMetadata(session).lastActiveAt : null,
+					messageActivity(lines ? lines.split("\n").map((line) => JSON.parse(line) as ViewerMessage) : []),
 				);
+				stored.thread.lastActiveAt = stored.serverLastActiveAt;
 				delete stored.thread.updatedAt;
 				this.persist(stored);
 			}
@@ -210,6 +214,19 @@ export class ViewerStore {
 			legacy: !stored || (stored.length === 0 && Boolean(session?.entries.length)),
 			live: stored ? structuredClone(stored.thread.live) : { message: null, tools: [] },
 		};
+	}
+
+	recordActivity(id: string): void {
+		let stored = this.threads.get(id);
+		if (!stored) {
+			stored = this.createThread(id, null);
+			mkdirSync(this.directory, { recursive: true });
+			writeFileSync(join(this.directory, `${stored.logId}.jsonl`), "");
+		}
+		stored.serverLastActiveAt = Date.now();
+		stored.thread.lastActiveAt = stored.serverLastActiveAt;
+		this.persist(stored);
+		this.emit(stored);
 	}
 
 	refreshSession(id: string): void {
@@ -337,23 +354,7 @@ export class ViewerStore {
 		const created = !stored;
 		if (!stored) {
 			if (!body.replace || !body.cwd) throw new Error("First observer update requires cwd and replace");
-			stored = {
-				fileId: randomUUID(),
-				logId: randomUUID(),
-				thread: {
-					id: body.sessionId,
-					title: body.title ?? body.sessionId,
-					cwd: body.cwd,
-					projectId: body.cwd,
-					status: "unknown",
-					lastActiveAt: null,
-					legacy: false,
-					live: { message: null, tools: [] },
-				},
-				rounds: [],
-				length: 0,
-			};
-			this.threads.set(body.sessionId, stored);
+			stored = this.createThread(body.sessionId, body.cwd, body.title);
 		}
 		const metadataChanged =
 			(body.cwd !== undefined && body.cwd !== stored.thread.cwd) ||
@@ -367,12 +368,6 @@ export class ViewerStore {
 		if (body.status !== undefined) stored.thread.status = body.status;
 		if (body.live !== undefined) stored.thread.live = body.live;
 		const messages = body.replace ?? body.append ?? [];
-		const lastActiveAt = latestActivity(
-			stored.thread.lastActiveAt,
-			latestActivity(body.lastActiveAt ?? null, messageActivity(messages)),
-		);
-		const activityChanged = lastActiveAt !== stored.thread.lastActiveAt;
-		stored.thread.lastActiveAt = lastActiveAt;
 		const replacesArchive =
 			stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
 		const oldLogId = stored.logId;
@@ -382,8 +377,7 @@ export class ViewerStore {
 			stored.length = 0;
 		}
 		const log = join(this.directory, `${stored.logId}.jsonl`);
-		if (created || body.replace || messages.length || metadataChanged || activityChanged)
-			mkdirSync(this.directory, { recursive: true });
+		if (created || body.replace || messages.length || metadataChanged) mkdirSync(this.directory, { recursive: true });
 		if (body.replace) writeFileSync(log, "");
 		for (const message of messages) {
 			if (!stored.rounds.length || message.role === "user")
@@ -393,7 +387,7 @@ export class ViewerStore {
 			stored.length += Buffer.byteLength(line);
 			stored.rounds[stored.rounds.length - 1].end = stored.length;
 		}
-		if (created || messages.length || body.replace || metadataChanged || activityChanged) {
+		if (created || messages.length || body.replace || metadataChanged) {
 			this.persist(stored);
 			if (body.replace && oldLogId !== stored.logId)
 				rmSync(join(this.directory, `${oldLogId}.jsonl`), { force: true });
@@ -403,13 +397,30 @@ export class ViewerStore {
 			stored,
 			body.append,
 			body.replace !== undefined || replacesArchive,
-			created ||
-				messages.length > 0 ||
-				body.replace !== undefined ||
-				metadataChanged ||
-				statusChanged ||
-				activityChanged,
+			created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
 		);
+	}
+
+	private createThread(id: string, cwd: string | null, title = id): StoredThread {
+		const stored: StoredThread = {
+			fileId: randomUUID(),
+			logId: randomUUID(),
+			serverLastActiveAt: null,
+			thread: {
+				id,
+				title,
+				cwd,
+				projectId: cwd ?? "unassigned",
+				status: "unknown",
+				lastActiveAt: null,
+				legacy: false,
+				live: { message: null, tools: [] },
+			},
+			rounds: [],
+			length: 0,
+		};
+		this.threads.set(id, stored);
+		return stored;
 	}
 
 	private persist(stored: StoredThread): void {
@@ -512,7 +523,8 @@ export class ViewerStore {
 	}
 
 	private summary(id: string): ThreadSummary | undefined {
-		const stored = this.threads.get(id)?.thread;
+		const projection = this.threads.get(id);
+		const stored = projection?.thread;
 		const session = getSession(id);
 		if (!session && !stored) return undefined;
 		const metadata = session ? this.sessionMetadata(session) : undefined;
@@ -523,7 +535,7 @@ export class ViewerStore {
 			cwd,
 			projectId: cwd ?? "unassigned",
 			status: stored?.status ?? "unknown",
-			lastActiveAt: latestActivity(metadata?.lastActiveAt ?? null, stored?.lastActiveAt ?? null),
+			lastActiveAt: projection?.serverLastActiveAt ?? metadata?.lastActiveAt ?? null,
 		};
 	}
 
