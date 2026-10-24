@@ -272,7 +272,11 @@ describe("server session archives in the viewer", () => {
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("refresh", (update) => updates.push(update));
 		now.mockReturnValue(2000);
-		appendSessionEntries("refresh", [user("next", "u", "Next question")], "next");
+		appendSessionEntries(
+			"refresh",
+			[{ ...user("next", "u", "Next question"), timestamp: "2026-10-24T03:00:01.000Z" }],
+			"next",
+		);
 		savePersistedSession(directory, getSession("refresh")!);
 		store.refreshSession("refresh");
 		expect(catalog).toHaveBeenCalledTimes(2);

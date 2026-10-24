@@ -80,7 +80,7 @@ const thread: ViewerThread = {
 	projectId: "project",
 	cwd: null,
 	status: "idle",
-	updatedAt: 0,
+	lastActiveAt: null,
 	live: { message: null, tools: [] },
 	legacy: false,
 };

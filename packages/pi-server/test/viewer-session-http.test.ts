@@ -159,7 +159,11 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		expect(snapshot?.data.replace).toBe(true);
 		expect((snapshot?.data.rounds as ViewerRound[]).map((round) => round.id)).toEqual(["u2", "u3", "u4", "u5", "u6"]);
 		const before = String(snapshot?.data.nextCursor);
-		const appended = await post("tree/append", { sessionId: "remote", entries: [user("u7", "u6")], leafId: "u7" });
+		const appended = await post("tree/append", {
+			sessionId: "remote",
+			entries: [{ ...user("u7", "u6"), timestamp: "2026-10-24T03:00:01.000Z" }],
+			leafId: "u7",
+		});
 		expect(appended.status).toBe(200);
 		expect(await appended.json()).toMatchObject({ revision: syncState.revision + 1, entryCount: 8, leafId: "u7" });
 		expect((await catalog.next())?.event).toBe("catalog");

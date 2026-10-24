@@ -8,7 +8,7 @@ const thread: ViewerThread = {
 	title: "检查服务",
 	projectId: "project",
 	cwd: "/project",
-	updatedAt: 0,
+	lastActiveAt: null,
 	status: "running",
 	legacy: false,
 	live: {

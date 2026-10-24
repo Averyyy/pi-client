@@ -272,6 +272,12 @@ export class ViewerHttp {
 			if (body.cwd !== undefined && (typeof body.cwd !== "string" || !body.cwd))
 				throw new Error("cwd must be a non-empty string");
 			if (body.title !== undefined && typeof body.title !== "string") throw new Error("title must be a string");
+			if (
+				body.lastActiveAt !== undefined &&
+				body.lastActiveAt !== null &&
+				(typeof body.lastActiveAt !== "number" || !Number.isFinite(body.lastActiveAt))
+			)
+				throw new Error("lastActiveAt must be a finite number or null");
 			if (body.status !== undefined && body.status !== "running" && body.status !== "idle")
 				throw new Error("Invalid observer status");
 			if (body.replace !== undefined && body.append !== undefined)
@@ -282,6 +288,7 @@ export class ViewerHttp {
 				sequence: body.sequence as number,
 				...(body.cwd !== undefined ? { cwd: body.cwd as string } : {}),
 				...(body.title !== undefined ? { title: body.title as string } : {}),
+				...(body.lastActiveAt !== undefined ? { lastActiveAt: body.lastActiveAt as number | null } : {}),
 				...(body.status !== undefined ? { status: body.status as "running" | "idle" } : {}),
 				...(body.replace !== undefined ? { replace: messages(body.replace) } : {}),
 				...(body.append !== undefined ? { append: messages(body.append) } : {}),

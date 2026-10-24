@@ -52,7 +52,7 @@ describe("older history requests", () => {
 });
 
 function project(id: string, revision = "epoch:1"): ViewerProject {
-	return { id, path: id, name: id, threadCount: 10, updatedAt: 0, revision };
+	return { id, path: id, name: id, threadCount: 10, lastActiveAt: null, revision };
 }
 
 function page(id: string, nextCursor: string | null = null): Response {

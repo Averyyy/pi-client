@@ -79,21 +79,21 @@ describe("viewer catalog indexes", () => {
 		const after = store.projects();
 		expect(after.revision).not.toBe(before.revision);
 		expect(after.projects.map((project) => [project.id, project.threadCount])).toEqual([
-			["D:/b", 2],
 			["D:/c", 1],
+			["D:/b", 2],
 			["D:/a", 1],
 		]);
 		expect(after.projects.find((project) => project.id === "D:/a")?.revision).not.toBe(revisions.get("D:/a"));
 		expect(after.projects.find((project) => project.id === "D:/b")?.revision).not.toBe(revisions.get("D:/b"));
 		expect(after.projects.find((project) => project.id === "D:/c")?.revision).toBe(revisions.get("D:/c"));
 		expect(before.projects.find((project) => project.id === "D:/a")?.threadCount).toBe(2);
-		expect(store.page("D:/b", null).threads.map((thread) => thread.id)).toEqual(["a", "b"]);
+		expect(store.page("D:/b", null).threads.map((thread) => thread.id)).toEqual(["b", "a"]);
 		store.refreshSession("a");
 		expect(store.projects()).toBe(after);
 		expect(catalogEvents).toHaveBeenCalledTimes(1);
 		sessions.deleteSession("a2");
 		store.remove("a2");
-		expect(store.projects().projects.map((project) => project.id)).toEqual(["D:/b", "D:/c"]);
+		expect(store.projects().projects.map((project) => project.id)).toEqual(["D:/c", "D:/b"]);
 		expect(catalogEvents).toHaveBeenCalledTimes(2);
 	});
 
@@ -104,7 +104,7 @@ describe("viewer catalog indexes", () => {
 		archive("c", "D:/c", 30);
 		const list = vi.spyOn(sessions, "listSessions");
 		const store = new ViewerStore(directory);
-		expect(store.projects().projects.map(({ id, updatedAt }) => [id, updatedAt])).toEqual([
+		expect(store.projects().projects.map(({ id, lastActiveAt }) => [id, lastActiveAt])).toEqual([
 			["D:/a", 50],
 			["D:/b", 30],
 			["D:/c", 30],
@@ -112,7 +112,7 @@ describe("viewer catalog indexes", () => {
 		expect(store.projectThreadIds("D:/a")).toEqual(["a-new", "a-old"]);
 		sessions.deleteSession("a-new");
 		store.remove("a-new");
-		expect(store.projects().projects.map(({ id, updatedAt }) => [id, updatedAt])).toEqual([
+		expect(store.projects().projects.map(({ id, lastActiveAt }) => [id, lastActiveAt])).toEqual([
 			["D:/b", 30],
 			["D:/c", 30],
 			["D:/a", 10],

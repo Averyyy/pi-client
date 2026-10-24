@@ -48,16 +48,27 @@ interface ProjectIndex {
 	threads: ThreadSummary[];
 }
 
+function latestActivity(left: number | null, right: number | null): number | null {
+	return left === null ? right : right === null ? left : Math.max(left, right);
+}
+
+function messageActivity(messages: ViewerMessage[]): number | null {
+	let lastActiveAt: number | null = null;
+	for (const message of messages)
+		if (message.role !== "system") lastActiveAt = latestActivity(lastActiveAt, message.timestamp);
+	return lastActiveAt;
+}
+
 function compareThreads(
-	left: Pick<ThreadSummary, "id" | "updatedAt">,
-	right: Pick<ThreadSummary, "id" | "updatedAt">,
+	left: Pick<ThreadSummary, "id" | "lastActiveAt">,
+	right: Pick<ThreadSummary, "id" | "lastActiveAt">,
 ): number {
-	return right.updatedAt - left.updatedAt || left.id.localeCompare(right.id);
+	return (right.lastActiveAt ?? -Infinity) - (left.lastActiveAt ?? -Infinity) || left.id.localeCompare(right.id);
 }
 
 function threadOffset(
 	threads: ThreadSummary[],
-	target: Pick<ThreadSummary, "id" | "updatedAt">,
+	target: Pick<ThreadSummary, "id" | "lastActiveAt">,
 	after = false,
 ): number {
 	let start = 0;
@@ -108,7 +119,7 @@ export class ViewerStore {
 	private readonly deletedConnections = new Set<string>();
 	private readonly archiveMetadata = new Map<
 		string,
-		{ revision: number; title: string | undefined; cwd: string | null }
+		{ revision: number; title: string | undefined; cwd: string | null; lastActiveAt: number | null }
 	>();
 	private readonly listeners = new Map<string, Set<(update: ViewerUpdate) => void>>();
 	private readonly catalogEpoch = randomUUID();
@@ -126,12 +137,22 @@ export class ViewerStore {
 		if (!existsSync(this.directory)) return;
 		for (const file of readdirSync(this.directory)) {
 			if (!/^[a-f0-9-]+\.json$/.test(file)) continue;
-			const stored = JSON.parse(readFileSync(join(this.directory, file), "utf8")) as StoredThread;
+			const stored = JSON.parse(readFileSync(join(this.directory, file), "utf8")) as StoredThread & {
+				thread: { updatedAt?: number };
+			};
 			const log = join(this.directory, `${stored.logId}.jsonl`);
 			if (statSync(log).size < stored.length) throw new Error("Viewer log is shorter than committed index");
 			truncateSync(log, stored.length);
 			stored.thread.status = "disconnected";
 			stored.thread.live = { message: null, tools: [] };
+			if (stored.thread.lastActiveAt === undefined) {
+				const lines = readFileSync(log, "utf8").trimEnd();
+				stored.thread.lastActiveAt = messageActivity(
+					lines ? lines.split("\n").map((line) => JSON.parse(line) as ViewerMessage) : [],
+				);
+				delete stored.thread.updatedAt;
+				this.persist(stored);
+			}
 			this.threads.set(stored.thread.id, stored);
 		}
 	}
@@ -139,9 +160,7 @@ export class ViewerStore {
 	projects(): ViewerCatalog {
 		this.initializeCatalog();
 		this.catalog ??= {
-			projects: [...this.projectIndex.values()]
-				.map(({ project }) => project)
-				.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
+			projects: [...this.projectIndex.values()].map(({ project }) => project).sort(compareThreads),
 			running: [...this.running.values()].sort(compareThreads),
 			revision: `${this.catalogEpoch}:${this.catalogSequence}`,
 		};
@@ -160,9 +179,13 @@ export class ViewerStore {
 		if (cursor !== null) {
 			const anchor = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
 				id: string;
-				updatedAt: number;
+				lastActiveAt: number | null;
 			};
-			if (typeof anchor.id !== "string" || typeof anchor.updatedAt !== "number")
+			if (
+				typeof anchor.id !== "string" ||
+				(anchor.lastActiveAt !== null &&
+					(typeof anchor.lastActiveAt !== "number" || !Number.isFinite(anchor.lastActiveAt)))
+			)
 				throw new Error("Invalid pagination cursor");
 			start = threadOffset(threads, anchor, true);
 		}
@@ -172,7 +195,7 @@ export class ViewerStore {
 			threads: page,
 			nextCursor:
 				threads.length > start + 5 && last
-					? Buffer.from(JSON.stringify({ id: last.id, updatedAt: last.updatedAt })).toString("base64url")
+					? Buffer.from(JSON.stringify({ id: last.id, lastActiveAt: last.lastActiveAt })).toString("base64url")
 					: null,
 		};
 	}
@@ -323,7 +346,7 @@ export class ViewerStore {
 					cwd: body.cwd,
 					projectId: body.cwd,
 					status: "unknown",
-					updatedAt: Date.now(),
+					lastActiveAt: null,
 					legacy: false,
 					live: { message: null, tools: [] },
 				},
@@ -344,6 +367,12 @@ export class ViewerStore {
 		if (body.status !== undefined) stored.thread.status = body.status;
 		if (body.live !== undefined) stored.thread.live = body.live;
 		const messages = body.replace ?? body.append ?? [];
+		const lastActiveAt = latestActivity(
+			stored.thread.lastActiveAt,
+			latestActivity(body.lastActiveAt ?? null, messageActivity(messages)),
+		);
+		const activityChanged = lastActiveAt !== stored.thread.lastActiveAt;
+		stored.thread.lastActiveAt = lastActiveAt;
 		const replacesArchive =
 			stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
 		const oldLogId = stored.logId;
@@ -353,7 +382,8 @@ export class ViewerStore {
 			stored.length = 0;
 		}
 		const log = join(this.directory, `${stored.logId}.jsonl`);
-		if (created || body.replace || messages.length || metadataChanged) mkdirSync(this.directory, { recursive: true });
+		if (created || body.replace || messages.length || metadataChanged || activityChanged)
+			mkdirSync(this.directory, { recursive: true });
 		if (body.replace) writeFileSync(log, "");
 		for (const message of messages) {
 			if (!stored.rounds.length || message.role === "user")
@@ -363,17 +393,8 @@ export class ViewerStore {
 			stored.length += Buffer.byteLength(line);
 			stored.rounds[stored.rounds.length - 1].end = stored.length;
 		}
-		if (created || messages.length || body.replace || metadataChanged) {
-			stored.thread.updatedAt = Date.now();
-			const path = join(this.directory, `${stored.fileId}.json`);
-			writeFileSync(
-				`${path}.tmp`,
-				JSON.stringify({
-					...stored,
-					thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
-				}),
-			);
-			renameSync(`${path}.tmp`, path);
+		if (created || messages.length || body.replace || metadataChanged || activityChanged) {
+			this.persist(stored);
 			if (body.replace && oldLogId !== stored.logId)
 				rmSync(join(this.directory, `${oldLogId}.jsonl`), { force: true });
 		}
@@ -382,8 +403,25 @@ export class ViewerStore {
 			stored,
 			body.append,
 			body.replace !== undefined || replacesArchive,
-			created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
+			created ||
+				messages.length > 0 ||
+				body.replace !== undefined ||
+				metadataChanged ||
+				statusChanged ||
+				activityChanged,
 		);
+	}
+
+	private persist(stored: StoredThread): void {
+		const path = join(this.directory, `${stored.fileId}.json`);
+		writeFileSync(
+			`${path}.tmp`,
+			JSON.stringify({
+				...stored,
+				thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
+			}),
+		);
+		renameSync(`${path}.tmp`, path);
 	}
 
 	private initializeCatalog(): void {
@@ -404,7 +442,7 @@ export class ViewerStore {
 		}
 		for (const indexed of this.projectIndex.values()) {
 			indexed.threads.sort(compareThreads);
-			indexed.project.updatedAt = indexed.threads[0].updatedAt;
+			indexed.project.lastActiveAt = indexed.threads[0].lastActiveAt;
 		}
 	}
 
@@ -416,7 +454,7 @@ export class ViewerStore {
 				name: summary.cwd?.split("/").filter(Boolean).at(-1) ?? "Unassigned archives",
 				threadCount: 0,
 				revision: `${this.catalogEpoch}:${this.catalogSequence}`,
-				updatedAt: summary.updatedAt,
+				lastActiveAt: summary.lastActiveAt,
 			},
 			threads: [],
 		};
@@ -436,7 +474,7 @@ export class ViewerStore {
 			previous?.projectId === next?.projectId &&
 			previous?.cwd === next?.cwd &&
 			previous?.status === next?.status &&
-			previous?.updatedAt === next?.updatedAt
+			previous?.lastActiveAt === next?.lastActiveAt
 		)
 			return;
 		const revision = `${this.catalogEpoch}:${++this.catalogSequence}`;
@@ -446,7 +484,7 @@ export class ViewerStore {
 			project.project = {
 				...project.project,
 				threadCount: project.threads.length,
-				updatedAt: project.threads[0]?.updatedAt ?? 0,
+				lastActiveAt: project.threads[0]?.lastActiveAt ?? null,
 				revision,
 			};
 			if (project.threads.length === 0) this.projectIndex.delete(previous.projectId);
@@ -464,7 +502,7 @@ export class ViewerStore {
 			project.project = {
 				...project.project,
 				threadCount: project.threads.length,
-				updatedAt: project.threads[0].updatedAt,
+				lastActiveAt: project.threads[0].lastActiveAt,
 				revision,
 			};
 			if (next.status === "running") this.running.set(id, next);
@@ -485,7 +523,7 @@ export class ViewerStore {
 			cwd,
 			projectId: cwd ?? "unassigned",
 			status: stored?.status ?? "unknown",
-			updatedAt: Math.max(session?.updatedAt ?? 0, stored?.updatedAt ?? 0),
+			lastActiveAt: latestActivity(metadata?.lastActiveAt ?? null, stored?.lastActiveAt ?? null),
 		};
 	}
 
@@ -507,7 +545,11 @@ export class ViewerStore {
 		return index;
 	}
 
-	private sessionMetadata(session: SessionState): { title: string | undefined; cwd: string | null } {
+	private sessionMetadata(session: SessionState): {
+		title: string | undefined;
+		cwd: string | null;
+		lastActiveAt: number | null;
+	} {
 		const cached = this.archiveMetadata.get(session.sessionId);
 		if (cached?.revision === session.revision) return cached;
 		let name: string | undefined;
@@ -531,8 +573,19 @@ export class ViewerStore {
 		const cwd =
 			(typeof section === "string" ? /^<cwd>\r?\n([^\r\n]+)\r?\n<\/cwd>$/.exec(section)?.[1] : undefined) ??
 			staticPromptCwd(prompt);
+		let lastActiveAt: number | null = null;
+		for (const entry of session.entries) {
+			const message = entry.type === "message" ? (entry.message as Record<string, unknown>) : undefined;
+			const active =
+				(message !== undefined && message.role !== "system" && !(message.role === "custom" && !message.display)) ||
+				(entry.type === "custom_message" && entry.display) ||
+				entry.type === "compaction" ||
+				entry.type === "branch_summary";
+			if (active) lastActiveAt = latestActivity(lastActiveAt, Date.parse(entry.timestamp));
+		}
 		const metadata = {
 			revision: session.revision,
+			lastActiveAt,
 			title: name ?? firstUser,
 			cwd: cwd ? normalizeProjectPath(cwd) : null,
 		};

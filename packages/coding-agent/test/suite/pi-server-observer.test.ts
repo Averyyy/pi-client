@@ -3,6 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSessionEventListener } from "../../src/core/agent-session.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type ObserverUpdate, PiServerObserver, projectObserverEntries } from "../../src/core/pi-server-observer.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -180,6 +181,167 @@ describe("pi-server observer", () => {
 		expect(Math.max(...fixture.rawSizes)).toBeLessThanOrEqual(65536);
 	});
 
+	it.each(["message", "custom_message", "compaction", "branch_summary"] as const)(
+		"derives initial activity from a durable %s entry",
+		async (type) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const manager = harness.sessionManager;
+			let id: string;
+			if (type === "message") id = manager.appendMessage({ role: "user", content: "history", timestamp: 1 });
+			else if (type === "custom_message") id = manager.appendCustomMessageEntry("notice", "visible", true);
+			else if (type === "compaction") id = manager.appendCompaction("summary", null, 100);
+			else id = manager.branchWithSummary(null, "branch summary");
+			manager.getEntry(id)!.timestamp = "2020-01-01T00:00:00.000Z";
+			const fixture = await createFixture();
+			fixtures.push(fixture);
+			observers.push(new PiServerObserver(harness.session));
+			await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+			expect(fixture.updates[0]?.lastActiveAt).toBe(Date.parse("2020-01-01T00:00:00.000Z"));
+			expect(fixture.updates[0]?.replace?.[0]?.timestamp).toBe(fixture.updates[0]?.lastActiveAt);
+		},
+	);
+
+	it("keeps sessions without visible activity undated", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		manager.appendMessage({ role: "system", content: "instructions", timestamp: 1 });
+		manager.appendMessage({ role: "custom", customType: "hidden", content: "hidden", display: false, timestamp: 2 });
+		manager.appendCustomMessageEntry("hidden", "hidden", false);
+		manager.appendCustomEntry("metadata", {});
+		manager.appendSessionInfo("name");
+		manager.appendModelChange("provider", "model");
+		manager.appendThinkingLevelChange("high");
+		manager.appendUsage("warm", "provider", "model", fauxAssistantMessage("").usage);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		expect(fixture.updates[0]?.lastActiveAt).toBeNull();
+		expect(fixture.updates[0]?.replace).toEqual([]);
+	});
+
+	it("preserves whole-tree activity across reconnect, title changes, history replay, and old branches", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		const first = manager.appendMessage({ role: "user", content: "older", timestamp: 1 });
+		manager.getEntry(first)!.timestamp = "2020-01-01T00:00:00.000Z";
+		const latest = manager.appendMessage({ role: "user", content: "newer branch", timestamp: 2 });
+		manager.getEntry(latest)!.timestamp = "2020-01-02T00:00:00.000Z";
+		manager.branch(first);
+		let emit: AgentSessionEventListener = () => {};
+		vi.spyOn(harness.session, "subscribe").mockImplementation((listener) => {
+			emit = listener;
+			return () => {};
+		});
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		const activity = Date.parse("2020-01-02T00:00:00.000Z");
+		expect(fixture.updates[0]?.lastActiveAt).toBe(activity);
+		emit({ type: "session_info_changed", name: "renamed" });
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(2));
+		emit({ type: "history_reconciled", entryCount: 2, messageCount: 2 });
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(3));
+		manager.resetLeaf();
+		emit({ type: "session_tree_changed" });
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(4));
+		expect(fixture.updates.at(-1)?.replace).toEqual([]);
+		fixture.sockets[0]?.end();
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(5), { timeout: 4000 });
+		expect(fixture.updates.every((update) => update.lastActiveAt === activity)).toBe(true);
+		expect(diagnostic).toHaveBeenLastCalledWith("pi-server observer connected");
+	});
+
+	it("advances activity on lifecycle boundaries and committed entries while live deltas retain their boundary time", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let emit: AgentSessionEventListener = () => {};
+		vi.spyOn(harness.session, "subscribe").mockImplementation((listener) => {
+			emit = listener;
+			return () => {};
+		});
+		const clock = vi.spyOn(Date, "now");
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		let time = 1000;
+		clock.mockReturnValue(time);
+		emit({ type: "run_state_changed", running: true });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		time += 1000;
+		clock.mockReturnValue(time);
+		const message = fauxAssistantMessage("stream", { timestamp: 20 });
+		emit({ type: "message_start", message });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		clock.mockReturnValue(9000);
+		for (let index = 0; index < 200; index++) {
+			emit({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial: message },
+			});
+		}
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.live.message?.timestamp).toBe(20));
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time);
+		time += 1000;
+		clock.mockReturnValue(time);
+		emit({ type: "tool_execution_start", toolCallId: "tool", toolName: "wait", args: {} });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		clock.mockReturnValue(9000);
+		for (let index = 0; index < 200; index++) {
+			emit({
+				type: "tool_execution_update",
+				toolCallId: "tool",
+				toolName: "wait",
+				args: {},
+				partialResult: { content: [{ type: "text", text: `partial ${index}` }], details: {} },
+			});
+		}
+		await vi.waitFor(() =>
+			expect(fixture.updates.at(-1)?.live.tools[0]?.result).toEqual({
+				content: [{ type: "text", text: "partial 199" }],
+			}),
+		);
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time);
+		time += 1000;
+		clock.mockReturnValue(time);
+		emit({
+			type: "tool_execution_end",
+			toolCallId: "tool",
+			toolName: "wait",
+			result: { content: [], details: {} },
+			isError: true,
+		});
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		time += 1000;
+		clock.mockReturnValue(time);
+		emit({ type: "compaction_start", reason: "manual" });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		time += 1000;
+		clock.mockReturnValue(time);
+		emit({ type: "compaction_end", reason: "manual", result: undefined, aborted: true, willRetry: false });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		time += 1000;
+		clock.mockReturnValue(time);
+		emit({ type: "run_state_changed", running: false });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(time));
+		const id = harness.sessionManager.appendMessage({ role: "user", content: "committed", timestamp: 1 });
+		const entry = harness.sessionManager.getEntry(id)!;
+		entry.timestamp = new Date(8000).toISOString();
+		emit({ type: "entry_appended", entry });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.lastActiveAt).toBe(8000));
+		entry.timestamp = new Date(1000).toISOString();
+		emit({ type: "message_committed", entry });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.append?.[0]?.timestamp).toBe(1000));
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(8000);
+	});
+
 	it("stays running through tools and appends final persisted entries before becoming idle", async () => {
 		let release: (() => void) | undefined;
 		const gate = new Promise<void>((resolve) => {
@@ -272,11 +434,16 @@ describe("pi-server observer", () => {
 		fixtures.push(fixture);
 		observers.push(new PiServerObserver(harness.session));
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		const startedAt = Date.now() + 1000000;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
 		const run = harness.session.prompt("prepare").catch((error: unknown) => error);
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("running"));
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(startedAt);
+		clock.mockReturnValue(startedAt + 1000);
 		rejectPreparation?.(new Error("preparation failed"));
 		expect(await run).toMatchObject({ message: "preparation failed" });
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(startedAt + 1000);
 		expect(harness.faux.state.callCount).toBe(0);
 	});
 
@@ -320,6 +487,46 @@ describe("pi-server observer", () => {
 		expect(
 			fixture.updates.flatMap((update) => update.append ?? []).filter((message) => message.role === "assistant"),
 		).toHaveLength(1);
+	});
+
+	it("timestamps a five-minute assistant response at commit while retaining its live message timestamp", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_update", async (event) => {
+						if (event.assistantMessageEvent.type === "text_end") await gate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		vi.useFakeTimers({ toFake: ["Date"] });
+		const startedAt = Date.parse("2020-01-01T00:00:00.000Z");
+		vi.setSystemTime(startedAt);
+		harness.setResponses([fauxAssistantMessage("long response", { timestamp: startedAt })]);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		const run = harness.session.prompt("start");
+		await vi.waitFor(() =>
+			expect(fixture.updates.at(-1)?.live.message?.content).toEqual([{ type: "text", text: "long response" }]),
+		);
+		expect(fixture.updates.at(-1)?.live.message?.timestamp).toBe(startedAt);
+		vi.setSystemTime(startedAt + 300000);
+		release?.();
+		await run;
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		const committed = fixture.updates
+			.flatMap((update) => update.append ?? [])
+			.find((message) => message.role === "assistant");
+		expect(committed?.timestamp).toBe(startedAt + 300000);
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(startedAt + 300000);
 	});
 
 	it("preserves failed attempts in transcript history and stays running until retry recovery settles", async () => {
@@ -436,6 +643,8 @@ describe("pi-server observer", () => {
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
 		const run = harness.session.prompt("start");
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.live.tools[0]?.status).toBe("running"));
+		const settledAt = Date.now() + 1000000;
+		vi.spyOn(Date, "now").mockReturnValue(settledAt);
 		const cancellation = harness.session.abort();
 		await vi.waitFor(() => expect(aborted).toBe(true));
 		expect(harness.session.isStreaming).toBe(true);
@@ -443,22 +652,57 @@ describe("pi-server observer", () => {
 		release?.();
 		await Promise.all([run, cancellation]);
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		expect(fixture.updates.at(-1)?.lastActiveAt).toBe(settledAt);
 		expect(fixture.updates.at(-1)?.live).toEqual({ message: null, tools: [] });
 	});
 
 	it("moves presence to the new session immediately when its manager changes", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "old session", timestamp: 1 });
 		const fixture = await createFixture();
 		fixtures.push(fixture);
 		observers.push(new PiServerObserver(harness.session));
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		expect(fixture.updates[0]?.lastActiveAt).toBeTypeOf("number");
 		const oldId = harness.session.sessionId;
 		harness.sessionManager.newSession();
 		harness.session.refreshContext();
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).not.toBe(oldId));
 		expect(fixture.closed).toBe(1);
-		expect(fixture.updates.at(-1)).toMatchObject({ sessionId: harness.session.sessionId, sequence: 1, replace: [] });
+		expect(fixture.updates.at(-1)).toMatchObject({
+			sessionId: harness.session.sessionId,
+			sequence: 1,
+			replace: [],
+			lastActiveAt: null,
+		});
+	});
+
+	it("retains activity arriving while an older update is awaiting acknowledgement", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let emit: AgentSessionEventListener = () => {};
+		vi.spyOn(harness.session, "subscribe").mockImplementation((listener) => {
+			emit = listener;
+			return () => {};
+		});
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		let release: (() => void) | undefined;
+		fixture.holdResponse = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		expect(fixture.updates[0]?.lastActiveAt).toBeNull();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
+		emit({ type: "run_state_changed", running: true });
+		clock.mockReturnValue(2000);
+		emit({ type: "run_state_changed", running: false });
+		fixture.holdResponse = undefined;
+		release?.();
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(2));
+		expect(fixture.updates[1]?.lastActiveAt).toBe(2000);
 	});
 
 	it("preserves each native text phase and omits unrelated provider signature formats", () => {
@@ -497,7 +741,7 @@ describe("pi-server observer", () => {
 				],
 				stopReason: "stop",
 				phase: "final_answer",
-				timestamp: message.timestamp,
+				timestamp: Date.parse(manager.getEntry(manager.getLeafId()!)!.timestamp),
 				errorMessage: undefined,
 			},
 		]);

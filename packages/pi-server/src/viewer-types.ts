@@ -33,7 +33,7 @@ export interface ThreadSummary {
 	projectId: string;
 	cwd: string | null;
 	status: "running" | "idle" | "disconnected" | "unknown";
-	updatedAt: number;
+	lastActiveAt: number | null;
 }
 
 export interface ViewerThread extends ThreadSummary {
@@ -47,7 +47,7 @@ export interface ViewerProject {
 	name: string;
 	threadCount: number;
 	revision: string;
-	updatedAt: number;
+	lastActiveAt: number | null;
 }
 
 export interface ViewerDeleteResult {
@@ -78,6 +78,7 @@ export interface ObserverUpdate {
 	sequence: number;
 	cwd?: string;
 	title?: string;
+	lastActiveAt?: number | null;
 	replace?: ViewerMessage[];
 	append?: ViewerMessage[];
 	status?: "running" | "idle";

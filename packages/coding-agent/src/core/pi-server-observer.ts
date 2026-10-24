@@ -43,6 +43,7 @@ export interface ObserverUpdate {
 	sequence: number;
 	cwd: string;
 	title: string;
+	lastActiveAt: number | null;
 	replace?: ObserverMessage[];
 	append?: ObserverMessage[];
 	status: "running" | "idle";
@@ -78,13 +79,13 @@ function projectContent(
 	});
 }
 
-function projectMessage(id: string, message: AgentMessage): ObserverMessage | undefined {
+function projectMessage(id: string, message: AgentMessage, timestamp = message.timestamp): ObserverMessage | undefined {
 	if (message.role === "system" || (message.role === "custom" && !message.display)) return undefined;
 	let content: ObserverMessage["content"];
 	if (message.role === "bashExecution") content = bashExecutionToText(message);
 	else if (message.role === "compactionSummary" || message.role === "branchSummary") content = message.summary;
 	else content = projectContent(message.content);
-	const projected: ObserverMessage = { id, role: message.role, content, timestamp: message.timestamp };
+	const projected: ObserverMessage = { id, role: message.role, content, timestamp };
 	if (message.role === "assistant") {
 		projected.stopReason = message.stopReason;
 		projected.errorMessage = message.errorMessage;
@@ -100,7 +101,7 @@ export function projectObserverEntries(entries: SessionEntry[]): ObserverMessage
 	const messages: ObserverMessage[] = [];
 	for (const entry of entries) {
 		let message: ObserverMessage | undefined;
-		if (entry.type === "message") message = projectMessage(entry.id, entry.message);
+		if (entry.type === "message") message = projectMessage(entry.id, entry.message, Date.parse(entry.timestamp));
 		else if (entry.type === "custom_message" && entry.display) {
 			message = {
 				id: entry.id,
@@ -143,9 +144,12 @@ export class PiServerObserver {
 	private liveMessageId = "";
 	private readonly tools = new Map<string, ObserverTool>();
 	private disconnected = false;
+	private activitySessionId?: string;
+	private lastActiveAt: number | null = null;
 
 	constructor(session: AgentSession) {
 		this.session = session;
+		this.syncActivity();
 		observers.set(session, this);
 		this.unsubscribe = session.subscribe((event) => {
 			try {
@@ -158,11 +162,13 @@ export class PiServerObserver {
 	}
 
 	private handleEvent(event: AgentSessionEvent): void {
+		this.syncActivity();
 		switch (event.type) {
 			case "session_disposed":
 				this.dispose();
 				return;
 			case "run_state_changed":
+				this.recordActivity(Date.now());
 				if (!event.running) {
 					this.liveMessage = null;
 					this.tools.clear();
@@ -170,6 +176,7 @@ export class PiServerObserver {
 				break;
 			case "message_start":
 				if (event.message.role !== "assistant") return;
+				this.recordActivity(Date.now());
 				this.tools.clear();
 				this.liveMessageId = randomUUID();
 				this.liveMessage = event.message;
@@ -179,6 +186,7 @@ export class PiServerObserver {
 				break;
 			case "entry_appended":
 			case "message_committed":
+				this.recordEntryActivity(event.entry);
 				if (this.connectionId && !this.historyDirty) {
 					this.pendingEntries.push(event.entry);
 					if (this.pendingEntries.length > 64) {
@@ -190,6 +198,7 @@ export class PiServerObserver {
 				break;
 			case "history_reconciled":
 			case "session_tree_changed":
+				for (const entry of this.session.sessionManager.getEntries()) this.recordEntryActivity(entry);
 				if (this.deletedSessionId && this.deletedSessionId !== this.session.sessionId) {
 					this.deletedSessionId = undefined;
 					void this.connect();
@@ -202,13 +211,16 @@ export class PiServerObserver {
 				this.historyDirty = true;
 				break;
 			case "compaction_end":
+				this.recordActivity(Date.now());
 				this.historyDirty = true;
 				break;
 			case "compaction_start":
+				this.recordActivity(Date.now());
 				break;
 			case "session_info_changed":
 				break;
 			case "tool_execution_start":
+				this.recordActivity(Date.now());
 				this.tools.set(event.toolCallId, {
 					id: event.toolCallId,
 					name: event.toolName,
@@ -222,6 +234,7 @@ export class PiServerObserver {
 				break;
 			}
 			case "tool_execution_end": {
+				this.recordActivity(Date.now());
 				const tool = this.tools.get(event.toolCallId);
 				if (tool) {
 					tool.result = { content: projectContent(event.result.content), isError: event.isError };
@@ -238,6 +251,34 @@ export class PiServerObserver {
 				? 0
 				: 80,
 		);
+	}
+
+	private syncActivity(): void {
+		if (this.activitySessionId === this.session.sessionId) return;
+		this.activitySessionId = this.session.sessionId;
+		this.lastActiveAt = null;
+		this.sentEntryId = undefined;
+		this.pendingEntries = [];
+		this.firstUserTitle = "";
+		this.liveMessage = null;
+		this.tools.clear();
+		for (const entry of this.session.sessionManager.getEntries()) this.recordEntryActivity(entry);
+	}
+
+	private recordEntryActivity(entry: SessionEntry): void {
+		if (
+			(entry.type === "message" &&
+				entry.message.role !== "system" &&
+				(entry.message.role !== "custom" || entry.message.display)) ||
+			(entry.type === "custom_message" && entry.display) ||
+			entry.type === "compaction" ||
+			entry.type === "branch_summary"
+		)
+			this.recordActivity(Date.parse(entry.timestamp));
+	}
+
+	private recordActivity(timestamp: number): void {
+		this.lastActiveAt = this.lastActiveAt === null ? timestamp : Math.max(this.lastActiveAt, timestamp);
 	}
 
 	private schedule(delay: number): void {
@@ -289,6 +330,7 @@ export class PiServerObserver {
 
 	private async connect(): Promise<void> {
 		if (this.disposed || this.deletedSessionId === this.session.sessionId) return;
+		this.syncActivity();
 		const controller = new AbortController();
 		this.controller = controller;
 		const sessionId = this.session.sessionId;
@@ -383,6 +425,7 @@ export class PiServerObserver {
 		if (
 			!connectionId ||
 			!sessionId ||
+			sessionId !== this.session.sessionId ||
 			!controller ||
 			this.disposed ||
 			this.deletedSessionId === sessionId ||
@@ -419,6 +462,7 @@ export class PiServerObserver {
 				sequence: ++this.sequence,
 				cwd: this.session.sessionManager.getCwd(),
 				title: this.session.sessionManager.getSessionName() ?? this.firstUserTitle,
+				lastActiveAt: this.lastActiveAt,
 				...(replace ? { replace: messages } : messages.length ? { append: messages } : {}),
 				status: this.session.isIdle ? "idle" : "running",
 				live: {
@@ -434,6 +478,7 @@ export class PiServerObserver {
 			if (!response.ok) throw new Error(`update failed (HTTP ${response.status})`);
 			const result = (await response.json()) as { accepted: boolean };
 			if (!result.accepted) throw new Error("update was not accepted");
+			if (sessionId !== this.session.sessionId) return;
 			if (entries.length > 0) this.sentEntryId = entries.at(-1)?.id;
 			else if (replace) this.sentEntryId = undefined;
 			if (this.disconnected) {
