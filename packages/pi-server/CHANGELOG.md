@@ -4,7 +4,8 @@
 
 ### Added
 
-- Added a read-only browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.
+- Added a browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.
+- Added project and thread context menus for folding and confirmed server deletion, automatic history loading at the top, and project ordering by the latest thread update.
 - Added an independent observer store and streaming endpoints without changing provider requests or authoritative session trees.
 - Reported the resolved cache-retention policy before provider dispatch and retained it for same-run recovery and replay, without returning server credentials or environment values.
 - Added an authenticated mixed model catalog and image/classifier endpoints with heartbeat streaming, completed-run recovery, and acknowledged cancellation.

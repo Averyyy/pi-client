@@ -116,7 +116,7 @@ export function projectObserverEntries(entries: SessionEntry[]): ObserverMessage
 	return messages;
 }
 
-/** Publishes a read-only transcript independently of provider requests and durable server trees. */
+/** Publishes transcript updates independently of provider requests and durable server trees. */
 export class PiServerObserver {
 	private readonly session: AgentSession;
 	private readonly unsubscribe: () => void;
@@ -303,6 +303,10 @@ export class PiServerObserver {
 			const response = await this.request(controller.signal).getJson(
 				`/api/observer/connect?sessionId=${encodeURIComponent(sessionId)}`,
 			);
+			if (response.status === 410) {
+				this.stopDeletedSession(sessionId, controller);
+				return;
+			}
 			if (!response.ok || !response.headers.get("content-type")?.includes("text/event-stream") || !response.body) {
 				throw new Error(`connection failed (HTTP ${response.status})`);
 			}

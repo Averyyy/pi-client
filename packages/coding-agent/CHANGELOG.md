@@ -9,7 +9,7 @@
 
 ### Added
 
-- Published pi-client project metadata, committed conversation history, and run/tool activity to the server's independent read-only viewer.
+- Published pi-client project metadata, committed conversation history, and run/tool activity to the server's independent viewer.
 - Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
 - Added native Devin Pro login and account model selection while retaining pi-server inference routing.
 
@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Stopped viewer observer reconnection when the server's presence handshake reports that the session was deleted.
 - Preserved client identity and attribution settings across pi-server chat, compaction, image, classifier, and deferred requests.
 - Normalized home-directory separators in resource displays and applied the configured home directory consistently to resource exclusion patterns.
 - Preserved configured model scopes across credential and catalog changes while excluding unavailable models from selection, autocomplete, and cycling; cycling uses current model metadata.

@@ -22,13 +22,16 @@ describe("viewer asset caching", () => {
 	let base: string;
 
 	function createViewer() {
-		return new ViewerHttp({
-			host: "127.0.0.1",
-			port: 0,
-			authToken: "asset-fixture",
-			sessionStoreDir: directory,
-			uploadDir: directory,
-		});
+		return new ViewerHttp(
+			{
+				host: "127.0.0.1",
+				port: 0,
+				authToken: "asset-fixture",
+				sessionStoreDir: directory,
+				uploadDir: directory,
+			},
+			async (ids) => ({ deletedIds: ids, deletedCount: ids.length, failed: [] }),
+		);
 	}
 
 	function asset(body: string) {

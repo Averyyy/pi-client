@@ -37,7 +37,7 @@ function message(id: string, role = "user"): ViewerMessage {
 	return { id, role, content: `内容 ${id}`, timestamp: 1000 };
 }
 
-describe("read-only thread viewer", () => {
+describe("server thread viewer", () => {
 	let directory: string;
 	let server: Server;
 	let base: string;
@@ -116,7 +116,7 @@ describe("read-only thread viewer", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
-	it("uses scoped read-only cookies and rejects foreign browser mutations", async () => {
+	it("scopes viewer cookies to viewer routes and rejects foreign browser mutations", async () => {
 		const response = await login();
 		const setCookie = response.headers.get("set-cookie") ?? "";
 		expect(setCookie).toContain("Path=/viewer; HttpOnly; SameSite=Strict; Max-Age=43200");

@@ -141,11 +141,16 @@ export class ViewerStore {
 		this.catalog ??= {
 			projects: [...this.projectIndex.values()]
 				.map(({ project }) => project)
-				.sort((a, b) => a.name.localeCompare(b.name)),
+				.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
 			running: [...this.running.values()].sort(compareThreads),
 			revision: `${this.catalogEpoch}:${this.catalogSequence}`,
 		};
 		return this.catalog;
+	}
+
+	projectThreadIds(project: string): string[] {
+		this.initializeCatalog();
+		return this.projectIndex.get(project)?.threads.map((thread) => thread.id) ?? [];
 	}
 
 	page(project: string, cursor: string | null): { threads: ThreadSummary[]; nextCursor: string | null } {
@@ -397,7 +402,10 @@ export class ViewerStore {
 			project.project.threadCount++;
 			if (summary.status === "running") this.running.set(id, summary);
 		}
-		for (const { threads } of this.projectIndex.values()) threads.sort(compareThreads);
+		for (const indexed of this.projectIndex.values()) {
+			indexed.threads.sort(compareThreads);
+			indexed.project.updatedAt = indexed.threads[0].updatedAt;
+		}
 	}
 
 	private createProjectIndex(summary: ThreadSummary): ProjectIndex {
@@ -408,6 +416,7 @@ export class ViewerStore {
 				name: summary.cwd?.split("/").filter(Boolean).at(-1) ?? "Unassigned archives",
 				threadCount: 0,
 				revision: `${this.catalogEpoch}:${this.catalogSequence}`,
+				updatedAt: summary.updatedAt,
 			},
 			threads: [],
 		};
@@ -434,7 +443,12 @@ export class ViewerStore {
 		if (previous) {
 			const project = this.projectIndex.get(previous.projectId)!;
 			project.threads.splice(threadOffset(project.threads, previous), 1);
-			project.project = { ...project.project, threadCount: project.threads.length, revision };
+			project.project = {
+				...project.project,
+				threadCount: project.threads.length,
+				updatedAt: project.threads[0]?.updatedAt ?? 0,
+				revision,
+			};
 			if (project.threads.length === 0) this.projectIndex.delete(previous.projectId);
 		}
 		this.indexedSummaries.delete(id);
@@ -447,7 +461,12 @@ export class ViewerStore {
 				this.projectIndex.set(next.projectId, project);
 			}
 			project.threads.splice(threadOffset(project.threads, next), 0, next);
-			project.project = { ...project.project, threadCount: project.threads.length, revision };
+			project.project = {
+				...project.project,
+				threadCount: project.threads.length,
+				updatedAt: project.threads[0].updatedAt,
+				revision,
+			};
 			if (next.status === "running") this.running.set(id, next);
 		}
 		this.catalog = undefined;

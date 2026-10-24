@@ -20,7 +20,9 @@ describe("older history requests", () => {
 		);
 		const history = new OlderHistoryRequest();
 		const oldPage = history.load("threads/thread/rounds?before=old", new AbortController().signal);
+		expect(history.loading).toBe(true);
 		history.cancel();
+		expect(history.loading).toBe(false);
 		respond(new Response(JSON.stringify({ rounds: [{ id: "old-branch", messages: [] }], nextCursor: "old-cursor" })));
 		const result = await oldPage;
 		expect(requestSignal?.aborted).toBe(true);
@@ -45,11 +47,12 @@ describe("older history requests", () => {
 		const current = await newPage;
 		expect(current.page?.rounds.map((round) => round.id)).toEqual(["new"]);
 		expect(history.isCurrent(current.generation)).toBe(true);
+		expect(history.loading).toBe(false);
 	});
 });
 
 function project(id: string, revision = "epoch:1"): ViewerProject {
-	return { id, path: id, name: id, threadCount: 10, revision };
+	return { id, path: id, name: id, threadCount: 10, updatedAt: 0, revision };
 }
 
 function page(id: string, nextCursor: string | null = null): Response {
@@ -103,6 +106,36 @@ describe("catalog refresh requests", () => {
 });
 
 describe("visible project cache", () => {
+	it("removes only successful deletions and rejects a pre-deletion page without touching another project", async () => {
+		let respond!: (response: Response) => void;
+		let signal!: AbortSignal;
+		const fetch = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ threads: [{ id: "deleted" }, { id: "failed" }], nextCursor: "older" })),
+			)
+			.mockResolvedValueOnce(page("other-thread"))
+			.mockImplementationOnce((_url: string, options: RequestInit) => {
+				signal = options.signal as AbortSignal;
+				return new Promise<Response>((resolve) => {
+					respond = resolve;
+				});
+			});
+		vi.stubGlobal("fetch", fetch);
+		const cache = new ProjectCache(vi.fn(), vi.fn());
+		cache.updateCatalog([project("a"), project("b")]);
+		await cache.load("a");
+		await cache.load("b");
+		const oldPage = cache.load("a", true);
+		cache.removeThreads(["deleted"], "a");
+		expect(signal.aborted).toBe(true);
+		respond(page("deleted"));
+		await oldPage;
+		expect(cache.rows.a.threads.map((thread) => thread.id)).toEqual(["failed"]);
+		expect(cache.rows.a.revision).toBe("");
+		expect(cache.rows.b.threads.map((thread) => thread.id)).toEqual(["other-thread"]);
+		cache.clear();
+	});
 	it("loads only visible projects and shares one first request between home and sidebar", async () => {
 		const fetch = vi.fn(async (url: string) => page(url));
 		vi.stubGlobal("fetch", fetch);

@@ -116,7 +116,7 @@ const Round = memo(function Round({
 					? "输出达到长度限制"
 					: undefined;
 	return (
-		<article className="conversation-round">
+		<article className="conversation-round" data-round-id={round.id}>
 			{split.leading.map((message) => (
 				<Message message={message} key={message.id} />
 			))}
@@ -178,46 +178,114 @@ export function Transcript({
 	thread,
 	nextCursor,
 	loadingOlder,
+	olderError,
+	historyVersion,
 	loadOlder,
 }: {
 	rounds: ViewerRound[];
 	thread: ViewerThread;
 	nextCursor: string | null;
 	loadingOlder: boolean;
-	loadOlder: () => Promise<void>;
+	olderError: string;
+	historyVersion: number;
+	loadOlder: () => Promise<boolean>;
 }) {
-	const scroll = useRef<HTMLDivElement>(null);
+	const scroll = useRef<HTMLElement>(null);
 	const nearBottom = useRef(true);
-	const prepended = useRef<{ height: number; top: number; firstId: string | undefined } | null>(null);
-	const previousThread = useRef(thread.id);
-	useLayoutEffect(() => {
-		const element = scroll.current;
-		if (!element) return;
-		if (prepended.current && prepended.current.firstId !== rounds[0]?.id) {
-			element.scrollTop = prepended.current.top + element.scrollHeight - prepended.current.height;
-			prepended.current = null;
-		} else if (previousThread.current !== thread.id || nearBottom.current) element.scrollTop = element.scrollHeight;
-		previousThread.current = thread.id;
-	}, [rounds, thread]);
-	async function older() {
-		const element = scroll.current;
-		if (element) prepended.current = { height: element.scrollHeight, top: element.scrollTop, firstId: rounds[0]?.id };
-		await loadOlder();
+	const lastTop = useRef(0);
+	const anchor = useRef<{ element: HTMLElement; top: number; firstId: string | undefined } | null>(null);
+	const pending = useRef<object | null>(null);
+	const failed = useRef(false);
+	const previousVersion = useRef(historyVersion);
+	const touchY = useRef(0);
+
+	function captureAnchor(element: HTMLElement) {
+		const top = element.getBoundingClientRect().top;
+		const round = Array.from(element.querySelectorAll<HTMLElement>("[data-round-id]")).find(
+			(item) => item.getBoundingClientRect().bottom > top,
+		);
+		return round ? { element: round, top: round.getBoundingClientRect().top, firstId: rounds[0]?.id } : null;
 	}
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Live messages and tools resize the last round independently of committed rounds.
+	useLayoutEffect(() => {
+		const element = scroll.current!;
+		if (previousVersion.current !== historyVersion) {
+			anchor.current = null;
+			pending.current = null;
+			failed.current = false;
+			nearBottom.current = true;
+		}
+		if (anchor.current && anchor.current.firstId !== rounds[0]?.id) {
+			if (anchor.current.element.isConnected)
+				element.scrollTop += anchor.current.element.getBoundingClientRect().top - anchor.current.top;
+			anchor.current = null;
+			nearBottom.current = false;
+		} else if (nearBottom.current) element.scrollTop = element.scrollHeight;
+		lastTop.current = element.scrollTop;
+		previousVersion.current = historyVersion;
+	}, [rounds, thread, historyVersion]);
+
+	async function older(retry = false) {
+		if (!nextCursor || loadingOlder || pending.current || (failed.current && !retry)) return;
+		const attempt = {};
+		pending.current = attempt;
+		failed.current = false;
+		anchor.current = captureAnchor(scroll.current!);
+		nearBottom.current = false;
+		const applied = await loadOlder();
+		if (pending.current !== attempt) return;
+		pending.current = null;
+		if (!applied) {
+			anchor.current = null;
+			failed.current = true;
+		}
+	}
+
 	return (
-		<div
+		<section
+			aria-label="对话记录"
 			className="transcript-scroll"
 			ref={scroll}
+			// biome-ignore lint/a11y/noNoninteractiveTabindex: The scroll region supports keyboard history navigation.
+			tabIndex={0}
 			onScroll={() => {
-				const element = scroll.current;
-				if (element) nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100;
+				const element = scroll.current!;
+				const movingUp = element.scrollTop < lastTop.current;
+				lastTop.current = element.scrollTop;
+				nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100;
+				if (pending.current) anchor.current = captureAnchor(element);
+				if (movingUp && element.scrollTop <= 48) void older();
+			}}
+			onWheel={(event) => {
+				if (event.deltaY < 0 && scroll.current!.scrollTop <= 48) void older();
+			}}
+			onKeyDown={(event) => {
+				if (["Home", "PageUp", "ArrowUp"].includes(event.key) && scroll.current!.scrollTop <= 48) void older();
+			}}
+			onTouchStart={(event) => {
+				touchY.current = event.touches[0].clientY;
+			}}
+			onTouchMove={(event) => {
+				const y = event.touches[0].clientY;
+				if (y > touchY.current + 4 && scroll.current!.scrollTop <= 48) void older();
+				touchY.current = y;
 			}}
 		>
 			<div className="transcript">
 				{nextCursor ? (
-					<button type="button" className="load-older" onClick={older} disabled={loadingOlder}>
-						{loadingOlder ? "正在加载…" : "加载更早的 5 轮对话"}
-					</button>
+					<div className="history-status">
+						{olderError ? (
+							<>
+								<span role="alert">{olderError}</span>
+								<button type="button" className="plain-button" onClick={() => void older(true)}>
+									重试
+								</button>
+							</>
+						) : (
+							<output>{loadingOlder ? "正在加载更早的对话…" : "向上滚动加载更早的对话"}</output>
+						)}
+					</div>
 				) : null}
 				{rounds.length === 0 && !thread.live.message ? (
 					<div className="empty-conversation">
@@ -236,8 +304,8 @@ export function Transcript({
 				{rounds.length === 0 && thread.live.message ? (
 					<Round round={{ id: "live", messages: [] }} live={thread.live} active={thread.status === "running"} />
 				) : null}
-				<div className="transcript-end">只读对话</div>
+				<div className="transcript-end">对话记录</div>
 			</div>
-		</div>
+		</section>
 	);
 }

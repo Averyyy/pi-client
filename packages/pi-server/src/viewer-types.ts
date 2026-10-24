@@ -47,6 +47,13 @@ export interface ViewerProject {
 	name: string;
 	threadCount: number;
 	revision: string;
+	updatedAt: number;
+}
+
+export interface ViewerDeleteResult {
+	deletedIds: string[];
+	deletedCount: number;
+	failed: { id: string; error: string }[];
 }
 
 export interface ViewerCatalog {

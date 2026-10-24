@@ -36,6 +36,7 @@ interface RequestChunk {
 }
 
 interface PendingRequest {
+	requestVersion: number;
 	target: string;
 	totalChunks: number;
 	chunks: Map<number, RequestChunk>;
@@ -44,6 +45,7 @@ interface PendingRequest {
 }
 
 interface CompletedRequest {
+	requestVersion: number;
 	target: string;
 	totalChunks: number;
 	bodyJson: string;
@@ -68,6 +70,7 @@ interface CompleteChunkResult {
 	complete: true;
 	target: string;
 	bodyJson: string;
+	requestVersion: number;
 }
 
 const pendingRequests = new Map<string, PendingRequest>();
@@ -79,6 +82,7 @@ export const REQUEST_CHUNK_MAX_PENDING_BYTES = 1024 * 1024 * 1024;
 export const REQUEST_CHUNK_COMPLETED_TTL_MS = 60 * 1000;
 
 interface ReceiveRequestChunkOptions {
+	requestVersion?: number;
 	nowMs?: number;
 	pendingTtlMs?: number;
 	maxPendingBytes?: number;
@@ -171,11 +175,13 @@ export function receiveRequestChunk(
 		if (!existing || existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
 			throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
 		}
+		completed.requestVersion = Math.min(completed.requestVersion, options.requestVersion ?? 0);
 		if (body.chunkIndex === completed.completedChunkIndex) {
 			return {
 				complete: true,
 				target: completed.target,
 				bodyJson: completed.bodyJson,
+				requestVersion: completed.requestVersion,
 			};
 		}
 		return makeAck(body);
@@ -191,15 +197,18 @@ export function receiveRequestChunk(
 			if (existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
 				throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
 			}
+			pending.requestVersion = Math.min(pending.requestVersion, options.requestVersion ?? 0);
 			pending.updatedAtMs = nowMs;
 			return makeAck(body);
 		}
+		pending.requestVersion = Math.min(pending.requestVersion, options.requestVersion ?? 0);
 	}
 
 	const chunkBytes = Buffer.byteLength(body.chunk, "utf-8");
 	cleanupForPendingBytes(chunkBytes, options.maxPendingBytes ?? REQUEST_CHUNK_MAX_PENDING_BYTES, body.requestId);
 	if (!pending) {
 		pending = {
+			requestVersion: options.requestVersion ?? 0,
 			target: body.target,
 			totalChunks: body.totalChunks,
 			chunks: new Map(),
@@ -227,6 +236,7 @@ export function receiveRequestChunk(
 	deletePendingRequest(body.requestId, pending);
 	const bodyJson = Buffer.from(encodedChunks.join(""), "base64").toString("utf-8");
 	completedRequests.set(body.requestId, {
+		requestVersion: pending.requestVersion,
 		target: pending.target,
 		totalChunks: pending.totalChunks,
 		bodyJson,
@@ -238,6 +248,7 @@ export function receiveRequestChunk(
 		complete: true,
 		target: pending.target,
 		bodyJson,
+		requestVersion: pending.requestVersion,
 	};
 }
 

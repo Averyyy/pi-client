@@ -26,6 +26,24 @@ const thread: ViewerThread = {
 };
 
 describe("transcript disclosures", () => {
+	it("offers automatic top pagination and an explicit retry only after a history failure", () => {
+		const props = {
+			rounds: [],
+			thread,
+			nextCursor: "older",
+			loadingOlder: false,
+			historyVersion: 0,
+			loadOlder: async () => false,
+		};
+		const initial = renderToStaticMarkup(<Transcript {...props} olderError="" />);
+		expect(initial).toContain('tabindex="0"');
+		expect(initial).toContain("向上滚动加载更早的对话");
+		expect(initial).not.toContain("加载更早的 5 轮对话");
+		expect(initial).not.toContain("重试");
+		const failed = renderToStaticMarkup(<Transcript {...props} olderError="无法读取历史" />);
+		expect(failed).toContain("无法读取历史");
+		expect(failed).toContain("重试");
+	});
 	it("shows streaming prose while thought and command content remain independently collapsed", () => {
 		const html = renderToStaticMarkup(
 			<Transcript
@@ -33,7 +51,9 @@ describe("transcript disclosures", () => {
 				thread={thread}
 				nextCursor={null}
 				loadingOlder={false}
-				loadOlder={async () => {}}
+				olderError=""
+				historyVersion={0}
+				loadOlder={async () => false}
 			/>,
 		);
 		expect(html).toContain("正在检查服务状态");
@@ -65,7 +85,9 @@ describe("transcript disclosures", () => {
 				thread={{ ...thread, status: "idle", live: { message: null, tools: [] } }}
 				nextCursor={null}
 				loadingOlder={false}
-				loadOlder={async () => {}}
+				olderError=""
+				historyVersion={0}
+				loadOlder={async () => false}
 			/>,
 		);
 		expect(html).toContain("服务正常");

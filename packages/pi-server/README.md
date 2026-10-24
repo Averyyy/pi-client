@@ -52,13 +52,15 @@ Use the same release version for client and server. The authenticated `/api/mode
 
 Image generation and classification stream heartbeat responses and journal completed results for recovery without repeating the provider operation. Cancellation is acknowledged after provider cleanup finishes. Oversized operation payloads use `/api/request/chunk`, including when clients set a 64 KiB request-body limit.
 
-## Read-only Thread Viewer
+## Thread Viewer
 
-Open the server's root URL and sign in with `PI_SERVER_AUTH_TOKEN`. The home page groups threads by their client working directory and lists running threads first. Project folders expand five threads at a time. Thread pages show the latest five conversation rounds, with earlier rounds available on demand. Completed rounds expose the final answer; thinking and tool activity can be expanded separately, including while they stream.
+Open the server's root URL and sign in with `PI_SERVER_AUTH_TOKEN`. The home page groups threads by their client working directory and lists running threads first. Projects are ordered by their most recently updated thread. Project folders expand five threads at a time. Thread pages show the latest five conversation rounds; scrolling to the top loads five earlier rounds while keeping the current passage in place. Completed rounds expose the final answer; thinking and tool activity can be expanded separately, including while they stream.
+
+Right-click a project to collapse or expand it, or to delete all its server conversations. Right-click a thread to delete that server conversation. The same menus are available through the context-menu key or Shift+F10. Deletion requires confirmation and includes saved history and observer records. Project deletion includes conversations beyond the currently loaded pages.
 
 The server indexes projects once per process and updates only affected sessions as they change. Pagination reads the project's index without scanning every session. The browser loads visible expanded folders and keeps their pages in memory while the page remains open; unchanged folders reuse those pages. Offscreen changes are fetched when the folder becomes visible. JavaScript and CSS use browser caching with a validator that changes on server restart; authentication and conversation responses remain `no-store`.
 
-The browser receives a separate, 12-hour `HttpOnly`, `SameSite=Strict` session cookie scoped to `/viewer`. It cannot use that cookie to send prompts, change history, run tools, or cancel clients. Configure HTTPS at the reverse proxy for public access; the proxy must preserve the request host and HTTPS protocol. The viewer requires a configured server token.
+The browser receives a separate, 12-hour `HttpOnly`, `SameSite=Strict` session cookie scoped to `/viewer`. That cookie authorizes only viewer reads and same-origin session deletion. Provider requests and ordinary session APIs retain bearer authentication. Configure HTTPS at the reverse proxy for public access; the proxy must preserve the request host and HTTPS protocol. The viewer requires a configured server token.
 
 Ten failed token checks lock authenticated access, including correct tokens. The count persists across restarts and is shared by viewer login and requests that supply an incorrect API authorization header. Requests without API credentials do not consume attempts. A successful viewer login resets the count; ordinary client traffic does not. Unlock on the server, using the same configuration and session directory as the running process:
 

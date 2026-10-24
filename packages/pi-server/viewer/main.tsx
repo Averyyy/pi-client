@@ -1,7 +1,15 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Icon } from "./icons.tsx";
-import { ProjectFolder, Status, ThreadRow } from "./projects.tsx";
+import {
+	ContextMenu,
+	contextMenuHandlers,
+	DeleteDialog,
+	type MenuRequest,
+	ProjectFolder,
+	Status,
+	ThreadRow,
+} from "./projects.tsx";
 import { Transcript } from "./transcript.tsx";
 import { useViewer } from "./use-viewer.ts";
 import "./style.css";
@@ -74,7 +82,7 @@ function Login({ onLogin, locked }: { onLogin: () => void; locked: boolean }) {
 				</form>
 				<p className="login-note">
 					<Icon name="lock" size={13} />
-					只读访问 · Token 仅用于本次验证
+					对话查看器 · Token 仅用于本次验证
 				</p>
 				<p className="login-lock-note">连续 10 次失败后锁定，需在服务器解锁。</p>
 			</div>
@@ -94,6 +102,8 @@ function Viewer() {
 		rounds,
 		cursor,
 		loadingOlder,
+		olderError,
+		historyVersion,
 		loadingThread,
 		error,
 		drawer,
@@ -104,11 +114,24 @@ function Viewer() {
 		toggleProject,
 		projectVisibility,
 		loadOlder,
+		remove,
 		logout,
 		more,
 		login,
 		retry,
 	} = useViewer();
+	const [menu, setMenu] = useState<MenuRequest | null>(null);
+	const [confirmation, setConfirmation] = useState<MenuRequest | null>(null);
+	const closeMenu = useCallback(() => {
+		if (menu?.trigger.isConnected) menu.trigger.focus();
+		setMenu(null);
+	}, [menu]);
+	useEffect(() => {
+		if (auth !== "ready") {
+			setMenu(null);
+			setConfirmation(null);
+		}
+	}, [auth]);
 	const sidebar = useRef<HTMLElement>(null);
 	useEffect(() => {
 		if (!drawer || !sidebar.current) return;
@@ -183,7 +206,7 @@ function Viewer() {
 					</div>
 					{catalog.running.length ? (
 						catalog.running.map((item) => (
-							<ThreadRow key={item.id} thread={item} current={current} select={select} />
+							<ThreadRow key={item.id} thread={item} current={current} select={select} menu={setMenu} />
 						))
 					) : (
 						<p className="sidebar-empty">暂无运行中的对话</p>
@@ -203,13 +226,14 @@ function Viewer() {
 							select={select}
 							more={more}
 							visibility={projectVisibility}
+							menu={setMenu}
 						/>
 					))}
 				</div>
 				<div className="sidebar-footer">
 					<span>
 						<Icon name="lock" size={13} />
-						只读访问
+						对话记录
 					</span>
 					<button type="button" className="icon-button" onClick={logout} aria-label="退出登录" title="退出登录">
 						<Icon name="logout" size={16} />
@@ -242,7 +266,7 @@ function Viewer() {
 					) : (
 						<span className="header-caption mobile-only">pi-server</span>
 					)}
-					<span className="readonly-label">只读</span>
+					<span className="viewer-label">对话记录</span>
 				</header>
 				{error ? (
 					<div className="error-banner" role="alert">
@@ -258,10 +282,13 @@ function Viewer() {
 						<div className="content-loading">正在读取对话…</div>
 					) : thread ? (
 						<Transcript
+							key={thread.id}
 							rounds={rounds}
 							thread={thread}
 							nextCursor={cursor}
 							loadingOlder={loadingOlder}
+							olderError={olderError}
+							historyVersion={historyVersion}
 							loadOlder={loadOlder}
 						/>
 					) : (
@@ -295,6 +322,16 @@ function Viewer() {
 												className="active-card"
 												onClick={() => select(item.id)}
 												key={item.id}
+												{...contextMenuHandlers(
+													{
+														kind: "thread",
+														id: item.id,
+														name: item.title || "未命名对话",
+														count: 1,
+														projectId: item.projectId,
+													},
+													setMenu,
+												)}
 											>
 												<span className="active-project">
 													{catalog.projects.find((entry) => entry.id === item.projectId)?.name ?? "项目"}
@@ -332,6 +369,7 @@ function Viewer() {
 											select={select}
 											more={more}
 											visibility={projectVisibility}
+											menu={setMenu}
 										/>
 									))}
 								</div>
@@ -340,6 +378,24 @@ function Viewer() {
 					</div>
 				)}
 			</main>
+			{menu ? (
+				<ContextMenu
+					request={menu}
+					close={closeMenu}
+					toggle={toggleProject}
+					remove={() => {
+						setConfirmation(menu);
+						setMenu(null);
+					}}
+				/>
+			) : null}
+			{confirmation ? (
+				<DeleteDialog
+					request={confirmation}
+					close={() => setConfirmation(null)}
+					remove={(target) => remove(target.kind, target.id, target.projectId)}
+				/>
+			) : null}
 		</div>
 	);
 }

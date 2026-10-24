@@ -5,7 +5,14 @@ import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.ts";
 import { ViewerAuth } from "./viewer-auth.ts";
 import { projectContent, projectMessage, ViewerStore } from "./viewer-store.ts";
-import type { ObserverUpdate, ViewerLive, ViewerMessage, ViewerTool, ViewerUpdate } from "./viewer-types.ts";
+import type {
+	ObserverUpdate,
+	ViewerDeleteResult,
+	ViewerLive,
+	ViewerMessage,
+	ViewerTool,
+	ViewerUpdate,
+} from "./viewer-types.ts";
 
 function json(res: ServerResponse, status: number, body: unknown): void {
 	res.writeHead(status, { "Content-Type": "application/json" });
@@ -82,17 +89,19 @@ export class ViewerHttp {
 	private readonly streams = new Set<ServerResponse>();
 	private readonly assets = new Map<string, Buffer>();
 	private readonly assetTag = `"${randomUUID()}"`;
+	private readonly deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>;
 
-	constructor(config: ServerConfig) {
+	constructor(config: ServerConfig, deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>) {
 		this.auth = new ViewerAuth(config.sessionStoreDir, config.authToken);
 		this.store = new ViewerStore(config.sessionStoreDir);
+		this.deleteSessions = deleteSessions;
 	}
 
 	close(): void {
 		for (const stream of this.streams) stream.end();
 	}
 
-	handle(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+	async handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
 		if (url.pathname !== "/" && !url.pathname.startsWith("/viewer/")) return false;
 		securityHeaders(res);
 		if (!this.auth.configured) {
@@ -134,7 +143,7 @@ export class ViewerHttp {
 			res.end(cached);
 			return true;
 		}
-		if (req.method === "POST" && !sameOrigin(req)) {
+		if ((req.method === "POST" || req.method === "DELETE") && !sameOrigin(req)) {
 			json(res, 403, { error: "Origin rejected" });
 			return true;
 		}
@@ -164,11 +173,27 @@ export class ViewerHttp {
 			json(res, 200, { authenticated: false });
 			return true;
 		}
-		if (req.method !== "GET") {
-			json(res, 405, { error: "Read-only viewer" });
-			return true;
-		}
 		try {
+			if (req.method === "DELETE") {
+				const match = /^\/viewer\/api\/(threads|projects)\/([^/]+)$/.exec(url.pathname);
+				if (!match) {
+					json(res, 404, { error: "Not found" });
+					return true;
+				}
+				const id = decodeURIComponent(match[2]);
+				const ids = match[1] === "projects" ? this.store.projectThreadIds(id) : this.store.get(id) ? [id] : [];
+				if (ids.length === 0) {
+					json(res, 404, { error: match[1] === "projects" ? "Project not found" : "Thread not found" });
+					return true;
+				}
+				const result = await this.deleteSessions(ids);
+				json(res, result.failed.length ? 207 : 200, result);
+				return true;
+			}
+			if (req.method !== "GET") {
+				json(res, 405, { error: "Method not allowed" });
+				return true;
+			}
 			if (url.pathname === "/viewer/api/projects") json(res, 200, this.store.projects());
 			else if (url.pathname === "/viewer/api/threads")
 				json(res, 200, this.store.page(url.searchParams.get("project") ?? "", url.searchParams.get("cursor")));

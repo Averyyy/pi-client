@@ -16,6 +16,7 @@ interface ObserverFixture {
 	sockets: ServerResponse[];
 	rawSizes: number[];
 	chunkTargets: string[];
+	connectRequests: number;
 	closed: number;
 	fail: boolean;
 	deleted: boolean;
@@ -30,6 +31,7 @@ async function createFixture(): Promise<ObserverFixture> {
 		sockets: [],
 		rawSizes: [],
 		chunkTargets: [],
+		connectRequests: 0,
 		closed: 0,
 		fail: false,
 		deleted: false,
@@ -40,14 +42,19 @@ async function createFixture(): Promise<ObserverFixture> {
 			return;
 		}
 		if (request.method === "GET") {
+			fixture.connectRequests++;
+			response.on("close", () => {
+				fixture.closed++;
+			});
+			if (fixture.deleted) {
+				response.writeHead(410, { "Content-Type": "application/json" }).end('{"deleted":true}');
+				return;
+			}
 			response.writeHead(200, { "Content-Type": "text/event-stream" });
 			response.write(
 				`event: connected\r\ndata: ${JSON.stringify({ connectionId: `connection-${fixture.sockets.length}` })}\r\n\r\n`,
 			);
 			fixture.sockets.push(response);
-			response.on("close", () => {
-				fixture.closed++;
-			});
 			return;
 		}
 		const buffers: Buffer[] = [];
@@ -624,6 +631,29 @@ describe("pi-server observer", () => {
 		harness.session.refreshContext();
 		await vi.waitFor(() => expect(fixture.sockets).toHaveLength(2));
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).toBe(harness.session.sessionId));
+	});
+
+	it("stops reconnecting when the presence handshake reports deletion", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		fixture.deleted = true;
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.closed).toBe(1));
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		harness.session.setSessionName("deleted thread");
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(fixture.connectRequests).toBe(1);
+		expect(fixture.updates).toEqual([]);
+		expect(diagnostic).not.toHaveBeenCalled();
+		vi.useRealTimers();
+		fixture.deleted = false;
+		harness.sessionManager.newSession();
+		harness.session.refreshContext();
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).toBe(harness.session.sessionId));
+		expect(fixture.connectRequests).toBe(2);
 	});
 
 	it("treats HTTP 410 as deletion when it arrives before the presence deletion event", async () => {

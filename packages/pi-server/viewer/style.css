@@ -458,7 +458,7 @@ pre {
 .back-button {
 	display: none;
 }
-.readonly-label {
+.viewer-label {
 	font-size: 12px;
 	color: #767b84;
 	border: 1px solid #e8e8eb;
@@ -707,6 +707,7 @@ pre {
 	font-size: 13px;
 }
 .transcript-scroll {
+	overflow-anchor: none;
 	flex: 1;
 	overflow-y: auto;
 	scroll-behavior: auto;
@@ -991,20 +992,14 @@ pre {
 	gap: 9px;
 	margin-top: 12px;
 }
-.load-older {
-	display: block;
-	margin: 0 auto 38px;
-	padding: 9px 16px;
-	border: 1px solid #e7e8eb;
-	border-radius: 7px;
+.history-status {
+	min-height: 32px;
+	margin: 0 auto 24px;
 	font-size: 12px;
 	color: #92969e;
-	background: #fff;
+	text-align: center;
 }
-.load-older:hover {
-	background: #f8f8f9;
-	color: #666b74;
-}
+.history-status [role="alert"] { color: #ab615d; }
 .transcript-end {
 	font-size: 12px;
 	color: #c1c3c9;
@@ -1096,7 +1091,7 @@ pre {
 		gap: 5px;
 		margin: 0;
 	}
-	.workspace-header .readonly-label {
+	.workspace-header .viewer-label {
 		display: none;
 	}
 	.workspace-header > svg {
@@ -1193,9 +1188,6 @@ pre {
 	.login-brand {
 		font-size: 41px;
 	}
-	.load-older {
-		margin-bottom: 28px;
-	}
 }
 @media (prefers-reduced-motion: reduce) {
 	* {
@@ -1246,4 +1238,54 @@ output.terminal-state {
 	padding: 10px 11px;
 	font-size: 12px;
 	color: #787d86;
+}
+
+.context-menu {
+	position: fixed;
+	z-index: 100;
+	min-width: 220px;
+	max-width: calc(100vw - 16px);
+	padding: 5px;
+	border: 1px solid #e5e5e8;
+	border-radius: 9px;
+	background: #fff;
+	box-shadow: 0 8px 32px #00000020;
+}
+.context-menu > button {
+	display: block;
+	width: 100%;
+	padding: 9px 11px;
+	border-radius: 5px;
+	text-align: left;
+	font-size: 13px;
+}
+.context-menu > button:hover,
+.context-menu > button:focus-visible { background: #f0f0f3; }
+.danger-text { color: #ac4541; }
+.delete-dialog {
+	width: min(440px, calc(100vw - 32px));
+	padding: 26px;
+	border: 1px solid #e5e5e8;
+	border-radius: 13px;
+	color: #303136;
+	box-shadow: 0 16px 64px #00000030;
+}
+.delete-dialog::backdrop { background: #14161a66; }
+.delete-dialog h2 { font-size: 17px; font-weight: 550; }
+.delete-dialog p { margin-top: 15px; line-height: 1.8; overflow-wrap: anywhere; }
+.delete-dialog > p { color: #737780; font-size: 13px; }
+.delete-error { color: #a24b47; font-size: 12px; }
+.delete-error ul { margin-bottom: 0; padding-left: 18px; overflow-wrap: anywhere; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; }
+.dialog-actions button { border-radius: 7px; padding: 9px 15px; font-size: 13px; }
+.dialog-cancel { border: 1px solid #dedfe2; }
+.dialog-cancel:hover { background: #f4f4f6; }
+.danger-button { background: #ab4541; color: #fff; }
+.danger-button:hover { background: #923a37; }
+
+.delete-progress {
+	display: block;
+	margin-top: 15px;
+	color: #737780;
+	font-size: 13px;
 }

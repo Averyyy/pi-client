@@ -49,6 +49,7 @@ describe("request chunks", () => {
 			complete: true,
 			target: "/api/session/init",
 			bodyJson: JSON.stringify({ sessionId: "chunk-idempotent" }),
+			requestVersion: 0,
 		});
 	});
 
@@ -88,6 +89,7 @@ describe("request chunks", () => {
 			complete: true,
 			target: "/api/session/init",
 			bodyJson: JSON.stringify({ sessionId: "chunk-ttl" }),
+			requestVersion: 0,
 		});
 	});
 
@@ -117,7 +119,18 @@ describe("request chunks", () => {
 			complete: true,
 			target: "/api/session/init",
 			bodyJson: JSON.stringify({ sessionId: "chunk-complete-cache" }),
+			requestVersion: 0,
 		});
 		expect(receiveRequestChunk(completingChunk)).toEqual(completed);
+	});
+
+	it("keeps the earliest request version through out-of-order parsing, duplicates and completed retries", () => {
+		const encoded = Buffer.from(JSON.stringify({ sessionId: "versioned" })).toString("base64");
+		const first = chunkBody("versioned", 0, 2, encoded.slice(0, 4));
+		const last = chunkBody("versioned", 1, 2, encoded.slice(4));
+		receiveRequestChunk(first, { requestVersion: 8 });
+		receiveRequestChunk(first, { requestVersion: 3 });
+		expect(receiveRequestChunk(last, { requestVersion: 10 })).toMatchObject({ complete: true, requestVersion: 3 });
+		expect(receiveRequestChunk(last, { requestVersion: 20 })).toMatchObject({ complete: true, requestVersion: 3 });
 	});
 });

@@ -259,6 +259,7 @@ describe("server session archives in the viewer", () => {
 	});
 
 	it("publishes persisted session replacements and avoids loading history without thread listeners", () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(1000);
 		setStaticContext("refresh", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/jev" });
 		replaceSessionTree("refresh", [user("u", null, "First question")], "u");
 		const store = new ViewerStore(directory);
@@ -270,6 +271,7 @@ describe("server session archives in the viewer", () => {
 		expect(rounds).not.toHaveBeenCalled();
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("refresh", (update) => updates.push(update));
+		now.mockReturnValue(2000);
 		appendSessionEntries("refresh", [user("next", "u", "Next question")], "next");
 		savePersistedSession(directory, getSession("refresh")!);
 		store.refreshSession("refresh");

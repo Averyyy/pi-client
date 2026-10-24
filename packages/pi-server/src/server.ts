@@ -80,11 +80,15 @@ import {
 	switchSessionLeaf,
 } from "./session-store.ts";
 import { ViewerHttp } from "./viewer-http.ts";
+import type { ViewerDeleteResult } from "./viewer-types.ts";
 
 export { loadConfig, type ServerConfig } from "./config.ts";
 
 interface ServerRuntime extends ServerConfig {
 	viewer: ViewerHttp;
+	deletingSessions: Map<string, Promise<void>>;
+	deleteVersion: number;
+	sessionDeleteVersions: Map<string, number>;
 }
 
 interface SessionInitBody {
@@ -586,6 +590,59 @@ async function deleteStreamRunsForSession(sessionId: string): Promise<void> {
 	for (const [key, run] of runs) {
 		if (streamRuns.get(key) === run) streamRuns.delete(key);
 	}
+}
+
+async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promise<ViewerDeleteResult> {
+	const operations = ids.map((id) => {
+		const existing = config.deletingSessions.get(id);
+		if (existing) return existing;
+		config.sessionDeleteVersions.set(id, ++config.deleteVersion);
+		const operation = Promise.resolve().then(async () => {
+			await deleteStreamRunsForSession(id);
+			deletePersistedSession(config.sessionStoreDir, id);
+			config.viewer.store.remove(id);
+			deleteSessionFromStore(id);
+		});
+		config.deletingSessions.set(id, operation);
+		const finish = () => {
+			config.sessionDeleteVersions.set(id, ++config.deleteVersion);
+			config.deletingSessions.delete(id);
+		};
+		void operation.then(finish, finish);
+		return operation;
+	});
+	const results = await Promise.allSettled(operations);
+	const deletedIds: string[] = [];
+	const failed: ViewerDeleteResult["failed"] = [];
+	for (const [index, result] of results.entries()) {
+		if (result.status === "fulfilled") deletedIds.push(ids[index]);
+		else
+			failed.push({
+				id: ids[index],
+				error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+			});
+	}
+	return { deletedIds, deletedCount: deletedIds.length, failed };
+}
+
+function rejectDeletingSession(
+	config: ServerRuntime,
+	body: unknown,
+	res: ServerResponse,
+	requestVersion: number,
+): boolean {
+	if (
+		body &&
+		typeof body === "object" &&
+		"sessionId" in body &&
+		typeof body.sessionId === "string" &&
+		(config.deletingSessions.has(body.sessionId) ||
+			(config.sessionDeleteVersions.get(body.sessionId) ?? 0) > requestVersion)
+	) {
+		sendJson(res, 410, { error: "Session deleted", deleted: true });
+		return true;
+	}
+	return false;
 }
 
 const streamRunCleanupTimer = setInterval(() => cleanupExpiredStreamRuns(Date.now()), STREAM_RUN_TTL_MS / 4);
@@ -1406,8 +1463,10 @@ async function handlePostRequest(
 	body: unknown,
 	res: ServerResponse,
 	models: Models,
-	streamModels?: Models,
+	streamModels: Models | undefined,
+	requestVersion: number,
 ): Promise<boolean> {
+	if (rejectDeletingSession(config, body, res, requestVersion)) return true;
 	if (pathname === "/api/provider-callback") {
 		handleProviderCallbackReply(body, res);
 		return true;
@@ -1648,17 +1707,24 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 	const serverConfig = loadConfig(configOverride);
 	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(serverConfig.sessionStoreDir);
-	const viewer = new ViewerHttp(serverConfig);
-	const config: ServerRuntime = { ...serverConfig, viewer };
+	const viewer = new ViewerHttp(serverConfig, (ids) => deleteServerSessions(config, ids));
+	const config: ServerRuntime = {
+		...serverConfig,
+		viewer,
+		deletingSessions: new Map(),
+		deleteVersion: 0,
+		sessionDeleteVersions: new Map(),
+	};
 
 	const server = createServer(async (req, res) => {
+		const requestVersion = config.deleteVersion;
 		const url = new URL(req.url ?? "/", "http://localhost");
 
 		if (req.method === "GET" && url.pathname === "/health") {
 			sendJson(res, 200, { status: "ok" });
 			return;
 		}
-		if (viewer.handle(req, res, url)) return;
+		if (await viewer.handle(req, res, url)) return;
 
 		const authStatus = viewer.auth.authenticate(req);
 		if (authStatus !== 200) {
@@ -1666,6 +1732,8 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 			return;
 		}
 		if (req.method === "GET" && url.pathname === "/api/observer/connect") {
+			if (rejectDeletingSession(config, { sessionId: url.searchParams.get("sessionId") }, res, requestVersion))
+				return;
 			viewer.connect(req, res, url.searchParams.get("sessionId"));
 			return;
 		}
@@ -1706,6 +1774,8 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 		const runAbortMatch = /^\/api\/session\/([^/]+)\/runs\/([^/]+)\/abort$/.exec(url.pathname);
 		if (req.method === "POST" && runAbortMatch) {
 			await readBody(req);
+			if (rejectDeletingSession(config, { sessionId: decodeURIComponent(runAbortMatch[1]) }, res, requestVersion))
+				return;
 			await handleSessionRunAbort(decodeURIComponent(runAbortMatch[1]), decodeURIComponent(runAbortMatch[2]), res);
 			return;
 		}
@@ -1744,13 +1814,15 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 		if (req.method === "POST" && url.pathname === CHUNK_ENDPOINT) {
 			try {
 				const body = JSON.parse(await readBody(req)) as RequestChunkBody;
-				const chunkResult = receiveRequestChunk(body);
+				const chunkResult = receiveRequestChunk(body, { requestVersion });
 				if (!chunkResult.complete) {
 					sendJson(res, 200, chunkResult.ack);
 					return;
 				}
 				if (chunkResult.target === "/api/observer") {
-					viewer.observe(JSON.parse(chunkResult.bodyJson) as unknown, res);
+					const observerBody = JSON.parse(chunkResult.bodyJson) as unknown;
+					if (rejectDeletingSession(config, observerBody, res, chunkResult.requestVersion)) return;
+					viewer.observe(observerBody, res);
 					return;
 				}
 				const handled = await handlePostRequest(
@@ -1760,6 +1832,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 					res,
 					models,
 					streamModels,
+					chunkResult.requestVersion,
 				);
 				if (!handled && !res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
@@ -1780,10 +1853,11 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
 				if (url.pathname === "/api/observer") {
+					if (rejectDeletingSession(config, body, res, requestVersion)) return;
 					viewer.observe(body, res);
 					return;
 				}
-				if (await handlePostRequest(config, url.pathname, body, res, models, streamModels)) return;
+				if (await handlePostRequest(config, url.pathname, body, res, models, streamModels, requestVersion)) return;
 				if (!res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
 					return;
@@ -1802,11 +1876,9 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 
 		if (req.method === "DELETE" && url.pathname.startsWith("/api/session/")) {
 			const sessionId = decodeURIComponent(url.pathname.slice("/api/session/".length));
-			deleteSessionFromStore(sessionId);
-			deletePersistedSession(config.sessionStoreDir, sessionId);
-			viewer.store.remove(sessionId);
-			await deleteStreamRunsForSession(sessionId);
-			sendJson(res, 200, { deleted: sessionId });
+			const result = await deleteServerSessions(config, [sessionId]);
+			if (result.failed.length) sendError(res, 500, result.failed[0].error, PiServerErrorCode.INTERNAL_ERROR);
+			else sendJson(res, 200, { deleted: sessionId });
 			return;
 		}
 

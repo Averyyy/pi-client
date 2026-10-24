@@ -79,14 +79,14 @@ describe("viewer catalog indexes", () => {
 		const after = store.projects();
 		expect(after.revision).not.toBe(before.revision);
 		expect(after.projects.map((project) => [project.id, project.threadCount])).toEqual([
-			["D:/a", 1],
 			["D:/b", 2],
 			["D:/c", 1],
+			["D:/a", 1],
 		]);
 		expect(after.projects.find((project) => project.id === "D:/a")?.revision).not.toBe(revisions.get("D:/a"));
 		expect(after.projects.find((project) => project.id === "D:/b")?.revision).not.toBe(revisions.get("D:/b"));
 		expect(after.projects.find((project) => project.id === "D:/c")?.revision).toBe(revisions.get("D:/c"));
-		expect(before.projects[0].threadCount).toBe(2);
+		expect(before.projects.find((project) => project.id === "D:/a")?.threadCount).toBe(2);
 		expect(store.page("D:/b", null).threads.map((thread) => thread.id)).toEqual(["a", "b"]);
 		store.refreshSession("a");
 		expect(store.projects()).toBe(after);
@@ -95,6 +95,29 @@ describe("viewer catalog indexes", () => {
 		store.remove("a2");
 		expect(store.projects().projects.map((project) => project.id)).toEqual(["D:/b", "D:/c"]);
 		expect(catalogEvents).toHaveBeenCalledTimes(2);
+	});
+
+	it("orders projects by their newest thread and recomputes the head after deletion", () => {
+		archive("a-old", "D:/a", 10);
+		archive("a-new", "D:/a", 50);
+		archive("b", "D:/b", 30);
+		archive("c", "D:/c", 30);
+		const list = vi.spyOn(sessions, "listSessions");
+		const store = new ViewerStore(directory);
+		expect(store.projects().projects.map(({ id, updatedAt }) => [id, updatedAt])).toEqual([
+			["D:/a", 50],
+			["D:/b", 30],
+			["D:/c", 30],
+		]);
+		expect(store.projectThreadIds("D:/a")).toEqual(["a-new", "a-old"]);
+		sessions.deleteSession("a-new");
+		store.remove("a-new");
+		expect(store.projects().projects.map(({ id, updatedAt }) => [id, updatedAt])).toEqual([
+			["D:/b", 30],
+			["D:/c", 30],
+			["D:/a", 10],
+		]);
+		expect(list).toHaveBeenCalledTimes(1);
 	});
 
 	it("indexes observer activity and removal without invalidating the catalog for live deltas", () => {

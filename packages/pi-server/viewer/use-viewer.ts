@@ -7,7 +7,7 @@ import type {
 	ViewerThread,
 	ViewerUpdate,
 } from "../src/viewer-types.ts";
-import { ApiError, request } from "./api.ts";
+import { ApiError, deleteSessions, request } from "./api.ts";
 import { appendMessages, mergeRecentRounds } from "./rounds.ts";
 
 interface Catalog {
@@ -30,7 +30,11 @@ export class OlderHistoryRequest {
 
 	cancel() {
 		this.controller?.abort();
+		this.controller = null;
 		this.generation++;
+	}
+	get loading() {
+		return this.controller !== null;
 	}
 	isCurrent(generation: number) {
 		return generation === this.generation;
@@ -48,6 +52,8 @@ export class OlderHistoryRequest {
 		} catch (error) {
 			if (signal.aborted) return { page: null, generation };
 			throw error;
+		} finally {
+			if (this.controller === controller) this.controller = null;
 		}
 	}
 }
@@ -154,6 +160,26 @@ export class ProjectCache {
 		this.ensure(id);
 	}
 
+	removeThreads(ids: string[], projectId: string) {
+		if (!ids.length) return;
+		this.requests.get(projectId)?.controller.abort();
+		this.requests.delete(projectId);
+		const deleted = new Set(ids);
+		const rows = this.rows[projectId];
+		if (rows) {
+			this.rows = {
+				...this.rows,
+				[projectId]: {
+					...rows,
+					threads: rows.threads.filter((thread) => !deleted.has(thread.id)),
+					revision: "",
+					loading: false,
+				},
+			};
+			this.changed(this.rows);
+		}
+	}
+
 	private ensure(id: string) {
 		if (this.expanded.has(id) && this.visible.has(id) && this.rows[id]?.revision !== this.revisions.get(id))
 			void this.load(id);
@@ -244,6 +270,8 @@ export function useViewer() {
 	const [rounds, setRounds] = useState<ViewerRound[]>([]);
 	const [cursor, setCursor] = useState<string | null>(null);
 	const [loadingOlder, setLoadingOlder] = useState(false);
+	const [olderError, setOlderError] = useState("");
+	const [historyVersion, setHistoryVersion] = useState(0);
 	const [loadingThread, setLoadingThread] = useState(false);
 	const [error, setError] = useState("");
 	const [drawer, setDrawer] = useState(false);
@@ -255,7 +283,10 @@ export function useViewer() {
 	const [catalogRequest] = useState(() => new CatalogRequest());
 	const roundsRef = useRef(rounds);
 	const selectionController = useRef<AbortController | null>(null);
-	roundsRef.current = rounds;
+	const commitRounds = useCallback((next: ViewerRound[]) => {
+		roundsRef.current = next;
+		setRounds(next);
+	}, []);
 	const fail = useCallback(
 		(caught: unknown) => {
 			if (caught instanceof DOMException && caught.name === "AbortError") return;
@@ -263,7 +294,7 @@ export function useViewer() {
 				setAuth("login");
 				setLocked(caught.status === 423);
 				setThread(null);
-				setRounds([]);
+				commitRounds([]);
 				setCatalog({ revision: "", projects: [], running: [] });
 				catalogRef.current = { revision: "", projects: [], running: [] };
 				catalogRequest.cancel();
@@ -271,7 +302,7 @@ export function useViewer() {
 				setExpanded(new Set());
 			} else setError(caught instanceof Error ? caught.message : "无法读取服务器数据");
 		},
-		[projects, catalogRequest],
+		[projects, catalogRequest, commitRounds],
 	);
 	failure.current = fail;
 	const refreshCatalog = useCallback(
@@ -348,11 +379,12 @@ export function useViewer() {
 		let frame = 0;
 		let updates: ViewerUpdate[] = [];
 		setThread(null);
-		setRounds([]);
-		roundsRef.current = [];
+		commitRounds([]);
 		setCursor(null);
 		setLoadingThread(true);
 		setLoadingOlder(false);
+		setOlderError("");
+		setHistoryVersion((version) => version + 1);
 		olderHistory.cancel();
 		setError("");
 		request<{ thread: ViewerThread }>(`threads/${encodeURIComponent(current)}`, controller.signal)
@@ -370,9 +402,11 @@ export function useViewer() {
 					if (!snapshot.rounds.length || !roundsRef.current.some((round) => round.id === snapshot.rounds[0].id)) {
 						olderHistory.cancel();
 						setLoadingOlder(false);
+						setOlderError("");
+						setHistoryVersion((version) => version + 1);
 					}
 					setThread(snapshot.thread);
-					setRounds(merged.rounds);
+					commitRounds(merged.rounds);
 					if (!merged.preservedOlder) setCursor(snapshot.nextCursor);
 					setLoadingThread(false);
 				});
@@ -394,11 +428,19 @@ export function useViewer() {
 							} else if (update.append) committed.push(...update.append);
 						}
 						if (replacement) {
-							olderHistory.cancel();
-							setLoadingOlder(false);
-							setRounds(appendMessages(replacement.rounds, committed));
-							setCursor(replacement.nextCursor);
-						} else if (committed.length) setRounds((old) => appendMessages(old, committed));
+							const merged = mergeRecentRounds(roundsRef.current, replacement.rounds);
+							if (
+								!replacement.rounds.length ||
+								!roundsRef.current.some((round) => round.id === replacement.rounds[0].id)
+							) {
+								olderHistory.cancel();
+								setLoadingOlder(false);
+								setOlderError("");
+								setHistoryVersion((version) => version + 1);
+							}
+							commitRounds(appendMessages(merged.rounds, committed));
+							if (!merged.preservedOlder) setCursor(replacement.nextCursor);
+						} else if (committed.length) commitRounds(appendMessages(roundsRef.current, committed));
 					});
 				});
 				source.addEventListener("deleted", () => {
@@ -407,7 +449,7 @@ export function useViewer() {
 					cancelAnimationFrame(frame);
 					updates = [];
 					setThread(null);
-					setRounds([]);
+					commitRounds([]);
 					setLoadingThread(false);
 					setError("");
 					window.location.hash = "/";
@@ -432,7 +474,7 @@ export function useViewer() {
 			source?.close();
 			cancelAnimationFrame(frame);
 		};
-	}, [current, auth, fail, refreshCatalog, olderHistory]);
+	}, [current, auth, fail, refreshCatalog, olderHistory, commitRounds]);
 	function select(id: string) {
 		window.location.hash = `/thread/${encodeURIComponent(id)}`;
 		setDrawer(false);
@@ -447,9 +489,10 @@ export function useViewer() {
 		setExpanded(new Set(projects.expanded));
 	}
 	async function loadOlder() {
-		if (!current || !cursor || !selectionController.current) return;
+		if (!current || !cursor || !selectionController.current || olderHistory.loading) return false;
 		const controller = selectionController.current;
 		setLoadingOlder(true);
+		setOlderError("");
 		try {
 			const result = await olderHistory.load(
 				`threads/${encodeURIComponent(current)}/rounds?before=${encodeURIComponent(cursor)}`,
@@ -458,14 +501,32 @@ export function useViewer() {
 			if (olderHistory.isCurrent(result.generation)) {
 				if (result.page) {
 					const data = result.page;
-					setRounds((old) => [...data.rounds, ...old]);
+					commitRounds([...data.rounds, ...roundsRef.current]);
 					setCursor(data.nextCursor);
 				}
 				setLoadingOlder(false);
+				return Boolean(result.page?.rounds.length);
 			}
 		} catch (caught) {
-			setLoadingOlder(false);
-			fail(caught);
+			if (!controller.signal.aborted) {
+				setLoadingOlder(false);
+				setOlderError(caught instanceof Error ? caught.message : "无法读取更早的对话");
+				if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) fail(caught);
+			}
+		}
+		return false;
+	}
+	async function remove(kind: "project" | "thread", id: string, projectId: string) {
+		try {
+			const result = await deleteSessions(kind, id);
+			catalogRequest.cancel();
+			projects.removeThreads(result.deletedIds, projectId);
+			if (current && result.deletedIds.includes(current)) home();
+			refreshCatalog().catch(fail);
+			return result;
+		} catch (caught) {
+			if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) fail(caught);
+			throw caught;
 		}
 	}
 	async function logout() {
@@ -474,7 +535,7 @@ export function useViewer() {
 			if (!response.ok) throw new Error("退出登录失败");
 			setAuth("login");
 			setThread(null);
-			setRounds([]);
+			commitRounds([]);
 			setCatalog({ revision: "", projects: [], running: [] });
 			catalogRef.current = { revision: "", projects: [], running: [] };
 			catalogRequest.cancel();
@@ -496,6 +557,8 @@ export function useViewer() {
 		rounds,
 		cursor,
 		loadingOlder,
+		olderError,
+		historyVersion,
 		loadingThread,
 		error,
 		drawer,
@@ -505,6 +568,7 @@ export function useViewer() {
 		home,
 		toggleProject,
 		loadOlder,
+		remove,
 		logout,
 		projectVisibility,
 		more: (id: string) => projects.load(id, true),

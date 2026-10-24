@@ -12,7 +12,7 @@ import { clearAllSessions, getOrCreateSession } from "../src/session-store.ts";
 import { ViewerStore } from "../src/viewer-store.ts";
 import type { ViewerRound, ViewerThread } from "../src/viewer-types.ts";
 
-it("publishes a client tool run through the real observer transport and read-only viewer", async () => {
+it("publishes a client tool run through the real observer transport and server viewer", async () => {
 	const directory = mkdtempSync(join(tmpdir(), "pi-viewer-observer-"));
 	const server = createPiServer({ authToken: "integration-token", sessionStoreDir: directory }, createModels());
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
