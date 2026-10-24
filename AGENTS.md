@@ -311,6 +311,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 - Remote CLI model selection must stay within the pi-server catalog; shared model-reference resolution must not synthesize custom IDs in `PI_SERVER_MODE`.
 - The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
 - Provider telemetry requests accept the active span from `Context.telemetry`. Harness span factories derive native Chord `withTelemetry()` contexts; explicit root-parent values seed the outer span.
+- Environment test jobs that load Chord sources must build `packages/telemetry` first; its runtime package exports resolve to `dist`, including when Chord and Durable use source exports.
 - Builtin provider factories and the compatibility registry must use lazy API factories so model listing does not load provider SDKs. Runtime loaders need both a Node bundle entry and Bun static registration.
 - When upstream adds a classifier API, register it in pi-server's `CLASSIFIER_APIS` as well as builtin provider dispatch. Cover a custom provider ID in remote tests so builtin dispatch cannot mask a missing API registration.
 - When an upstream catalog removes a model/API combination, remove its provider dispatch and update affected integration tests to a currently generated catalog model; do not widen model-id types to preserve stale coverage.
