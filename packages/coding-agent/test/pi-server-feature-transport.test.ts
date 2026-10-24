@@ -818,16 +818,6 @@ describe("upstream features over 64 KiB pi-server HTTP requests", () => {
 				.find((line) => line.startsWith("data:"));
 			if (!callbackLine) throw new Error("Missing provider callback data");
 			const callback = JSON.parse(callbackLine.slice(5).trim()) as { callbackId: string };
-			let deletionSettled = false;
-			const deletion = fetch(`${baseUrl}/api/session/${sessionId}`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer transport-token" },
-			}).then((reply) => {
-				deletionSettled = true;
-				return reply;
-			});
-			await rejected;
-			expect(deletionSettled).toBe(false);
 			let abortSettled = false;
 			const abort = request
 				.postJson(`/api/session/${sessionId}/runs/${runId}/abort`, { sessionId, runId })
@@ -835,16 +825,27 @@ describe("upstream features over 64 KiB pi-server HTTP requests", () => {
 					abortSettled = true;
 					return reply;
 				});
-			expect(
-				(
-					await request.postJson("/api/provider-callback", {
-						sessionId,
-						runId,
-						callbackId: callback.callbackId,
-						result: {},
-					})
-				).status,
-			).toBe(409);
+			await rejected;
+			expect(abortSettled).toBe(false);
+			let deletionSettled = false;
+			const deletionReceived = new Promise<void>((resolve) => server.once("request", () => resolve()));
+			const deletion = fetch(`${baseUrl}/api/session/${sessionId}`, {
+				method: "DELETE",
+				headers: { Authorization: "Bearer transport-token" },
+			}).then((reply) => {
+				deletionSettled = true;
+				return reply;
+			});
+			await deletionReceived;
+			expect(deletionSettled).toBe(false);
+			const callbackReply = await request.postJson("/api/provider-callback", {
+				sessionId,
+				runId,
+				callbackId: callback.callbackId,
+				result: {},
+			});
+			expect(callbackReply.status).toBe(410);
+			expect(await callbackReply.json()).toEqual({ error: "Session deleted", deleted: true });
 			expect(abortSettled).toBe(false);
 			expect(deletionSettled).toBe(false);
 			release?.();
