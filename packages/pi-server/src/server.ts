@@ -83,6 +83,10 @@ import { ViewerHttp } from "./viewer-http.ts";
 
 export { loadConfig, type ServerConfig } from "./config.ts";
 
+interface ServerRuntime extends ServerConfig {
+	viewer: ViewerHttp;
+}
+
 interface SessionInitBody {
 	sessionId: string;
 	staticContext?: SessionStaticContext;
@@ -272,8 +276,13 @@ function sessionResponseBody(session: SessionState) {
 	};
 }
 
-function persistSession(config: ServerConfig, session: SessionState): void {
+function persistSession(config: ServerRuntime, session: SessionState): void {
 	savePersistedSession(config.sessionStoreDir, session);
+	try {
+		config.viewer.store.refreshSession(session.sessionId);
+	} catch (error) {
+		console.error(`Failed to refresh viewer session ${session.sessionId}:`, error);
+	}
 }
 
 function runKey(sessionId: string, runId: string): string {
@@ -669,7 +678,7 @@ interface SessionCompactHttpResponse {
 	body: PiServerErrorResponse | SessionCompactSuccessBody;
 }
 
-function handleSessionInit(config: ServerConfig, body: SessionInitBody, res: ServerResponse): void {
+function handleSessionInit(config: ServerRuntime, body: SessionInitBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -685,7 +694,7 @@ function handleSessionInit(config: ServerConfig, body: SessionInitBody, res: Ser
 }
 
 function handleSessionUpdate(
-	config: ServerConfig,
+	config: ServerRuntime,
 	body: SessionInitBody & { staticContext: SessionStaticContext },
 	res: ServerResponse,
 ): void {
@@ -703,7 +712,7 @@ function handleSessionUpdate(
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionSync(config: ServerConfig, body: SessionSyncBody, res: ServerResponse): void {
+function handleSessionSync(config: ServerRuntime, body: SessionSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -720,7 +729,7 @@ function handleSessionSync(config: ServerConfig, body: SessionSyncBody, res: Ser
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionAppend(config: ServerConfig, body: SessionAppendBody, res: ServerResponse): void {
+function handleSessionAppend(config: ServerRuntime, body: SessionAppendBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -737,7 +746,7 @@ function handleSessionAppend(config: ServerConfig, body: SessionAppendBody, res:
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
+function handleSessionTreeSync(config: ServerRuntime, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -754,7 +763,7 @@ function handleSessionTreeSync(config: ServerConfig, body: SessionTreeSyncBody, 
 	sendJson(res, 200, sessionResponseBody(session));
 }
 
-function handleSessionTreeAppend(config: ServerConfig, body: SessionTreeSyncBody, res: ServerResponse): void {
+function handleSessionTreeAppend(config: ServerRuntime, body: SessionTreeSyncBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -780,7 +789,7 @@ function handleSessionTreeAppend(config: ServerConfig, body: SessionTreeSyncBody
 	}
 }
 
-function handleSessionTreeSwitch(config: ServerConfig, body: SessionTreeSwitchBody, res: ServerResponse): void {
+function handleSessionTreeSwitch(config: ServerRuntime, body: SessionTreeSwitchBody, res: ServerResponse): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -924,7 +933,7 @@ function sessionCompactConflict(
 }
 
 async function completeSessionCompact(
-	config: ServerConfig,
+	config: ServerRuntime,
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 	run?: StreamRunRecord,
@@ -1004,7 +1013,7 @@ function writeServerSentEvent(res: ServerResponse, event: string, body: unknown)
 }
 
 async function handleSessionCompactStream(
-	config: ServerConfig,
+	config: ServerRuntime,
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 	res: ServerResponse,
@@ -1046,7 +1055,7 @@ async function handleSessionCompactStream(
 }
 
 async function handleSessionCompactJsonStream(
-	config: ServerConfig,
+	config: ServerRuntime,
 	body: SessionCompactBody,
 	prepared: PreparedSessionCompact,
 	res: ServerResponse,
@@ -1104,7 +1113,7 @@ function finishCompactRun(run: StreamRunRecord | undefined, result: SessionCompa
 }
 
 async function handleSessionCompact(
-	config: ServerConfig,
+	config: ServerRuntime,
 	body: SessionCompactBody,
 	res: ServerResponse,
 	models?: Models,
@@ -1221,7 +1230,7 @@ export function buildStreamContext(
 	};
 }
 
-function handleStream(config: ServerConfig, body: StreamRequestBody, res: ServerResponse, models?: Models): void {
+function handleStream(config: ServerRuntime, body: StreamRequestBody, res: ServerResponse, models?: Models): void {
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -1392,7 +1401,7 @@ function handleStream(config: ServerConfig, body: StreamRequestBody, res: Server
 }
 
 async function handlePostRequest(
-	config: ServerConfig,
+	config: ServerRuntime,
 	pathname: string,
 	body: unknown,
 	res: ServerResponse,
@@ -1636,10 +1645,11 @@ function resolveOperationModels(models: Models, model: AnyModel, options?: Image
 }
 
 export function createPiServer(configOverride?: Partial<ServerConfig>, streamModels?: Models): HttpServer {
-	const config = loadConfig(configOverride);
+	const serverConfig = loadConfig(configOverride);
 	const models = streamModels ?? builtinModels();
-	loadPersistedSessions(config.sessionStoreDir);
-	const viewer = new ViewerHttp(config);
+	loadPersistedSessions(serverConfig.sessionStoreDir);
+	const viewer = new ViewerHttp(serverConfig);
+	const config: ServerRuntime = { ...serverConfig, viewer };
 
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", "http://localhost");

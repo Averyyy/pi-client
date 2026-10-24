@@ -15,8 +15,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import type { TextSignatureV1 } from "@earendil-works/pi-ai";
-import { getSession, getSessionBranch, listSessions } from "./session-store.ts";
+import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage, type TextSignatureV1 } from "@earendil-works/pi-ai";
+import { getSession, getSessionBranch, listSessions, type SessionState } from "./session-store.ts";
 import type {
 	ObserverUpdate,
 	ThreadSummary,
@@ -41,12 +42,45 @@ interface StoredThread {
 	length: number;
 }
 
+function normalizeProjectPath(path: string): string {
+	return path.replaceAll("\\", "/");
+}
+
+function staticPromptCwd(prompt: string): string | undefined {
+	const legacy = /\r?\nCurrent working directory: ([^\r\n]+)(?:\r?\n)*$/.exec(prompt)?.[1];
+	if (legacy !== undefined) return legacy;
+	const sections: string[] = [];
+	let cwd: string | undefined;
+	let cwdStart = 0;
+	let cwdCount = 0;
+	for (const tag of prompt.matchAll(/^<(\/?)([a-z][a-z0-9_-]*)(?:[ \t][^<>\r\n]*)?>\r?$/gm)) {
+		const name = tag[2];
+		if (tag[1] === "") {
+			if (sections.length === 0 && name === "cwd") {
+				if (tag[0].trimEnd() !== "<cwd>") return undefined;
+				cwdCount++;
+				cwdStart = tag.index + tag[0].length;
+			}
+			if (!tag[0].trimEnd().endsWith("/>")) sections.push(name);
+		} else {
+			if (sections.pop() !== name) return undefined;
+			if (sections.length === 0 && name === "cwd")
+				cwd = /^\r?\n([^\r\n]+)\r?\n$/.exec(prompt.slice(cwdStart, tag.index))?.[1];
+		}
+	}
+	if (sections.length > 0 || cwdCount > 1) return undefined;
+	return cwdCount === 1 ? cwd : undefined;
+}
+
 export class ViewerStore {
 	private readonly directory: string;
 	private readonly threads = new Map<string, StoredThread>();
 	private readonly connections = new Map<string, { id: string; sequence: number }>();
 	private readonly deletedConnections = new Set<string>();
-	private readonly legacyTitles = new Map<string, { revision: number; title: string }>();
+	private readonly archiveMetadata = new Map<
+		string,
+		{ revision: number; title: string | undefined; cwd: string | null }
+	>();
 	readonly listeners = new Set<(id: string, update: ViewerUpdate) => void>();
 	readonly catalogListeners = new Set<() => void>();
 	readonly removedListeners = new Set<(id: string) => void>();
@@ -116,27 +150,33 @@ export class ViewerStore {
 	}
 
 	get(id: string): ViewerThread | undefined {
+		const summary = this.summary(id);
+		if (!summary) return undefined;
 		const stored = this.threads.get(id);
-		if (stored) return structuredClone(stored.thread);
 		const session = getSession(id);
-		if (!session) return undefined;
 		return {
-			id,
-			title: this.legacyTitle(id),
-			projectId: "unassigned",
-			cwd: null,
-			status: "unknown",
-			updatedAt: session.updatedAt,
-			legacy: true,
-			live: { message: null, tools: [] },
+			...summary,
+			legacy: !stored || (stored.length === 0 && Boolean(session?.entries.length)),
+			live: stored ? structuredClone(stored.thread.live) : { message: null, tools: [] },
 		};
+	}
+
+	refreshSession(id: string): void {
+		if (this.listeners.size > 0) {
+			const thread = this.get(id);
+			if (thread) {
+				const update: ViewerUpdate = { thread, replace: true, refresh: true, ...this.rounds(id, null) };
+				for (const listener of this.listeners) listener(id, update);
+			}
+		}
+		for (const listener of this.catalogListeners) listener();
 	}
 
 	remove(id: string): void {
 		const connection = this.connections.get(id);
 		if (connection) this.deletedConnections.add(connection.id);
 		this.connections.delete(id);
-		this.legacyTitles.delete(id);
+		this.archiveMetadata.delete(id);
 		const stored = this.threads.get(id);
 		if (stored) {
 			rmSync(join(this.directory, `${stored.fileId}.json`), { force: true });
@@ -149,10 +189,13 @@ export class ViewerStore {
 
 	rounds(id: string, before: string | null): { rounds: ViewerRound[]; nextCursor: string | null } {
 		const stored = this.threads.get(id);
-		if (!stored) {
-			const session = getSession(id);
+		const session = getSession(id);
+		if (!stored || (stored.length === 0 && session?.entries.length)) {
 			if (!session) throw new Error("Thread not found");
-			const branch = getSessionBranch(session).filter((entry) => entry.type === "message");
+			const branch = getSessionBranch(session).filter(
+				(entry): entry is Extract<SessionTreeEntry, { type: "message" }> =>
+					entry.type === "message" && entry.message.role !== "system",
+			);
 			const boundaries: { id: string; offset: number }[] = [];
 			for (const [offset, entry] of branch.entries()) {
 				if (!boundaries.length || (entry.message as Record<string, unknown>).role === "user")
@@ -259,6 +302,8 @@ export class ViewerStore {
 		if (body.status !== undefined) stored.thread.status = body.status;
 		if (body.live !== undefined) stored.thread.live = body.live;
 		const messages = body.replace ?? body.append ?? [];
+		const replacesArchive =
+			stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
 		const oldLogId = stored.logId;
 		if (body.replace) {
 			stored.logId = randomUUID();
@@ -294,33 +339,39 @@ export class ViewerStore {
 		this.emit(
 			stored,
 			body.append,
-			body.replace !== undefined,
+			body.replace !== undefined || replacesArchive,
 			created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
 		);
 	}
 
 	private summaries(): ThreadSummary[] {
-		const summaries: ThreadSummary[] = [...this.threads.values()].map(({ thread }) => {
-			const { live: _live, legacy: _legacy, ...summary } = thread;
-			return summary;
-		});
-		for (const session of listSessions()) {
-			if (this.threads.has(session.sessionId)) continue;
-			summaries.push({
-				id: session.sessionId,
-				title: this.legacyTitle(session.sessionId),
-				cwd: null,
-				projectId: "unassigned",
-				status: "unknown",
-				updatedAt: session.updatedAt,
-			});
+		const ids = new Set([...listSessions().map((session) => session.sessionId), ...this.threads.keys()]);
+		const summaries: ThreadSummary[] = [];
+		for (const id of ids) {
+			summaries.push(this.summary(id)!);
 		}
 		return summaries.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
 	}
 
+	private summary(id: string): ThreadSummary | undefined {
+		const stored = this.threads.get(id)?.thread;
+		const session = getSession(id);
+		if (!session && !stored) return undefined;
+		const metadata = session ? this.sessionMetadata(session) : undefined;
+		const cwd = metadata?.cwd ?? (stored?.cwd ? normalizeProjectPath(stored.cwd) : null);
+		return {
+			id,
+			title: metadata?.title ?? stored?.title ?? id,
+			cwd,
+			projectId: cwd ?? "unassigned",
+			status: stored?.status ?? "unknown",
+			updatedAt: Math.max(session?.updatedAt ?? 0, stored?.updatedAt ?? 0),
+		};
+	}
+
 	private emit(stored: StoredThread, append?: ViewerMessage[], replace = false, catalog = true): void {
 		if (this.listeners.size > 0) {
-			const thread = structuredClone(stored.thread);
+			const thread = this.get(stored.thread.id)!;
 			const update: ViewerUpdate = replace
 				? { thread, replace: true, ...this.rounds(thread.id, null) }
 				: { thread, ...(append?.length ? { append } : {}) };
@@ -335,15 +386,13 @@ export class ViewerStore {
 		return index;
 	}
 
-	private legacyTitle(id: string): string {
-		const session = getSession(id);
-		if (!session) return id;
-		const cached = this.legacyTitles.get(id);
-		if (cached?.revision === session.revision) return cached.title;
+	private sessionMetadata(session: SessionState): { title: string | undefined; cwd: string | null } {
+		const cached = this.archiveMetadata.get(session.sessionId);
+		if (cached?.revision === session.revision) return cached;
 		let name: string | undefined;
 		let firstUser: string | undefined;
 		for (const entry of getSessionBranch(session)) {
-			if (entry.type === "session_info" && typeof entry.name === "string") name = entry.name;
+			if (entry.type === "session_info") name = entry.name;
 			if (firstUser !== undefined || entry.type !== "message" || !entry.message) continue;
 			const message = entry.message as Record<string, unknown>;
 			if (message.role !== "user") continue;
@@ -356,9 +405,18 @@ export class ViewerStore {
 					.join("")
 					.slice(0, 120);
 		}
-		const title = name ?? firstUser ?? id;
-		this.legacyTitles.set(id, { revision: session.revision, title });
-		return title;
+		const section = getCurrentSystemMessage(session.messages)?.sections?.cwd;
+		const prompt = session.staticContext?.systemPrompt ?? "";
+		const cwd =
+			(typeof section === "string" ? /^<cwd>\r?\n([^\r\n]+)\r?\n<\/cwd>$/.exec(section)?.[1] : undefined) ??
+			staticPromptCwd(prompt);
+		const metadata = {
+			revision: session.revision,
+			title: name ?? firstUser,
+			cwd: cwd ? normalizeProjectPath(cwd) : null,
+		};
+		this.archiveMetadata.set(session.sessionId, metadata);
+		return metadata;
 	}
 }
 

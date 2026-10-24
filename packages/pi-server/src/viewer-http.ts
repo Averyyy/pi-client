@@ -172,7 +172,7 @@ export class ViewerHttp {
 				else if (match?.[2] === "events") {
 					const send = this.events(req, res);
 					const listener = (updatedId: string, update: ViewerUpdate) => {
-						if (updatedId === id) send("update", update);
+						if (updatedId === id) send(update.replace && update.refresh ? "snapshot" : "update", update);
 					};
 					this.store.listeners.add(listener);
 					const removed = (removedId: string) => {

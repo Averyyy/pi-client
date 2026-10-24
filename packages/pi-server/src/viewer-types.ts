@@ -54,7 +54,7 @@ export interface ViewerRound {
 }
 
 export type ViewerUpdate = { thread: ViewerThread } & (
-	| { replace: true; rounds: ViewerRound[]; nextCursor: string | null }
+	| { replace: true; refresh?: true; rounds: ViewerRound[]; nextCursor: string | null }
 	| { replace?: false; append?: ViewerMessage[] }
 );
 

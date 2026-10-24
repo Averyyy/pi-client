@@ -28,6 +28,8 @@
 
 ### Fixed
 
+- Grouped archived remote-client sessions by their saved working directory, including snapshot/WAL metadata and incremental system sections, without requiring an observer connection.
+- Refreshed viewer pages after successful session persistence and excluded system instructions from archived conversation content.
 - Rejected newer WAL records that overlap the session snapshot instead of silently dropping them, while continuing to ignore revisions already included in the snapshot.
 - Removed repeated leaf and compaction-run checks after the same synchronous checks had already succeeded.
 - Registered the OpenAI Decisions API for custom classifier providers, including image inputs over chunked requests.

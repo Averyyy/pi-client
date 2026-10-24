@@ -129,6 +129,7 @@
 ## pi-client Web UI
 
 - Keep the pi-server root viewer separate from Tau and provider/tree synchronization. Its browser cookie authorizes read-only viewer routes only; explicit incorrect API credentials and viewer logins share the persistent lockout budget.
+- Read archived remote projects from the server's recovered snapshot and WAL state, including the effective system message's `sections.cwd` and Pi's standard working-directory fields. Do not resolve remote paths on the server or require an observer to display saved sessions. Notify the viewer after successful persistence; projection failures are diagnostics and must not change the session request result.
 - Publish viewer history after persistence through `message_committed`; `entry_appended` also drives TUI rendering for boundary messages. Derive activity from the whole session lifecycle, including tools and manual compaction, and distinguish disconnected observers from idle sessions.
 - Await the observer's bounded final drain in runtime teardown before synchronous session disposal. Print-mode completion must persist the final assistant message; observer delivery failures remain diagnostics and do not change the prompt result.
 - Invalidate pending older-history requests when a viewer branch snapshot replaces their pagination base. Deleted observer connections receive terminal HTTP 410 as well as SSE notification so response ordering cannot restart the deleted projection.

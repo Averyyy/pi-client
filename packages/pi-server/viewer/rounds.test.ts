@@ -77,4 +77,15 @@ describe("conversation round projection", () => {
 		const branch = { id: "branch", messages: [message("branch", "user", "另一个分支")] };
 		expect(mergeRecentRounds([older, current], [branch])).toEqual({ rounds: [branch], preservedOlder: false });
 	});
+	it("retains ten loaded rounds when a persisted branch appends a new round", () => {
+		const rounds = Array.from({ length: 11 }, (_, index) => ({
+			id: `user-${index}`,
+			messages: [message(`user-${index}`, "user", `Question ${index}`)],
+		}));
+		expect(mergeRecentRounds(rounds.slice(0, 10), rounds.slice(6))).toEqual({
+			rounds,
+			preservedOlder: true,
+		});
+		expect(mergeRecentRounds(rounds, rounds.slice(6))).toEqual({ rounds, preservedOlder: true });
+	});
 });

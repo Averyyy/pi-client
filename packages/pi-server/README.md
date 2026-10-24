@@ -68,6 +68,8 @@ Unlocking takes effect without restarting the server. There is no HTTP unlock en
 
 Matching `pi-client` releases publish a separate observation stream containing the current branch's committed messages, project directory, title, and explicit run/tool state. Tool execution remains running between model requests. A disconnected client is shown as disconnected, rather than idle. The observer does not modify the server's inference tree or provider context. Its history and authentication state live under `.viewer` inside the session directory.
 
-Existing server trees remain readable as unassigned archives until their clients reconnect and supply project metadata. The viewer can only display history actually saved by the server or supplied by a connected client. Images are represented as attachment labels. Transcript Markdown does not execute HTML or load external images.
+Existing server sessions are read from the recovered snapshots and WAL records. Projects use the remote working directory declared in the effective system message or Pi's standard system-prompt directory field; only sessions without that metadata appear as unassigned archives. Saved branch history is available without a connected client, and successful session writes update open viewer pages.
+
+The viewer displays history saved by the server or published by a connected client. A session containing only initialization metadata has no saved conversation body. System instructions are used for project metadata and excluded from the conversation display. Images are represented as attachment labels. Transcript Markdown does not execute HTML or load external images.
 
 The frontend is maintained in `viewer/` and ships as static assets in `dist/viewer/`. Build it with `npm run build:viewer`; `npm run build` includes that step. This viewer is independent of the interactive Tau interface launched by `pi-client web`.

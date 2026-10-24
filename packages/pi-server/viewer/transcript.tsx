@@ -222,7 +222,7 @@ export function Transcript({
 				{rounds.length === 0 && !thread.live.message ? (
 					<div className="empty-conversation">
 						<Icon name="spark" size={26} />
-						<p>此对话还没有消息</p>
+						<p>服务器尚未保存此会话的消息</p>
 					</div>
 				) : null}
 				{rounds.map((round, index) => (

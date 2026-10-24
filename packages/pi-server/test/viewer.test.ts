@@ -248,14 +248,14 @@ describe("read-only thread viewer", () => {
 			projects: ViewerProject[];
 			running: ThreadSummary[];
 		};
-		expect(catalog.projects).toEqual([{ id: "C:\\project", path: "C:\\project", name: "project", threadCount: 7 }]);
+		expect(catalog.projects).toEqual([{ id: "C:/project", path: "C:/project", name: "project", threadCount: 7 }]);
 		expect(catalog.running.map((thread) => thread.id)).toEqual(["thread-0"]);
 		const first = (await (
-			await viewer(`threads?project=${encodeURIComponent("C:\\project")}`, authCookie)
+			await viewer(`threads?project=${encodeURIComponent("C:/project")}`, authCookie)
 		).json()) as { threads: ThreadSummary[]; nextCursor: string };
 		expect(first.threads).toHaveLength(5);
 		const second = (await (
-			await viewer(`threads?project=${encodeURIComponent("C:\\project")}&cursor=${first.nextCursor}`, authCookie)
+			await viewer(`threads?project=${encodeURIComponent("C:/project")}&cursor=${first.nextCursor}`, authCookie)
 		).json()) as { threads: ThreadSummary[]; nextCursor: null };
 		expect(second.threads).toHaveLength(2);
 		expect(new Set([...first.threads, ...second.threads].map((thread) => thread.id)).size).toBe(7);
