@@ -423,10 +423,28 @@ describe("pi-server HTTP", () => {
 	it("serves the public viewer shell or reports unavailable build assets", async () => {
 		const res = await fetch(`${baseUrl}/`);
 		expect(res.headers.get("cache-control")).toBe("no-store");
-		if (existsSync(new URL("../dist/viewer/index.html", import.meta.url))) {
+		if (existsSync(new URL("../dist/viewer/asset-version.json", import.meta.url))) {
 			expect(res.status).toBe(200);
 			expect(res.headers.get("content-type")).toContain("text/html");
-			expect(await res.text()).toContain("/viewer/assets/app.js");
+			const html = await res.text();
+			const paths = [...html.matchAll(/(?:src|href)="(\/viewer\/assets\/[^"/]+\/app\.(?:js|css))"/g)].map(
+				(match) => match[1],
+			);
+			expect(paths).toHaveLength(2);
+			expect(paths.some((path) => path.endsWith("app.js"))).toBe(true);
+			expect(paths.some((path) => path.endsWith("app.css"))).toBe(true);
+			for (const path of paths) {
+				const asset = await fetch(`${baseUrl}${path}`);
+				expect(asset.status).toBe(200);
+				expect(asset.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+				const tag = asset.headers.get("etag")!;
+				expect(tag).toMatch(/^"[^"]+"$/);
+				expect(await asset.text()).not.toBe("");
+				const cached = await fetch(`${baseUrl}${path}`, { headers: { "If-None-Match": tag } });
+				expect(cached.status).toBe(304);
+				expect(await cached.text()).toBe("");
+			}
+			expect((await fetch(`${baseUrl}/viewer/assets/app.js`)).status).toBe(404);
 		} else {
 			expect(res.status).toBe(503);
 			expect(await res.json()).toEqual({ error: "Viewer assets unavailable" });

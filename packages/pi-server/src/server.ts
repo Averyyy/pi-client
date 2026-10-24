@@ -281,7 +281,9 @@ function sessionResponseBody(session: SessionState) {
 }
 
 function persistSession(config: ServerRuntime, session: SessionState): void {
+	const changed = session.persistenceChange !== undefined;
 	savePersistedSession(config.sessionStoreDir, session);
+	if (!changed) return;
 	try {
 		config.viewer.store.refreshSession(session.sessionId);
 	} catch (error) {

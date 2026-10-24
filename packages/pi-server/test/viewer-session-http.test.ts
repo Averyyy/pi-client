@@ -9,7 +9,7 @@ import { createPiServer } from "../src/server.ts";
 import * as persistence from "../src/session-persistence.ts";
 import { clearAllSessions } from "../src/session-store.ts";
 import { ViewerStore } from "../src/viewer-store.ts";
-import type { ViewerCatalog, ViewerProject, ViewerRound, ViewerThread } from "../src/viewer-types.ts";
+import type { ViewerCatalog, ViewerProject, ViewerRound, ViewerThread, ViewerUpdate } from "../src/viewer-types.ts";
 
 class Events {
 	private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -36,7 +36,7 @@ class Events {
 	}
 }
 
-function user(id: string, parentId: string | null): SessionTreeEntry {
+function user(id: string, parentId: string | null): Extract<SessionTreeEntry, { type: "message" }> {
 	return {
 		type: "message",
 		id,
@@ -200,6 +200,98 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		expect(restored.thread).toMatchObject({ cwd: "D:/changed", status: "unknown" });
 		const rounds = (await (await viewer("threads/remote/rounds")).json()) as { rounds: ViewerRound[] };
 		expect(rounds.rounds.map((round) => round.id)).toEqual(["u3", "u4", "u5", "u6", "u7"]);
+	});
+
+	it("skips unchanged persisted history and publishes revisions with unchanged catalog summaries", async () => {
+		vi.spyOn(Date, "now").mockReturnValue(1000);
+		const refresh = vi.spyOn(ViewerStore.prototype, "refreshSession");
+		const rounds = vi.spyOn(ViewerStore.prototype, "rounds");
+		expect((await post("init", { sessionId: "dedup" })).status).toBe(200);
+		expect(refresh).toHaveBeenCalledExactlyOnceWith("dedup");
+		const store = refresh.mock.contexts[0] as ViewerStore;
+		expect(store.projects().projects[0]).toMatchObject({ id: "unassigned", threadCount: 1 });
+		const staticContext = { systemPrompt: "Instructions\nCurrent working directory: D:/dedup" };
+		expect((await post("update", { sessionId: "dedup", staticContext })).status).toBe(200);
+		const entries = Array.from(
+			{ length: 5 },
+			(_, index): SessionTreeEntry => ({
+				...user(`u${index}`, index ? `u${index - 1}` : null),
+				message: { role: "user", content: "x".repeat(1024 * 1024), timestamp: 1000 },
+			}),
+		);
+		const synced = await post("tree/sync", { sessionId: "dedup", entries, leafId: "u4" });
+		expect(synced.status).toBe(200);
+		const initial = (await synced.json()) as { revision: number };
+		expect(rounds).not.toHaveBeenCalled();
+		const catalog = store.projects();
+		const updates: ViewerUpdate[] = [];
+		const unsubscribe = store.subscribe("dedup", (update) => updates.push(update));
+		refresh.mockClear();
+		for (const [path, body] of [
+			["init", { sessionId: "dedup", staticContext }],
+			["tree/append", { sessionId: "dedup", entries: [entries[4]], leafId: "u4" }],
+		] as const) {
+			const response = await post(path, body);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ revision: initial.revision });
+		}
+		const repeatedBytes = updates.reduce((bytes, update) => bytes + Buffer.byteLength(JSON.stringify(update)), 0);
+		expect(repeatedBytes).toBe(0);
+		expect(refresh).not.toHaveBeenCalled();
+		expect(rounds).not.toHaveBeenCalled();
+		const branch = { ...user("branch", "u0"), message: { role: "user", content: "Branch", timestamp: 1000 } };
+		expect((await post("tree/append", { sessionId: "dedup", entries: [branch], leafId: "branch" })).status).toBe(200);
+		expect(store.projects()).toBe(catalog);
+		expect(updates.at(-1)).toMatchObject({ refresh: true, rounds: [{ id: "u0" }, { id: "branch" }] });
+		expect((await post("tree/switch", { sessionId: "dedup", leafId: "u4" })).status).toBe(200);
+		expect(store.projects()).toBe(catalog);
+		expect(updates.at(-1)).toMatchObject({
+			rounds: [{ id: "u0" }, { id: "u1" }, { id: "u2" }, { id: "u3" }, { id: "u4" }],
+		});
+		expect(refresh).toHaveBeenCalledTimes(2);
+		expect(rounds).toHaveBeenCalledTimes(2);
+		unsubscribe();
+	});
+
+	it("keeps observer history and live updates independent of unchanged archive requests", async () => {
+		const refresh = vi.spyOn(ViewerStore.prototype, "refreshSession");
+		const entry = user("archive", null);
+		expect((await post("tree/sync", { sessionId: "observed", entries: [entry], leafId: entry.id })).status).toBe(200);
+		const store = refresh.mock.contexts[0] as ViewerStore;
+		const connection = store.connect("observed");
+		const updates: ViewerUpdate[] = [];
+		const unsubscribe = store.subscribe("observed", (update) => updates.push(update));
+		const first = { id: "observer", role: "user", content: "Observer history", timestamp: 1000 };
+		store.update({
+			sessionId: "observed",
+			connectionId: connection.connectionId,
+			sequence: 1,
+			cwd: "D:/observer",
+			replace: [first],
+		});
+		refresh.mockClear();
+		expect((await post("init", { sessionId: "observed" })).status).toBe(200);
+		const second = { id: "next", role: "user", content: "Next observer round", timestamp: 2000 };
+		store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 2, append: [second] });
+		expect((await post("tree/append", { sessionId: "observed", entries: [entry], leafId: entry.id })).status).toBe(
+			200,
+		);
+		const live = { message: { id: "live", role: "assistant", content: "Streaming", timestamp: 3000 }, tools: [] };
+		store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 3, live });
+		store.update({
+			sessionId: "observed",
+			connectionId: connection.connectionId,
+			sequence: 4,
+			replace: [second],
+		});
+		expect(refresh).not.toHaveBeenCalled();
+		expect(updates).toHaveLength(4);
+		expect(updates[0]).toMatchObject({ replace: true, rounds: [{ id: "observer" }] });
+		expect(updates[1]).toMatchObject({ append: [second] });
+		expect(updates[2]).toMatchObject({ thread: { live } });
+		expect(updates[3]).toMatchObject({ replace: true, rounds: [{ id: "next" }] });
+		unsubscribe();
+		connection.close();
 	});
 
 	it("reports a viewer projection failure while preserving the successful persisted session result", async () => {

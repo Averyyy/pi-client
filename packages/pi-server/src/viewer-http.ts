@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -87,8 +86,7 @@ export class ViewerHttp {
 	readonly auth: ViewerAuth;
 	readonly store: ViewerStore;
 	private readonly streams = new Set<ServerResponse>();
-	private readonly assets = new Map<string, Buffer>();
-	private readonly assetTag = `"${randomUUID()}"`;
+	private assets: { version: string; files: Map<string, { body: Buffer; contentType: string }> } | undefined;
 	private readonly deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>;
 
 	constructor(config: ServerConfig, deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>) {
@@ -109,38 +107,42 @@ export class ViewerHttp {
 			return true;
 		}
 		if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/viewer/assets/"))) {
-			const assets: Record<string, [string, string]> = {
-				"/": ["index.html", "text/html; charset=utf-8"],
-				"/viewer/assets/app.js": ["app.js", "text/javascript; charset=utf-8"],
-				"/viewer/assets/app.css": ["app.css", "text/css; charset=utf-8"],
-			};
-			const asset = assets[url.pathname];
+			if (!this.assets) {
+				const directory = new URL("../dist/viewer/", import.meta.url);
+				const manifest = fileURLToPath(new URL("asset-version.json", directory));
+				if (!existsSync(manifest)) {
+					json(res, 503, { error: "Viewer assets unavailable" });
+					return true;
+				}
+				const { version } = JSON.parse(readFileSync(manifest, "utf8")) as { version: string };
+				const files = new Map<string, { body: Buffer; contentType: string }>();
+				for (const [path, file, contentType] of [
+					["/", "index.html", "text/html; charset=utf-8"],
+					[`/viewer/assets/${version}/app.js`, "app.js", "text/javascript; charset=utf-8"],
+					[`/viewer/assets/${version}/app.css`, "app.css", "text/css; charset=utf-8"],
+				]) {
+					files.set(path, { body: readFileSync(new URL(file, directory)), contentType });
+				}
+				this.assets = { version, files };
+			}
+			const asset = this.assets.files.get(url.pathname);
 			if (!asset) {
 				json(res, 404, { error: "Not found" });
 				return true;
 			}
-			let cached = this.assets.get(asset[0]);
-			if (!cached) {
-				const path = fileURLToPath(new URL(`../dist/viewer/${asset[0]}`, import.meta.url));
-				if (!existsSync(path)) {
-					json(res, 503, { error: "Viewer assets unavailable" });
-					return true;
-				}
-				cached = readFileSync(path);
-				this.assets.set(asset[0], cached);
-			}
 			if (url.pathname !== "/") {
-				res.setHeader("Cache-Control", "private, no-cache");
-				res.setHeader("ETag", this.assetTag);
+				const tag = `"${this.assets.version}"`;
+				res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+				res.setHeader("ETag", tag);
 				const validator = req.headers["if-none-match"];
-				if (validator === this.assetTag || validator === `W/${this.assetTag}`) {
+				if (validator === tag || validator === `W/${tag}`) {
 					res.writeHead(304);
 					res.end();
 					return true;
 				}
 			}
-			res.writeHead(200, { "Content-Type": asset[1] });
-			res.end(cached);
+			res.writeHead(200, { "Content-Type": asset.contentType });
+			res.end(asset.body);
 			return true;
 		}
 		if ((req.method === "POST" || req.method === "DELETE") && !sameOrigin(req)) {

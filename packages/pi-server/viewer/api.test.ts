@@ -1,7 +1,106 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deleteSessions } from "./api.ts";
+import { deleteSessions, readThreadEvents } from "./api.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("thread event stream", () => {
+	it("reads UTF-8 and SSE delimiters split at every byte and ignores heartbeats", async () => {
+		const bytes = new TextEncoder().encode(
+			': heartbeat\n\nevent: snapshot\ndata: {"title":"你好🙂"}\n\nevent: update\ndata: {"append":[]}\n\n',
+		);
+		const fetch = vi.fn(
+			async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+							controller.close();
+						},
+					}),
+					{ headers: { "Content-Type": "text/event-stream; charset=utf-8" } },
+				),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const receive = vi.fn();
+		const signal = new AbortController().signal;
+		await readThreadEvents("thread/one", signal, receive);
+		expect(fetch).toHaveBeenCalledExactlyOnceWith("/viewer/api/threads/thread%2Fone/events", {
+			signal,
+			credentials: "same-origin",
+		});
+		expect(receive.mock.calls).toEqual([
+			["snapshot", '{"title":"你好🙂"}'],
+			["update", '{"append":[]}'],
+		]);
+	});
+
+	it("rejects a successful HTML response instead of treating it as an event stream", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response("<html>Proxy error</html>", {
+						headers: { "Content-Type": "text/html" },
+					}),
+			),
+		);
+		await expect(readThreadEvents("thread", new AbortController().signal, vi.fn())).rejects.toThrow(
+			"服务器返回了无效的对话事件流",
+		);
+	});
+
+	it.each([401, 423, 404])("preserves terminal HTTP %s without reading its body", async (status) => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response("Unavailable", { status })),
+		);
+		const receive = vi.fn();
+		await expect(readThreadEvents("thread", new AbortController().signal, receive)).rejects.toMatchObject({ status });
+		expect(receive).not.toHaveBeenCalled();
+	});
+
+	it("cancels an idle reader when its selection aborts", async () => {
+		const cancel = vi.fn();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(new ReadableStream({ cancel }), { headers: { "Content-Type": "text/event-stream" } }),
+			),
+		);
+		const controller = new AbortController();
+		const pending = readThreadEvents("thread", controller.signal, vi.fn());
+		await Promise.resolve();
+		controller.abort();
+		await pending;
+		expect(cancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels after deleted without consuming queued updates", async () => {
+		const cancel = vi.fn();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(
+									new TextEncoder().encode("event: deleted\ndata: {}\n\nevent: update\ndata: {}\n\n"),
+								);
+							},
+							cancel,
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					),
+			),
+		);
+		const receive = vi.fn(() => false);
+		await readThreadEvents("thread", new AbortController().signal, receive);
+		expect(receive).toHaveBeenCalledExactlyOnceWith("deleted", "{}");
+		expect(cancel).toHaveBeenCalledTimes(1);
+	});
+});
 
 describe("server conversation deletion", () => {
 	it("deletes a full project through its encoded id with the viewer cookie", async () => {

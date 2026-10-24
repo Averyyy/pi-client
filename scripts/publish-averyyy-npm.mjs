@@ -69,7 +69,7 @@ const packageDefs = [
 		id: "pi-server",
 		source: "packages/pi-server",
 		name: "@averyyy/pi-server",
-		requiredFiles: ["bin/pi-server.js", "dist/server.js", "dist/viewer/index.html", "dist/viewer/app.js", "dist/viewer/app.css", "README.md"],
+		requiredFiles: ["bin/pi-server.js", "dist/server.js", "dist/viewer/index.html", "dist/viewer/app.js", "dist/viewer/app.css", "dist/viewer/asset-version.json", "README.md"],
 		mutate: (pkg, version) => {
 			setDependency(pkg, "@earendil-works/pi-agent-core", `npm:@averyyy/pi-agent-core@${version}`);
 			setDependency(pkg, "@earendil-works/pi-ai", `npm:@averyyy/pi-ai@${version}`);

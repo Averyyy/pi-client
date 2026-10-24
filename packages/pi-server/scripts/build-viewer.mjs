@@ -1,4 +1,5 @@
-import { copyFile, mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
@@ -19,4 +20,10 @@ await build({
 	define: { "process.env.NODE_ENV": '"production"' },
 	legalComments: "external",
 });
-await copyFile(new URL("../viewer/index.html", import.meta.url), new URL("index.html", output));
+const version = randomUUID();
+const html = (await readFile(new URL("../viewer/index.html", import.meta.url), "utf8")).replaceAll(
+	"/viewer/assets/",
+	`/viewer/assets/${version}/`,
+);
+await writeFile(new URL("asset-version.json", output), JSON.stringify({ version }));
+await writeFile(new URL("index.html", output), html);

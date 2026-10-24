@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Loaded thread history directly from its event stream in parallel with the catalog, cached build-versioned assets across reloads and restarts, and suppressed unchanged persistence snapshots.
 - Cached the viewer's project index and static assets, loaded visible project folders on demand, and refreshed only changed project pages.
 - Accepted weak ETags when revalidating assets compressed by a reverse proxy.
 - Grouped archived remote-client sessions by their saved working directory, including snapshot/WAL metadata and incremental system sections, without requiring an observer connection.

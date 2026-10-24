@@ -7,7 +7,7 @@ import type {
 	ViewerThread,
 	ViewerUpdate,
 } from "../src/viewer-types.ts";
-import { ApiError, deleteSessions, request } from "./api.ts";
+import { ApiError, deleteSessions, readThreadEvents, request } from "./api.ts";
 import { appendMessages, mergeRecentRounds } from "./rounds.ts";
 
 interface Catalog {
@@ -89,6 +89,8 @@ export class CatalogRequest {
 					if (active.controller.signal.aborted) return;
 					apply(data);
 				} while (active.dirty);
+			} catch (error) {
+				if (!active.controller.signal.aborted) throw error;
 			} finally {
 				if (this.active === active) this.active = null;
 			}
@@ -274,8 +276,12 @@ export function useViewer() {
 	const [historyVersion, setHistoryVersion] = useState(0);
 	const [loadingThread, setLoadingThread] = useState(false);
 	const [error, setError] = useState("");
+	const [catalogError, setCatalogError] = useState("");
 	const [drawer, setDrawer] = useState(false);
 	const [connected, setConnected] = useState(true);
+	const [threadConnected, setThreadConnected] = useState(true);
+	const [threadAttempt, setThreadAttempt] = useState(0);
+	const authBlocked = useRef(false);
 	const [olderHistory] = useState(() => new OlderHistoryRequest());
 	const failure = useRef<(error: unknown) => void>(() => {});
 	const [projects] = useState(() => new ProjectCache(setRows, (error) => failure.current(error)));
@@ -291,6 +297,8 @@ export function useViewer() {
 		(caught: unknown) => {
 			if (caught instanceof DOMException && caught.name === "AbortError") return;
 			if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) {
+				authBlocked.current = true;
+				selectionController.current?.abort();
 				setAuth("login");
 				setLocked(caught.status === 423);
 				setThread(null);
@@ -305,18 +313,22 @@ export function useViewer() {
 		[projects, catalogRequest, commitRounds],
 	);
 	failure.current = fail;
-	const refreshCatalog = useCallback(
-		() =>
-			catalogRequest.load((data) => {
+	const refreshCatalog = useCallback(async () => {
+		try {
+			await catalogRequest.load((data) => {
+				if (authBlocked.current) return;
 				catalogRef.current = data;
 				projects.updateCatalog(data.projects);
 				setExpanded(new Set(projects.expanded));
 				setCatalog(data);
 				setAuth("ready");
-				setError("");
-			}),
-		[projects, catalogRequest],
-	);
+				setCatalogError("");
+			});
+		} catch (caught) {
+			if (caught instanceof ApiError && (caught.status === 401 || caught.status === 423)) throw caught;
+			setCatalogError(caught instanceof Error ? caught.message : "无法读取服务器数据");
+		}
+	}, [projects, catalogRequest]);
 	useEffect(() => {
 		refreshCatalog().catch(fail);
 		return () => catalogRequest.cancel();
@@ -338,8 +350,9 @@ export function useViewer() {
 		},
 		[projects],
 	);
+	const canWatchCatalog = auth === "ready" && catalog.revision !== "";
 	useEffect(() => {
-		if (auth !== "ready") return;
+		if (!canWatchCatalog) return;
 		const source = new EventSource("/viewer/api/events");
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let checking = false;
@@ -367,114 +380,137 @@ export function useViewer() {
 			source.close();
 			if (timer) clearTimeout(timer);
 		};
-	}, [auth, fail, refreshCatalog]);
+	}, [canWatchCatalog, fail, refreshCatalog]);
+	const canLoadThread = auth !== "login";
+	// biome-ignore lint/correctness/useExhaustiveDependencies: threadAttempt restarts the stream for an explicit retry.
 	useEffect(() => {
-		if (auth !== "ready" || !current) {
+		if (!canLoadThread || !current) {
 			setThread(null);
+			setThreadConnected(true);
 			return;
 		}
+		const id = current;
 		const controller = new AbortController();
 		selectionController.current = controller;
-		let source: EventSource | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		let frame = 0;
 		let updates: ViewerUpdate[] = [];
 		setThread(null);
 		commitRounds([]);
 		setCursor(null);
 		setLoadingThread(true);
+		setThreadConnected(true);
 		setLoadingOlder(false);
 		setOlderError("");
 		setHistoryVersion((version) => version + 1);
 		olderHistory.cancel();
 		setError("");
-		request<{ thread: ViewerThread }>(`threads/${encodeURIComponent(current)}`, controller.signal)
-			.then((data) => {
-				if (controller.signal.aborted) return;
-				setThread(data.thread);
-				source = new EventSource(`/viewer/api/threads/${encodeURIComponent(current)}/events`);
-				source.addEventListener("snapshot", (event: MessageEvent<string>) => {
-					const snapshot = JSON.parse(event.data) as Snapshot;
-					if (controller.signal.aborted) return;
-					cancelAnimationFrame(frame);
-					frame = 0;
-					updates = [];
-					const merged = mergeRecentRounds(roundsRef.current, snapshot.rounds);
-					if (!snapshot.rounds.length || !roundsRef.current.some((round) => round.id === snapshot.rounds[0].id)) {
-						olderHistory.cancel();
-						setLoadingOlder(false);
-						setOlderError("");
-						setHistoryVersion((version) => version + 1);
-					}
-					setThread(snapshot.thread);
-					commitRounds(merged.rounds);
-					if (!merged.preservedOlder) setCursor(snapshot.nextCursor);
-					setLoadingThread(false);
-				});
-				source.addEventListener("update", (event: MessageEvent<string>) => {
-					updates.push(JSON.parse(event.data) as ViewerUpdate);
-					if (frame) return;
-					frame = requestAnimationFrame(() => {
-						frame = 0;
-						if (controller.signal.aborted) return;
-						const pending = updates;
-						updates = [];
-						setThread(pending[pending.length - 1].thread);
-						let replacement: Extract<ViewerUpdate, { replace: true }> | undefined;
-						let committed: ViewerMessage[] = [];
-						for (const update of pending) {
-							if (update.replace) {
-								replacement = update;
-								committed = [];
-							} else if (update.append) committed.push(...update.append);
-						}
-						if (replacement) {
-							const merged = mergeRecentRounds(roundsRef.current, replacement.rounds);
-							if (
-								!replacement.rounds.length ||
-								!roundsRef.current.some((round) => round.id === replacement.rounds[0].id)
-							) {
-								olderHistory.cancel();
-								setLoadingOlder(false);
-								setOlderError("");
-								setHistoryVersion((version) => version + 1);
-							}
-							commitRounds(appendMessages(merged.rounds, committed));
-							if (!merged.preservedOlder) setCursor(replacement.nextCursor);
-						} else if (committed.length) commitRounds(appendMessages(roundsRef.current, committed));
-					});
-				});
-				source.addEventListener("deleted", () => {
-					if (controller.signal.aborted) return;
-					source?.close();
-					cancelAnimationFrame(frame);
-					updates = [];
-					setThread(null);
-					commitRounds([]);
-					setLoadingThread(false);
-					setError("");
-					window.location.hash = "/";
-					setCurrent(null);
-					refreshCatalog().catch(fail);
-				});
-				source.onerror = () => {
-					if (controller.signal.aborted) return;
-					setThread((old) => (old ? { ...old, status: "disconnected" } : old));
-					refreshCatalog().catch(fail);
-				};
-			})
-			.catch((caught) => {
-				if (!controller.signal.aborted) {
-					setLoadingThread(false);
-					fail(caught);
+		function flushUpdates() {
+			frame = 0;
+			if (controller.signal.aborted) return;
+			const pending = updates;
+			updates = [];
+			setThread(pending[pending.length - 1].thread);
+			let replacement: Extract<ViewerUpdate, { replace: true }> | undefined;
+			let committed: ViewerMessage[] = [];
+			for (const update of pending) {
+				if (update.replace) {
+					replacement = update;
+					committed = [];
+				} else if (update.append) committed.push(...update.append);
+			}
+			if (replacement) {
+				const merged = mergeRecentRounds(roundsRef.current, replacement.rounds);
+				if (
+					!replacement.rounds.length ||
+					!roundsRef.current.some((round) => round.id === replacement.rounds[0].id)
+				) {
+					olderHistory.cancel();
+					setLoadingOlder(false);
+					setOlderError("");
+					setHistoryVersion((version) => version + 1);
 				}
-			});
+				commitRounds(appendMessages(merged.rounds, committed));
+				if (!merged.preservedOlder) setCursor(replacement.nextCursor);
+			} else if (committed.length) commitRounds(appendMessages(roundsRef.current, committed));
+		}
+		async function connect() {
+			try {
+				let deleted = false;
+				await readThreadEvents(id, controller.signal, (event, data) => {
+					if (controller.signal.aborted) return;
+					if (event === "snapshot") {
+						const snapshot = JSON.parse(data) as Snapshot;
+						cancelAnimationFrame(frame);
+						frame = 0;
+						updates = [];
+						const merged = mergeRecentRounds(roundsRef.current, snapshot.rounds);
+						if (
+							!snapshot.rounds.length ||
+							!roundsRef.current.some((round) => round.id === snapshot.rounds[0].id)
+						) {
+							olderHistory.cancel();
+							setLoadingOlder(false);
+							setOlderError("");
+							setHistoryVersion((version) => version + 1);
+						}
+						setThread(snapshot.thread);
+						commitRounds(merged.rounds);
+						if (!merged.preservedOlder) setCursor(snapshot.nextCursor);
+						setLoadingThread(false);
+						setThreadConnected(true);
+						setAuth("ready");
+						setError("");
+					} else if (event === "update") {
+						updates.push(JSON.parse(data) as ViewerUpdate);
+						if (frame) return;
+						frame = requestAnimationFrame(flushUpdates);
+					} else if (event === "deleted") {
+						deleted = true;
+						cancelAnimationFrame(frame);
+						updates = [];
+						setThread(null);
+						commitRounds([]);
+						setLoadingThread(false);
+						setError("");
+						window.location.hash = "/";
+						setCurrent(null);
+						refreshCatalog().catch(fail);
+						return false;
+					}
+				});
+				if (deleted || controller.signal.aborted) return;
+			} catch (caught) {
+				if (controller.signal.aborted) return;
+				setLoadingThread(false);
+				fail(caught);
+				if (caught instanceof ApiError && caught.status === 404) {
+					setThread(null);
+					setThreadConnected(true);
+					commitRounds([]);
+				}
+				if (caught instanceof ApiError && [401, 423, 404].includes(caught.status)) return;
+			}
+			if (!controller.signal.aborted) {
+				cancelAnimationFrame(frame);
+				if (updates.length) flushUpdates();
+				setLoadingThread(false);
+				setThreadConnected(false);
+				setThread((old) => (old ? { ...old, status: "disconnected" } : old));
+				timer = setTimeout(() => {
+					timer = undefined;
+					void connect();
+				}, 3000);
+			}
+		}
+		void connect();
 		return () => {
 			controller.abort();
 			olderHistory.cancel();
-			source?.close();
+			if (timer) clearTimeout(timer);
 			cancelAnimationFrame(frame);
 		};
-	}, [current, auth, fail, refreshCatalog, olderHistory, commitRounds]);
+	}, [current, canLoadThread, threadAttempt, fail, refreshCatalog, olderHistory, commitRounds]);
 	function select(id: string) {
 		window.location.hash = `/thread/${encodeURIComponent(id)}`;
 		setDrawer(false);
@@ -533,6 +569,8 @@ export function useViewer() {
 		try {
 			const response = await fetch("/viewer/logout", { method: "POST", credentials: "same-origin" });
 			if (!response.ok) throw new Error("退出登录失败");
+			authBlocked.current = true;
+			selectionController.current?.abort();
 			setAuth("login");
 			setThread(null);
 			commitRounds([]);
@@ -560,9 +598,9 @@ export function useViewer() {
 		olderError,
 		historyVersion,
 		loadingThread,
-		error,
+		error: error || catalogError,
 		drawer,
-		connected,
+		connected: connected && threadConnected,
 		setDrawer,
 		select,
 		home,
@@ -573,10 +611,13 @@ export function useViewer() {
 		projectVisibility,
 		more: (id: string) => projects.load(id, true),
 		login: () => {
+			authBlocked.current = false;
+			setAuth("loading");
 			refreshCatalog().catch(fail);
 		},
 		retry: () => {
-			setAuth("loading");
+			setError("");
+			setThreadAttempt((attempt) => attempt + 1);
 			refreshCatalog().catch(fail);
 		},
 	};

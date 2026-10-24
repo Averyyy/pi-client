@@ -34,9 +34,13 @@ describe("viewer asset caching", () => {
 		);
 	}
 
-	function asset(body: string) {
+	function assets(version = "build-one", body = "asset contents") {
 		vi.mocked(existsSync).mockReturnValueOnce(true);
-		vi.mocked(readFileSync).mockReturnValueOnce(Buffer.from(body));
+		vi.mocked(readFileSync)
+			.mockReturnValueOnce(JSON.stringify({ version }))
+			.mockReturnValueOnce(Buffer.from(`<script src="/viewer/assets/${version}/app.js"></script>`))
+			.mockReturnValueOnce(Buffer.from(body))
+			.mockReturnValueOnce(Buffer.from(body));
 		vi.clearAllMocks();
 	}
 
@@ -58,34 +62,50 @@ describe("viewer asset caching", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
-	it.each(["app.js", "app.css"])("reads %s once and revalidates cached browser copies", async (name) => {
-		asset("asset contents");
-		const first = await fetch(`${base}/viewer/assets/${name}`);
+	it.each(["app.js", "app.css"])("caches versioned %s across visits and process restarts", async (name) => {
+		assets();
+		const first = await fetch(`${base}/viewer/assets/build-one/${name}`);
 		expect(first.status).toBe(200);
-		expect(first.headers.get("cache-control")).toBe("private, no-cache");
+		expect(first.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
 		const tag = first.headers.get("etag")!;
 		expect(tag).toBeTruthy();
 		expect(await first.text()).toBe("asset contents");
-		const cached = await fetch(`${base}/viewer/assets/${name}`, { headers: { "If-None-Match": tag } });
+		const cached = await fetch(`${base}/viewer/assets/build-one/${name}`, { headers: { "If-None-Match": tag } });
 		expect(cached.status).toBe(304);
 		expect(await cached.text()).toBe("");
-		const compressed = await fetch(`${base}/viewer/assets/${name}`, { headers: { "If-None-Match": `W/${tag}` } });
+		const compressed = await fetch(`${base}/viewer/assets/build-one/${name}`, {
+			headers: { "If-None-Match": `W/${tag}` },
+		});
 		expect(compressed.status).toBe(304);
 		expect(await compressed.text()).toBe("");
-		const secondVisitor = await fetch(`${base}/viewer/assets/${name}`);
+		const secondVisitor = await fetch(`${base}/viewer/assets/build-one/${name}`);
 		expect(await secondVisitor.text()).toBe("asset contents");
-		expect(readFileSync).toHaveBeenCalledTimes(1);
+		expect(readFileSync).toHaveBeenCalledTimes(4);
 		expect(existsSync).toHaveBeenCalledTimes(1);
 		viewer = createViewer();
-		asset("new contents");
-		const updated = await fetch(`${base}/viewer/assets/${name}`, { headers: { "If-None-Match": tag } });
-		expect(updated.status).toBe(200);
-		expect(updated.headers.get("etag")).not.toBe(tag);
-		expect(await updated.text()).toBe("new contents");
+		assets();
+		const restarted = await fetch(`${base}/viewer/assets/build-one/${name}`, { headers: { "If-None-Match": tag } });
+		expect(restarted.status).toBe(304);
+		expect(restarted.headers.get("etag")).toBe(tag);
+	});
+
+	it("binds HTML and immutable assets to the same build and rejects obsolete URLs", async () => {
+		assets();
+		const first = await fetch(base);
+		expect(await first.text()).toContain("/viewer/assets/build-one/app.js");
+		viewer = createViewer();
+		assets("build-two", "new contents");
+		const updated = await fetch(base);
+		expect(await updated.text()).toContain("/viewer/assets/build-two/app.js");
+		for (const path of ["build-one/app.js", "app.js", "build-two/unknown.js"])
+			expect((await fetch(`${base}/viewer/assets/${path}`)).status).toBe(404);
+		const asset = await fetch(`${base}/viewer/assets/build-two/app.js`);
+		expect(await asset.text()).toBe("new contents");
+		expect(readFileSync).toHaveBeenCalledTimes(4);
 	});
 
 	it("keeps the HTML entrypoint and authentication responses out of browser caches", async () => {
-		asset("<html></html>");
+		assets();
 		const html = await fetch(base);
 		expect(html.headers.get("cache-control")).toBe("no-store");
 		expect(html.headers.get("etag")).toBeNull();
@@ -93,5 +113,12 @@ describe("viewer asset caching", () => {
 		const unauthorized = await fetch(`${base}/viewer/api/projects`);
 		expect(unauthorized.status).toBe(401);
 		expect(unauthorized.headers.get("cache-control")).toBe("no-store");
+	});
+
+	it("reports unavailable build assets when the build manifest is missing", async () => {
+		vi.mocked(existsSync).mockReturnValueOnce(false);
+		const response = await fetch(base);
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({ error: "Viewer assets unavailable" });
 	});
 });
