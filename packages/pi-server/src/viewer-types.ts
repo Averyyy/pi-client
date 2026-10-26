@@ -39,6 +39,23 @@ export interface ThreadSummary {
 export interface ViewerThread extends ThreadSummary {
 	live: ViewerLive;
 	legacy: boolean;
+	subagents?: ViewerSubagent[];
+}
+
+export interface ObserverSubagent {
+	agentId: string;
+	sessionId: string;
+	title: string;
+	taskStatus: "queued" | "running" | "completed" | "steered" | "error" | "stopped" | "aborted";
+}
+
+export interface ViewerSubagent {
+	id: string;
+	title: string;
+	status: ThreadSummary["status"];
+	taskStatus: ObserverSubagent["taskStatus"];
+	lifecycle: "active" | "completed";
+	outcome?: "completed" | "failed" | "aborted";
 }
 
 export interface ViewerProject {
@@ -82,4 +99,5 @@ export interface ObserverUpdate {
 	append?: ViewerMessage[];
 	status?: "running" | "idle";
 	live?: ViewerLive;
+	subagents?: ObserverSubagent[];
 }

@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEventListener } from "../../src/core/agent-session.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
+import { createEventBus } from "../../src/core/event-bus.ts";
 import { type ObserverUpdate, PiServerObserver, projectObserverEntries } from "../../src/core/pi-server-observer.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { runPrintMode } from "../../src/modes/print-mode.ts";
@@ -151,6 +152,80 @@ describe("pi-server observer", () => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 		vi.unstubAllEnvs();
+		vi.unstubAllGlobals();
+	});
+
+	it("publishes a child relationship when its run starts before the parent tool returns", async () => {
+		const events = createEventBus();
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const record: {
+			type: string;
+			description: string;
+			status: "running" | "completed";
+			session?: { sessionId: string };
+		} = {
+			type: "Explore",
+			description: "Inspect child",
+			status: "running",
+		};
+		vi.stubGlobal(Symbol.for("pi-subagents:manager"), {
+			getRecord: (id: string) => (id === "exact-task-id" ? record : undefined),
+		});
+		const parent = await createHarness({
+			resourceLoader: { ...createTestResourceLoader(), getEventBus: () => events },
+			tools: [
+				{
+					name: "delegate",
+					label: "Delegate",
+					description: "Delegate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						events.emit("subagents:started", { id: "exact-task-id" });
+						await gate;
+						return { content: [{ type: "text", text: "done" }], details: {} };
+					},
+				},
+			],
+		});
+		const child = await createHarness();
+		harnesses.push(parent, child);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(parent.session), new PiServerObserver(child.session));
+		parent.setResponses([
+			fauxAssistantMessage(fauxToolCall("delegate", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("parent done"),
+		]);
+		child.setResponses([fauxAssistantMessage("child done")]);
+		const parentRun = parent.session.prompt("delegate");
+		await vi.waitFor(() => expect(parent.eventsOfType("tool_execution_start")).toHaveLength(1));
+		record.session = child.session;
+		await child.session.prompt("child task");
+		await vi.waitFor(() =>
+			expect(
+				fixture.updates.some(
+					(update) =>
+						update.sessionId === parent.session.sessionId &&
+						update.subagents?.[0]?.sessionId === child.session.sessionId,
+				),
+			).toBe(true),
+		);
+		expect(parent.session.isStreaming).toBe(true);
+		expect(fixture.updates.filter((update) => update.subagents?.length).at(-1)?.subagents?.[0]?.taskStatus).toBe(
+			"running",
+		);
+		record.status = "completed";
+		events.emit("subagents:completed", { id: "exact-task-id" });
+		release?.();
+		await parentRun;
+		await vi.waitFor(() =>
+			expect(fixture.updates.filter((update) => update.subagents?.length).at(-1)?.subagents?.[0]?.taskStatus).toBe(
+				"completed",
+			),
+		);
 	});
 
 	it("publishes a full branch through byte-limited transport without sending system instructions or image data", async () => {

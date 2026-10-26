@@ -19,6 +19,7 @@ import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, type TextSignatureV1 } from "@earendil-works/pi-ai";
 import { getSession, getSessionBranch, listSessions, type SessionState } from "./session-store.ts";
 import type {
+	ObserverSubagent,
 	ObserverUpdate,
 	ThreadSummary,
 	ViewerCatalog,
@@ -26,6 +27,7 @@ import type {
 	ViewerMessage,
 	ViewerProject,
 	ViewerRound,
+	ViewerSubagent,
 	ViewerThread,
 	ViewerUpdate,
 } from "./viewer-types.ts";
@@ -42,6 +44,7 @@ interface StoredThread {
 	serverLastActiveAt: number | null;
 	rounds: RoundOffset[];
 	length: number;
+	subagents?: ObserverSubagent[];
 }
 
 interface ProjectIndex {
@@ -118,9 +121,17 @@ export class ViewerStore {
 	private readonly threads = new Map<string, StoredThread>();
 	private readonly connections = new Map<string, { id: string; sequence: number }>();
 	private readonly deletedConnections = new Set<string>();
+	private readonly parents = new Map<string, Set<string>>();
+	private readonly indexedSubagents = new Map<string, ObserverSubagent[]>();
 	private readonly archiveMetadata = new Map<
 		string,
-		{ revision: number; title: string | undefined; cwd: string | null; lastActiveAt: number | null }
+		{
+			revision: number;
+			title: string | undefined;
+			cwd: string | null;
+			lastActiveAt: number | null;
+			subagents?: ObserverSubagent[];
+		}
 	>();
 	private readonly listeners = new Map<string, Set<(update: ViewerUpdate) => void>>();
 	private readonly catalogEpoch = randomUUID();
@@ -158,6 +169,7 @@ export class ViewerStore {
 				this.persist(stored);
 			}
 			this.threads.set(stored.thread.id, stored);
+			this.indexSubagents(stored.thread.id, stored.subagents ?? []);
 		}
 	}
 
@@ -209,10 +221,37 @@ export class ViewerStore {
 		if (!summary) return undefined;
 		const stored = this.threads.get(id);
 		const session = getSession(id);
+		const relations = stored?.subagents ?? (session ? this.sessionMetadata(session).subagents : undefined);
+		if (stored?.subagents === undefined && relations) this.indexSubagents(id, relations);
+		const subagents = relations?.flatMap((relation): ViewerSubagent[] => {
+			const child = this.summary(relation.sessionId);
+			if (!child) return [];
+			const active = relation.taskStatus === "queued" || relation.taskStatus === "running";
+			return [
+				{
+					id: child.id,
+					title: relation.title,
+					status: child.status,
+					taskStatus: relation.taskStatus,
+					lifecycle: active ? "active" : "completed",
+					...(!active
+						? ({
+								outcome:
+									relation.taskStatus === "error"
+										? "failed"
+										: relation.taskStatus === "stopped" || relation.taskStatus === "aborted"
+											? "aborted"
+											: "completed",
+							} as const)
+						: {}),
+				},
+			];
+		});
 		return {
 			...summary,
 			legacy: !stored || (stored.length === 0 && Boolean(session?.entries.length)),
 			live: stored ? structuredClone(stored.thread.live) : { message: null, tools: [] },
+			...(subagents !== undefined ? { subagents } : {}),
 		};
 	}
 
@@ -230,6 +269,10 @@ export class ViewerStore {
 	}
 
 	refreshSession(id: string): void {
+		const session = getSession(id);
+		if (session && this.threads.get(id)?.subagents === undefined) {
+			this.indexSubagents(id, this.sessionMetadata(session).subagents ?? []);
+		}
 		this.refreshCatalog(id);
 		const listeners = this.listeners.get(id);
 		if (listeners?.size) {
@@ -239,6 +282,7 @@ export class ViewerStore {
 				for (const listener of listeners) listener(update);
 			}
 		}
+		this.emitParents(id);
 	}
 
 	subscribe(id: string, listener: (update: ViewerUpdate) => void): () => void {
@@ -258,8 +302,9 @@ export class ViewerStore {
 		const connection = this.connections.get(id);
 		if (connection) this.deletedConnections.add(connection.id);
 		this.connections.delete(id);
-		this.archiveMetadata.delete(id);
 		const stored = this.threads.get(id);
+		this.indexSubagents(id, []);
+		this.archiveMetadata.delete(id);
 		if (stored) {
 			rmSync(join(this.directory, `${stored.fileId}.json`), { force: true });
 			rmSync(join(this.directory, `${stored.logId}.jsonl`), { force: true });
@@ -267,6 +312,8 @@ export class ViewerStore {
 		}
 		for (const listener of this.removedListeners) listener(id);
 		this.refreshCatalog(id, true);
+		this.emitParents(id);
+		this.indexedSubagents.delete(id);
 	}
 
 	rounds(id: string, before: string | null): { rounds: ViewerRound[]; nextCursor: string | null } {
@@ -367,6 +414,10 @@ export class ViewerStore {
 		if (body.title !== undefined) stored.thread.title = body.title;
 		if (body.status !== undefined) stored.thread.status = body.status;
 		if (body.live !== undefined) stored.thread.live = body.live;
+		if (body.subagents !== undefined) {
+			this.indexSubagents(body.sessionId, body.subagents);
+			stored.subagents = body.subagents;
+		}
 		const messages = body.replace ?? body.append ?? [];
 		const replacesArchive =
 			stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
@@ -387,7 +438,7 @@ export class ViewerStore {
 			stored.length += Buffer.byteLength(line);
 			stored.rounds[stored.rounds.length - 1].end = stored.length;
 		}
-		if (created || messages.length || body.replace || metadataChanged) {
+		if (created || messages.length || body.replace || metadataChanged || body.subagents !== undefined) {
 			this.persist(stored);
 			if (body.replace && oldLogId !== stored.logId)
 				rmSync(join(this.directory, `${oldLogId}.jsonl`), { force: true });
@@ -549,6 +600,34 @@ export class ViewerStore {
 				: { thread, ...(append?.length ? { append } : {}) };
 			for (const listener of listeners) listener(update);
 		}
+		if (catalog) this.emitParents(stored.thread.id);
+	}
+
+	private indexSubagents(id: string, next: ObserverSubagent[]): void {
+		if (this.indexedSubagents.get(id) === next) return;
+		for (const child of this.indexedSubagents.get(id) ?? []) {
+			const parents = this.parents.get(child.sessionId);
+			parents?.delete(id);
+			if (parents?.size === 0) this.parents.delete(child.sessionId);
+		}
+		for (const child of next) {
+			let parents = this.parents.get(child.sessionId);
+			if (!parents) {
+				parents = new Set();
+				this.parents.set(child.sessionId, parents);
+			}
+			parents.add(id);
+		}
+		this.indexedSubagents.set(id, next);
+	}
+
+	private emitParents(id: string): void {
+		for (const parentId of [...(this.parents.get(id) ?? [])]) {
+			const listeners = this.listeners.get(parentId);
+			if (!listeners?.size) continue;
+			const thread = this.get(parentId);
+			if (thread) for (const listener of listeners) listener({ thread });
+		}
 	}
 
 	private roundCursor(value: string, rounds: { id: string }[]): number {
@@ -561,11 +640,13 @@ export class ViewerStore {
 		title: string | undefined;
 		cwd: string | null;
 		lastActiveAt: number | null;
+		subagents?: ObserverSubagent[];
 	} {
 		const cached = this.archiveMetadata.get(session.sessionId);
 		if (cached?.revision === session.revision) return cached;
 		let name: string | undefined;
 		let firstUser: string | undefined;
+		let subagents: ObserverSubagent[] | undefined;
 		for (const entry of getSessionBranch(session)) {
 			if (entry.type === "session_info") name = entry.name;
 			if (firstUser !== undefined || entry.type !== "message" || !entry.message) continue;
@@ -587,6 +668,8 @@ export class ViewerStore {
 			staticPromptCwd(prompt);
 		let lastActiveAt: number | null = null;
 		for (const entry of session.entries) {
+			if (entry.type === "custom" && entry.customType === "pi-server-subagent")
+				subagents = (entry.data as { subagents: ObserverSubagent[] }).subagents;
 			const message = entry.type === "message" ? (entry.message as Record<string, unknown>) : undefined;
 			const active =
 				(message !== undefined && message.role !== "system" && !(message.role === "custom" && !message.display)) ||
@@ -600,6 +683,7 @@ export class ViewerStore {
 			lastActiveAt,
 			title: name ?? firstUser,
 			cwd: cwd ? normalizeProjectPath(cwd) : null,
+			...(subagents !== undefined ? { subagents } : {}),
 		};
 		this.archiveMetadata.set(session.sessionId, metadata);
 		return metadata;

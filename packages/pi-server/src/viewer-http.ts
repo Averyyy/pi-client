@@ -5,6 +5,7 @@ import type { ServerConfig } from "./config.ts";
 import { ViewerAuth } from "./viewer-auth.ts";
 import { projectContent, projectMessage, ViewerStore } from "./viewer-store.ts";
 import type {
+	ObserverSubagent,
 	ObserverUpdate,
 	ViewerDeleteResult,
 	ViewerLive,
@@ -48,6 +49,28 @@ function object(value: unknown): Record<string, unknown> {
 function messages(value: unknown): ViewerMessage[] {
 	if (!Array.isArray(value)) throw new Error("messages must be an array");
 	return value.map((message) => projectMessage(object(message)));
+}
+
+function subagents(value: unknown): ObserverSubagent[] {
+	if (!Array.isArray(value)) throw new Error("subagents must be an array");
+	return value.map((value) => {
+		const agent = object(value);
+		if (
+			typeof agent.agentId !== "string" ||
+			typeof agent.sessionId !== "string" ||
+			typeof agent.title !== "string" ||
+			!["queued", "running", "completed", "steered", "error", "stopped", "aborted"].includes(
+				String(agent.taskStatus),
+			)
+		)
+			throw new Error("Invalid observer subagent");
+		return {
+			agentId: agent.agentId,
+			sessionId: agent.sessionId,
+			title: agent.title,
+			taskStatus: agent.taskStatus as ObserverSubagent["taskStatus"],
+		};
+	});
 }
 
 function live(value: unknown): ViewerLive {
@@ -286,6 +309,7 @@ export class ViewerHttp {
 				...(body.replace !== undefined ? { replace: messages(body.replace) } : {}),
 				...(body.append !== undefined ? { append: messages(body.append) } : {}),
 				...(body.live !== undefined ? { live: live(body.live) } : {}),
+				...(body.subagents !== undefined ? { subagents: subagents(body.subagents) } : {}),
 			};
 			this.store.update(update);
 			json(res, 200, { accepted: true });

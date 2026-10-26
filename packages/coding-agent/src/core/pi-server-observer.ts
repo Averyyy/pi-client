@@ -5,6 +5,7 @@ import { raceWithAbortSignal } from "../utils/abort.ts";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.ts";
 import { bashExecutionToText } from "./messages.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
+import { type ObserverSubagent, PiServerSubagents, resolvePiServerSubagents } from "./pi-server-subagents.ts";
 import type { SessionEntry } from "./session-manager.ts";
 
 const observers = new WeakMap<AgentSession, PiServerObserver>();
@@ -43,6 +44,7 @@ export interface ObserverUpdate {
 	sequence: number;
 	cwd: string;
 	title: string;
+	subagents?: ObserverSubagent[];
 	replace?: ObserverMessage[];
 	append?: ObserverMessage[];
 	status: "running" | "idle";
@@ -144,9 +146,16 @@ export class PiServerObserver {
 	private readonly tools = new Map<string, ObserverTool>();
 	private disconnected = false;
 	private observedSessionId?: string;
+	private readonly subagents: PiServerSubagents;
+	private sentSubagentVersion = -1;
 
 	constructor(session: AgentSession) {
 		this.session = session;
+		this.subagents = new PiServerSubagents(session, () => {
+			this.dirty = true;
+			this.historyDirty = true;
+			this.schedule(0);
+		});
 		this.syncSession();
 		observers.set(session, this);
 		this.unsubscribe = session.subscribe((event) => {
@@ -166,6 +175,7 @@ export class PiServerObserver {
 				this.dispose();
 				return;
 			case "run_state_changed":
+				resolvePiServerSubagents();
 				if (!event.running) {
 					this.liveMessage = null;
 					this.tools.clear();
@@ -193,6 +203,7 @@ export class PiServerObserver {
 				break;
 			case "history_reconciled":
 			case "session_tree_changed":
+				this.subagents.restore();
 				if (this.deletedSessionId && this.deletedSessionId !== this.session.sessionId) {
 					this.deletedSessionId = undefined;
 					void this.connect();
@@ -246,6 +257,8 @@ export class PiServerObserver {
 	private syncSession(): void {
 		if (this.observedSessionId === this.session.sessionId) return;
 		this.observedSessionId = this.session.sessionId;
+		this.subagents.syncSession();
+		this.sentSubagentVersion = -1;
 		this.sentEntryId = undefined;
 		this.pendingEntries = [];
 		this.firstUserTitle = "";
@@ -346,6 +359,7 @@ export class PiServerObserver {
 							const connected = JSON.parse(line.slice(5)) as { connectionId: string };
 							this.connectionId = connected.connectionId;
 							this.sequence = 0;
+							this.sentSubagentVersion = -1;
 							clearTimeout(timeout);
 							this.replace = true;
 							this.historyDirty = true;
@@ -391,6 +405,7 @@ export class PiServerObserver {
 	}
 
 	private async sendUpdate(): Promise<void> {
+		this.subagents.resolve();
 		const connectionId = this.connectionId;
 		const sessionId = this.connectedSessionId;
 		const controller = this.controller;
@@ -428,12 +443,14 @@ export class PiServerObserver {
 								.join("") ?? "")
 				).slice(0, 120);
 			}
+			const subagentVersion = this.subagents.version;
 			const update: ObserverUpdate = {
 				sessionId,
 				connectionId,
 				sequence: ++this.sequence,
 				cwd: this.session.sessionManager.getCwd(),
 				title: this.session.sessionManager.getSessionName() ?? this.firstUserTitle,
+				...(subagentVersion !== this.sentSubagentVersion ? { subagents: this.subagents.snapshot() } : {}),
 				...(replace ? { replace: messages } : messages.length ? { append: messages } : {}),
 				status: this.session.isIdle ? "idle" : "running",
 				live: {
@@ -450,6 +467,7 @@ export class PiServerObserver {
 			const result = (await response.json()) as { accepted: boolean };
 			if (!result.accepted) throw new Error("update was not accepted");
 			if (sessionId !== this.session.sessionId) return;
+			this.sentSubagentVersion = subagentVersion;
 			if (entries.length > 0) this.sentEntryId = entries.at(-1)?.id;
 			else if (replace) this.sentEntryId = undefined;
 			if (this.disconnected) {
@@ -500,6 +518,7 @@ export class PiServerObserver {
 	dispose(): void {
 		this.disposed = true;
 		this.unsubscribe();
+		this.subagents.dispose();
 		clearTimeout(this.timer);
 		clearTimeout(this.reconnectTimer);
 		this.controller?.abort();

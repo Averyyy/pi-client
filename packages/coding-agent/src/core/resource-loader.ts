@@ -153,6 +153,7 @@ function omitReplacedExtensions(
 }
 
 export interface ResourceLoader {
+	getEventBus?(): EventBus;
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
@@ -421,6 +422,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.lastPromptPaths = [];
 		this.lastThemePaths = [];
 		this.loaded = false;
+	}
+
+	getEventBus(): EventBus {
+		return this.eventBus;
 	}
 
 	getExtensions(): LoadExtensionsResult {

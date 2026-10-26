@@ -10,6 +10,7 @@ import {
 	Status,
 	ThreadRow,
 } from "./projects.tsx";
+import { Subagents } from "./subagents.tsx";
 import { Transcript } from "./transcript.tsx";
 import { useViewer } from "./use-viewer.ts";
 import "./style.css";
@@ -122,6 +123,7 @@ function Viewer() {
 	} = useViewer();
 	const [menu, setMenu] = useState<MenuRequest | null>(null);
 	const [confirmation, setConfirmation] = useState<MenuRequest | null>(null);
+	const [subagentsOpen, setSubagentsOpen] = useState(true);
 	const closeMenu = useCallback(() => {
 		if (menu?.trigger.isConnected) menu.trigger.focus();
 		setMenu(null);
@@ -177,6 +179,7 @@ function Viewer() {
 			</div>
 		);
 	const project = catalog.projects.find((item) => item.id === thread?.projectId);
+	const subagents = thread?.subagents;
 	return (
 		<div className="app-shell">
 			{drawer ? (
@@ -267,6 +270,19 @@ function Viewer() {
 						<span className="header-caption mobile-only">pi-server</span>
 					)}
 					<span className="viewer-label">对话记录</span>
+					{current && subagents?.length ? (
+						<button
+							type="button"
+							className="subagents-toggle"
+							onClick={() => setSubagentsOpen((open) => !open)}
+							aria-expanded={subagentsOpen}
+							aria-controls="subagents-panel"
+						>
+							<Icon name="spark" size={15} />
+							子代理 <span>{subagents.length}</span>
+							<Icon name="chevron" size={12} className={subagentsOpen ? "rotate" : undefined} />
+						</button>
+					) : null}
 				</header>
 				{error ? (
 					<div className="error-banner" role="alert">
@@ -281,16 +297,19 @@ function Viewer() {
 					loadingThread ? (
 						<div className="content-loading">正在读取对话…</div>
 					) : thread ? (
-						<Transcript
-							key={thread.id}
-							rounds={rounds}
-							thread={thread}
-							nextCursor={cursor}
-							loadingOlder={loadingOlder}
-							olderError={olderError}
-							historyVersion={historyVersion}
-							loadOlder={loadOlder}
-						/>
+						<div className="thread-workspace">
+							<Transcript
+								key={thread.id}
+								rounds={rounds}
+								thread={thread}
+								nextCursor={cursor}
+								loadingOlder={loadingOlder}
+								olderError={olderError}
+								historyVersion={historyVersion}
+								loadOlder={loadOlder}
+							/>
+							{subagentsOpen && subagents?.length ? <Subagents agents={subagents} select={select} /> : null}
+						</div>
 					) : (
 						<div className="content-loading">{error ? "请选择其他对话" : "此对话不可用"}</div>
 					)
