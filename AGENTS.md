@@ -128,6 +128,7 @@
 - When `PI_SERVER_MODE` is set, the pi-client CLI adapter automatically installs a process-local PATH shim that redirects `pi` subprocess invocations to `pi-client`, and rewrites displayed command strings to show `pi-client` instead of `pi` for consistency.
 ## pi-client Web UI
 
+- Keep committed tool-result bodies out of viewer snapshots and append events; load them by exact thread, round, and message IDs when expanded. Parse large SSE frames incrementally without rescanning or flattening the accumulated frame on each network chunk.
 - Link tintinweb subagents through their exact manager record session IDs and lifecycle events. Keep active/completed task state separate from observer presence; idle or disconnected observers do not establish completion. The extension's public lifecycle excludes nested and workflow-owned agents.
 - Keep the pi-server root viewer separate from Tau and provider/tree synchronization. Its browser cookie authorizes viewer reads and same-origin server-session deletion only; explicit incorrect API credentials and viewer logins share the persistent lockout budget.
 - Read archived remote projects from the server's recovered snapshot and WAL state, including the effective system message's `sections.cwd` and Pi's standard working-directory fields. Do not resolve remote paths on the server or require an observer to display saved sessions. Notify the viewer after successful persistence; projection failures are diagnostics and must not change the session request result.

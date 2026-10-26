@@ -63,6 +63,12 @@ function messageActivity(messages: ViewerMessage[]): number | null {
 	return lastActiveAt;
 }
 
+function browserMessage(message: ViewerMessage): ViewerMessage {
+	return message.role === "toolResult" || message.role === "bashExecution"
+		? { ...message, content: [], contentDeferred: true }
+		: message;
+}
+
 function compareThreads(
 	left: Pick<ThreadSummary, "id" | "lastActiveAt">,
 	right: Pick<ThreadSummary, "id" | "lastActiveAt">,
@@ -342,16 +348,45 @@ export class ViewerStore {
 							id: entry.id,
 							timestamp: new Date(entry.timestamp).getTime(),
 						}),
-					),
+					)
+					.map(browserMessage),
 			}));
 			return { rounds, nextCursor: start > 0 ? boundaries[start].id : null };
 		}
 		const end = before === null ? stored.rounds.length : this.roundCursor(before, stored.rounds);
 		const start = Math.max(0, end - 5);
 		const offsets = stored.rounds.slice(start, end);
+		const rounds = this.readRounds(stored, offsets).map((round) => ({
+			...round,
+			messages: round.messages.map(browserMessage),
+		}));
+		return { rounds, nextCursor: start > 0 ? stored.rounds[start].id : null };
+	}
+
+	message(id: string, roundId: string, messageId: string): ViewerMessage | undefined {
+		const stored = this.threads.get(id);
+		const session = getSession(id);
+		if (!stored || (stored.length === 0 && session?.entries.length)) {
+			if (!session) return undefined;
+			let currentRound: string | undefined;
+			for (const entry of getSessionBranch(session)) {
+				if (entry.type !== "message" || entry.message.role === "system") continue;
+				if (currentRound === undefined || entry.message.role === "user") currentRound = entry.id;
+				if (entry.id === messageId && currentRound === roundId)
+					return projectMessage({ ...entry.message, id: entry.id, timestamp: Date.parse(entry.timestamp) });
+			}
+			return undefined;
+		}
+		const round = stored.rounds.find((round) => round.id === roundId);
+		return round
+			? this.readRounds(stored, [round])[0].messages.find((message) => message.id === messageId)
+			: undefined;
+	}
+
+	private readRounds(stored: StoredThread, rounds: RoundOffset[]): ViewerRound[] {
 		const fd = openSync(join(this.directory, `${stored.logId}.jsonl`), "r");
 		try {
-			const rounds = offsets.map((round) => {
+			return rounds.map((round) => {
 				const buffer = Buffer.alloc(round.end - round.start);
 				readSync(fd, buffer, 0, buffer.length, round.start);
 				return {
@@ -363,7 +398,6 @@ export class ViewerStore {
 						.map((line) => JSON.parse(line) as ViewerMessage),
 				};
 			});
-			return { rounds, nextCursor: start > 0 ? stored.rounds[start].id : null };
 		} finally {
 			closeSync(fd);
 		}
@@ -597,7 +631,7 @@ export class ViewerStore {
 			const thread = this.get(stored.thread.id)!;
 			const update: ViewerUpdate = replace
 				? { thread, replace: true, ...this.rounds(thread.id, null) }
-				: { thread, ...(append?.length ? { append } : {}) };
+				: { thread, ...(append?.length ? { append: append.map(browserMessage) } : {}) };
 			for (const listener of listeners) listener(update);
 		}
 		if (catalog) this.emitParents(stored.thread.id);

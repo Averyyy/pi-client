@@ -12,6 +12,7 @@ export interface ViewerMessage {
 	stopReason?: string;
 	phase?: string;
 	errorMessage?: string;
+	contentDeferred?: true;
 }
 
 export interface ViewerTool {

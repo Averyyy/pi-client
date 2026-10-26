@@ -9,6 +9,7 @@ import type {
 } from "../src/viewer-types.ts";
 import { ApiError, deleteSessions, readThreadEvents, request } from "./api.ts";
 import { appendMessages, mergeRecentRounds } from "./rounds.ts";
+import type { LoadMessage } from "./transcript.tsx";
 
 interface Catalog {
 	revision: string;
@@ -313,6 +314,22 @@ export function useViewer() {
 		[projects, catalogRequest, commitRounds],
 	);
 	failure.current = fail;
+	const loadMessage: LoadMessage = useCallback(
+		async (threadId, roundId, messageId, signal) => {
+			try {
+				const result = await request<{ message: ViewerMessage }>(
+					`threads/${encodeURIComponent(threadId)}/rounds/${encodeURIComponent(roundId)}/messages/${encodeURIComponent(messageId)}`,
+					signal,
+				);
+				return result.message;
+			} catch (caught) {
+				if (!signal.aborted && caught instanceof ApiError && (caught.status === 401 || caught.status === 423))
+					fail(caught);
+				throw caught;
+			}
+		},
+		[fail],
+	);
 	const refreshCatalog = useCallback(async () => {
 		try {
 			await catalogRequest.load((data) => {
@@ -606,6 +623,7 @@ export function useViewer() {
 		home,
 		toggleProject,
 		loadOlder,
+		loadMessage,
 		remove,
 		logout,
 		projectVisibility,

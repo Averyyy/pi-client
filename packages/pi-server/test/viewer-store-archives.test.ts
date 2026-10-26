@@ -122,9 +122,8 @@ describe("server session archives in the viewer", () => {
 			"assistant",
 			"toolResult",
 		]);
-		expect(store.rounds("remote", null).rounds[0].messages[2].content).toEqual([
-			{ type: "text", text: "Remote file contents" },
-		]);
+		expect(store.rounds("remote", null).rounds[0].messages[2]).toMatchObject({ content: [], contentDeferred: true });
+		expect(store.message("remote", "u", "tool")?.content).toEqual([{ type: "text", text: "Remote file contents" }]);
 		expect(getSession("remote")).toEqual(original);
 		expect(existsSync(join(directory, ".viewer"))).toBe(false);
 	});

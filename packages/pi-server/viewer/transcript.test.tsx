@@ -34,6 +34,9 @@ describe("transcript disclosures", () => {
 			loadingOlder: false,
 			historyVersion: 0,
 			loadOlder: async () => false,
+			loadMessage: async () => {
+				throw new Error("Collapsed detail must not load");
+			},
 		};
 		const initial = renderToStaticMarkup(<Transcript {...props} olderError="" />);
 		expect(initial).toContain('tabindex="0"');
@@ -54,6 +57,9 @@ describe("transcript disclosures", () => {
 				olderError=""
 				historyVersion={0}
 				loadOlder={async () => false}
+				loadMessage={async () => {
+					throw new Error("Collapsed detail must not load");
+				}}
 			/>,
 		);
 		expect(html).toContain("正在检查服务状态");
@@ -88,6 +94,9 @@ describe("transcript disclosures", () => {
 				olderError=""
 				historyVersion={0}
 				loadOlder={async () => false}
+				loadMessage={async () => {
+					throw new Error("Collapsed detail must not load");
+				}}
 			/>,
 		);
 		expect(html).toContain("服务正常");

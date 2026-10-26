@@ -34,6 +34,33 @@ describe("thread event stream", () => {
 		]);
 	});
 
+	it("reads a large snapshot across many chunks and continues with subsequent frames", async () => {
+		const payload = JSON.stringify({ content: "文🙂".repeat(600_000) });
+		const bytes = new TextEncoder().encode(`event: snapshot\ndata: ${payload}\n\nevent: update\ndata: {}\n\n`);
+		vi.stubGlobal("fetch", async () => {
+			let offset = 0;
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						if (offset >= bytes.length) {
+							controller.close();
+							return;
+						}
+						controller.enqueue(bytes.subarray(offset, offset + 16_384));
+						offset += 16_384;
+					},
+				}),
+				{ headers: { "Content-Type": "text/event-stream" } },
+			);
+		});
+		const receive = vi.fn();
+		await readThreadEvents("large", new AbortController().signal, receive);
+		expect(receive.mock.calls).toEqual([
+			["snapshot", payload],
+			["update", "{}"],
+		]);
+	});
+
 	it("rejects a successful HTML response instead of treating it as an event stream", async () => {
 		vi.stubGlobal(
 			"fetch",

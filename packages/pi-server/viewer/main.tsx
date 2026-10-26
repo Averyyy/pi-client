@@ -115,6 +115,7 @@ function Viewer() {
 		toggleProject,
 		projectVisibility,
 		loadOlder,
+		loadMessage,
 		remove,
 		logout,
 		more,
@@ -307,6 +308,7 @@ function Viewer() {
 								olderError={olderError}
 								historyVersion={historyVersion}
 								loadOlder={loadOlder}
+								loadMessage={loadMessage}
 							/>
 							{subagentsOpen && subagents?.length ? <Subagents agents={subagents} select={select} /> : null}
 						</div>

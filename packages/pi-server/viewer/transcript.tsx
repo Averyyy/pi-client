@@ -1,5 +1,5 @@
 // biome-ignore-all lint/suspicious/noArrayIndexKey: Content blocks retain their positions throughout streaming.
-import { memo, type ReactNode, useLayoutEffect, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type {
 	ViewerContent,
 	ViewerLive,
@@ -11,6 +11,58 @@ import type {
 import { Icon } from "./icons.tsx";
 import { Markdown } from "./markdown.tsx";
 import { messageParts, partitionRound } from "./rounds.ts";
+
+export type LoadMessage = (
+	threadId: string,
+	roundId: string,
+	messageId: string,
+	signal: AbortSignal,
+) => Promise<ViewerMessage>;
+
+function DeferredContent({
+	message,
+	threadId,
+	roundId,
+	loadMessage,
+}: {
+	message: ViewerMessage;
+	threadId: string;
+	roundId: string;
+	loadMessage: LoadMessage;
+}) {
+	const [attempt, setAttempt] = useState(0);
+	const [detail, setDetail] = useState<{ source: ViewerMessage; body?: ViewerMessage; error?: string }>({
+		source: message,
+	});
+	// biome-ignore lint/correctness/useExhaustiveDependencies: A retry starts a new request for the same message.
+	useEffect(() => {
+		const controller = new AbortController();
+		setDetail({ source: message });
+		loadMessage(threadId, roundId, message.id, controller.signal).then(
+			(body) => {
+				if (!controller.signal.aborted) setDetail({ source: message, body });
+			},
+			(error: unknown) => {
+				if (!controller.signal.aborted)
+					setDetail({ source: message, error: error instanceof Error ? error.message : "无法读取命令结果" });
+			},
+		);
+		return () => controller.abort();
+	}, [message, threadId, roundId, loadMessage, attempt]);
+	if (detail.source !== message || (!detail.body && !detail.error)) return <output>正在读取命令结果…</output>;
+	if (detail.error)
+		return (
+			<div>
+				<p className="error-text" role="alert">
+					{detail.error}
+				</p>
+				<button type="button" className="plain-button" onClick={() => setAttempt((value) => value + 1)}>
+					重试
+				</button>
+			</div>
+		);
+	return <Content parts={messageParts(detail.body!)} plainText />;
+}
 
 function Detail({ title, children, kind = "process" }: { title: string; children: ReactNode; kind?: string }) {
 	const [open, setOpen] = useState(false);
@@ -54,12 +106,26 @@ function Content({ parts, plainText = false }: { parts: ViewerContent[]; plainTe
 	});
 }
 
-function Message({ message }: { message: ViewerMessage }) {
+function Message({
+	message,
+	threadId,
+	roundId,
+	loadMessage,
+}: {
+	message: ViewerMessage;
+	threadId: string;
+	roundId: string;
+	loadMessage: LoadMessage;
+}) {
 	const command = message.role === "toolResult" || message.role === "bashExecution";
 	if (command)
 		return (
 			<Detail title={message.role === "toolResult" ? "命令结果" : "终端执行"} kind="command">
-				<Content parts={messageParts(message)} plainText />
+				{message.contentDeferred ? (
+					<DeferredContent message={message} threadId={threadId} roundId={roundId} loadMessage={loadMessage} />
+				) : (
+					<Content parts={messageParts(message)} plainText />
+				)}
 				{message.errorMessage ? <p className="error-text">{message.errorMessage}</p> : null}
 			</Detail>
 		);
@@ -91,10 +157,14 @@ const Round = memo(function Round({
 	round,
 	live,
 	active,
+	threadId,
+	loadMessage,
 }: {
 	round: ViewerRound;
 	live: ViewerLive | null;
 	active: boolean;
+	threadId: string;
+	loadMessage: LoadMessage;
 }) {
 	const split = partitionRound(round.messages);
 	const [processChoice, setProcessOpen] = useState<boolean | undefined>();
@@ -118,7 +188,13 @@ const Round = memo(function Round({
 	return (
 		<article className="conversation-round" data-round-id={round.id}>
 			{split.leading.map((message) => (
-				<Message message={message} key={message.id} />
+				<Message
+					message={message}
+					threadId={threadId}
+					roundId={round.id}
+					loadMessage={loadMessage}
+					key={message.id}
+				/>
 			))}
 			{processCount > 0 ? (
 				<div className="round-process">
@@ -135,9 +211,23 @@ const Round = memo(function Round({
 					{processOpen ? (
 						<div className="process-body">
 							{split.process.map((message) => (
-								<Message message={message} key={message.id} />
+								<Message
+									message={message}
+									threadId={threadId}
+									roundId={round.id}
+									loadMessage={loadMessage}
+									key={message.id}
+								/>
 							))}
-							{liveMessage ? <Message message={liveMessage} key={`live:${liveMessage.id}`} /> : null}
+							{liveMessage ? (
+								<Message
+									message={liveMessage}
+									threadId={threadId}
+									roundId={round.id}
+									loadMessage={loadMessage}
+									key={`live:${liveMessage.id}`}
+								/>
+							) : null}
 							{live?.tools.map((tool) => (
 								<LiveTool key={tool.id} tool={tool} />
 							))}
@@ -147,7 +237,7 @@ const Round = memo(function Round({
 			) : null}
 			{split.response ? (
 				<div className="final-answer">
-					<Message message={split.response} />
+					<Message message={split.response} threadId={threadId} roundId={round.id} loadMessage={loadMessage} />
 				</div>
 			) : null}
 			{terminalLabel ? (
@@ -161,7 +251,13 @@ const Round = memo(function Round({
 				</output>
 			) : null}
 			{split.trailing.map((message) => (
-				<Message message={message} key={message.id} />
+				<Message
+					message={message}
+					threadId={threadId}
+					roundId={round.id}
+					loadMessage={loadMessage}
+					key={message.id}
+				/>
 			))}
 			{active && processCount === 0 ? (
 				<div className="waiting">
@@ -181,6 +277,7 @@ export function Transcript({
 	olderError,
 	historyVersion,
 	loadOlder,
+	loadMessage,
 }: {
 	rounds: ViewerRound[];
 	thread: ViewerThread;
@@ -189,6 +286,7 @@ export function Transcript({
 	olderError: string;
 	historyVersion: number;
 	loadOlder: () => Promise<boolean>;
+	loadMessage: LoadMessage;
 }) {
 	const scroll = useRef<HTMLElement>(null);
 	const nearBottom = useRef(true);
@@ -249,6 +347,10 @@ export function Transcript({
 			ref={scroll}
 			// biome-ignore lint/a11y/noNoninteractiveTabindex: The scroll region supports keyboard history navigation.
 			tabIndex={0}
+			onClick={(event) => {
+				const toggle = (event.target as Element).closest(".detail-toggle, .process-toggle");
+				if (toggle?.getAttribute("aria-expanded") === "false") nearBottom.current = false;
+			}}
 			onScroll={() => {
 				const element = scroll.current!;
 				const movingUp = element.scrollTop < lastTop.current;
@@ -299,10 +401,18 @@ export function Transcript({
 						round={round}
 						live={index === rounds.length - 1 ? thread.live : null}
 						active={index === rounds.length - 1 && thread.status === "running"}
+						threadId={thread.id}
+						loadMessage={loadMessage}
 					/>
 				))}
 				{rounds.length === 0 && thread.live.message ? (
-					<Round round={{ id: "live", messages: [] }} live={thread.live} active={thread.status === "running"} />
+					<Round
+						round={{ id: "live", messages: [] }}
+						live={thread.live}
+						active={thread.status === "running"}
+						threadId={thread.id}
+						loadMessage={loadMessage}
+					/>
 				) : null}
 				<div className="transcript-end">对话记录</div>
 			</div>

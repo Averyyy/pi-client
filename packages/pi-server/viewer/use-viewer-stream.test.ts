@@ -151,6 +151,36 @@ afterEach(async () => {
 });
 
 describe("thread selection lifecycle", () => {
+	it.each([401, 423])("returns to login when a detail request receives HTTP %s", async (status) => {
+		browser.location.hash = "#/";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => (url.endsWith("/projects") ? catalog() : new Response(null, { status }))),
+		);
+		runtime.flush();
+		await settle();
+		await expect(viewer.loadMessage("first", "round", "tool", new AbortController().signal)).rejects.toThrow();
+		await settle();
+		expect(viewer.auth).toBe("login");
+		expect(viewer.locked).toBe(status === 423);
+	});
+	it("keeps detail failures local and passes exact encoded message identity and cancellation", async () => {
+		browser.location.hash = "#/";
+		const fetch = vi.fn(async (url: string) =>
+			url.endsWith("/projects") ? catalog() : new Response(null, { status: 500 }),
+		);
+		vi.stubGlobal("fetch", fetch);
+		runtime.flush();
+		await settle();
+		const controller = new AbortController();
+		await expect(viewer.loadMessage("thread/id", "round/id", "tool/id", controller.signal)).rejects.toThrow();
+		expect(fetch).toHaveBeenLastCalledWith("/viewer/api/threads/thread%2Fid/rounds/round%2Fid/messages/tool%2Fid", {
+			signal: controller.signal,
+			credentials: "same-origin",
+		});
+		expect(viewer.auth).toBe("ready");
+		expect(viewer.error).toBe("");
+	});
 	it("clears an initial home catalog failure after a successful retry", async () => {
 		browser.location.hash = "#/";
 		vi.stubGlobal(

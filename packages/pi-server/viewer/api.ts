@@ -35,25 +35,30 @@ export async function readThreadEvents(
 	};
 	signal.addEventListener("abort", cancel);
 	const decoder = new TextDecoder();
-	let buffer = "";
+	let lineParts: string[] = [];
+	let event = "";
+	let data = "";
 	try {
 		while (!signal.aborted) {
 			const { value, done } = await reader.read();
 			if (done || signal.aborted) return;
-			buffer += decoder.decode(value, { stream: true });
-			let end = buffer.indexOf("\n\n");
+			const chunk = decoder.decode(value, { stream: true });
+			let start = 0;
+			let end = chunk.indexOf("\n");
 			while (end !== -1) {
-				const frame = buffer.slice(0, end);
-				buffer = buffer.slice(end + 2);
-				let event = "";
-				let data = "";
-				for (const line of frame.split("\n")) {
-					if (line.startsWith("event: ")) event = line.slice(7);
-					else if (line.startsWith("data: ")) data = line.slice(6);
-				}
-				if (event && receive(event, data) === false) return;
-				end = buffer.indexOf("\n\n");
+				lineParts.push(chunk.slice(start, end));
+				const line = lineParts.join("");
+				lineParts = [];
+				if (line === "") {
+					if (event && receive(event, data) === false) return;
+					event = "";
+					data = "";
+				} else if (line.startsWith("event: ")) event = line.slice(7);
+				else if (line.startsWith("data: ")) data = line.slice(6);
+				start = end + 1;
+				end = chunk.indexOf("\n", start);
 			}
+			if (start < chunk.length) lineParts.push(chunk.slice(start));
 		}
 	} finally {
 		signal.removeEventListener("abort", cancel);

@@ -229,6 +229,16 @@ export class ViewerHttp {
 				res.once("close", () => this.store.catalogListeners.delete(listener));
 				listener();
 			} else {
+				const detail = /^\/viewer\/api\/threads\/([^/]+)\/rounds\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+				if (detail) {
+					const message = this.store.message(
+						decodeURIComponent(detail[1]),
+						decodeURIComponent(detail[2]),
+						decodeURIComponent(detail[3]),
+					);
+					json(res, message ? 200 : 404, message ? { message } : { error: "Message not found" });
+					return true;
+				}
 				const match = /^\/viewer\/api\/threads\/([^/]+)(?:\/(rounds|events))?$/.exec(url.pathname);
 				const id = match ? decodeURIComponent(match[1]) : "";
 				const thread = this.store.get(id);

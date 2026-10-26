@@ -30,6 +30,7 @@
 
 ### Fixed
 
+- Loaded committed viewer tool outputs on expansion and parsed large event-stream frames incrementally to reduce thread-opening transfer size and browser CPU work.
 - Ordered threads and projects by server-recorded operation activity, preserving order across reconnects, metadata changes, history synchronization, and completed-result replay without requiring client activity timestamps.
 - Loaded thread history directly from its event stream in parallel with the catalog, cached build-versioned assets across reloads and restarts, and suppressed unchanged persistence snapshots.
 - Cached the viewer's project index and static assets, loaded visible project folders on demand, and refreshed only changed project pages.
