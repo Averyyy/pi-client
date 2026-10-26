@@ -5,6 +5,7 @@ import {
 	supportsGoogleStrictToolSampling,
 } from "../src/api/google-shared.ts";
 import type { Tool } from "../src/types.ts";
+import { validateToolArguments } from "../src/utils/validation.ts";
 
 function makeTool(parameters: Record<string, unknown>): Tool {
 	return {
@@ -109,6 +110,131 @@ describe("google-shared convertTools", () => {
 				},
 			},
 		});
+	});
+
+	it("converts constraints inside array items and anyOf without changing the source schema", () => {
+		const parameters = {
+			type: "object",
+			properties: {
+				rows: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: {
+							amount: { type: "number", description: "Amount", exclusiveMinimum: 0, exclusiveMaximum: 10 },
+							labels: { type: "object", patternProperties: { "^x-": { type: "string" } } },
+							mode: {
+								anyOf: [
+									{ type: "string", const: "auto" },
+									{ type: "string", const: "manual" },
+								],
+							},
+						},
+					},
+				},
+			},
+		};
+		const original = structuredClone(parameters);
+		expect(convertTools([makeTool(parameters)], true)?.[0].functionDeclarations[0].parameters).toEqual({
+			type: "object",
+			properties: {
+				rows: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: {
+							amount: {
+								type: "number",
+								description:
+									'Amount\nMust satisfy JSON Schema constraints: {"exclusiveMinimum":0,"exclusiveMaximum":10}',
+							},
+							labels: {
+								type: "object",
+								description:
+									'Must satisfy JSON Schema constraints: {"patternProperties":{"^x-":{"type":"string"}}}',
+							},
+							mode: {
+								type: "string",
+								enum: ["auto", "manual"],
+							},
+						},
+					},
+				},
+			},
+		});
+		expect(parameters).toEqual(original);
+		expect(convertTools([makeTool(parameters)], false)?.[0].functionDeclarations[0].parametersJsonSchema).toEqual(
+			original,
+		);
+	});
+
+	it("preserves anyOf branches with additional constraints or descriptions", () => {
+		const parameters = {
+			type: "object",
+			properties: {
+				value: {
+					anyOf: [
+						{ type: "string", enum: ["auto"], description: "Automatic" },
+						{ type: "string", pattern: "^manual-" },
+					],
+				},
+			},
+		};
+		expect(convertTools([makeTool(parameters)], true)?.[0].functionDeclarations[0].parameters).toEqual(parameters);
+	});
+
+	it("retains non-string constants as exact description constraints", () => {
+		for (const constant of [0, false, null, { const: "data" }]) {
+			const parameters = { type: "object", properties: { value: { const: constant } } };
+			expect(convertTools([makeTool(parameters)], true)?.[0].functionDeclarations[0].parameters).toEqual({
+				type: "object",
+				properties: {
+					value: { description: `Must satisfy JSON Schema constraints: ${JSON.stringify({ const: constant })}` },
+				},
+			});
+		}
+	});
+
+	it("enforces the original tool constraints after conversion", () => {
+		const tool = makeTool({
+			type: "object",
+			properties: {
+				amount: { type: "number", exclusiveMinimum: 0 },
+				labels: { type: "object", patternProperties: { "^x-": { type: "string", const: "enabled" } } },
+				mode: {
+					anyOf: [
+						{ type: "string", const: "auto" },
+						{ type: "string", const: "manual" },
+					],
+				},
+			},
+			required: ["amount", "labels", "mode"],
+		});
+		convertTools([tool], true);
+		const args = { amount: 1, labels: { "x-feature": "enabled" }, mode: "auto" };
+		const call = { type: "toolCall" as const, id: "call", name: tool.name, arguments: args };
+		expect(validateToolArguments(tool, call)).toEqual(args);
+		for (const invalid of [
+			{ ...args, amount: 0 },
+			{ ...args, labels: { "x-feature": "disabled" } },
+			{ ...args, mode: "other" },
+		]) {
+			expect(() => validateToolArguments(tool, { ...call, arguments: invalid })).toThrow("Validation failed");
+		}
+	});
+
+	it("preserves keyword-named properties and literal default/example data", () => {
+		const data = { $id: "literal", const: "literal", exclusiveMinimum: 1, patternProperties: { x: "literal" } };
+		const parameters = {
+			type: "object",
+			properties: {
+				$schema: { type: "string" },
+				const: { type: "string" },
+				exclusiveMinimum: { type: "number" },
+				patternProperties: { type: "object", default: data, example: data },
+			},
+		};
+		expect(convertTools([makeTool(parameters)], true)?.[0].functionDeclarations[0].parameters).toEqual(parameters);
 	});
 
 	it("does not mutate the original Tool.parameters object", () => {

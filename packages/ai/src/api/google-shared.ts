@@ -356,7 +356,8 @@ const JSON_SCHEMA_META_DECLARATIONS = new Set([
 ]);
 
 /**
- * Strip meta-declarations from a schema obj
+ * Convert JSON Schema nodes to Cloud Code Assist's Schema representation.
+ * Constraints without a wire equivalent remain model instructions in description.
  */
 function sanitizeForOpenApi(schema: unknown): unknown {
 	if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
@@ -364,9 +365,51 @@ function sanitizeForOpenApi(schema: unknown): unknown {
 	}
 
 	const result: Record<string, unknown> = {};
+	const constraints: Record<string, unknown> = {};
+	let stringConstant: string | undefined;
 	for (const [key, value] of Object.entries(schema)) {
 		if (JSON_SCHEMA_META_DECLARATIONS.has(key)) continue;
-		result[key] = sanitizeForOpenApi(value);
+		if (key === "const") {
+			if (typeof value === "string") stringConstant = value;
+			else constraints[key] = value;
+		} else if (key === "exclusiveMinimum" || key === "exclusiveMaximum" || key === "patternProperties") {
+			constraints[key] = value;
+		} else if (key === "properties") {
+			result[key] = Object.fromEntries(
+				Object.entries(value as Record<string, unknown>).map(([name, property]) => [
+					name,
+					sanitizeForOpenApi(property),
+				]),
+			);
+		} else if (key === "items") {
+			result[key] = sanitizeForOpenApi(value);
+		} else if (key === "anyOf") {
+			result[key] = (value as unknown[]).map(sanitizeForOpenApi);
+		} else {
+			result[key] = value;
+		}
+	}
+	if (stringConstant !== undefined) result.enum = [stringConstant];
+	if (
+		(result.type === undefined || result.type === "string") &&
+		result.enum === undefined &&
+		Array.isArray(result.anyOf) &&
+		result.anyOf.length > 0 &&
+		result.anyOf.every(
+			(variant) =>
+				variant.type === "string" &&
+				Array.isArray(variant.enum) &&
+				variant.enum.every((value: unknown) => typeof value === "string") &&
+				Object.keys(variant).every((key) => key === "type" || key === "enum"),
+		)
+	) {
+		result.type = "string";
+		result.enum = [...new Set(result.anyOf.flatMap((variant) => variant.enum))];
+		delete result.anyOf;
+	}
+	if (Object.keys(constraints).length > 0) {
+		const instruction = `Must satisfy JSON Schema constraints: ${JSON.stringify(constraints)}`;
+		result.description = result.description ? `${result.description}\n${instruction}` : instruction;
 	}
 	return result;
 }

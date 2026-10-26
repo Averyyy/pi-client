@@ -43,6 +43,62 @@ afterEach(() => {
 });
 
 describe("Google Antigravity protocol", () => {
+	it("sends Claude Opus high tool schemas through the supported parameters representation", async () => {
+		const transport = vi.fn<typeof fetch>(async () => sse([stopped]));
+		const parameters = Type.Object({
+			amount: Type.Number({ exclusiveMinimum: 0 }),
+			rows: Type.Array(Type.Object({ labels: Type.Record(Type.String(), Type.String()) })),
+			mode: Type.Union([Type.Literal("auto"), Type.Literal("manual")]),
+		});
+		const result = await streamSimple(
+			{ ...model, id: "claude-opus-4-6-thinking" },
+			{ ...context, tools: [{ name: "configure", description: "Configure", parameters }] },
+			{ apiKey, reasoning: "high", fetch: transport },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		const payload = JSON.parse(String(transport.mock.calls[0][1]?.body));
+		expect(payload.model).toBe("claude-opus-4-6-thinking");
+		expect(payload.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 16384 });
+		expect(payload.request.tools).toEqual([
+			{
+				functionDeclarations: [
+					{
+						name: "configure",
+						description: "Configure",
+						parameters: {
+							type: "object",
+							required: ["amount", "rows", "mode"],
+							properties: {
+								amount: {
+									type: "number",
+									description: 'Must satisfy JSON Schema constraints: {"exclusiveMinimum":0}',
+								},
+								rows: {
+									type: "array",
+									items: {
+										type: "object",
+										required: ["labels"],
+										properties: {
+											labels: {
+												type: "object",
+												description:
+													'Must satisfy JSON Schema constraints: {"patternProperties":{"^.*$":{"type":"string"}}}',
+											},
+										},
+									},
+								},
+								mode: {
+									type: "string",
+									enum: ["auto", "manual"],
+								},
+							},
+						},
+					},
+				],
+			},
+		]);
+	});
+
 	it("sends normalized system instructions, tool deltas, and the subscription envelope through public dispatch", async () => {
 		const transport = vi.fn<typeof fetch>(async () => sse([stopped]));
 		const onPayload = vi.fn((payload: unknown) => payload);

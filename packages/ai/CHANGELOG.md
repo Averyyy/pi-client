@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Fixed Google Antigravity Claude tool declarations rejecting JSON Schema constants, exclusive numeric bounds, and pattern properties, including nested array items and unions.
 - Stopped pending model refreshes from publishing catalogs after login replaces or logout removes their credentials.
 - Kept Google Antigravity inference runtime loading lazy when listing models or using other providers.
 - Fixed Devin losing system instructions and tool definitions after transcript normalization, which caused replies to stop without calling tools.
