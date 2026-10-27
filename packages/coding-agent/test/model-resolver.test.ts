@@ -469,7 +469,7 @@ describe("resolveModelScopeWithDiagnostics", () => {
 });
 
 describe("resolveCliModel", () => {
-	test("requires custom model ids to exist in the remote catalog", () => {
+	test("resolves custom model ids from client provider metadata in pi-server mode", () => {
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		try {
 			const registry = {
@@ -479,9 +479,11 @@ describe("resolveCliModel", () => {
 			for (const cliModel of ["ghost-model", "openai/ghost-model:high"]) {
 				const result = resolveCliModel({ cliProvider: "openai", cliModel, modelRuntime: registry });
 
-				expect(result.model).toBeUndefined();
-				expect(result.warning).toBeUndefined();
-				expect(result.error).toContain("not found");
+				expect(result.model?.provider).toBe("openai");
+				expect(result.model?.id).toBe("ghost-model");
+				expect(result.model?.baseUrl).toBe(mockModels[1].baseUrl);
+				expect(result.warning).toContain("Using custom model id");
+				expect(result.error).toBeUndefined();
 			}
 
 			const result = resolveCliModel({ cliModel: "openai/gpt-4o:high", modelRuntime: registry });

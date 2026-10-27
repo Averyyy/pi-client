@@ -185,9 +185,6 @@ describe("Google Antigravity ModelRuntime", () => {
 				expect(new Headers(init?.headers).get("authorization")).toBe("Bearer server-token");
 				const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 				requests.push({ path: url.pathname, body });
-				if (url.pathname === "/api/models") {
-					return Response.json({ models: [model], available: [model], providers: [] });
-				}
 				if (url.pathname === "/api/session/init") return Response.json({ sessionId: body.sessionId });
 				if (url.pathname === "/api/stream") {
 					return new Response(
@@ -205,14 +202,17 @@ describe("Google Antigravity ModelRuntime", () => {
 				throw new Error(`Unexpected pi-server request: ${url.pathname}`);
 			}),
 		);
+		const modelsStore = new InMemoryModelsStore();
+		await modelsStore.write(providerId, { models: [model], checkedAt: 1 });
 		const runtime = await ModelRuntime.create({
 			credentials: clientOAuth ? await credentialsWithOAuth() : new InMemoryCredentialStore(),
-			modelsStore: new InMemoryModelsStore(),
+			modelsStore,
 			modelsPath: null,
 			allowModelNetwork: false,
 		});
-		expect(await runtime.getAvailable(providerId)).toEqual([model]);
-		expect(runtime.hasConfiguredAuth(providerId)).toBe(true);
+		expect(runtime.getModels(providerId)).toEqual([model]);
+		expect(await runtime.getAvailable(providerId)).toEqual(clientOAuth ? [model] : []);
+		expect(runtime.hasConfiguredAuth(providerId)).toBe(clientOAuth);
 		const stream =
 			entryPoint === "runtime"
 				? runtime.streamSimple(model, context, { sessionId: "antigravity-runtime" })
@@ -221,7 +221,7 @@ describe("Google Antigravity ModelRuntime", () => {
 		for await (const event of stream) events.push(event);
 		expect(await stream.result()).toEqual(message);
 		expect(events.find((event) => event.type === "toolcall_end")).toMatchObject({ toolCall });
-		expect(requests.map((request) => request.path)).toEqual(["/api/models", "/api/session/init", "/api/stream"]);
+		expect(requests.map((request) => request.path)).toEqual(["/api/session/init", "/api/stream"]);
 		const request = requests.find((request) => request.path === "/api/stream")?.body;
 		expect(request).toMatchObject({ model, contextOverlay: context.messages });
 		expect(request?.options).toMatchObject(

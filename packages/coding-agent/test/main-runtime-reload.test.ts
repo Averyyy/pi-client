@@ -98,7 +98,7 @@ SessionManager.prototype.resetLeaf = function () { resetLeaf.call(this); writeOb
 
 		expect(result.error, result.stderr).toBeUndefined();
 		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("pi-server model catalog:");
+		expect(result.stderr).toContain("No models available.");
 		expect(JSON.parse(readFileSync(observationPath, "utf-8"))).toEqual({
 			method: reloadLeafId ? "branch" : "resetLeaf",
 			leafId: reloadLeafId || null,

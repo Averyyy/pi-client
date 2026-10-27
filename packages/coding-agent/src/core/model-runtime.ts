@@ -78,7 +78,6 @@ import {
 	cancelDeferredPiServer,
 	classifyPiServer,
 	fetchDeferredPiServer,
-	fetchPiServerModels,
 	generateImagesPiServer,
 	streamPiServer,
 	streamRawPiServer,
@@ -186,7 +185,6 @@ export class ModelRuntime implements Models {
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
-	private readonly nativeCatalogProviders: ReadonlySet<string>;
 	private readonly builtins = new Map<string, Provider>();
 	private readonly nativeExtensionProviders = new Map<string, Provider>();
 	private readonly extensionProviders = new Map<string, ProviderConfigInput>();
@@ -196,18 +194,8 @@ export class ModelRuntime implements Models {
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
 	private readonly piServerMode = process.env.PI_SERVER_MODE === "true";
-	private remoteCatalog: { models: readonly AnyModel[]; available: readonly AnyModel[] } = {
-		models: [],
-		available: [],
-	};
-	private remoteProviderCapabilities: readonly { id: string; fetchDeferred: boolean; cancelDeferred: boolean }[] = [];
-	private remoteCatalogError: string | undefined;
 	private registrationRefresh: Promise<void> = Promise.resolve();
 	private readonly registrationRefreshErrors = new Map<string, string>();
-	private remoteCatalogRefreshSeq = 0;
-	private remoteCatalogRequested = false;
-	private localOperationAvailable: readonly AnyModel[] = [];
-	private remoteProjection: { models: readonly AnyModel[]; available: readonly AnyModel[] } | undefined;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -229,13 +217,11 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
-		nativeCatalogProviders: ReadonlySet<string>,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
-		this.nativeCatalogProviders = nativeCatalogProviders;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -274,9 +260,6 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
-			new Set(
-				builtinProviders.filter((provider) => provider.refreshModels !== undefined).map((provider) => provider.id),
-			),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -364,7 +347,6 @@ export class ModelRuntime implements Models {
 	}
 
 	private updateModelSnapshot(): void {
-		this.remoteProjection = undefined;
 		const all = [...this.models.getModels()];
 		this.snapshot = {
 			...this.snapshot,
@@ -388,8 +370,6 @@ export class ModelRuntime implements Models {
 			this.credentials.list({ signal }),
 		]);
 		if (seq !== this.availabilityRefreshSeq) return;
-		this.localOperationAvailable = allAvailable;
-		this.remoteProjection = undefined;
 		const auth = new Map(checks);
 		const configuredProviders = new Set(
 			checks
@@ -435,11 +415,6 @@ export class ModelRuntime implements Models {
 			]);
 			signal.throwIfAborted();
 			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
-			this.localOperationAvailable = [
-				...this.localOperationAvailable.filter((model) => model.provider !== providerId),
-				...allAvailable,
-			];
-			this.remoteProjection = undefined;
 			const available = allAvailable.filter((model) => isModelType(model, "chat"));
 			const configuredProviders = new Set(this.snapshot.configuredProviders);
 			const storedProviders = new Set(this.snapshot.storedProviders);
@@ -482,62 +457,43 @@ export class ModelRuntime implements Models {
 
 	getProviders(): readonly Provider[] {
 		if (this.piServerMode) {
-			const ids = new Set([
-				...this.models.getProviders().map((provider) => provider.id),
-				...this.getAllModels().map((model) => model.provider),
-			]);
-			return [...ids].flatMap((id) => this.getProvider(id) ?? []);
+			return this.models.getProviders().flatMap((provider) => this.getProvider(provider.id) ?? []);
 		}
 		return this.models.getProviders();
 	}
 
 	getProvider(providerId: string): Provider | undefined {
 		const local = this.models.getProvider(providerId);
-		if (!this.piServerMode) return local;
-		const catalog = this.getAllModels(providerId);
-		if (!local && catalog.length === 0) return undefined;
-		const capabilities = this.remoteProviderCapabilities.find((provider) => provider.id === providerId);
+		if (!this.piServerMode || !local) return local;
 		return {
 			...local,
-			id: providerId,
-			name: local?.name ?? providerId,
-			auth: local?.auth ?? {},
 			getModels: () => this.getModels(providerId),
 			getAllModels: () => this.getAllModels(providerId),
 			stream: <TApi extends Api>(model: Model<TApi>, context: TranscriptContext, options?: ApiStreamOptions<TApi>) =>
 				this.stream(model, context, options as ModelsApiStreamOptions<TApi> | undefined),
 			streamSimple: (model, context, options) => this.streamSimple(model, context, options),
-			generateImages:
-				local?.generateImages || catalog.some((model) => isModelType(model, "image"))
-					? (model, context, options) => this.generateImages(model, context, options)
-					: undefined,
-			classify:
-				local?.classify || catalog.some((model) => isModelType(model, "classifier"))
-					? (model, context, options) => this.classify(model, context, options)
-					: undefined,
-			fetchDeferred:
-				local?.fetchDeferred || capabilities?.fetchDeferred
-					? (model, handle, options) => this.streamDeferred(model, handle, options)
-					: undefined,
-			cancelDeferred:
-				local?.cancelDeferred || capabilities?.cancelDeferred
-					? (model, handle, options) => this.cancelDeferred(model, handle, options)
-					: undefined,
+			generateImages: local.generateImages
+				? (model, context, options) => this.generateImages(model, context, options)
+				: undefined,
+			classify: local.classify ? (model, context, options) => this.classify(model, context, options) : undefined,
+			fetchDeferred: local.fetchDeferred
+				? (model, handle, options) => this.streamDeferred(model, handle, options)
+				: undefined,
+			cancelDeferred: local.cancelDeferred
+				? (model, handle, options) => this.cancelDeferred(model, handle, options)
+				: undefined,
 		};
 	}
 
 	getModels(providerId?: string): readonly Model<Api>[] {
-		if (this.piServerMode) return this.getModelsOfType("chat", providerId);
 		return this.models.getModels(providerId);
 	}
 
 	getModel(providerId: string, modelId: string): Model<Api> | undefined {
-		if (this.piServerMode) return this.getModelOfType("chat", providerId, modelId);
 		return this.models.getModel(providerId, modelId);
 	}
 
 	getModelsOfType<TType extends ModelType>(type: TType, providerId?: string): readonly ModelTypeMap[TType][] {
-		if (this.piServerMode) return this.getRemoteModels(false, providerId).filter((model) => isModelType(model, type));
 		return this.models.getModelsOfType(type, providerId);
 	}
 
@@ -546,12 +502,10 @@ export class ModelRuntime implements Models {
 		providerId: string,
 		modelId: string,
 	): ModelTypeMap[TType] | undefined {
-		if (this.piServerMode) return this.getModelsOfType(type, providerId).find((model) => model.id === modelId);
 		return this.models.getModelOfType(type, providerId, modelId);
 	}
 
 	getAllModels(providerId?: string): readonly AnyModel[] {
-		if (this.piServerMode) return this.getRemoteModels(false, providerId);
 		return this.models.getAllModels(providerId);
 	}
 
@@ -560,111 +514,13 @@ export class ModelRuntime implements Models {
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
-		if (this.piServerMode) {
-			options?.signal?.throwIfAborted();
-			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-			return this.getRemoteModels(true, providerId).filter((model) => isModelType(model, type));
-		}
+		await raceWithAbortSignal(this.registrationRefresh, options?.signal);
 		return this.models.getAvailableOfType(type, providerId, options);
 	}
 
 	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
-		if (this.piServerMode) {
-			options?.signal?.throwIfAborted();
-			await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-			return this.getRemoteModels(true, providerId);
-		}
+		await raceWithAbortSignal(this.registrationRefresh, options?.signal);
 		return this.models.getAllAvailable(providerId, options);
-	}
-
-	private getRemoteModels(available: boolean, providerId?: string): readonly AnyModel[] {
-		if (this.remoteProjection) {
-			const models = available ? this.remoteProjection.available : this.remoteProjection.models;
-			return providerId === undefined ? models : models.filter((model) => model.provider === providerId);
-		}
-		const catalog = new Map(
-			this.remoteCatalog.models.map((model) => [`${model.type ?? "chat"}\0${model.provider}\0${model.id}`, model]),
-		);
-		for (const model of this.localOperationAvailable) {
-			const key = `${model.type ?? "chat"}\0${model.provider}\0${model.id}`;
-			if (!catalog.has(key)) catalog.set(key, model);
-		}
-		const localAvailableKeys = new Set(
-			this.localOperationAvailable.map((model) => `${model.type ?? "chat"}\0${model.provider}\0${model.id}`),
-		);
-		for (const id of this.nativeCatalogProviders) {
-			for (const model of this.models.getAllModels(id)) {
-				const key = `${model.type ?? "chat"}\0${model.provider}\0${model.id}`;
-				if (!catalog.has(key) || localAvailableKeys.has(key)) catalog.set(key, model);
-			}
-		}
-		const availableKeys = new Set(
-			this.remoteCatalog.available.map((model) => `${model.type ?? "chat"}\0${model.provider}\0${model.id}`),
-		);
-		for (const model of this.localOperationAvailable) {
-			availableKeys.add(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`);
-		}
-		const overlayProviders = new Set([...this.config.getProviderIds(), ...this.getRegisteredProviderIds()]);
-		for (const id of overlayProviders) {
-			const native = this.nativeExtensionProviders.get(id);
-			const base = native ?? this.builtins.get(id);
-			const baseModels = native
-				? (native.getAllModels?.() ?? native.getModels())
-				: [...catalog.values()].filter((model) => model.provider === id);
-			const provider = composeModelProvider(
-				id,
-				base && {
-					...base,
-					getModels: () => baseModels.filter((model) => isModelType(model, "chat")),
-					getAllModels: () => baseModels,
-				},
-				this.config,
-				this.extensionProviders.get(id),
-			);
-			for (const [key, model] of catalog) if (model.provider === id) catalog.delete(key);
-			for (const model of provider.getAllModels?.() ?? provider.getModels()) {
-				catalog.set(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`, model);
-			}
-		}
-		const models = [...catalog.values()];
-		const availableProviders = new Set(
-			models
-				.filter((model) => availableKeys.has(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`))
-				.map((model) => model.provider),
-		);
-		const virtualModels = [...this.virtualModels.values()].flatMap((models) =>
-			[...models.values()].map((entry) => entry.model),
-		);
-		const virtualIds = new Set(virtualModels.map((model) => `${model.provider}\0${model.id}`));
-		const physical = models.filter(
-			(model) => !isModelType(model, "chat") || !virtualIds.has(`${model.provider}\0${model.id}`),
-		);
-		const eligibleVirtual = virtualModels.filter(
-			(model) =>
-				!models.some((entry) => entry.provider === model.provider) || availableProviders.has(model.provider),
-		);
-		this.remoteProjection = {
-			models: [...physical, ...virtualModels],
-			available: [
-				...physical.filter((model) => availableKeys.has(`${model.type ?? "chat"}\0${model.provider}\0${model.id}`)),
-				...eligibleVirtual,
-			],
-		};
-		return this.getRemoteModels(available, providerId);
-	}
-
-	private async refreshRemoteCatalog(signal?: AbortSignal): Promise<void> {
-		const seq = ++this.remoteCatalogRefreshSeq;
-		this.remoteCatalogRequested = true;
-		const timeoutSignal = AbortSignal.timeout(15_000);
-		const catalog = await fetchPiServerModels({
-			signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
-		});
-		if (seq !== this.remoteCatalogRefreshSeq) return;
-		this.remoteCatalog = catalog;
-		this.remoteProviderCapabilities = catalog.providers;
-		this.remoteCatalogError = undefined;
-		this.remoteProjection = undefined;
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
@@ -672,7 +528,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
-		if (this.piServerMode) return this.getAvailableOfType("chat", providerId, options);
+		await raceWithAbortSignal(this.registrationRefresh, options?.signal);
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
@@ -691,7 +547,6 @@ export class ModelRuntime implements Models {
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
-		if (this.piServerMode) return this.getRemoteModels(true).filter((model) => isModelType(model, "chat"));
 		return this.snapshot.available;
 	}
 
@@ -703,7 +558,6 @@ export class ModelRuntime implements Models {
 			errors.push(`Provider "${providerId}": ${error}`);
 		}
 		if (this.availabilityError) errors.push(`Availability refresh: ${this.availabilityError}`);
-		if (this.remoteCatalogError) errors.push(`pi-server model catalog: ${this.remoteCatalogError}`);
 		for (const [providerId, error] of this.registrationRefreshErrors)
 			errors.push(`Provider "${providerId}" refresh: ${error}`);
 		return errors.length > 0 ? errors.join("\n\n") : undefined;
@@ -739,7 +593,6 @@ export class ModelRuntime implements Models {
 	}
 
 	hasConfiguredAuth(providerId: string): boolean {
-		if (this.piServerMode) return this.getRemoteModels(true, providerId).length > 0;
 		return this.snapshot.configuredProviders.has(providerId);
 	}
 
@@ -1122,49 +975,6 @@ export class ModelRuntime implements Models {
 			if (options.signal?.aborted) return { aborted: true, errors: new Map() };
 			throw error;
 		}
-		if (this.piServerMode) {
-			this.config = await ModelConfig.load(this.modelsPath);
-			this.configureRadiusProviders();
-			this.rebuildProviders();
-			let result = await this.models.refresh({ ...options, allowNetwork: false });
-			const nativeProviders = [
-				...new Set([...this.nativeCatalogProviders, ...this.nativeExtensionProviders.keys()]),
-			].filter((id) => options.providers === undefined || options.providers.includes(id));
-			if ((options.allowNetwork ?? this.modelNetworkEnabled) && nativeProviders.length > 0) {
-				const nativeResult = await this.models.refresh({
-					...options,
-					providers: nativeProviders,
-					allowNetwork: true,
-				});
-				result = {
-					aborted: result.aborted || nativeResult.aborted,
-					errors: new Map([...result.errors, ...nativeResult.errors]),
-				};
-			}
-			const errors = new Map(result.errors);
-			try {
-				await this.queueAvailabilityRefresh(options.signal);
-			} catch (error) {
-				if (!options.signal?.aborted)
-					errors.set("availability", error instanceof Error ? error : new Error(String(error)));
-			}
-			try {
-				if (!options.signal?.aborted && (!this.remoteCatalogRequested || options.allowNetwork !== false)) {
-					await this.refreshRemoteCatalog(options.signal);
-				}
-			} catch (error) {
-				if (!options.signal?.aborted) {
-					const remoteError = error instanceof Error ? error : new Error(String(error));
-					this.remoteCatalogError = remoteError.message;
-					errors.set("pi-server", remoteError);
-				}
-			}
-			for (const id of this.registrationRefreshErrors.keys()) {
-				if (!errors.has(id) && (options.providers === undefined || options.providers.includes(id)))
-					this.registrationRefreshErrors.delete(id);
-			}
-			return { aborted: result.aborted || options.signal?.aborted === true, errors };
-		}
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -1198,6 +1008,10 @@ export class ModelRuntime implements Models {
 			} catch {
 				// Availability errors are recorded by the latest pass; refreshed models remain usable.
 			}
+		}
+		for (const id of this.registrationRefreshErrors.keys()) {
+			if (!errors.has(id) && (options.providers === undefined || options.providers.includes(id)))
+				this.registrationRefreshErrors.delete(id);
 		}
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}

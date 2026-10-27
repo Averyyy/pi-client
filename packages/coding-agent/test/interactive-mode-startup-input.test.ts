@@ -150,33 +150,35 @@ describe("InteractiveMode startup model catalog", () => {
 		return context;
 	}
 
-	it("reports every failed catalog and explains how to retry remote model selection", async () => {
+	it("reports every failed client provider catalog", async () => {
 		const context = await runStartup(async () => ({
 			aborted: false,
 			errors: new Map([
-				["pi-server", new Error("503 Service Unavailable")],
+				["google-antigravity", new Error("503 Service Unavailable")],
 				["devin", new Error("Account unavailable")],
 			]),
 		}));
 
 		await vi.waitFor(() => expect(context.showWarning).toHaveBeenCalledTimes(2));
 		expect(context.showWarning).toHaveBeenCalledWith(
-			"Could not refresh pi-server model catalog: 503 Service Unavailable Use /model to refresh catalogs and select a model.",
+			"Could not refresh google-antigravity model catalog: 503 Service Unavailable",
 		);
 		expect(context.showWarning).toHaveBeenCalledWith("Could not refresh devin model catalog: Account unavailable");
 	});
 
-	it("shows the initial runtime catalog error once when the background refresh repeats it", async () => {
+	it("reports initial runtime and background provider catalog errors", async () => {
 		const context = await runStartup(
-			async () => ({ aborted: false, errors: new Map([["pi-server", new Error("Connection refused")]]) }),
-			"pi-server: Connection refused",
+			async () => ({ aborted: false, errors: new Map([["google-antigravity", new Error("Connection refused")]]) }),
+			"google-antigravity: Connection refused",
 		);
 
 		await vi.waitFor(() => expect(context.updateAvailableProviderCount).toHaveBeenCalledOnce());
 		expect(context.showError).toHaveBeenCalledExactlyOnceWith(
-			"Model catalog error: pi-server: Connection refused Use /model to refresh catalogs and select a model.",
+			"Model catalog error: google-antigravity: Connection refused",
 		);
-		expect(context.showWarning).not.toHaveBeenCalled();
+		expect(context.showWarning).toHaveBeenCalledExactlyOnceWith(
+			"Could not refresh google-antigravity model catalog: Connection refused",
+		);
 	});
 
 	it("reports a rejected background refresh", async () => {
@@ -186,7 +188,7 @@ describe("InteractiveMode startup model catalog", () => {
 
 		await vi.waitFor(() =>
 			expect(context.showWarning).toHaveBeenCalledExactlyOnceWith(
-				"Could not refresh model catalogs: Connection refused Use /model to refresh catalogs and select a model.",
+				"Could not refresh model catalogs: Connection refused",
 			),
 		);
 	});

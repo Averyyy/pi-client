@@ -20,6 +20,7 @@ import {
 	getCurrentTools,
 	type ImageModel,
 	InMemoryModelsStore,
+	isModelType,
 	lazyStream,
 	type Model,
 	type MutableModels,
@@ -130,8 +131,6 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 	let dir: string;
 	let models: MutableModels;
 	let rejected: boolean;
-	let catalogGate: Promise<void> | undefined;
-	let catalogStarted: (() => void) | undefined;
 	let requests: { path: string; bytes: number; target?: string }[];
 	let calls: { operation: string; apiKey?: string; payload: unknown }[];
 	let responses: AssistantMessage[];
@@ -149,8 +148,6 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		providerContexts = [];
 		providerOptions = [];
 		rejected = false;
-		catalogGate = undefined;
-		catalogStarted = undefined;
 		models = createModels();
 		models.setProvider(
 			createProvider({
@@ -249,11 +246,6 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 				res.end(JSON.stringify({ error: "fixture rejected request" }));
 				return;
 			}
-			if (req.url === "/api/models" && catalogGate) {
-				catalogStarted?.();
-				await catalogGate;
-				if (res.destroyed) return;
-			}
 			const controller = new AbortController();
 			res.on("close", () => {
 				if (!res.writableEnded) controller.abort();
@@ -293,19 +285,34 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 	});
 
 	async function createRuntime(credentials = AuthStorage.inMemory()): Promise<ModelRuntime> {
-		return ModelRuntime.create({
+		const runtime = await ModelRuntime.create({
 			credentials,
 			modelsPath: null,
 			modelsStore: new InMemoryModelsStore(),
 			allowModelNetwork: false,
 		});
+		const forbidden = (): never => {
+			throw new Error("Local inference is forbidden");
+		};
+		runtime.registerNativeProvider(
+			createProvider({
+				id: providerId,
+				models: [chat, image, classifier, { ...chat, id: "not-granted" }],
+				auth: { apiKey: { name: "Client fixture", resolve: async () => ({ auth: {} }) } },
+				api: { stream: forbidden, streamSimple: forbidden },
+				images: { "fixture-image": { generateImages: forbidden } },
+				classifiers: { "fixture-classifier": { classify: forbidden } },
+			}),
+		);
+		await runtime.refresh({ allowNetwork: false, providers: [providerId] });
+		return runtime;
 	}
 
-	it("uses server-only credentials, preserves model types and per-model availability, and caches catalog reads", async () => {
+	it("uses client model types and availability while routing operations through the server", async () => {
 		const runtime = await createRuntime();
 		expect(await runtime.listCredentials()).toEqual([]);
 		const remoteProvider = runtime.getProvider(providerId)!;
-		expect(remoteProvider.auth).toEqual({});
+		expect(remoteProvider.auth.apiKey?.name).toBe("Client fixture");
 		expect(runtime.getProviders().some((provider) => provider.id === providerId)).toBe(true);
 		expect(runtime.getModels(providerId).map((model) => model.id)).toEqual(["shared", "not-granted"]);
 		expect(runtime.getAllModels(providerId).map((model) => model.type ?? "chat")).toEqual([
@@ -318,10 +325,11 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 			"chat",
 			"image",
 			"classifier",
+			"chat",
 		]);
 		expect((await runtime.getAvailableOfType("image", providerId))[0]?.id).toBe("shared");
 		expect((await runtime.getAvailableOfType("classifier", providerId))[0]?.id).toBe("shared");
-		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(1);
+		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(0);
 		const largeText = "你".repeat(30_000);
 		const generated = await remoteProvider.generateImages!(runtime.getModelOfType("image", providerId, "shared")!, {
 			input: [
@@ -344,7 +352,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(requests.some((request) => request.target === "/api/generate-images")).toBe(true);
 		expect(requests.some((request) => request.target === "/api/classify")).toBe(true);
 		await runtime.refresh({ allowNetwork: false });
-		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(1);
+		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(0);
 	});
 
 	it("routes virtual models and direct extension streams remotely with exact API options", async () => {
@@ -885,7 +893,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		},
 	);
 
-	it("uses advertised server-only Provider deferred capabilities without local registration", async () => {
+	it("takes deferred capabilities from the client provider and executes them remotely", async () => {
 		const provider = models.getProvider(providerId)!;
 		const fetched: DeferredHandle[] = [];
 		const cancelled: DeferredHandle[] = [];
@@ -901,6 +909,14 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		});
 		const runtime = await createRuntime();
 		expect(await runtime.listCredentials()).toEqual([]);
+		const clientProvider = runtime.getProvider(providerId)!;
+		expect(clientProvider.fetchDeferred).toBeUndefined();
+		expect(clientProvider.cancelDeferred).toBeUndefined();
+		const forbidden = (): never => {
+			throw new Error("Local inference is forbidden");
+		};
+		runtime.registerNativeProvider({ ...clientProvider, fetchDeferred: forbidden, cancelDeferred: forbidden });
+		await runtime.refresh({ allowNetwork: false, providers: [providerId] });
 		const facade = runtime.getProvider(providerId)!;
 		expect(facade.fetchDeferred).toBeTypeOf("function");
 		expect(facade.cancelDeferred).toBeTypeOf("function");
@@ -911,7 +927,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(cancelled).toEqual([handle]);
 	});
 
-	it("updates registrations and authentication locally while the server catalog is unavailable", async () => {
+	it("updates client registrations and authentication while the server is unavailable", async () => {
 		const runtime = await createRuntime();
 		const initialReads = requests.filter((request) => request.path === "/api/models").length;
 		rejected = true;
@@ -944,36 +960,41 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(await runtime.getAvailable("registered-router")).toEqual([]);
 		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(initialReads);
 		expect(runtime.getError()).toBeUndefined();
-		const refresh = await runtime.refresh({ allowNetwork: true });
-		expect(refresh.errors.get("pi-server")?.message).toContain("503");
-		expect(runtime.getError()).toContain("503");
+		const refresh = await runtime.refresh({ allowNetwork: false });
+		expect(refresh.errors.size).toBe(0);
+		expect(runtime.getError()).toBeUndefined();
 	});
 
 	it("returns cancellation in the refresh result without changing the verified catalog", async () => {
 		const runtime = await createRuntime();
 		const before = runtime.getAllModels(providerId);
 		const controller = new AbortController();
-		let release: (() => void) | undefined;
-		catalogGate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		let startedRefresh: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
-			catalogStarted = resolve;
+			startedRefresh = resolve;
 		});
-		try {
-			const refreshed = runtime.refresh({ allowNetwork: true, signal: controller.signal });
-			await started;
-			controller.abort();
-			expect(await refreshed).toEqual({ aborted: true, errors: new Map() });
-			expect(runtime.getAllModels(providerId)).toEqual(before);
-			expect(runtime.getError()).toBeUndefined();
-			expect(await runtime.refresh({ signal: controller.signal })).toEqual({ aborted: true, errors: new Map() });
-		} finally {
-			release?.();
-		}
+		runtime.registerNativeProvider({
+			...runtime.getProvider(providerId)!,
+			getModels: () => before.filter((model) => isModelType(model, "chat")),
+			getAllModels: () => before,
+			refreshModels: async ({ allowNetwork, signal }) => {
+				if (!allowNetwork) return;
+				startedRefresh?.();
+				await new Promise<void>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			},
+		});
+		const refreshed = runtime.refresh({ allowNetwork: true, providers: [providerId], signal: controller.signal });
+		await started;
+		controller.abort();
+		expect(await refreshed).toEqual({ aborted: true, errors: new Map() });
+		expect(runtime.getAllModels(providerId)).toEqual(before);
+		expect(runtime.getError()).toBeUndefined();
+		expect(await runtime.refresh({ signal: controller.signal })).toEqual({ aborted: true, errors: new Map() });
 	});
 
-	it("keeps server native catalog metadata when the client has no account credential", async () => {
+	it("keeps client native catalog metadata unavailable without client account credentials", async () => {
 		const fallback = { ...chat, provider: "native-metadata", contextWindow: 1000, maxTokens: 10 };
 		const native: Provider = {
 			id: fallback.provider,
@@ -1012,8 +1033,9 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 			}),
 		);
 		const runtime = await createRuntime();
-		expect(runtime.getModel(native.id, discovered.id)).toEqual(discovered);
-		expect((await runtime.getAvailable(native.id))[0]).toEqual(discovered);
+		expect(runtime.getModel(native.id, discovered.id)).toEqual(fallback);
+		expect(await runtime.getAvailable(native.id)).toEqual([]);
+		expect(runtime.hasConfiguredAuth(native.id)).toBe(false);
 	});
 
 	it("reports remote errors without falling back to a client provider implementation", async () => {
@@ -1042,12 +1064,12 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("503");
 		expect(localCalls).toBe(0);
-		const refreshed = await runtime.refresh({ allowNetwork: true });
+		const refreshed = await runtime.refresh({ allowNetwork: false });
 		expect(refreshed.aborted).toBe(false);
-		expect(refreshed.errors.get("pi-server")?.message).toContain("503");
-		expect(runtime.getError()).toContain("503");
+		expect(refreshed.errors.size).toBe(0);
+		expect(runtime.getError()).toBeUndefined();
 		const restarted = await createRuntime();
-		expect(restarted.getError()).toContain("503");
+		expect(restarted.getError()).toBeUndefined();
 	});
 
 	it("runs codemode image/classifier calls in a remote session and records their complete usage", async () => {
@@ -1100,7 +1122,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 			)?.constrainedSampling;
 			expect(typeof sampling === "object" ? sampling.type : sampling).toBe("grammar");
 			expect(requests.every((request) => request.bytes <= 65_536)).toBe(true);
-			expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(1);
+			expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(0);
 		} finally {
 			session.dispose();
 		}

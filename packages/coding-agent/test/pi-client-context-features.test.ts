@@ -131,6 +131,8 @@ describe("pi-client canonical context features through a 64 KiB HTTP guard", () 
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
+		runtime.registerNativeProvider(faux.provider);
+		await runtime.refresh({ providers: [faux.provider.id], allowNetwork: false });
 		const extensionsResult = await createTestExtensionsResult(extensionFactories);
 		const { session } = await createAgentSession({
 			cwd: directory,
@@ -160,6 +162,7 @@ describe("pi-client canonical context features through a 64 KiB HTTP guard", () 
 			);
 		}
 		function verifyTransport(): void {
+			expect(requests.some((request) => request.path === "/api/models")).toBe(false);
 			expect(requests.some((request) => request.path === "/api/request/chunk")).toBe(true);
 			expect(requests.every((request) => request.bytes <= MAX_REQUEST_BYTES)).toBe(true);
 			expect(rejected).toBe(0);
@@ -389,12 +392,12 @@ describe("pi-client canonical context features through a 64 KiB HTTP guard", () 
 	});
 
 	// #9631: the selected model's resize profile applies before sending user attachments.
-	it("uses remote catalog image limits after before_agent_start selects another model", async () => {
+	it("uses client catalog image limits after before_agent_start selects another model", async () => {
 		const fixture = await createFixture([
 			(pi) => {
 				pi.on("before_agent_start", async (_event, context) => {
 					const strict = context.modelRegistry.find("faux", "strict");
-					if (!strict) throw new Error("Expected strict model in remote catalog");
+					if (!strict) throw new Error("Expected strict model in client catalog");
 					await pi.setModel(strict);
 				});
 			},

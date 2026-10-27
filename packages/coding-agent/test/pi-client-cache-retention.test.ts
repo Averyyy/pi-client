@@ -289,6 +289,22 @@ server.listen(0,"127.0.0.1");await once(server,"listening");process.send({kind:"
 		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture-token");
 		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
+		runtime.registerNativeProvider(
+			createProvider({
+				id: model.provider,
+				models: [model],
+				auth: { apiKey: { name: "Client", resolve: async () => ({ auth: {} }) } },
+				api: {
+					stream: () => {
+						throw new Error("Local inference forbidden");
+					},
+					streamSimple: () => {
+						throw new Error("Local inference forbidden");
+					},
+				},
+			}),
+		);
+		await runtime.refresh({ providers: [model.provider], allowNetwork: false });
 		const extensionsResult = await createTestExtensionsResult([]);
 		const { session } = await createAgentSession({
 			cwd: directory,
@@ -349,7 +365,7 @@ server.listen(0,"127.0.0.1");await once(server,"listening");process.send({kind:"
 		"uses authoritative $expected for server $serverEnv, process $clientProcess, caller $callerEnv, explicit $explicit",
 		async (options) => {
 			const f = await fixture(options);
-			expect(await f.runtime.getAuth(model)).toBeUndefined();
+			expect(await f.runtime.getAuth(model)).toEqual({ auth: {} });
 			const run = f.session.prompt(largeText);
 			try {
 				await f.toolEntered;

@@ -1167,10 +1167,6 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 		const modelCatalogError = this.session.modelRuntime.getError();
-		const modelSelectionGuidance =
-			process.env.PI_SERVER_MODE === "true" && (!this.session.model || isUnknownModel(this.session.model))
-				? " Use /model to refresh catalogs and select a model."
-				: "";
 
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
@@ -1180,22 +1176,13 @@ export class InteractiveMode {
 					this.updateAvailableProviderCount();
 					if (result.aborted) return;
 					for (const [provider, error] of result.errors) {
-						if (
-							provider === "pi-server" &&
-							modelCatalogError &&
-							this.session.modelRuntime.getError() === modelCatalogError
-						) {
-							continue;
-						}
-						this.showWarning(
-							`Could not refresh ${provider} model catalog: ${error.message}${provider === "pi-server" ? modelSelectionGuidance : ""}`,
-						);
+						this.showWarning(`Could not refresh ${provider} model catalog: ${error.message}`);
 					}
 				})
 				.catch((error: unknown) => {
 					if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) return;
 					this.showWarning(
-						`Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}${modelSelectionGuidance}`,
+						`Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
 					);
 				})
 				.finally(() => clearTimeout(timeout));
@@ -1255,7 +1242,7 @@ export class InteractiveMode {
 		}
 
 		if (modelCatalogError) {
-			this.showError(`Model catalog error: ${modelCatalogError}${modelSelectionGuidance}`);
+			this.showError(`Model catalog error: ${modelCatalogError}`);
 		}
 
 		if (modelFallbackMessage) {
@@ -6299,9 +6286,7 @@ export class InteractiveMode {
 							const source =
 								authStatus.configured && authStatus.source
 									? sources[authStatus.source]
-									: process.env.PI_SERVER_MODE === "true"
-										? "pi-server credentials"
-										: "configured authentication";
+									: "configured authentication";
 							message += `. Models remain available through ${source}.`;
 						}
 						this.showStatus(message);

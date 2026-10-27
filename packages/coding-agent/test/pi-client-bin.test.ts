@@ -1,9 +1,14 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { createModels, createProvider } from "@earendil-works/pi-ai";
+import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import { describe, expect, it, vi } from "vitest";
+import { createPiServer } from "../../pi-server/src/server.ts";
+import { clearAllSessions } from "../../pi-server/src/session-store.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(__dirname, "..");
@@ -86,6 +91,182 @@ describe("coding-agent bins", () => {
 		expect(pkg.piConfig?.name).toBeUndefined();
 	});
 
+	it("lists client models and sends client auth through a server with only Hugging Face models", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-client-owned-catalog-"));
+		const providerRequests: { authorization: string | undefined; body: { model: string } }[] = [];
+		const provider = createServer(async (request, response) => {
+			const chunks: Buffer[] = [];
+			for await (const chunk of request) chunks.push(Buffer.from(chunk));
+			providerRequests.push({
+				authorization: request.headers.authorization,
+				body: JSON.parse(Buffer.concat(chunks).toString()) as { model: string },
+			});
+			response.writeHead(200, { "Content-Type": "text/event-stream" });
+			for (const chunk of [
+				{
+					choices: [
+						{ index: 0, delta: { role: "assistant", content: "CLIENT_MODEL_REMOTE_OK" }, finish_reason: null },
+					],
+				},
+				{ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+			])
+				response.write(`data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", ...chunk })}\n\n`);
+			response.end("data: [DONE]\n\n");
+		});
+		const serverModels = createModels();
+		serverModels.setProvider(
+			createProvider({
+				id: "huggingface",
+				models: [
+					{
+						id: "server-hf-only",
+						name: "Server HF",
+						provider: "huggingface",
+						api: "openai-completions",
+						baseUrl: "https://unused.invalid",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 8192,
+						maxTokens: 1024,
+					},
+				],
+				auth: { apiKey: { name: "HF", resolve: async () => ({ auth: { apiKey: "server-hf-key" } }) } },
+				api: {
+					stream: () => {
+						throw new Error("HF inference is not selected");
+					},
+					streamSimple: () => {
+						throw new Error("HF inference is not selected");
+					},
+				},
+			}),
+		);
+		clearAllSessions();
+		const catalog = vi.spyOn(builtinProviderCatalog, "builtinModels").mockReturnValue(serverModels);
+		const server = createPiServer({ authToken: "fixture-server-token", sessionStoreDir: join(root, "sessions") });
+		const serverPaths: string[] = [];
+		server.on("request", (request) => serverPaths.push(request.url ?? ""));
+		try {
+			await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const providerAddress = provider.address();
+			const serverAddress = server.address();
+			if (
+				!providerAddress ||
+				typeof providerAddress === "string" ||
+				!serverAddress ||
+				typeof serverAddress === "string"
+			) {
+				throw new Error("Missing fixture listeners");
+			}
+			const agentDir = join(root, "agent");
+			mkdirSync(agentDir);
+			writeFileSync(
+				join(agentDir, "models.json"),
+				JSON.stringify({
+					providers: {
+						"client-owned": {
+							baseUrl: `http://127.0.0.1:${providerAddress.port}/v1`,
+							api: "openai-completions",
+							apiKey: "client-fixture-key",
+							models: [
+								{
+									id: "client-non-hf",
+									name: "Client model",
+									reasoning: false,
+									input: ["text"],
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+									contextWindow: 32768,
+									maxTokens: 1024,
+								},
+							],
+						},
+					},
+				}),
+			);
+			const env = {
+				PATH: process.env.PATH,
+				SystemRoot: process.env.SystemRoot,
+				WINDIR: process.env.WINDIR,
+				COMSPEC: process.env.COMSPEC,
+				PATHEXT: process.env.PATHEXT,
+				TEMP: process.env.TEMP,
+				TMP: process.env.TMP,
+				HOME: join(root, "home"),
+				USERPROFILE: join(root, "home"),
+				APPDATA: join(root, "appdata"),
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_OFFLINE: "true",
+				PI_SERVER_AUTH_TOKEN: "fixture-server-token",
+				PI_SERVER_URL: `http://127.0.0.1:${serverAddress.port}`,
+			};
+			async function runCli(args: string[]) {
+				const child = spawn(
+					process.execPath,
+					["--import", sourceLoader, join(pkgRoot, "src", "pi-client-cli.ts"), ...args],
+					{
+						cwd: root,
+						env,
+						stdio: ["ignore", "pipe", "pipe"],
+						timeout: 15000,
+					},
+				);
+				let stdout = "";
+				let stderr = "";
+				child.stdout.on("data", (data: Buffer) => {
+					stdout += data.toString();
+				});
+				child.stderr.on("data", (data: Buffer) => {
+					stderr += data.toString();
+				});
+				const status = await new Promise<number | null>((resolve, reject) => {
+					child.once("error", reject);
+					child.once("close", resolve);
+				});
+				return { status, stdout, stderr };
+			}
+			const listed = await runCli(["--list-models", "-ne", "--no-mcp", "--no-context-files"]);
+			expect(listed.status, listed.stderr).toBe(0);
+			expect(listed.stdout).toContain("client-owned");
+			expect(listed.stdout).toContain("client-non-hf");
+			expect(listed.stdout).toContain("32.8K");
+			expect(listed.stdout).not.toContain("server-hf-only");
+			expect(serverPaths).toEqual([]);
+			const prompted = await runCli([
+				"-p",
+				"--no-session",
+				"-ne",
+				"--no-mcp",
+				"--no-context-files",
+				"--model",
+				"client-owned/client-non-hf",
+				"hello",
+			]);
+			expect(prompted.status, JSON.stringify({ prompted, serverPaths, providerRequests })).toBe(0);
+			expect(prompted.stdout, JSON.stringify({ prompted, serverPaths, providerRequests })).toContain(
+				"CLIENT_MODEL_REMOTE_OK",
+			);
+			expect(serverPaths).toContain("/api/stream");
+			expect(serverPaths).not.toContain("/api/models");
+			expect(providerRequests.length).toBeGreaterThan(0);
+			for (const request of providerRequests) {
+				expect(request).toMatchObject({
+					authorization: "Bearer client-fixture-key",
+					body: { model: "client-non-hf" },
+				});
+			}
+		} finally {
+			catalog.mockRestore();
+			for (const fixture of [server, provider]) {
+				fixture.closeAllConnections();
+				await new Promise<void>((resolve, reject) => fixture.close((error) => (error ? reject(error) : resolve())));
+			}
+			clearAllSessions();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30000);
+
 	it("rejects a provider selection without a model in the pi-client entrypoint", () => {
 		// #10236: an incomplete provider selection must not run another provider's default model.
 		const root = mkdtempSync(join(tmpdir(), "pi-client-provider-"));
@@ -114,7 +295,7 @@ describe("coding-agent bins", () => {
 	it.each([
 		{ selection: "without an explicit model", args: [] },
 		{ selection: "with an explicit model", args: ["--model", "unavailable/model"] },
-	])("reports an unavailable pi-server $selection without a startup stack trace", ({ args }) => {
+	])("reports unavailable client models $selection without a server catalog error", ({ args }) => {
 		const root = mkdtempSync(join(tmpdir(), "pi-client-unavailable-server-"));
 		try {
 			const result = spawnSync(
@@ -157,13 +338,13 @@ describe("coding-agent bins", () => {
 			expect(result.error, result.stderr).toBeUndefined();
 			expect(result.status).toBe(1);
 			expect(result.stdout).toBe("");
-			expect(result.stderr).toContain("pi-server model catalog:");
+			expect(result.stderr).not.toContain("pi-server model catalog:");
 			if (args.length > 0) {
-				expect(result.stderr).toContain('Cannot resolve model "unavailable/model"');
+				expect(result.stderr).toContain("unavailable/model");
+			} else {
+				expect(result.stderr).toContain("No models available");
 			}
-			expect(result.stderr).not.toMatch(
-				/UnhandledPromiseRejection|node:internal|\n\s+at |models\.json|\/login|install/i,
-			);
+			expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|node:internal|\n\s+at /i);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

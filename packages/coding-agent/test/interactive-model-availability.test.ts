@@ -253,11 +253,11 @@ describe("logout availability feedback", () => {
 			expected: "extension configuration",
 		},
 		{
-			name: "pi-server",
-			status: { configured: false },
+			name: "client environment in pi-server mode",
+			status: { configured: true, source: "environment", label: "HF_TOKEN" },
 			configured: true,
 			remote: true,
-			expected: "pi-server credentials",
+			expected: "environment (HF_TOKEN)",
 		},
 		{ name: "no remaining authentication", status: { configured: false }, configured: false },
 	];

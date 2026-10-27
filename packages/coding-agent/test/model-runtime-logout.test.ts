@@ -40,11 +40,11 @@ describe.each([false, true])("ModelRuntime logout with pi-server mode %s", (remo
 		expect(runtime.getProviderAuthStatus("huggingface")).toEqual(
 			token ? { configured: true, source: "environment", label: "HF_TOKEN" } : { configured: false },
 		);
-		expect(fetcher).toHaveBeenCalledTimes(remote ? 1 : 0);
+		expect(fetcher).not.toHaveBeenCalled();
 	});
 });
 
-it("retains server-authenticated models after removing the client's stored credential", async () => {
+it("removes client availability after logout without reading server-authenticated models", async () => {
 	vi.stubEnv("PI_SERVER_MODE", "true");
 	vi.stubEnv("PI_SERVER_URL", "http://pi-server.test");
 	vi.stubEnv("HF_TOKEN", "");
@@ -64,8 +64,8 @@ it("retains server-authenticated models after removing the client's stored crede
 	await runtime.logout("huggingface");
 
 	expect(await runtime.checkAuth("huggingface")).toBeUndefined();
-	expect(runtime.hasConfiguredAuth("huggingface")).toBe(true);
-	expect(await runtime.getAvailable("huggingface")).toEqual(serverModels);
-	expect(runtime.getAvailableSnapshot().filter((model) => model.provider === "huggingface")).toEqual(serverModels);
-	expect(fetch).toHaveBeenCalledTimes(1);
+	expect(runtime.hasConfiguredAuth("huggingface")).toBe(false);
+	expect(await runtime.getAvailable("huggingface")).toEqual([]);
+	expect(runtime.getAvailableSnapshot().filter((model) => model.provider === "huggingface")).toEqual([]);
+	expect(fetch).not.toHaveBeenCalled();
 });

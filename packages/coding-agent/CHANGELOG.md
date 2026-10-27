@@ -34,10 +34,8 @@
 - Kept model resolution errors inside the calling process and returned failed exit status for signal-terminated extension commands.
 - Connected `/reload` to updated pi-client runtime startup while preserving the session tree, selected branch, and startup options across active sessions.
 - Restored persisted model and thinking selections before the first prompt and applied runtime API keys to the exact selected provider before session model resolution.
-- Kept provider-only credential commands independent of server model catalog access.
-- Kept pi-client interactive startup usable when pi-server's model catalog is unavailable, reported catalog failures, and reused the current catalog until an explicit refresh.
+- Kept pi-client model catalogs, availability, provider capabilities, and model selection determined by client configuration, credentials, and native discovery without consulting the server catalog.
 - Routed model-registry and provider image generation, classification, direct streams, and deferred response fetch/cancel through pi-server, including codemode usage and virtual-model routing.
-- Combined the server's typed model catalog and precise availability with configured client models and native account discovery without requiring client-side provider credentials.
 - Preserved provider sampling options, parsed stream events, payload transformations, and response callbacks across pi-server requests.
 - Kept help, version, and invalid provider selections independent of server connectivity while preserving extension help flags.
 - Enabled prompt-cache warming through pi-server during active runs and idle mode, preserving request prefixes, cache options, cancellation, and local usage accounting.

@@ -264,36 +264,37 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture-token");
 		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
-		if (options.clientAuth) {
-			runtime.registerNativeProvider(
-				createProvider({
-					id: model.provider,
-					models: [model],
-					auth: {
-						apiKey: {
-							name: "Client key",
-							resolve: async () => ({
-								...(options.clientAuthEnv ? { env: { PI_CACHE_RETENTION: "long" } } : {}),
-								auth: {
-									apiKey: "client-cache-key",
-									baseUrl: "https://configured-client.invalid/v1",
-									headers: { "X-Auth": "client-auth-header", "X-Override": "auth" },
-								},
-							}),
-						},
+		runtime.registerNativeProvider(
+			createProvider({
+				id: model.provider,
+				models: [model, { ...model, id: "other" }],
+				auth: {
+					apiKey: {
+						name: "Client key",
+						resolve: async () =>
+							options.clientAuth
+								? {
+										...(options.clientAuthEnv ? { env: { PI_CACHE_RETENTION: "long" } } : {}),
+										auth: {
+											apiKey: "client-cache-key",
+											baseUrl: "https://configured-client.invalid/v1",
+											headers: { "X-Auth": "client-auth-header", "X-Override": "auth" },
+										},
+									}
+								: { auth: {} },
 					},
-					api: {
-						stream: () => {
-							throw new Error("Local inference forbidden");
-						},
-						streamSimple: () => {
-							throw new Error("Local inference forbidden");
-						},
+				},
+				api: {
+					stream: () => {
+						throw new Error("Local inference forbidden");
 					},
-				}),
-			);
-			await runtime.refresh({ allowNetwork: false });
-		}
+					streamSimple: () => {
+						throw new Error("Local inference forbidden");
+					},
+				},
+			}),
+		);
+		await runtime.refresh({ allowNetwork: false });
 		const extensionsResult = await createTestExtensionsResult(
 			options.hooks || options.clientAuth || options.autoCompact
 				? [
@@ -397,7 +398,7 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 
 	it("warms the exact provider prefix during a long tool in default streaming mode, then stops on settlement", async () => {
 		const { session, runtime, calls, requests, toolStarted, releaseTool, rejected } = await fixture({ tool: true });
-		expect(await runtime.getAuth(model)).toBeUndefined();
+		expect(await runtime.getAuth(model)).toEqual({ auth: { headers: model.headers } });
 		const run = session.prompt(largeText);
 		try {
 			await toolStarted;

@@ -41,11 +41,11 @@
 
 ## pi-client / pi-server Request Sync
 
-- In `PI_SERVER_MODE`, chat, image, classifier, and deferred operations exposed by `ModelRuntime` and its `Provider` objects must use pi-server transport. Preserve optional client auth and header transforms; server-only credentials must also work for prompts, model selection, and summaries. MCP auth and provider login remain client-local.
-- Preserve model type and exact model availability in remote catalogs, including identical provider/id pairs across chat, image, and classifier operations. Ordinary model accessors reuse the initialized catalog; explicit refresh updates it and preserves native account discovery.
-- Successful login/logout must supersede pending provider model refreshes so an old credential's catalog cannot publish afterward. Availability still includes models authenticated by environment, configuration, or pi-server credentials; logout feedback must identify the remaining source.
+- In `PI_SERVER_MODE`, chat, image, classifier, and deferred operations exposed by `ModelRuntime` and its `Provider` objects must use pi-server transport. Preserve client auth and header transforms. Model catalogs, metadata, availability, and provider capabilities are determined by client credentials, configuration, extensions, and native account discovery. Server credentials do not add or remove client model choices. MCP auth and provider login remain client-local.
+- Preserve model type and exact client model availability, including identical provider/id pairs across chat, image, and classifier operations. Ordinary model accessors reuse the initialized client catalog; explicit refresh updates it and preserves native account discovery.
+- Successful login/logout must supersede pending provider model refreshes so an old credential's catalog cannot publish afterward. Availability still includes models authenticated by client environment or configuration; logout feedback must identify the remaining client source.
 - Intersect configured model scopes with current availability for model selection, autocomplete, and cycling, using current model metadata. Keep unavailable configured IDs in `/models` so users can remove them from their scope.
-- A pi-server catalog outage must remain a visible model-runtime diagnostic instead of aborting interactive startup. Bound the catalog request itself, preserve caller cancellation, reuse the last catalog for ordinary access and local-only refreshes, and retry through explicit catalog refresh.
+- Client model initialization, listing, and refresh must not request pi-server's `/api/models`; that endpoint describes the server's own catalog. Preserve caller cancellation and diagnostics for client provider catalog refreshes.
 - An explicit terminal SSE error is a completed failure, not a disconnected stream. Preserve its error and skip run recovery; recover only streams that ended without a terminal result.
 - Provider lifecycle callbacks must execute in the client and return their result before the server continues the provider request. Route oversized callback replies through `ChunkRequest`; callback errors and cancellation must reject pending callbacks rather than recover a successful result. Reject unsupported executable transport options explicitly.
 - Omit SDK-internal provider callbacks from remote requests only by their exact function identity and absence of the corresponding extension handler. Preserve explicit caller callbacks and registered handlers; ordinary requests must not round-trip unused payloads or native stream events.
@@ -188,7 +188,7 @@
   - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
-- Remote `ModelRuntime` initialization requires an explicit `/api/models` fixture. Tests limited to `AgentSession` cancellation or boundary rules may initialize a local faux/custom-stream runtime before enabling remote lifecycle behavior; assert zero fetch calls so they cannot depend on a running pi-server.
+- Remote `ModelRuntime` tests must configure client providers and credentials explicitly. Assert that initialization and model listing do not request pi-server's `/api/models`; isolate inference with a pi-server transport fixture.
 - Terminal provider-error fixtures must use a documented non-retryable error such as `insufficient_quota`; unknown error text is retryable. Script a faux reply for every queued input rather than allowing an exhausted response queue to enter the retry loop.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
 - When coding-agent tests spawn source CLI entrypoints under Node 26, preload `src/experimental/source-resolver.ts` so workspace packages resolve through the repo TS path mappings. Pass the resolver through `pathToFileURL(...).href` on Windows because Node's ESM loader rejects raw drive-letter paths.
@@ -325,7 +325,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 ## Upstream Sync
 
 - Keep `packages/pi-client/package.json` `piClient.basePiVersion` and `basePiCommit` aligned with the merged formal release tag, and run the client wrapper's update tests.
-- Remote CLI model selection must stay within the pi-server catalog; shared model-reference resolution must not synthesize custom IDs in `PI_SERVER_MODE`.
+- Remote CLI model selection follows the same client catalog and custom-model resolution as local mode. Send the selected client model and request auth through pi-server transport.
 - The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
 - Provider telemetry requests accept the active span from `Context.telemetry`. Harness span factories derive native Chord `withTelemetry()` contexts; explicit root-parent values seed the outer span.
 - Environment test jobs that load Chord sources must build `packages/telemetry` first; its runtime package exports resolve to `dist`, including when Chord and Durable use source exports.

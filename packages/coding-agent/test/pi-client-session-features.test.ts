@@ -90,6 +90,11 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
+		runtime.registerNativeProvider({
+			...faux.provider,
+			auth: { apiKey: { name: "Client", resolve: async () => ({ auth: {} }) } },
+		});
+		await runtime.refresh({ providers: [faux.provider.id], allowNetwork: false });
 		const inputEvents: string[] = [];
 		const providerEvents: string[] = [];
 		const extensionsResult = await createTestExtensionsResult([
@@ -136,7 +141,7 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 	it("preserves prompt, steer, follow-up dispositions and server-only auth across oversized queued turns", async () => {
 		const { session, runtime, faux, requests, rejected } = await createFixture();
 		try {
-			expect(await runtime.getAuth(faux.getModel())).toBeUndefined();
+			expect(await runtime.getAuth(faux.getModel())).toEqual({ auth: {} });
 			await session.setModel(faux.getModel());
 			const dispositions: string[] = [];
 			await session.prompt("/handled", { preflightResult: (result) => dispositions.push(result) });
@@ -165,9 +170,9 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 			expect(requests.some((request) => request.path === "/api/request/chunk")).toBe(true);
 			expect(requests.every((request) => request.bytes <= MAX_REQUEST_BYTES)).toBe(true);
 			expect(rejected()).toBe(0);
-			const unknown = resolveCliModel({ cliProvider: "faux", cliModel: "missing-chat", modelRuntime: runtime });
-			expect(unknown.model).toBeUndefined();
-			expect(unknown.error).toContain("not found");
+			const custom = resolveCliModel({ cliProvider: "faux", cliModel: "custom-chat", modelRuntime: runtime });
+			expect(custom.model).toMatchObject({ ...faux.getModel(), id: "custom-chat", name: "custom-chat" });
+			expect(custom.error).toBeUndefined();
 		} finally {
 			session.dispose();
 		}

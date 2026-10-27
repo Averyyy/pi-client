@@ -517,7 +517,7 @@ export function resolveCliModel(options: {
 	}
 
 	const { target } = result;
-	if (!target || process.env.PI_SERVER_MODE === "true") {
+	if (!target) {
 		return {
 			model: undefined,
 			warning: undefined,
