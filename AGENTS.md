@@ -176,6 +176,7 @@
 
 - Help/version and invalid built-in CLI options must exit before model services contact the server. Help must still load trusted extension resources so their registered flags remain visible.
 - On Windows with Node 26, `spawnSync("npm.cmd", ...)` can fail with `EINVAL`; release scripts that spawn npm must invoke npm's CLI through `process.execPath` instead.
+- Windows PowerShell service loops must redirect native stdout and stderr through `cmd.exe` so stderr remains in the log and does not terminate the loop under `$ErrorActionPreference = 'Stop'`.
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - When merging upstream changes into forked interactive-mode handlers, rerun the compaction/status tests and preserve turn-start cleanup plus redraw behavior; merge conflict resolution can silently drop those fork-specific UI transitions.
 - Never run `npm run build` or `npm test` unless requested by the user.
