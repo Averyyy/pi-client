@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import chalk from "chalk";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { SessionManager } from "../../../src/core/session-manager.ts";
@@ -147,9 +148,13 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
-		const stdoutWrite = vi
-			.spyOn(process.stdout, "write")
-			.mockImplementation((() => true) as typeof process.stdout.write);
+		const stdoutWrite = vi.spyOn(process.stdout, "write").mockImplementation(((
+			_chunk: string,
+			callback: () => void,
+		) => {
+			callback();
+			return true;
+		}) as typeof process.stdout.write);
 		setStdoutIsTTY(true);
 		process.env.PI_SERVER_MODE = "true";
 		const order: string[] = [];
@@ -160,6 +165,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 		expect(stdoutWrite).toHaveBeenCalledWith(
 			`${chalk.dim("To resume this session:")} pi-client --session test-session\n`,
+			expect.any(Function),
 		);
 	});
 
@@ -179,6 +185,38 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		for (const call of stdoutWrite.mock.calls) {
 			expect(call[0]).not.toContain("To resume this session:");
 		}
+	});
+
+	test("interactive quit waits for the resume hint to reach an asynchronous output stream", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new ProcessExitError();
+		}) as typeof process.exit);
+		const output: string[] = [];
+		let finishWrite: (() => void) | undefined;
+		const stdout = new Writable({
+			write(chunk: Buffer, _encoding, callback) {
+				finishWrite = () => {
+					output.push(chunk.toString());
+					callback();
+				};
+			},
+		});
+		vi.spyOn(process.stdout, "write").mockImplementation(stdout.write.bind(stdout) as typeof process.stdout.write);
+		setStdoutIsTTY(true);
+		process.env.PI_SERVER_MODE = "true";
+		const context = createContext([], createSessionManager({ sessionFile: createTempFile() }));
+
+		const shutdown = callShutdown(context);
+		await vi.waitFor(() => expect(finishWrite).toBeTypeOf("function"));
+
+		expect(exit).not.toHaveBeenCalled();
+		expect(output).toEqual([]);
+		if (!finishWrite) throw new Error("Resume hint write did not start");
+		finishWrite();
+		await shutdown;
+
+		expect(output).toEqual([`${chalk.dim("To resume this session:")} pi-client --session test-session\n`]);
+		expect(exit).toHaveBeenCalledWith(0);
 	});
 
 	test("re-entrant shutdown is a no-op", async () => {

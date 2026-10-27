@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Fixed session resume hints being truncated by interactive exit before terminal output completed.
 - Kept pi-server observer socket reconnections quiet while preserving connection, update, and shutdown failure diagnostics.
 - Used entry commit times for saved observer messages and isolated pending observer responses when switching sessions.
 - Stopped viewer observer reconnection when the server's presence handshake reports that the session was deleted.

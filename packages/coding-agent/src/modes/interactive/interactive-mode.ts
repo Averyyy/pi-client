@@ -4526,7 +4526,12 @@ export class InteractiveMode {
 		if (options?.exitCode !== PI_CLIENT_RUNTIME_RELOAD_EXIT_CODE) {
 			const resumeCommand = formatResumeCommand(this.sessionManager);
 			if (resumeCommand) {
-				process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+				await new Promise<void>((resolve, reject) => {
+					process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`, (error) => {
+						if (error) reject(error);
+						else resolve();
+					});
+				});
 			}
 		}
 

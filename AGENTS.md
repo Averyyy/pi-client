@@ -124,6 +124,7 @@
 - Do not mark pi-server sync as successful until the response is valid JSON. For proxy/network failures, report status, content-type, and a short body excerpt; stream responses must be `text/event-stream`.
 - If post-stream pi-server tree sync fails after a successful assistant response, do not auto-retry the LLM or call `agent.continue()` from that assistant leaf; detach the sync-error assistant from the active branch and let the next pi-server sync recover.
 - Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
+- Await the interactive shutdown resume hint's stdout write callback before calling `process.exit()` so asynchronous terminal output completes.
 - To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
 - When `PI_SERVER_MODE` is set, the pi-client CLI adapter automatically installs a process-local PATH shim that redirects `pi` subprocess invocations to `pi-client`, and rewrites displayed command strings to show `pi-client` instead of `pi` for consistency.
 ## pi-client Web UI
