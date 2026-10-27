@@ -505,7 +505,8 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		});
 
 		it.each([
-			MODELS.opencode["deepseek-v4-flash"],
+			// Keep coverage for the retired model's explicit compatibility contract.
+			{ ...MODELS.opencode["deepseek-v4.1-flash"], compat: { supportsLongCacheRetention: false } },
 			MODELS.opencode["deepseek-v4-pro"],
 			MODELS.opencode["kimi-k2.5"],
 			MODELS.opencode["kimi-k2.6"],
