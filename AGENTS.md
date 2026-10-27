@@ -324,6 +324,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 
 ## Upstream Sync
 
+- This fork only consumes the upstream pi.dev model catalog. Keep generation, validation, and upstream release compatibility checks enabled, but gate the catalog publication job to `earendil-works/pi`; do not configure fork R2 credentials or change the runtime catalog default.
 - Keep `packages/pi-client/package.json` `piClient.basePiVersion` and `basePiCommit` aligned with the merged formal release tag, and run the client wrapper's update tests.
 - Remote CLI model selection follows the same client catalog and custom-model resolution as local mode. Send the selected client model and request auth through pi-server transport.
 - The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
