@@ -15,6 +15,8 @@ import { Transcript } from "./transcript.tsx";
 import { useViewer } from "./use-viewer.ts";
 import "./style.css";
 
+const version = document.querySelector<HTMLMetaElement>('meta[name="pi-server-version"]')!.content;
+
 function Login({ onLogin, locked }: { onLogin: () => void; locked: boolean }) {
 	const input = useRef<HTMLInputElement>(null);
 	const [pending, setPending] = useState(false);
@@ -86,6 +88,7 @@ function Login({ onLogin, locked }: { onLogin: () => void; locked: boolean }) {
 					对话查看器 · Token 仅用于本次验证
 				</p>
 				<p className="login-lock-note">连续 10 次失败后锁定，需在服务器解锁。</p>
+				<p className="server-version login-version">v{version}</p>
 			</div>
 		</main>
 	);
@@ -398,6 +401,7 @@ function Viewer() {
 						</div>
 					</div>
 				)}
+				<footer className="server-version workspace-version">pi-server v{version}</footer>
 			</main>
 			{menu ? (
 				<ContextMenu

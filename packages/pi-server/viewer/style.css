@@ -415,6 +415,20 @@ pre {
 	flex-direction: column;
 	overflow: hidden;
 }
+.server-version {
+	color: #81858d;
+	font-size: 12px;
+	line-height: 1.5;
+}
+.login-version {
+	margin-top: 14px;
+	text-align: center;
+}
+.workspace-version {
+	flex-shrink: 0;
+	padding: 6px 16px;
+	text-align: right;
+}
 .workspace-header {
 	height: 65px;
 	min-height: 65px;

@@ -5,6 +5,7 @@
 ### Added
 
 - Added a collapsible parent-thread sidebar for tintinweb subagents, grouped by active and completed task state with live updates and persisted session links.
+- Displayed the pi-server package version on the viewer login and conversation pages.
 - Added a browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.
 - Added project and thread context menus for folding and confirmed server deletion, automatic history loading at the top, and project ordering by the latest thread activity.
 - Added an independent observer store and streaming endpoints without changing provider requests or authoritative session trees.

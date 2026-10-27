@@ -1,10 +1,13 @@
 import type * as Fs from "node:fs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ViewerHttp } from "../src/viewer-http.ts";
+
+const { version: packageVersion } = createRequire(import.meta.url)("../package.json") as { version: string };
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof Fs>();
@@ -38,7 +41,11 @@ describe("viewer asset caching", () => {
 		vi.mocked(existsSync).mockReturnValueOnce(true);
 		vi.mocked(readFileSync)
 			.mockReturnValueOnce(JSON.stringify({ version }))
-			.mockReturnValueOnce(Buffer.from(`<script src="/viewer/assets/${version}/app.js"></script>`))
+			.mockReturnValueOnce(
+				Buffer.from(
+					`<meta name="pi-server-version" content="__PI_SERVER_VERSION__"><script src="/viewer/assets/${version}/app.js"></script>`,
+				),
+			)
 			.mockReturnValueOnce(Buffer.from(body))
 			.mockReturnValueOnce(Buffer.from(body));
 		vi.clearAllMocks();
@@ -109,7 +116,9 @@ describe("viewer asset caching", () => {
 		const html = await fetch(base);
 		expect(html.headers.get("cache-control")).toBe("no-store");
 		expect(html.headers.get("etag")).toBeNull();
-		await html.text();
+		const body = await html.text();
+		expect(body).toContain(`<meta name="pi-server-version" content="${packageVersion}">`);
+		expect(body).not.toContain("__PI_SERVER_VERSION__");
 		const unauthorized = await fetch(`${base}/viewer/api/projects`);
 		expect(unauthorized.status).toBe(401);
 		expect(unauthorized.headers.get("cache-control")).toBe("no-store");

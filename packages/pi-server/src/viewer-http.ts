@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.ts";
 import { ViewerAuth } from "./viewer-auth.ts";
@@ -13,6 +14,8 @@ import type {
 	ViewerTool,
 	ViewerUpdate,
 } from "./viewer-types.ts";
+
+const { version: packageVersion } = createRequire(import.meta.url)("../package.json") as { version: string };
 
 function json(res: ServerResponse, status: number, body: unknown): void {
 	res.writeHead(status, { "Content-Type": "application/json" });
@@ -144,7 +147,10 @@ export class ViewerHttp {
 					[`/viewer/assets/${version}/app.js`, "app.js", "text/javascript; charset=utf-8"],
 					[`/viewer/assets/${version}/app.css`, "app.css", "text/css; charset=utf-8"],
 				]) {
-					files.set(path, { body: readFileSync(new URL(file, directory)), contentType });
+					let body = readFileSync(new URL(file, directory));
+					if (path === "/")
+						body = Buffer.from(body.toString("utf8").replace("__PI_SERVER_VERSION__", packageVersion));
+					files.set(path, { body, contentType });
 				}
 				this.assets = { version, files };
 			}
