@@ -168,4 +168,44 @@ describe("http dispatcher", () => {
 		expect(connectSpy.mock.calls[0]?.[0]).not.toHaveProperty("autoSelectFamily");
 		expect(net.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(originalAttemptTimeoutMs);
 	});
+
+	it("rejects excessive content encodings without breaking later requests", async () => {
+		// GHSA-xjj6-f33q-929c: rejecting fetch must not leave an unhandled body-stream error.
+		const origin = http.createServer((request, response) => {
+			if (request.url === "/malformed") {
+				response.writeHead(200, {
+					"content-encoding": "gzip, gzip, gzip, gzip, gzip, gzip",
+					"content-length": "100",
+				});
+				response.flushHeaders();
+				response.socket?.end();
+				return;
+			}
+			response.end("ok");
+		});
+		await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+		const address = origin.address();
+		if (!address || typeof address === "string") throw new Error("Origin did not bind");
+		configureHttpDispatcher();
+		try {
+			await expect(undici.fetch(`http://127.0.0.1:${address.port}/malformed`)).rejects.toThrow();
+			await expect(
+				undici.fetch(`http://127.0.0.1:${address.port}/ok`).then((response) => response.text()),
+			).resolves.toBe("ok");
+		} finally {
+			await undici.getGlobalDispatcher().close();
+			undici.setGlobalDispatcher(originalDispatcher);
+			await new Promise<void>((resolve) => origin.close(() => resolve()));
+		}
+	});
+
+	it("validates mixed-case integrity algorithms instead of accepting a mismatched digest", async () => {
+		// GHSA-f72v-6w45-q472.
+		configureHttpDispatcher();
+		await expect(
+			undici.fetch("data:text/plain,unexpected", {
+				integrity: "SHA256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+			}),
+		).rejects.toThrow();
+	});
 });

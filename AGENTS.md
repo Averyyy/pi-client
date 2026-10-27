@@ -200,6 +200,9 @@
 
 ## Dependency and Install Security
 
+- The public pi.dev model-catalog compatibility gate targets `@earendil-works/pi-ai` releases. Fetch their tags from the upstream repository in isolation; fork tags or the working tree are not substitutes for released source.
+- Preserve dependency major-version constraints during security updates. Sandbox runtime currently requires Zod 3; do not silence its advisory with a forced Zod 4 override.
+
 - Treat npm dep and lockfile changes as reviewed code. Direct registry deps, including internal workspace deps, stay pinned to exact versions.
 - When updating `undici`, you MUST read its changelog/release notes for the target version and evaluate whether any changes may affect functionality before applying the update.
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.

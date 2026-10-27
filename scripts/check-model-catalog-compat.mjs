@@ -32,6 +32,25 @@ import { MINIMUM_PI_VERSION } from "./model-catalog-minimum-version.mjs";
 import { compareModelCatalogPiVersions } from "./model-catalog-protocol.ts";
 
 const PI_AI_PACKAGE = "@earendil-works/pi-ai";
+const PI_REPOSITORY = "https://github.com/earendil-works/pi.git";
+
+// The public pi.dev catalog targets upstream releases, even when this script is
+// run in a fork. Never resolve its release tag through the checkout's origin.
+export function archiveReleaseSource(release, temporaryDir, execute = run) {
+	if (!/^\d+\.\d+\.\d+$/.test(release)) throw new Error(`Invalid stable pi release: ${release}`);
+	const sourceDir = join(temporaryDir, "source.git");
+	execute("git", ["init", "--bare", sourceDir], temporaryDir);
+	execute("git", ["fetch", "--depth=1", "--no-tags", PI_REPOSITORY, `refs/tags/v${release}`], sourceDir);
+	const commit = execute("git", ["rev-parse", "FETCH_HEAD^{commit}"], sourceDir).trim();
+	const manifest = JSON.parse(execute("git", ["show", `${commit}:packages/ai/package.json`], sourceDir));
+	if (manifest.name !== PI_AI_PACKAGE || manifest.version !== release) {
+		throw new Error(`Upstream v${release} does not contain ${PI_AI_PACKAGE}@${release}`);
+	}
+	console.log(`Using ${PI_REPOSITORY} v${release} (${commit}).`);
+	const archive = join(temporaryDir, "release.tar");
+	execute("git", ["archive", "--prefix=release/", "--output", archive, commit], sourceDir);
+	return archive;
+}
 
 /** Read a release's built-in model data (`dist/providers/data`) as model lists by provider. */
 function readBuiltinModels(dataDir) {
@@ -89,13 +108,12 @@ function main() {
 	try {
 		console.log(`Checking the model catalog against pi ${release}...`);
 		// The release's source code.
-		const archive = join(temporaryDir, "release.tar");
-		run("git", ["archive", "--prefix=release/", "--output", archive, `v${release}`], root);
+		const archive = archiveReleaseSource(release, temporaryDir);
 		run("tar", ["xf", archive, "-C", temporaryDir], root);
 
 		// The built-in models users have: the data shipped in the published package.
 		const [{ filename }] = JSON.parse(
-			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--pack-destination", temporaryDir, "--json"], root),
+			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--ignore-scripts", "--pack-destination", temporaryDir, "--json"], root),
 		);
 		run("tar", ["xzf", join(temporaryDir, filename), "-C", temporaryDir, "package/dist/providers/data"], root);
 		const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));
@@ -134,9 +152,11 @@ function main() {
 	}
 }
 
-try {
-	main();
-} catch (error) {
-	console.error(error instanceof Error ? error.message : String(error));
-	process.exitCode = 1;
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	try {
+		main();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	}
 }
