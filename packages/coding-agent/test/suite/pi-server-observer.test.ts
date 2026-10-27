@@ -22,6 +22,7 @@ interface ObserverFixture {
 	closed: number;
 	fail: boolean;
 	deleted: boolean;
+	terminateHandshake: boolean;
 	holdResponse?: Promise<void>;
 }
 
@@ -37,6 +38,7 @@ async function createFixture(): Promise<ObserverFixture> {
 		closed: 0,
 		fail: false,
 		deleted: false,
+		terminateHandshake: false,
 	};
 	fixture.server.on("request", async (request, response) => {
 		if (request.headers.authorization !== "Bearer observer-test") {
@@ -45,6 +47,10 @@ async function createFixture(): Promise<ObserverFixture> {
 		}
 		if (request.method === "GET") {
 			fixture.connectRequests++;
+			if (fixture.terminateHandshake) {
+				response.destroy();
+				return;
+			}
 			response.on("close", () => {
 				fixture.closed++;
 			});
@@ -496,6 +502,56 @@ describe("pi-server observer", () => {
 		await vi.waitFor(() => expect(fixture.closed).toBe(1));
 	});
 
+	it("reconnects quietly after repeated presence socket termination and publishes the current branch", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		for (let attempt = 0; attempt < 2; attempt++) {
+			fixture.sockets[attempt]!.destroy();
+			harness.setResponses([fauxAssistantMessage(`response ${attempt}`)]);
+			await harness.session.prompt(`prompt ${attempt}`);
+			await vi.waitFor(() => expect(fixture.sockets).toHaveLength(attempt + 2), { timeout: 4000 });
+			await vi.waitFor(() =>
+				expect(fixture.updates.at(-1)?.replace?.at(-1)?.content).toEqual([
+					{ type: "text", text: `response ${attempt}` },
+				]),
+			);
+			expect(fixture.updates.at(-1)?.replace).toHaveLength((attempt + 1) * 2);
+			expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+			expect(diagnostic).not.toHaveBeenCalled();
+		}
+	});
+
+	it("reports socket termination before the presence handshake", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		fixture.terminateHandshake = true;
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: fetch failed"));
+		expect(fixture.updates).toEqual([]);
+	});
+
+	it("reports presence authentication failures", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "wrong-token");
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() =>
+			expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: connection failed (HTTP 401)"),
+		);
+		expect(fixture.updates).toEqual([]);
+	});
+
 	it("isolates observer transport failure from prompts and reconnects with a fresh branch", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -508,6 +564,7 @@ describe("pi-server observer", () => {
 		harness.setResponses([fauxAssistantMessage("completed despite observer failure")]);
 		await harness.session.prompt("go");
 		await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledTimes(1));
+		expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: update failed (HTTP 503)");
 		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 		fixture.fail = false;
 		await vi.waitFor(() => expect(fixture.sockets).toHaveLength(2), { timeout: 4000 });

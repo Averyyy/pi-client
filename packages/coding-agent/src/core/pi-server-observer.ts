@@ -375,6 +375,14 @@ export class PiServerObserver {
 				reader.releaseLock();
 			}
 		} catch (error) {
+			if (
+				error instanceof TypeError &&
+				error.message === "terminated" &&
+				error.cause instanceof Error &&
+				"code" in error.cause &&
+				error.cause.code === "UND_ERR_SOCKET"
+			)
+				return;
 			if (sessionId === this.session.sessionId && this.deletedSessionId !== sessionId) this.reportError(error);
 		} finally {
 			resolveConnection?.();
