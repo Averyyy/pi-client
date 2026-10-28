@@ -39,7 +39,7 @@ describe("server session archives in the viewer", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
-	it("loads remote projects and conversation history from snapshots and WAL without an observer", () => {
+	it("loads remote projects and conversation history from snapshots and WAL without an observer", async () => {
 		setStaticContext("remote", { systemPrompt: "Pi instructions\nCurrent working directory: D:\\qhk\\old" });
 		savePersistedSession(directory, replaceSessionTree("remote", [user("u", null, "Read the project")], "u"));
 		savePersistedSession(
@@ -117,18 +117,23 @@ describe("server session archives in the viewer", () => {
 			status: "unknown",
 			legacy: true,
 		});
-		expect(store.rounds("remote", null).rounds[0].messages.map((message) => message.role)).toEqual([
+		expect((await store.rounds("remote", null)).rounds[0].messages.map((message) => message.role)).toEqual([
 			"user",
 			"assistant",
 			"toolResult",
 		]);
-		expect(store.rounds("remote", null).rounds[0].messages[2]).toMatchObject({ content: [], contentDeferred: true });
-		expect(store.message("remote", "u", "tool")?.content).toEqual([{ type: "text", text: "Remote file contents" }]);
+		expect((await store.rounds("remote", null)).rounds[0].messages[2]).toMatchObject({
+			content: [],
+			contentDeferred: true,
+		});
+		expect((await store.message("remote", "u", "tool"))?.content).toEqual([
+			{ type: "text", text: "Remote file contents" },
+		]);
 		expect(getSession("remote")).toEqual(original);
 		expect(existsSync(join(directory, ".viewer"))).toBe(false);
 	});
 
-	it("replays structured cwd sections across later partial system updates and keeps system text out of history", () => {
+	it("replays structured cwd sections across later partial system updates and keeps system text out of history", async () => {
 		setStaticContext("structured", { systemPrompt: "Old prompt\nCurrent working directory: D:/stale" });
 		const session = replaceSessionTree(
 			"structured",
@@ -166,7 +171,7 @@ describe("server session archives in the viewer", () => {
 		loadPersistedSessions(directory);
 		const store = new ViewerStore(directory);
 		expect(store.get("structured")).toMatchObject({ cwd: "D:/qhk/jev", title: "Inspect remote files" });
-		expect(store.rounds("structured", null).rounds).toEqual([
+		expect((await store.rounds("structured", null)).rounds).toEqual([
 			{
 				id: "question",
 				messages: [
@@ -224,13 +229,13 @@ describe("server session archives in the viewer", () => {
 		expect(store.get("generated")).toMatchObject({ cwd: "D:/qhk/jev", projectId: "D:/qhk/jev" });
 	});
 
-	it("groups slash variants together and gives the server cwd priority over an observer", () => {
+	it("groups slash variants together and gives the server cwd priority over an observer", async () => {
 		setStaticContext("server", { systemPrompt: "Instructions\nCurrent working directory: D:\\qhk\\jev" });
 		replaceSessionTree("server", [user("u", null, "Server conversation")], "u");
 		setStaticContext("second", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/jev" });
 		const store = new ViewerStore(directory);
 		const connection = store.connect("server");
-		store.update({
+		await store.update({
 			sessionId: "server",
 			connectionId: connection.connectionId,
 			sequence: 1,
@@ -239,35 +244,33 @@ describe("server session archives in the viewer", () => {
 			replace: [],
 		});
 		expect(store.get("server")).toMatchObject({ cwd: "D:/qhk/jev", title: "Server conversation" });
-		expect(store.rounds("server", null).rounds[0].messages[0].content).toBe("Server conversation");
+		expect((await store.rounds("server", null)).rounds[0].messages[0].content).toBe("Server conversation");
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("server", (update) => updates.push(update));
-		store.update({
+		await store.update({
 			sessionId: "server",
 			connectionId: connection.connectionId,
 			sequence: 2,
 			append: [{ id: "observer", role: "user", content: "Observer history", timestamp: 1000 }],
 		});
 		expect(updates[0]).toMatchObject({ replace: true, rounds: [{ id: "observer" }] });
-		store.refreshSession("server");
+		await store.refreshSession("server");
 		expect(updates[1]).toMatchObject({ replace: true, rounds: [{ id: "observer" }] });
-		expect(store.rounds("server", null).rounds[0].messages[0].content).toBe("Observer history");
+		expect((await store.rounds("server", null)).rounds[0].messages[0].content).toBe("Observer history");
 		expect(store.projects().projects).toMatchObject([
 			{ id: "D:/qhk/jev", path: "D:/qhk/jev", name: "jev", threadCount: 2 },
 		]);
 	});
 
-	it("publishes persisted session replacements and avoids loading history without thread listeners", () => {
+	it("publishes persisted session replacements to thread listeners and updates the catalog", async () => {
 		const now = vi.spyOn(Date, "now").mockReturnValue(1000);
 		setStaticContext("refresh", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/jev" });
 		replaceSessionTree("refresh", [user("u", null, "First question")], "u");
 		const store = new ViewerStore(directory);
-		const rounds = vi.spyOn(store, "rounds");
 		const catalog = vi.fn();
 		store.catalogListeners.add(catalog);
-		store.refreshSession("refresh");
+		await store.refreshSession("refresh");
 		expect(catalog).toHaveBeenCalledTimes(1);
-		expect(rounds).not.toHaveBeenCalled();
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("refresh", (update) => updates.push(update));
 		now.mockReturnValue(2000);
@@ -277,9 +280,9 @@ describe("server session archives in the viewer", () => {
 			"next",
 		);
 		savePersistedSession(directory, getSession("refresh")!);
-		store.refreshSession("refresh");
+		await store.refreshSession("refresh");
 		expect(catalog).toHaveBeenCalledTimes(2);
-		expect(rounds).toHaveBeenCalledTimes(1);
+		expect(updates).toHaveLength(1);
 		expect(updates[0]).toMatchObject({
 			thread: { id: "refresh", cwd: "D:/qhk/jev", title: "First question" },
 			replace: true,
@@ -287,23 +290,23 @@ describe("server session archives in the viewer", () => {
 		});
 	});
 
-	it("pages complete conversation rounds after loading only a server snapshot", () => {
+	it("pages complete conversation rounds after loading only a server snapshot", async () => {
 		setStaticContext("history", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/history" });
 		const entries = Array.from({ length: 7 }, (_, index) => user(`u${index}`, index ? `u${index - 1}` : null));
 		savePersistedSession(directory, replaceSessionTree("history", entries, "u6"));
 		clearAllSessions();
 		loadPersistedSessions(directory);
 		const store = new ViewerStore(directory);
-		const recent = store.rounds("history", null);
+		const recent = await store.rounds("history", null);
 		expect(recent.rounds.map((round) => round.id)).toEqual(["u2", "u3", "u4", "u5", "u6"]);
 		expect(recent.nextCursor).toBe("u2");
-		expect(store.rounds("history", recent.nextCursor)).toMatchObject({
+		expect(await store.rounds("history", recent.nextCursor)).toMatchObject({
 			rounds: [{ id: "u0" }, { id: "u1" }],
 			nextCursor: null,
 		});
 	});
 
-	it("caches metadata until the session revision changes", () => {
+	it("caches metadata until the session revision changes", async () => {
 		const session = setStaticContext("cached", {
 			systemPrompt: "Instructions\nCurrent working directory: D:/qhk/old",
 		});
@@ -315,7 +318,7 @@ describe("server session archives in the viewer", () => {
 		store.projects();
 		store.page("D:/qhk/old", null);
 		store.get("cached");
-		store.refreshSession("cached");
+		await store.refreshSession("cached");
 		store.projects();
 		expect(readPrompt).toHaveBeenCalledTimes(1);
 		setStaticContext("cached", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/new" });
@@ -325,7 +328,7 @@ describe("server session archives in the viewer", () => {
 			"name",
 		);
 		expect(store.get("cached")).toMatchObject({ cwd: "D:/qhk/new", title: "Renamed" });
-		store.refreshSession("cached");
+		await store.refreshSession("cached");
 		expect(store.projects().projects[0].id).toBe("D:/qhk/new");
 	});
 });

@@ -123,6 +123,8 @@ describe("server request activity", () => {
 		expect(await response.text()).toContain('"type":"done"');
 		expect((await thread())?.lastActiveAt).toBe(200);
 		expect(getSession(sessionId)).toEqual(original);
+		server.closeAllConnections();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
 		expect(new ViewerStore(directory).get(sessionId)?.lastActiveAt).toBe(200);
 	});
 

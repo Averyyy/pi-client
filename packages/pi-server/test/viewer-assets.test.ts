@@ -1,22 +1,16 @@
-import type * as Fs from "node:fs";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { promises as fs, mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ViewerHttp } from "../src/viewer-http.ts";
 
 const { version: packageVersion } = createRequire(import.meta.url)("../package.json") as { version: string };
 
-vi.mock("node:fs", async (importOriginal) => {
-	const actual = await importOriginal<typeof Fs>();
-	return {
-		...actual,
-		existsSync: vi.fn(actual.existsSync),
-		readFileSync: vi.fn(actual.readFileSync),
-	};
-});
+const readFile = fs.readFile;
+const assetDirectory = fileURLToPath(new URL("../dist/viewer/", import.meta.url));
 
 describe("viewer asset caching", () => {
 	let directory: string;
@@ -38,16 +32,20 @@ describe("viewer asset caching", () => {
 	}
 
 	function assets(version = "build-one", body = "asset contents") {
-		vi.mocked(existsSync).mockReturnValueOnce(true);
-		vi.mocked(readFileSync)
-			.mockReturnValueOnce(JSON.stringify({ version }))
-			.mockReturnValueOnce(
-				Buffer.from(
-					`<meta name="pi-server-version" content="__PI_SERVER_VERSION__"><script src="/viewer/assets/${version}/app.js"></script>`,
-				),
-			)
-			.mockReturnValueOnce(Buffer.from(body))
-			.mockReturnValueOnce(Buffer.from(body));
+		const files = new Map([
+			[join(assetDirectory, "asset-version.json"), JSON.stringify({ version })],
+			[
+				join(assetDirectory, "index.html"),
+				`<meta name="pi-server-version" content="__PI_SERVER_VERSION__"><script src="/viewer/assets/${version}/app.js"></script>`,
+			],
+			[join(assetDirectory, "app.js"), body],
+			[join(assetDirectory, "app.css"), body],
+		]);
+		vi.spyOn(fs, "readFile").mockImplementation(async (path, options) => {
+			const file = files.get(path instanceof URL ? fileURLToPath(path) : String(path));
+			if (file === undefined) return readFile(path, options);
+			return options === "utf8" ? file : Buffer.from(file);
+		});
 		vi.clearAllMocks();
 	}
 
@@ -65,7 +63,7 @@ describe("viewer asset caching", () => {
 		viewer.close();
 		server.closeAllConnections();
 		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-		vi.clearAllMocks();
+		vi.restoreAllMocks();
 		rmSync(directory, { recursive: true, force: true });
 	});
 
@@ -87,8 +85,7 @@ describe("viewer asset caching", () => {
 		expect(await compressed.text()).toBe("");
 		const secondVisitor = await fetch(`${base}/viewer/assets/build-one/${name}`);
 		expect(await secondVisitor.text()).toBe("asset contents");
-		expect(readFileSync).toHaveBeenCalledTimes(4);
-		expect(existsSync).toHaveBeenCalledTimes(1);
+		expect(fs.readFile).toHaveBeenCalledTimes(4);
 		viewer = createViewer();
 		assets();
 		const restarted = await fetch(`${base}/viewer/assets/build-one/${name}`, { headers: { "If-None-Match": tag } });
@@ -108,7 +105,7 @@ describe("viewer asset caching", () => {
 			expect((await fetch(`${base}/viewer/assets/${path}`)).status).toBe(404);
 		const asset = await fetch(`${base}/viewer/assets/build-two/app.js`);
 		expect(await asset.text()).toBe("new contents");
-		expect(readFileSync).toHaveBeenCalledTimes(4);
+		expect(fs.readFile).toHaveBeenCalledTimes(4);
 	});
 
 	it("keeps the HTML entrypoint and authentication responses out of browser caches", async () => {
@@ -124,10 +121,18 @@ describe("viewer asset caching", () => {
 		expect(unauthorized.headers.get("cache-control")).toBe("no-store");
 	});
 
-	it("reports unavailable build assets when the build manifest is missing", async () => {
-		vi.mocked(existsSync).mockReturnValueOnce(false);
+	it("loads build assets after a missing manifest becomes available", async () => {
+		vi.spyOn(fs, "readFile").mockImplementation(async (path, options) => {
+			if (path === join(assetDirectory, "asset-version.json"))
+				throw Object.assign(new Error("Manifest missing"), { code: "ENOENT" });
+			return readFile(path, options);
+		});
 		const response = await fetch(base);
 		expect(response.status).toBe(503);
 		expect(await response.json()).toEqual({ error: "Viewer assets unavailable" });
+		assets();
+		const available = await fetch(base);
+		expect(available.status).toBe(200);
+		expect(await available.text()).toContain("/viewer/assets/build-one/app.js");
 	});
 });

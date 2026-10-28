@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { performance } from "node:perf_hooks";
 import {
 	type CompactionCacheRequestOptions,
 	type CompactionPreparationOptions,
@@ -38,6 +39,7 @@ import {
 	type ModelsSimpleStreamOptions,
 	type ProviderClassifier,
 	type ProviderRequestOptions,
+	type ProviderResponse,
 	type ProviderStreamOptions,
 	type ProviderStreams,
 	type SimpleStreamOptions,
@@ -105,6 +107,7 @@ interface StreamRequestBody {
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
 	observeProviderStreamEvents?: boolean;
+	observeTiming?: boolean;
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
@@ -284,11 +287,9 @@ function persistSession(config: ServerRuntime, session: SessionState): void {
 	const changed = session.persistenceChange !== undefined;
 	savePersistedSession(config.sessionStoreDir, session);
 	if (!changed) return;
-	try {
-		config.viewer.store.refreshSession(session.sessionId);
-	} catch (error) {
+	void config.viewer.store.refreshSession(session.sessionId).catch((error: unknown) => {
 		console.error(`Failed to refresh viewer session ${session.sessionId}:`, error);
-	}
+	});
 }
 
 function recordSessionActivity(config: ServerRuntime, sessionId: string, deleteVersion: number): void {
@@ -612,7 +613,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 		const operation = Promise.resolve().then(async () => {
 			await deleteStreamRunsForSession(id);
 			deletePersistedSession(config.sessionStoreDir, id);
-			config.viewer.store.remove(id);
+			await config.viewer.store.remove(id);
 			deleteSessionFromStore(id);
 		});
 		config.deletingSessions.set(id, operation);
@@ -1304,7 +1305,28 @@ export function buildStreamContext(
 	};
 }
 
-function handleStream(config: ServerRuntime, body: StreamRequestBody, res: ServerResponse, models?: Models): void {
+function handleStream(
+	config: ServerRuntime,
+	body: StreamRequestBody,
+	res: ServerResponse,
+	models: Models | undefined,
+	requestStartedAt: number,
+): void {
+	const timing = body.observeTiming
+		? {
+				bodyReadyMs: performance.now() - requestStartedAt,
+				providerDispatchMs: 0,
+				upstreamRequestMs: undefined as number | undefined,
+				upstreamHeadersMs: undefined as number | undefined,
+				firstContentMs: undefined as number | undefined,
+			}
+		: undefined;
+	let timingSent = false;
+	const sendTiming = () => {
+		if (!timing || timingSent) return;
+		timingSent = true;
+		if (!res.writableEnded && !res.destroyed) writeServerSentEvent(res, "timing", timing);
+	};
 	if (!body.sessionId) {
 		sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 		return;
@@ -1382,6 +1404,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 	}
 
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
+	const providerCallbacks = run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {};
 	const streamOptions: ModelsSimpleStreamOptions = {
 		...(body.options ?? {}),
 		transformPreparedStreamOptions: (prepared) => {
@@ -1397,7 +1420,22 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 			return { ...prepared, cacheRetention };
 		},
 		...(run ? { signal: run.controller.signal } : {}),
-		...(run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {}),
+		...providerCallbacks,
+		...(timing
+			? {
+					onPayload: async (payload: unknown, model: Model<string>) => {
+						const result = providerCallbacks.onPayload
+							? await providerCallbacks.onPayload(payload, model)
+							: undefined;
+						timing.upstreamRequestMs ??= performance.now() - requestStartedAt;
+						return result;
+					},
+					onResponse: async (response: ProviderResponse, model: Model<string>) => {
+						timing.upstreamHeadersMs ??= performance.now() - requestStartedAt;
+						await providerCallbacks.onResponse?.(response, model);
+					},
+				}
+			: {}),
 		...(body.observeProviderStreamEvents
 			? {
 					onProviderStreamEvent: (data: unknown, model: Model<string>) => {
@@ -1431,6 +1469,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 	const activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
 	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
+		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
 		if (body.requestKind === "deferred") {
 			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle!, streamOptions);
 		} else {
@@ -1446,6 +1485,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 		failStreamRun(run, message);
 		recordSessionActivity(config, body.sessionId, activityVersion);
 		settleRun(run);
+		sendTiming();
 		writeStreamError(res, message);
 		endStreamResponse(res);
 		return;
@@ -1454,6 +1494,24 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 	void (async () => {
 		try {
 			for await (const event of stream) {
+				if (
+					timing &&
+					timing.firstContentMs === undefined &&
+					(((event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") &&
+						event.delta.length > 0) ||
+						(event.type === "done" &&
+							event.message.content.some((content) =>
+								content.type === "text"
+									? content.text.length > 0
+									: content.type === "thinking"
+										? content.thinking.length > 0
+										: content.type === "toolCall" && content.name.length > 0,
+							)))
+				) {
+					timing.firstContentMs = performance.now() - requestStartedAt;
+					sendTiming();
+				}
+				if (event.type === "done" || event.type === "error") sendTiming();
 				const proxyEvent = toProxyEvent(event);
 				if (proxyEvent) {
 					touchStreamRun(run);
@@ -1468,6 +1526,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			failStreamRun(run, message);
+			sendTiming();
 			writeStreamError(res, message);
 		} finally {
 			clearInterval(heartbeat);
@@ -1476,6 +1535,7 @@ function handleStream(config: ServerRuntime, body: StreamRequestBody, res: Serve
 			}
 			recordSessionActivity(config, body.sessionId, activityVersion);
 			settleRun(run);
+			sendTiming();
 			endStreamResponse(res);
 		}
 	})();
@@ -1489,6 +1549,7 @@ async function handlePostRequest(
 	models: Models,
 	streamModels: Models | undefined,
 	requestVersion: number,
+	requestStartedAt: number,
 ): Promise<boolean> {
 	if (rejectDeletingSession(config, body, res, requestVersion)) return true;
 	if (pathname === "/api/provider-callback") {
@@ -1558,7 +1619,7 @@ async function handlePostRequest(
 	}
 
 	if (pathname === "/api/stream") {
-		handleStream(config, body as StreamRequestBody, res, streamModels);
+		handleStream(config, body as StreamRequestBody, res, streamModels, requestStartedAt);
 		return true;
 	}
 
@@ -1746,6 +1807,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 	};
 
 	const server = createServer(async (req, res) => {
+		const requestStartedAt = performance.now();
 		const requestVersion = config.deleteVersion;
 		const url = new URL(req.url ?? "/", "http://localhost");
 
@@ -1753,9 +1815,22 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 			sendJson(res, 200, { status: "ok" });
 			return;
 		}
-		if (await viewer.handle(req, res, url)) return;
-
-		const authStatus = viewer.auth.authenticate(req);
+		let authStatus: 200 | 401 | 423;
+		try {
+			if (await viewer.handle(req, res, url)) return;
+			authStatus = await viewer.auth.authenticate(req);
+		} catch (error) {
+			logRequestError(req, error);
+			if (!res.headersSent)
+				sendError(
+					res,
+					500,
+					error instanceof Error ? error.message : String(error),
+					PiServerErrorCode.INTERNAL_ERROR,
+				);
+			else res.end();
+			return;
+		}
 		if (authStatus !== 200) {
 			sendJson(res, authStatus, { error: authStatus === 423 ? "Viewer locked" : "Unauthorized" });
 			return;
@@ -1851,7 +1926,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 				if (chunkResult.target === "/api/observer") {
 					const observerBody = JSON.parse(chunkResult.bodyJson) as unknown;
 					if (rejectDeletingSession(config, observerBody, res, chunkResult.requestVersion)) return;
-					viewer.observe(observerBody, res);
+					await viewer.observe(observerBody, res);
 					return;
 				}
 				const handled = await handlePostRequest(
@@ -1862,6 +1937,7 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 					models,
 					streamModels,
 					chunkResult.requestVersion,
+					requestStartedAt,
 				);
 				if (!handled && !res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
@@ -1883,10 +1959,22 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 				const body = JSON.parse(await readBody(req)) as unknown;
 				if (url.pathname === "/api/observer") {
 					if (rejectDeletingSession(config, body, res, requestVersion)) return;
-					viewer.observe(body, res);
+					await viewer.observe(body, res);
 					return;
 				}
-				if (await handlePostRequest(config, url.pathname, body, res, models, streamModels, requestVersion)) return;
+				if (
+					await handlePostRequest(
+						config,
+						url.pathname,
+						body,
+						res,
+						models,
+						streamModels,
+						requestVersion,
+						requestStartedAt,
+					)
+				)
+					return;
 				if (!res.headersSent) {
 					sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
 					return;
@@ -1917,7 +2005,9 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 	const close = server.close;
 	server.close = function (callback) {
 		viewer.close();
-		return close.call(this, callback);
+		return close.call(this, (error) => {
+			void viewer.store.flush().then(() => callback?.(error));
+		});
 	};
 	return server;
 }

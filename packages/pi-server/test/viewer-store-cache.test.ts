@@ -63,7 +63,7 @@ describe("viewer catalog indexes", () => {
 		expect(get).toHaveBeenCalledTimes(initialReads);
 	});
 
-	it("updates both projects on a cwd move and leaves unrelated project revisions intact", () => {
+	it("updates both projects on a cwd move and leaves unrelated project revisions intact", async () => {
 		archive("a", "D:/a", 10);
 		archive("a2", "D:/a", 20);
 		archive("b", "D:/b", 30);
@@ -75,7 +75,7 @@ describe("viewer catalog indexes", () => {
 		store.catalogListeners.add(catalogEvents);
 		vi.spyOn(Date, "now").mockReturnValue(100);
 		sessions.setStaticContext("a", { systemPrompt: "Instructions\nCurrent working directory: D:/b" });
-		store.refreshSession("a");
+		await store.refreshSession("a");
 		const after = store.projects();
 		expect(after.revision).not.toBe(before.revision);
 		expect(after.projects.map((project) => [project.id, project.threadCount])).toEqual([
@@ -88,16 +88,16 @@ describe("viewer catalog indexes", () => {
 		expect(after.projects.find((project) => project.id === "D:/c")?.revision).toBe(revisions.get("D:/c"));
 		expect(before.projects.find((project) => project.id === "D:/a")?.threadCount).toBe(2);
 		expect(store.page("D:/b", null).threads.map((thread) => thread.id)).toEqual(["b", "a"]);
-		store.refreshSession("a");
+		await store.refreshSession("a");
 		expect(store.projects()).toBe(after);
 		expect(catalogEvents).toHaveBeenCalledTimes(1);
 		sessions.deleteSession("a2");
-		store.remove("a2");
+		await store.remove("a2");
 		expect(store.projects().projects.map((project) => project.id)).toEqual(["D:/c", "D:/b"]);
 		expect(catalogEvents).toHaveBeenCalledTimes(2);
 	});
 
-	it("orders projects by their newest thread and recomputes the head after deletion", () => {
+	it("orders projects by their newest thread and recomputes the head after deletion", async () => {
 		archive("a-old", "D:/a", 10);
 		archive("a-new", "D:/a", 50);
 		archive("b", "D:/b", 30);
@@ -111,7 +111,7 @@ describe("viewer catalog indexes", () => {
 		]);
 		expect(store.projectThreadIds("D:/a")).toEqual(["a-new", "a-old"]);
 		sessions.deleteSession("a-new");
-		store.remove("a-new");
+		await store.remove("a-new");
 		expect(store.projects().projects.map(({ id, lastActiveAt }) => [id, lastActiveAt])).toEqual([
 			["D:/b", 30],
 			["D:/c", 30],
@@ -120,11 +120,11 @@ describe("viewer catalog indexes", () => {
 		expect(list).toHaveBeenCalledTimes(1);
 	});
 
-	it("indexes observer activity and removal without invalidating the catalog for live deltas", () => {
+	it("indexes observer activity and removal without invalidating the catalog for live deltas", async () => {
 		const store = new ViewerStore(directory);
 		store.projects();
 		const connection = store.connect("observer");
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: connection.connectionId,
 			sequence: 1,
@@ -134,7 +134,7 @@ describe("viewer catalog indexes", () => {
 		});
 		const running = store.projects();
 		expect(running.running.map((thread) => thread.id)).toEqual(["observer"]);
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: connection.connectionId,
 			sequence: 2,
@@ -142,12 +142,14 @@ describe("viewer catalog indexes", () => {
 		});
 		expect(store.projects()).toBe(running);
 		connection.close();
+		await store.flush();
 		const disconnected = store.projects();
 		expect(disconnected.running).toEqual([]);
 		expect(disconnected.projects[0].revision).not.toBe(running.projects[0].revision);
 		const reconnected = store.connect("observer");
+		await store.flush();
 		expect(store.page("D:/a", null).threads[0].status).toBe("unknown");
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: reconnected.connectionId,
 			sequence: 1,
@@ -155,27 +157,32 @@ describe("viewer catalog indexes", () => {
 			status: "idle",
 		});
 		expect(store.projects().projects.map((project) => project.id)).toEqual(["D:/b"]);
-		store.remove("observer");
+		await store.remove("observer");
 		expect(store.projects().projects).toEqual([]);
 	});
 
-	it("loads history only for the subscribed thread and sends snapshots even when its summary is unchanged", () => {
+	it("publishes snapshots only to subscribed threads even when their summaries are unchanged", async () => {
 		archive("a", "D:/a", 10);
 		archive("b", "D:/b", 20);
 		const store = new ViewerStore(directory);
 		const catalog = store.projects();
-		const rounds = vi.spyOn(store, "rounds");
 		const listener = vi.fn();
 		const unsubscribe = store.subscribe("a", listener);
-		store.refreshSession("b");
-		expect(rounds).not.toHaveBeenCalled();
-		store.refreshSession("a");
-		expect(rounds).toHaveBeenCalledExactlyOnceWith("a", null);
-		expect(listener).toHaveBeenCalledWith(expect.objectContaining({ replace: true, refresh: true }));
+		await store.refreshSession("b");
+		expect(listener).not.toHaveBeenCalled();
+		await store.refreshSession("a");
+		expect(listener).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				thread: expect.objectContaining({ id: "a" }),
+				replace: true,
+				refresh: true,
+				rounds: [{ id: "user", messages: expect.any(Array) }],
+			}),
+		);
 		expect(store.projects()).toBe(catalog);
 		unsubscribe();
-		store.refreshSession("a");
-		expect(rounds).toHaveBeenCalledTimes(1);
+		await store.refreshSession("a");
+		expect(listener).toHaveBeenCalledTimes(1);
 		expect(new ViewerStore(directory).projects().revision).not.toBe(catalog.revision);
 	});
 });

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added opt-in request timing that separates server preparation, upstream response headers, and first content, with client preparation and transport timings enabled by `PI_TIMING=1`.
 - Added a collapsible parent-thread sidebar for tintinweb subagents, grouped by active and completed task state with live updates and persisted session links.
 - Displayed the pi-server package version on the viewer login and conversation pages.
 - Added a browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.
@@ -31,6 +32,7 @@
 
 ### Fixed
 
+- Made viewer persistence, history and asset reads, and authentication state I/O asynchronous. Viewer notifications run outside inference dispatch, with ordered per-thread operations, committed history indexes, and shutdown draining.
 - Loaded committed viewer tool outputs on expansion and parsed large event-stream frames incrementally to reduce thread-opening transfer size and browser CPU work.
 - Ordered threads and projects by server-recorded operation activity, preserving order across reconnects, metadata changes, history synchronization, and completed-result replay without requiring client activity timestamps.
 - Loaded thread history directly from its event stream in parallel with the catalog, cached build-versioned assets across reloads and restarts, and suppressed unchanged persistence snapshots.

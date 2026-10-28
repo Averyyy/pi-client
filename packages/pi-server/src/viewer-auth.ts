@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 
@@ -8,35 +9,45 @@ interface AuthState {
 	generation: number;
 }
 
-function readState(directory: string): AuthState {
+function readStateSync(directory: string): AuthState {
 	const path = join(directory, "auth.json");
 	return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as AuthState) : { failures: 0, generation: 0 };
 }
 
-function writeState(directory: string, state: AuthState): void {
-	mkdirSync(directory, { recursive: true });
-	const path = join(directory, "auth.json");
-	writeFileSync(`${path}.tmp`, JSON.stringify(state), { mode: 0o600 });
-	renameSync(`${path}.tmp`, path);
+async function readState(directory: string): Promise<AuthState> {
+	try {
+		return JSON.parse(await readFile(join(directory, "auth.json"), "utf8")) as AuthState;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { failures: 0, generation: 0 };
+		throw error;
+	}
 }
 
-export function unlockViewer(sessionStoreDir: string): void {
+async function writeState(directory: string, state: AuthState): Promise<void> {
+	await mkdir(directory, { recursive: true });
+	const path = join(directory, "auth.json");
+	await writeFile(`${path}.tmp`, JSON.stringify(state), { mode: 0o600 });
+	await rename(`${path}.tmp`, path);
+}
+
+export async function unlockViewer(sessionStoreDir: string): Promise<void> {
 	const directory = join(sessionStoreDir, ".viewer");
-	const state = readState(directory);
-	writeState(directory, { failures: 0, generation: state.generation + 1 });
+	const state = await readState(directory);
+	await writeState(directory, { failures: 0, generation: state.generation + 1 });
 }
 
 export class ViewerAuth {
 	private readonly directory: string;
 	private readonly token: string | undefined;
 	private state: AuthState;
+	private pendingStateOperation: Promise<void> = Promise.resolve();
 	private readonly cookies = new Map<string, number>();
 	private readonly responses = new Map<ServerResponse, string | undefined>();
 
 	constructor(sessionStoreDir: string, token: string | undefined) {
 		this.directory = join(sessionStoreDir, ".viewer");
 		this.token = token;
-		this.state = readState(this.directory);
+		this.state = readStateSync(this.directory);
 	}
 
 	get configured(): boolean {
@@ -47,8 +58,21 @@ export class ViewerAuth {
 		return Math.max(0, 10 - this.state.failures);
 	}
 
-	get locked(): boolean {
-		const current = readState(this.directory);
+	isLocked(): Promise<boolean> {
+		return this.withState(() => this.refreshState());
+	}
+
+	private withState<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.pendingStateOperation.then(operation);
+		this.pendingStateOperation = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
+	}
+
+	private async refreshState(): Promise<boolean> {
+		const current = await readState(this.directory);
 		if (current.generation !== this.state.generation || current.failures >= 10) {
 			this.cookies.clear();
 			for (const response of this.responses.keys()) response.end();
@@ -58,27 +82,29 @@ export class ViewerAuth {
 		return current.failures >= 10;
 	}
 
-	authenticate(req: IncomingMessage, login = false): 200 | 401 | 423 {
-		if (this.locked) return 423;
-		if (!this.token) return login ? 401 : 200;
-		const header = req.headers.authorization;
-		if (!header && !login) return 401;
-		const received = Buffer.from(header?.startsWith("Bearer ") ? header.slice(7) : login ? "" : (header ?? ""));
-		const expected = Buffer.from(this.token);
-		if (received.length === expected.length && timingSafeEqual(received, expected)) {
-			if (login && this.state.failures) {
-				this.state.failures = 0;
-				writeState(this.directory, this.state);
+	authenticate(req: IncomingMessage, login = false): Promise<200 | 401 | 423> {
+		return this.withState(async () => {
+			if (await this.refreshState()) return 423;
+			if (!this.token) return login ? 401 : 200;
+			const header = req.headers.authorization;
+			if (!header && !login) return 401;
+			const received = Buffer.from(header?.startsWith("Bearer ") ? header.slice(7) : login ? "" : (header ?? ""));
+			const expected = Buffer.from(this.token);
+			if (received.length === expected.length && timingSafeEqual(received, expected)) {
+				if (login && this.state.failures) {
+					this.state.failures = 0;
+					await writeState(this.directory, this.state);
+				}
+				return 200;
 			}
-			return 200;
-		}
-		this.state.failures++;
-		writeState(this.directory, this.state);
-		if (this.state.failures < 10) return 401;
-		this.cookies.clear();
-		for (const response of this.responses.keys()) response.end();
-		this.responses.clear();
-		return 423;
+			this.state.failures++;
+			await writeState(this.directory, this.state);
+			if (this.state.failures < 10) return 401;
+			this.cookies.clear();
+			for (const response of this.responses.keys()) response.end();
+			this.responses.clear();
+			return 423;
+		});
 	}
 
 	createCookie(req: IncomingMessage): string {

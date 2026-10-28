@@ -261,6 +261,8 @@ export interface PiServerHistorySnapshot {
 }
 
 export interface PiServerStreamOptions extends SimpleStreamOptions {
+	/** Monotonic start of run preparation or the last top-level tool completion; kept client-local. */
+	clientTiming?: { startedAt: number; boundary: "run_accepted" | "tool_end" | "message_start" };
 	requireCacheRetention?: boolean;
 	onCacheRetentionResolved?: (retention: CacheRetention) => void | Promise<void>;
 	requestKind?: "api" | "simple" | "deferred";
@@ -1131,6 +1133,9 @@ export async function streamPiServer(
 	context: Context,
 	options?: PiServerStreamOptions,
 ): Promise<PiServerEventStream> {
+	const observeTiming = process.env.PI_TIMING === "1";
+	const startedAt = observeTiming ? performance.now() : 0;
+	const clientTiming = options?.clientTiming;
 	assertNoCustomPiServerFetch(options);
 	assertNoCustomPiServerFetch(options?.apiOptions);
 	const sessionId = options?.sessionId ?? randomUUID();
@@ -1163,6 +1168,48 @@ export async function streamPiServer(
 		let observerFailed = false;
 		let callbackFailed = false;
 		let cacheRetention: CacheRetention | undefined;
+		let sessionInitMs: number | undefined;
+		let requestStartedAt = startedAt;
+		let requestToHeadersMs: number | undefined;
+		let firstContentMs: number | undefined;
+		let timingPrinted = false;
+		let serverTiming:
+			| {
+					bodyReadyMs: number;
+					providerDispatchMs: number;
+					upstreamRequestMs?: number;
+					upstreamHeadersMs?: number;
+					firstContentMs?: number;
+			  }
+			| undefined;
+		const recordTiming = (message?: AssistantMessage): void => {
+			if (!observeTiming) return;
+			const details = {
+				runId,
+				provider: model.provider,
+				model: model.id,
+				...(clientTiming
+					? {
+							clientPrepareMs: Math.round(startedAt - clientTiming.startedAt),
+							clientPrepareFrom: clientTiming.boundary,
+						}
+					: {}),
+				...(sessionInitMs === undefined ? {} : { sessionInitMs }),
+				...(requestToHeadersMs === undefined ? {} : { requestToHeadersMs }),
+				...(firstContentMs === undefined ? {} : { firstContentMs }),
+				...(serverTiming ? { server: serverTiming } : {}),
+			};
+			if (!timingPrinted) {
+				timingPrinted = true;
+				console.error(`[pi-server timing] ${JSON.stringify(details)}`);
+			}
+			if (message) {
+				message.diagnostics = [
+					...(message.diagnostics ?? []),
+					{ type: "pi_server_timing", timestamp: Date.now(), details },
+				];
+			}
+		};
 		const requireCacheRetention = options?.requireCacheRetention || options?.onCacheRetentionResolved !== undefined;
 		const applyCachePolicy = async (retention: unknown): Promise<void> => {
 			try {
@@ -1186,10 +1233,12 @@ export async function streamPiServer(
 		try {
 			const request = createPiServerRequest(options?.signal);
 			await ensureSessionInit(sessionId, context, request);
+			if (observeTiming) sessionInitMs = Math.round(performance.now() - startedAt);
 
 			const makeBody = () => ({
 				sessionId,
 				runId,
+				...(observeTiming ? { observeTiming: true } : {}),
 				model,
 				options:
 					options?.requestKind === "api" || options?.requestKind === "deferred"
@@ -1205,14 +1254,18 @@ export async function streamPiServer(
 				],
 			});
 			phase = "provider_stream";
+			if (observeTiming) requestStartedAt = performance.now();
 			let response = await request.postJson("/api/stream", makeBody());
+			if (observeTiming) requestToHeadersMs = Math.round(performance.now() - requestStartedAt);
 
 			if (!response.ok) {
 				let failure = await readPiServerFailure(response);
 				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);
+					if (observeTiming) requestStartedAt = performance.now();
 					response = await request.postJson("/api/stream", makeBody());
+					if (observeTiming) requestToHeadersMs = Math.round(performance.now() - requestStartedAt);
 					if (response.ok) {
 						failure = { details: "", code: undefined };
 					} else {
@@ -1233,6 +1286,11 @@ export async function streamPiServer(
 
 			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
+					if (serverEvent.event === "timing") {
+						if (observeTiming)
+							serverTiming = parseServerSentEventData(serverEvent, "pi-server timing") as typeof serverTiming;
+						continue;
+					}
 					if (serverEvent.event === "cache_policy") {
 						try {
 							const policy = parseServerSentEventData(serverEvent, "pi-server cache policy");
@@ -1278,6 +1336,27 @@ export async function streamPiServer(
 					}
 					const event = processProxyEvent(proxyEvent, partial);
 					if (!event) continue;
+					const finalMessage =
+						event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
+					if (
+						observeTiming &&
+						firstContentMs === undefined &&
+						(((event.type === "text_delta" ||
+							event.type === "thinking_delta" ||
+							event.type === "toolcall_delta") &&
+							event.delta.length > 0) ||
+							finalMessage?.content.some((block) =>
+								block.type === "text"
+									? block.text.length > 0
+									: block.type === "thinking"
+										? block.thinking.length > 0
+										: block.name.length > 0,
+							))
+					) {
+						firstContentMs = Math.round(performance.now() - requestStartedAt);
+						recordTiming();
+					}
+					if (finalMessage) recordTiming(finalMessage);
 					if (event.type === "done" || event.type === "error") terminalReceived = true;
 					stream.push(event);
 				}
@@ -1335,6 +1414,7 @@ export async function streamPiServer(
 						await applyCachePolicy(recoveredRun?.cacheRetention);
 					}
 					if (recoveredRun?.status === "completed" && recoveredRun.message) {
+						recordTiming(recoveredRun.message);
 						switch (recoveredRun.message.stopReason) {
 							case "stop":
 							case "length":
@@ -1358,6 +1438,7 @@ export async function streamPiServer(
 					}
 					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
 						if (recoveredRun.message) {
+							recordTiming(recoveredRun.message);
 							stream.push({ type: "error", reason: "error", error: recoveredRun.message });
 							stream.end();
 							return;
@@ -1401,6 +1482,7 @@ export async function streamPiServer(
 					},
 				},
 			];
+			recordTiming(partial);
 			stream.push({
 				type: "error",
 				reason,

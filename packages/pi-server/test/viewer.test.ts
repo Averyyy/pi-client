@@ -200,7 +200,7 @@ describe("server thread viewer", () => {
 		await stop();
 		await start();
 		expect((await login()).status).toBe(423);
-		unlockViewer(directory);
+		await unlockViewer(directory);
 		expect((await login()).status).toBe(200);
 		expect((await viewer("projects", authCookie)).status).toBe(401);
 		await stop();
@@ -459,12 +459,12 @@ describe("server thread viewer", () => {
 });
 
 describe("viewer projection persistence", () => {
-	it("replays updates once and recovers only committed log offsets after restart and replacement", () => {
+	it("replays updates once and recovers only committed log offsets after restart and replacement", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-viewer-store-"));
 		try {
 			const store = new ViewerStore(directory);
 			const { connectionId } = store.connect("thread/../../id");
-			store.update({
+			await store.update({
 				sessionId: "thread/../../id",
 				connectionId,
 				sequence: 1,
@@ -472,19 +472,19 @@ describe("viewer projection persistence", () => {
 				replace: [message("original")],
 				status: "idle",
 			});
-			store.update({
+			await store.update({
 				sessionId: "thread/../../id",
 				connectionId,
 				sequence: 2,
 				append: [message("tail", "assistant")],
 			});
-			store.update({
+			await store.update({
 				sessionId: "thread/../../id",
 				connectionId,
 				sequence: 2,
 				append: [message("tail", "assistant")],
 			});
-			expect(store.rounds("thread/../../id", null).rounds[0].messages).toHaveLength(2);
+			expect((await store.rounds("thread/../../id", null)).rounds[0].messages).toHaveLength(2);
 			const metadataDir = join(directory, ".viewer", "threads");
 			const metadataPath = join(
 				metadataDir,
@@ -495,25 +495,25 @@ describe("viewer projection persistence", () => {
 			const restarted = new ViewerStore(directory);
 			expect(restarted.get("thread/../../id")?.status).toBe("disconnected");
 			const next = restarted.connect("thread/../../id");
-			restarted.update({
+			await restarted.update({
 				sessionId: "thread/../../id",
 				connectionId: next.connectionId,
 				sequence: 1,
 				append: [message("committed", "assistant")],
 			});
-			expect(restarted.rounds("thread/../../id", null).rounds[0].messages.map((entry) => entry.id)).toEqual([
+			expect((await restarted.rounds("thread/../../id", null)).rounds[0].messages.map((entry) => entry.id)).toEqual([
 				"original",
 				"tail",
 				"committed",
 			]);
-			restarted.update({
+			await restarted.update({
 				sessionId: "thread/../../id",
 				connectionId: next.connectionId,
 				sequence: 2,
 				replace: [message("replacement")],
 			});
 			const final = new ViewerStore(directory);
-			expect(final.rounds("thread/../../id", null).rounds[0].id).toBe("replacement");
+			expect((await final.rounds("thread/../../id", null)).rounds[0].id).toBe("replacement");
 			expect(readFileSync(metadataPath, "utf8")).not.toContain(`"logId":"${metadata.logId}"`);
 			expect(readdirSync(metadataDir).filter((path) => path.endsWith(".jsonl"))).toHaveLength(1);
 		} finally {
@@ -521,7 +521,7 @@ describe("viewer projection persistence", () => {
 		}
 	});
 
-	it("keeps live deltas off disk and catalog invalidation while publishing their exact state", () => {
+	it("keeps live deltas off disk and catalog invalidation while publishing their exact state", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-viewer-live-"));
 		try {
 			const store = new ViewerStore(directory);
@@ -534,7 +534,7 @@ describe("viewer projection persistence", () => {
 			store.subscribe("thread", () => {
 				updates++;
 			});
-			store.update({
+			await store.update({
 				sessionId: "thread",
 				connectionId,
 				sequence: 1,
@@ -546,7 +546,7 @@ describe("viewer projection persistence", () => {
 			const metadataDir = join(directory, ".viewer", "threads");
 			const path = join(metadataDir, readdirSync(metadataDir).find((path) => path.endsWith(".json")) ?? "missing");
 			const initial = readFileSync(path, "utf8");
-			store.update({
+			await store.update({
 				sessionId: "thread",
 				connectionId,
 				sequence: 2,

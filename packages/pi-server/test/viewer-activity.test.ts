@@ -54,7 +54,7 @@ describe("viewer activity timestamps", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
-	it("sorts projects and paginated threads by recorded activity with empty sessions last", () => {
+	it("sorts projects and paginated threads by recorded activity with empty sessions last", async () => {
 		for (let index = 0; index < 7; index++)
 			archive(`a${index}`, "D:/a", [entry(`u${index}`, index * 10)], 1000 - index * 10);
 		archive(
@@ -87,7 +87,7 @@ describe("viewer activity timestamps", () => {
 			lastActiveAt: 20,
 		});
 		deleteSession("a2");
-		store.remove("a2");
+		await store.remove("a2");
 		expect(store.page("D:/a", first.nextCursor).threads.map(({ id }) => id)).toEqual([
 			"a1",
 			"a0",
@@ -96,7 +96,7 @@ describe("viewer activity timestamps", () => {
 		]);
 		for (const id of ["a6", "a5", "a4"]) {
 			deleteSession(id);
-			store.remove(id);
+			await store.remove(id);
 		}
 		expect(store.projects().projects.map(({ id, lastActiveAt }) => [id, lastActiveAt])).toEqual([
 			["D:/b", 40],
@@ -105,7 +105,7 @@ describe("viewer activity timestamps", () => {
 		]);
 	});
 
-	it("continues pagination after a deleted null-activity cursor", () => {
+	it("continues pagination after a deleted null-activity cursor", async () => {
 		for (let index = 0; index < 7; index++) archive(`empty-${index}`, "D:/empty", [], index);
 		const store = new ViewerStore(directory);
 		const first = store.page("D:/empty", null);
@@ -115,16 +115,16 @@ describe("viewer activity timestamps", () => {
 			lastActiveAt: null,
 		});
 		deleteSession("empty-4");
-		store.remove("empty-4");
+		await store.remove("empty-4");
 		expect(store.page("D:/empty", first.nextCursor).threads.map(({ id }) => id)).toEqual(["empty-5", "empty-6"]);
 	});
 
-	it("keeps activity across branch switches and ignores metadata and hidden messages", () => {
+	it("keeps activity across branch switches and ignores metadata and hidden messages", async () => {
 		archive("thread", "D:/a", [entry("old", 10), entry("recent", 50, "old")], 1000);
 		const store = new ViewerStore(directory);
 		const original = store.projects();
 		switchSessionLeaf("thread", "old");
-		store.refreshSession("thread");
+		await store.refreshSession("thread");
 		expect(store.get("thread")?.lastActiveAt).toBe(50);
 		expect(store.projects()).toBe(original);
 		const metadata: SessionTreeEntry[] = [
@@ -176,7 +176,7 @@ describe("viewer activity timestamps", () => {
 			},
 		];
 		appendSessionEntries("thread", metadata, "system");
-		store.refreshSession("thread");
+		await store.refreshSession("thread");
 		expect(store.projects()).toBe(original);
 		appendSessionEntries(
 			"thread",
@@ -192,10 +192,10 @@ describe("viewer activity timestamps", () => {
 			"title",
 		);
 		setStaticContext("thread", { systemPrompt: "Instructions\nCurrent working directory: D:/moved" });
-		store.refreshSession("thread");
+		await store.refreshSession("thread");
 		expect(store.get("thread")).toMatchObject({ title: "Renamed", cwd: "D:/moved", lastActiveAt: 50 });
 		appendSessionEntries("thread", [entry("new", 900, "title")], "new");
-		store.refreshSession("thread");
+		await store.refreshSession("thread");
 		expect(store.projects().projects[0].lastActiveAt).toBe(900);
 	});
 
@@ -211,7 +211,7 @@ describe("viewer activity timestamps", () => {
 		expect(new ViewerStore(directory).get("thread")?.lastActiveAt).toBe(80);
 	});
 
-	it("records server activity without an observer and preserves archive history", () => {
+	it("records server activity without an observer and preserves archive history", async () => {
 		archive("thread", "D:/a", [entry("u", 900000)], 999999);
 		const original = structuredClone(getSession("thread"));
 		const store = new ViewerStore(directory);
@@ -220,18 +220,19 @@ describe("viewer activity timestamps", () => {
 		vi.spyOn(Date, "now").mockReturnValue(100);
 		store.recordActivity("thread");
 		expect(store.get("thread")).toMatchObject({ lastActiveAt: 100, legacy: true });
+		await store.flush();
 		expect(store.projects().projects[0].lastActiveAt).toBe(100);
 		expect(rounds).not.toHaveBeenCalled();
 		expect(getSession("thread")).toEqual(original);
-		expect(store.rounds("thread", null).rounds[0].messages[0].id).toBe("u");
+		expect((await store.rounds("thread", null)).rounds[0].messages[0].id).toBe("u");
 		expect(new ViewerStore(directory).get("thread")?.lastActiveAt).toBe(100);
 	});
 
-	it("keeps observer projections, metadata and reconnects from advancing server activity", () => {
+	it("keeps observer projections, metadata and reconnects from advancing server activity", async () => {
 		const store = new ViewerStore(directory);
 		const first = store.connect("observer");
 		const messages: ViewerMessage[] = [{ id: "u", role: "user", content: "Question", timestamp: 900000 }];
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: first.connectionId,
 			sequence: 1,
@@ -244,7 +245,7 @@ describe("viewer activity timestamps", () => {
 		store.recordActivity("observer");
 		first.close();
 		const reconnected = store.connect("observer");
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: reconnected.connectionId,
 			sequence: 1,
@@ -253,9 +254,14 @@ describe("viewer activity timestamps", () => {
 			status: "idle",
 		});
 		const catalog = store.projects();
-		store.update({ sessionId: "observer", connectionId: reconnected.connectionId, sequence: 2, replace: messages });
+		await store.update({
+			sessionId: "observer",
+			connectionId: reconnected.connectionId,
+			sequence: 2,
+			replace: messages,
+		});
 		expect(store.projects()).toBe(catalog);
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: reconnected.connectionId,
 			sequence: 3,
@@ -263,7 +269,7 @@ describe("viewer activity timestamps", () => {
 			cwd: "D:/b",
 		});
 		expect(store.get("observer")).toMatchObject({ title: "Renamed", cwd: "D:/b", lastActiveAt: 100 });
-		store.update({
+		await store.update({
 			sessionId: "observer",
 			connectionId: reconnected.connectionId,
 			sequence: 4,
@@ -275,7 +281,7 @@ describe("viewer activity timestamps", () => {
 
 	it.each([false, true])(
 		"migrates stored observer activity from historical records once with previous activity field %s",
-		(hasActivity) => {
+		async (hasActivity) => {
 			archive("observer", "D:/a", [entry("archive", 80)], 9999999);
 			const store = new ViewerStore(directory);
 			const { connectionId } = store.connect("observer");
@@ -283,7 +289,7 @@ describe("viewer activity timestamps", () => {
 				{ id: "u", role: "user", content: "Question", timestamp: 90 },
 				{ id: "a", role: "assistant", content: "Answer", timestamp: 30 },
 			];
-			store.update({ sessionId: "observer", connectionId, sequence: 1, cwd: "D:/a", replace: messages });
+			await store.update({ sessionId: "observer", connectionId, sequence: 1, cwd: "D:/a", replace: messages });
 			const metadataDir = join(directory, ".viewer", "threads");
 			const metadataPath = join(metadataDir, readdirSync(metadataDir).find((path) => path.endsWith(".json"))!);
 			const legacy = JSON.parse(readFileSync(metadataPath, "utf8")) as {
@@ -297,7 +303,7 @@ describe("viewer activity timestamps", () => {
 			writeFileSync(metadataPath, JSON.stringify(legacy));
 			const migrated = new ViewerStore(directory);
 			expect(migrated.get("observer")?.lastActiveAt).toBe(90);
-			expect(migrated.rounds("observer", null).rounds[0].messages).toEqual(messages);
+			expect((await migrated.rounds("observer", null)).rounds[0].messages).toEqual(messages);
 			const saved = readFileSync(metadataPath, "utf8");
 			expect(JSON.parse(saved)).toMatchObject({ serverLastActiveAt: 90, thread: { lastActiveAt: 90 } });
 			expect(saved).not.toContain("updatedAt");
@@ -305,11 +311,12 @@ describe("viewer activity timestamps", () => {
 			expect(readFileSync(metadataPath, "utf8")).toBe(saved);
 			vi.spyOn(Date, "now").mockReturnValue(10);
 			migrated.recordActivity("observer");
+			await migrated.flush();
 			expect(new ViewerStore(directory).get("observer")?.lastActiveAt).toBe(10);
 		},
 	);
 
-	it("ignores observer activity fields at the HTTP boundary", () => {
+	it("ignores observer activity fields at the HTTP boundary", async () => {
 		const http = new ViewerHttp(loadConfig({ sessionStoreDir: directory, authToken: "test" }), async () => ({
 			deletedIds: [],
 			deletedCount: 0,
@@ -320,7 +327,7 @@ describe("viewer activity timestamps", () => {
 		http.store.recordActivity("thread");
 		for (const [index, lastActiveAt] of ["10", true, {}, NaN, Infinity, null, 9999999].entries()) {
 			const writeHead = vi.fn();
-			http.observe(
+			await http.observe(
 				{
 					sessionId: "thread",
 					connectionId,

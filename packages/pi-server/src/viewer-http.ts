@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { promises as fs } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -108,11 +108,16 @@ function live(value: unknown): ViewerLive {
 	return { message: state.message === null ? null : projectMessage(object(state.message)), tools };
 }
 
+interface ViewerAssets {
+	version: string;
+	files: Map<string, { body: Buffer; contentType: string }>;
+}
+
 export class ViewerHttp {
 	readonly auth: ViewerAuth;
 	readonly store: ViewerStore;
 	private readonly streams = new Set<ServerResponse>();
-	private assets: { version: string; files: Map<string, { body: Buffer; contentType: string }> } | undefined;
+	private assets: Promise<ViewerAssets | undefined> | undefined;
 	private readonly deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>;
 
 	constructor(config: ServerConfig, deleteSessions: (ids: string[]) => Promise<ViewerDeleteResult>) {
@@ -125,6 +130,33 @@ export class ViewerHttp {
 		for (const stream of this.streams) stream.end();
 	}
 
+	private async loadAssets(): Promise<ViewerAssets | undefined> {
+		const directory = new URL("../dist/viewer/", import.meta.url);
+		const manifest = fileURLToPath(new URL("asset-version.json", directory));
+		let raw: string;
+		try {
+			raw = await fs.readFile(manifest, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		const { version } = JSON.parse(raw) as { version: string };
+		const files = new Map<string, { body: Buffer; contentType: string }>();
+		await Promise.all(
+			[
+				["/", "index.html", "text/html; charset=utf-8"],
+				[`/viewer/assets/${version}/app.js`, "app.js", "text/javascript; charset=utf-8"],
+				[`/viewer/assets/${version}/app.css`, "app.css", "text/css; charset=utf-8"],
+			].map(async ([path, file, contentType]) => {
+				let body = await fs.readFile(new URL(file, directory));
+				if (path === "/")
+					body = Buffer.from(body.toString("utf8").replace("__PI_SERVER_VERSION__", packageVersion));
+				files.set(path, { body, contentType });
+			}),
+		);
+		return { version, files };
+	}
+
 	async handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
 		if (url.pathname !== "/" && !url.pathname.startsWith("/viewer/")) return false;
 		securityHeaders(res);
@@ -133,34 +165,23 @@ export class ViewerHttp {
 			return true;
 		}
 		if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/viewer/assets/"))) {
-			if (!this.assets) {
-				const directory = new URL("../dist/viewer/", import.meta.url);
-				const manifest = fileURLToPath(new URL("asset-version.json", directory));
-				if (!existsSync(manifest)) {
-					json(res, 503, { error: "Viewer assets unavailable" });
-					return true;
-				}
-				const { version } = JSON.parse(readFileSync(manifest, "utf8")) as { version: string };
-				const files = new Map<string, { body: Buffer; contentType: string }>();
-				for (const [path, file, contentType] of [
-					["/", "index.html", "text/html; charset=utf-8"],
-					[`/viewer/assets/${version}/app.js`, "app.js", "text/javascript; charset=utf-8"],
-					[`/viewer/assets/${version}/app.css`, "app.css", "text/css; charset=utf-8"],
-				]) {
-					let body = readFileSync(new URL(file, directory));
-					if (path === "/")
-						body = Buffer.from(body.toString("utf8").replace("__PI_SERVER_VERSION__", packageVersion));
-					files.set(path, { body, contentType });
-				}
-				this.assets = { version, files };
+			this.assets ??= this.loadAssets().catch((error: unknown) => {
+				this.assets = undefined;
+				throw error;
+			});
+			const assets = await this.assets;
+			if (!assets) {
+				this.assets = undefined;
+				json(res, 503, { error: "Viewer assets unavailable" });
+				return true;
 			}
-			const asset = this.assets.files.get(url.pathname);
+			const asset = assets.files.get(url.pathname);
 			if (!asset) {
 				json(res, 404, { error: "Not found" });
 				return true;
 			}
 			if (url.pathname !== "/") {
-				const tag = `"${this.assets.version}"`;
+				const tag = `"${assets.version}"`;
 				res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
 				res.setHeader("ETag", tag);
 				const validator = req.headers["if-none-match"];
@@ -179,7 +200,7 @@ export class ViewerHttp {
 			return true;
 		}
 		if (req.method === "POST" && url.pathname === "/viewer/login") {
-			const status = this.auth.authenticate(req, true);
+			const status = await this.auth.authenticate(req, true);
 			if (status !== 200) {
 				json(res, status, {
 					error: status === 423 ? "Viewer locked" : "Unauthorized",
@@ -191,7 +212,7 @@ export class ViewerHttp {
 			json(res, 200, { authenticated: true });
 			return true;
 		}
-		if (this.auth.locked) {
+		if (await this.auth.isLocked()) {
 			json(res, 423, { error: "Viewer locked", remainingAttempts: 0 });
 			return true;
 		}
@@ -237,7 +258,7 @@ export class ViewerHttp {
 			} else {
 				const detail = /^\/viewer\/api\/threads\/([^/]+)\/rounds\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
 				if (detail) {
-					const message = this.store.message(
+					const message = await this.store.message(
 						decodeURIComponent(detail[1]),
 						decodeURIComponent(detail[2]),
 						decodeURIComponent(detail[3]),
@@ -252,12 +273,10 @@ export class ViewerHttp {
 					json(res, 404, { error: "Thread not found" });
 					return true;
 				}
-				if (match?.[2] === "rounds") json(res, 200, this.store.rounds(id, url.searchParams.get("before")));
+				if (match?.[2] === "rounds") json(res, 200, await this.store.rounds(id, url.searchParams.get("before")));
 				else if (match?.[2] === "events") {
 					const send = this.events(req, res);
-					const unsubscribe = this.store.subscribe(id, (update: ViewerUpdate) => {
-						send(update.replace && update.refresh ? "snapshot" : "update", update);
-					});
+					let unsubscribe: (() => void) | undefined;
 					const removed = (removedId: string) => {
 						if (removedId === id) {
 							send("deleted", { id });
@@ -266,10 +285,14 @@ export class ViewerHttp {
 					};
 					this.store.removedListeners.add(removed);
 					res.once("close", () => {
-						unsubscribe();
+						unsubscribe?.();
 						this.store.removedListeners.delete(removed);
 					});
-					send("snapshot", { thread, ...this.store.rounds(id, null) });
+					const release = await this.store.subscribeWithSnapshot(id, (update: ViewerUpdate) => {
+						send(update.replace && update.refresh ? "snapshot" : "update", update);
+					});
+					if (res.destroyed || res.writableEnded) release();
+					else unsubscribe = release;
 				} else json(res, 200, { thread });
 			}
 		} catch (error) {
@@ -301,7 +324,7 @@ export class ViewerHttp {
 		send("connected", { connectionId: connection.connectionId });
 	}
 
-	observe(value: unknown, res: ServerResponse): void {
+	async observe(value: unknown, res: ServerResponse): Promise<void> {
 		try {
 			const body = object(value);
 			if (typeof body.sessionId !== "string" || !body.sessionId || typeof body.connectionId !== "string")
@@ -327,7 +350,7 @@ export class ViewerHttp {
 				...(body.live !== undefined ? { live: live(body.live) } : {}),
 				...(body.subagents !== undefined ? { subagents: subagents(body.subagents) } : {}),
 			};
-			this.store.update(update);
+			await this.store.update(update);
 			json(res, 200, { accepted: true });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "Invalid observer request";
@@ -354,12 +377,22 @@ export class ViewerHttp {
 			}
 			blocked = !res.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
 		};
-		const heartbeat = setInterval(() => {
-			if (this.auth.locked || (cookie && !this.auth.hasCookie(req))) {
+		let checkingAuth = false;
+		const heartbeat = setInterval(async () => {
+			if (checkingAuth) return;
+			checkingAuth = true;
+			try {
+				if ((await this.auth.isLocked()) || (cookie && !this.auth.hasCookie(req))) {
+					res.end();
+					return;
+				}
+				if (!blocked && !res.writableEnded && !res.destroyed) blocked = !res.write(": keep-alive\n\n");
+			} catch (error) {
+				console.error("Viewer stream authentication failed:", error);
 				res.end();
-				return;
+			} finally {
+				checkingAuth = false;
 			}
-			if (!blocked && !res.writableEnded) blocked = !res.write(": keep-alive\n\n");
 		}, 25_000);
 		heartbeat.unref();
 		res.once("close", () => {

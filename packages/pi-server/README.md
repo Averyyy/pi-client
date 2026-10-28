@@ -52,6 +52,16 @@ Use the same release version for client and server. The authenticated `/api/mode
 
 Image generation and classification stream heartbeat responses and journal completed results for recovery without repeating the provider operation. Cancellation is acknowledged after provider cleanup finishes. Oversized operation payloads use `/api/request/chunk`, including when clients set a 64 KiB request-body limit.
 
+## Request Timing
+
+Set `PI_TIMING=1` on the client to print request latency diagnostics. The client requests an opt-in `event: timing` SSE frame from `/api/stream`; ordinary requests do not include that frame.
+
+Client `clientPrepareMs` starts at the boundary named by `clientPrepareFrom`: an accepted run, the agent's tool-completion event, or a user-message start. The tool boundary includes subsequent extension handlers and request preparation, while excluding tool execution itself. `sessionInitMs` measures session initialization, and client `firstContentMs` measures the interval from starting the stream POST to receiving content.
+
+Server fields are cumulative milliseconds from receipt of the HTTP request: `bodyReadyMs` marks parsed request data, `providerDispatchMs` marks the provider call, `upstreamRequestMs` marks the prepared upstream payload, `upstreamHeadersMs` marks the first upstream HTTP response, and `firstContentMs` marks the first nonempty text, thinking, or tool-call output. Final-only content also counts. Adapters without a lifecycle callback omit its field. For chunked uploads, server timing starts with the completing HTTP chunk. The client's `requestToHeadersMs` includes serialization, all upload chunks, server processing, and the response headers.
+
+`providerDispatchMs` to `upstreamRequestMs` covers provider authentication, loading, and payload preparation on the server. `upstreamRequestMs` to `firstContentMs` includes HTTP setup, network transit, upstream queueing, retries, and model processing. `upstreamHeadersMs` separates the first upstream HTTP response from the remaining wait for content. These intervals do not measure model prefill separately. HTTP headers, heartbeat bytes, and empty stream events do not count as model content.
+
 ## Thread Viewer
 
 Open the server's root URL and sign in with `PI_SERVER_AUTH_TOKEN`. The home page groups threads by their client working directory and lists running threads first. Threads are ordered by their latest activity; projects use their most recently active thread. The server records activity when it starts and finishes inference, compaction, image, classifier, and deferred operations. Reading history, reconnecting, synchronizing existing history, renaming, and replaying completed results do not advance that time. Archived sessions use their saved conversation timestamps until the server records a new operation. Cache warming uses the same provider request protocol and counts as activity. Sessions without activity appear last.
@@ -61,6 +71,8 @@ Project folders expand five threads at a time. Thread pages show the latest five
 Right-click a project to collapse or expand it, or to delete all its server conversations. Right-click a thread to delete that server conversation. The same menus are available through the context-menu key or Shift+F10. Deletion requires confirmation and includes saved history and observer records. Project deletion includes conversations beyond the currently loaded pages.
 
 The server indexes projects once per process and updates only affected sessions as they change. Pagination reads the project's index without scanning every session. The browser loads visible expanded folders and keeps their pages in memory while the page remains open; unchanged folders reuse those pages. Offscreen changes are fetched when the folder becomes visible. JavaScript and CSS use build-versioned URLs and immutable browser caching, including across server restarts; HTML, authentication, and conversation responses remain `no-store`.
+
+Viewer reads, writes, and notifications run asynchronously in order for each thread. Activity updates do not wait for viewer storage or notifications before dispatching inference. Observer updates publish their content index after storage commits; deletion waits for preceding operations, and server shutdown drains pending operations. Asset loading and authentication state I/O are also asynchronous.
 
 Opening a thread reads its initial history and live updates through one event-stream request. A direct thread URL starts that stream alongside the project catalog. Unchanged session initialization and idempotent history writes do not resend the viewer's history snapshot.
 

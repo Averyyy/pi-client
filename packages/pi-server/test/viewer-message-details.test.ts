@@ -30,29 +30,29 @@ describe("viewer committed message details", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
-	it("defers tool content in snapshots and appends while retaining full persisted content across restart", () => {
+	it("defers tool content in snapshots and appends while retaining full persisted content across restart", async () => {
 		const store = new ViewerStore(directory);
 		const connection = store.connect("thread");
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("thread", (update) => updates.push(update));
-		store.update({
+		await store.update({
 			sessionId: "thread",
 			connectionId: connection.connectionId,
 			sequence: 1,
 			cwd: "D:/project",
 			replace: [user, tool],
 		});
-		store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 2, append: [bash] });
+		await store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 2, append: [bash] });
 		expect(updates[0]).toMatchObject({
 			rounds: [{ messages: [user, { ...tool, content: [], contentDeferred: true }] }],
 		});
 		expect(updates[1]).toMatchObject({ append: [{ ...bash, content: [], contentDeferred: true }] });
-		expect(store.rounds("thread", null).rounds[0].messages).toEqual([
+		expect((await store.rounds("thread", null)).rounds[0].messages).toEqual([
 			user,
 			{ ...tool, content: [], contentDeferred: true },
 			{ ...bash, content: [], contentDeferred: true },
 		]);
-		expect(store.message("thread", "round", "tool")).toEqual(tool);
+		expect(await store.message("thread", "round", "tool")).toEqual(tool);
 		const logDirectory = join(directory, ".viewer", "threads");
 		const log = readdirSync(logDirectory).find((name) => name.endsWith(".jsonl"))!;
 		expect(
@@ -61,17 +61,17 @@ describe("viewer committed message details", () => {
 				.split("\n")
 				.map((line) => JSON.parse(line)),
 		).toEqual([user, tool, bash]);
-		expect(new ViewerStore(directory).message("thread", "round", "tool")).toEqual(tool);
-		expect(Buffer.byteLength(JSON.stringify(store.rounds("thread", null)))).toBeLessThan(1000);
-		expect(store.message("thread", "other-round", "tool")).toBeUndefined();
-		expect(store.message("thread", "round", "missing")).toBeUndefined();
-		store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 3, replace: [user] });
-		expect(store.message("thread", "round", "tool")).toBeUndefined();
-		store.remove("thread");
-		expect(store.message("thread", "round", "round")).toBeUndefined();
+		expect(await new ViewerStore(directory).message("thread", "round", "tool")).toEqual(tool);
+		expect(Buffer.byteLength(JSON.stringify(await store.rounds("thread", null)))).toBeLessThan(1000);
+		expect(await store.message("thread", "other-round", "tool")).toBeUndefined();
+		expect(await store.message("thread", "round", "missing")).toBeUndefined();
+		await store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 3, replace: [user] });
+		expect(await store.message("thread", "round", "tool")).toBeUndefined();
+		await store.remove("thread");
+		expect(await store.message("thread", "round", "round")).toBeUndefined();
 	});
 
-	it("retrieves archived details only from their current branch and round, with slim refresh snapshots", () => {
+	it("retrieves archived details only from their current branch and round, with slim refresh snapshots", async () => {
 		const entry = (message: ViewerMessage, parentId: string | null): SessionTreeEntry => ({
 			type: "message",
 			id: message.id,
@@ -97,14 +97,14 @@ describe("viewer committed message details", () => {
 		const store = new ViewerStore(directory);
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("archive", (update) => updates.push(update));
-		store.refreshSession("archive");
+		await store.refreshSession("archive");
 		expect(updates[0]).toMatchObject({
 			rounds: [{ messages: [user, { id: "tool", content: [], contentDeferred: true }] }],
 		});
-		expect(store.message("archive", "round", "tool")?.content).toEqual(tool.content);
-		expect(store.message("archive", "other", "tool")).toBeUndefined();
+		expect((await store.message("archive", "round", "tool"))?.content).toEqual(tool.content);
+		expect(await store.message("archive", "other", "tool")).toBeUndefined();
 		switchSessionLeaf("archive", "other");
-		expect(store.message("archive", "round", "tool")).toBeUndefined();
+		expect(await store.message("archive", "round", "tool")).toBeUndefined();
 	});
 
 	it("requires viewer authentication and returns 404 for missing detail identities", async () => {
@@ -113,7 +113,7 @@ describe("viewer committed message details", () => {
 			async () => ({ deletedIds: [], deletedCount: 0, failed: [] }),
 		);
 		const connection = viewer.store.connect("thread");
-		viewer.store.update({
+		await viewer.store.update({
 			sessionId: "thread",
 			connectionId: connection.connectionId,
 			sequence: 1,

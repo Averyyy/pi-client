@@ -209,7 +209,6 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 	it("skips unchanged persisted history and publishes revisions with unchanged catalog summaries", async () => {
 		vi.spyOn(Date, "now").mockReturnValue(1000);
 		const refresh = vi.spyOn(ViewerStore.prototype, "refreshSession");
-		const rounds = vi.spyOn(ViewerStore.prototype, "rounds");
 		expect((await post("init", { sessionId: "dedup" })).status).toBe(200);
 		expect(refresh).toHaveBeenCalledExactlyOnceWith("dedup");
 		const store = refresh.mock.contexts[0] as ViewerStore;
@@ -226,7 +225,6 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		const synced = await post("tree/sync", { sessionId: "dedup", entries, leafId: "u4" });
 		expect(synced.status).toBe(200);
 		const initial = (await synced.json()) as { revision: number };
-		expect(rounds).not.toHaveBeenCalled();
 		const catalog = store.projects();
 		const updates: ViewerUpdate[] = [];
 		const unsubscribe = store.subscribe("dedup", (update) => updates.push(update));
@@ -242,7 +240,6 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		const repeatedBytes = updates.reduce((bytes, update) => bytes + Buffer.byteLength(JSON.stringify(update)), 0);
 		expect(repeatedBytes).toBe(0);
 		expect(refresh).not.toHaveBeenCalled();
-		expect(rounds).not.toHaveBeenCalled();
 		const branch = { ...user("branch", "u0"), message: { role: "user", content: "Branch", timestamp: 1000 } };
 		expect((await post("tree/append", { sessionId: "dedup", entries: [branch], leafId: "branch" })).status).toBe(200);
 		expect(store.projects()).toBe(catalog);
@@ -253,7 +250,7 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 			rounds: [{ id: "u0" }, { id: "u1" }, { id: "u2" }, { id: "u3" }, { id: "u4" }],
 		});
 		expect(refresh).toHaveBeenCalledTimes(2);
-		expect(rounds).toHaveBeenCalledTimes(2);
+		expect(updates).toHaveLength(2);
 		unsubscribe();
 	});
 
@@ -266,7 +263,7 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		const updates: ViewerUpdate[] = [];
 		const unsubscribe = store.subscribe("observed", (update) => updates.push(update));
 		const first = { id: "observer", role: "user", content: "Observer history", timestamp: 1000 };
-		store.update({
+		await store.update({
 			sessionId: "observed",
 			connectionId: connection.connectionId,
 			sequence: 1,
@@ -276,13 +273,18 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		refresh.mockClear();
 		expect((await post("init", { sessionId: "observed" })).status).toBe(200);
 		const second = { id: "next", role: "user", content: "Next observer round", timestamp: 2000 };
-		store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 2, append: [second] });
+		await store.update({
+			sessionId: "observed",
+			connectionId: connection.connectionId,
+			sequence: 2,
+			append: [second],
+		});
 		expect((await post("tree/append", { sessionId: "observed", entries: [entry], leafId: entry.id })).status).toBe(
 			200,
 		);
 		const live = { message: { id: "live", role: "assistant", content: "Streaming", timestamp: 3000 }, tools: [] };
-		store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 3, live });
-		store.update({
+		await store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 3, live });
+		await store.update({
 			sessionId: "observed",
 			connectionId: connection.connectionId,
 			sequence: 4,
@@ -299,9 +301,9 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 	});
 
 	it("reports a viewer projection failure while preserving the successful persisted session result", async () => {
-		const refresh = vi.spyOn(ViewerStore.prototype, "refreshSession").mockImplementationOnce(() => {
-			throw new Error("Viewer projection unavailable");
-		});
+		const refresh = vi
+			.spyOn(ViewerStore.prototype, "refreshSession")
+			.mockRejectedValueOnce(new Error("Viewer projection unavailable"));
 		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
 		const response = await post("sync", {
 			sessionId: "projection-failure",

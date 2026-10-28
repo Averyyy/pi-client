@@ -15,7 +15,7 @@ import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
-import { type PiServerHistorySnapshot, streamPiServer } from "./pi-server-client.ts";
+import { type PiServerHistorySnapshot, type PiServerStreamOptions, streamPiServer } from "./pi-server-client.ts";
 import { PiServerObserver } from "./pi-server-observer.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -308,6 +308,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let agent: Agent;
 	let agentSession: AgentSession | undefined;
+	let clientTiming: PiServerStreamOptions["clientTiming"];
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -445,6 +446,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
 			const remote = process.env.PI_SERVER_MODE === "true";
+			const requestClientTiming = clientTiming;
+			clientTiming = undefined;
 			const cacheIsCurrent =
 				options?.sessionId === sessionManager.getSessionId() ? cacheContextIsCurrent(model) : undefined;
 			if (remote && cacheIsCurrent) cacheWarmer.cancel();
@@ -482,6 +485,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return streamPiServer(requestModel, context, {
 					...requestOptions,
+					clientTiming: requestClientTiming,
 					requireCacheRetention: cacheIsCurrent !== undefined,
 					onCacheRetentionResolved: cacheIsCurrent
 						? (cacheRetention) => {
@@ -533,6 +537,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
+	// Capture tool completion before AgentSession awaits extension event handlers.
+	agent.subscribe((event) => {
+		if (process.env.PI_TIMING === "1" && event.type === "tool_execution_end") {
+			clientTiming = { startedAt: performance.now(), boundary: "tool_end" };
+		}
+	});
+
 	const session = new AgentSession({
 		agent,
 		sessionManager,
@@ -556,6 +567,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (process.env.PI_SERVER_MODE === "true") new PiServerObserver(session);
 	session.subscribe((event) => {
 		if (event.type === "abort_start") cacheWarmer.cancel();
+		if (process.env.PI_TIMING !== "1") return;
+		if (event.type === "run_state_changed" && event.running) {
+			clientTiming = { startedAt: performance.now(), boundary: "run_accepted" };
+		} else if (event.type === "message_start" && event.message.role === "user" && !clientTiming) {
+			clientTiming = { startedAt: performance.now(), boundary: "message_start" };
+		} else if (event.type === "agent_settled") {
+			clientTiming = undefined;
+		}
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

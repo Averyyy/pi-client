@@ -13,7 +13,7 @@ const args = process.argv.slice(2);
 
 const unsupportedArgument = args.find((arg) => arg !== "--help" && arg !== "-h" && arg !== "--version" && arg !== "-v");
 if (args.length === 2 && args[0] === "viewer" && args[1] === "unlock") {
-	unlockViewer(loadConfig().sessionStoreDir);
+	await unlockViewer(loadConfig().sessionStoreDir);
 	console.log("Viewer unlocked");
 } else if (unsupportedArgument !== undefined) {
 	console.error(`Unknown option "${unsupportedArgument}". Use "pi-server --help" for usage.`);

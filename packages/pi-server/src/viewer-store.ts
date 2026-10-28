@@ -1,20 +1,16 @@
 import { randomUUID } from "node:crypto";
 import {
-	appendFileSync,
-	closeSync,
 	existsSync,
-	mkdirSync,
-	openSync,
+	promises as fs,
 	readdirSync,
 	readFileSync,
-	readSync,
 	renameSync,
-	rmSync,
 	statSync,
 	truncateSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, type TextSignatureV1 } from "@earendil-works/pi-ai";
 import { getSession, getSessionBranch, listSessions, type SessionState } from "./session-store.ts";
@@ -149,6 +145,7 @@ export class ViewerStore {
 	private readonly running = new Map<string, ThreadSummary>();
 	readonly catalogListeners = new Set<() => void>();
 	readonly removedListeners = new Set<(id: string) => void>();
+	private readonly pendingOperations = new Map<string, Promise<unknown>>();
 
 	constructor(sessionStoreDir: string) {
 		this.directory = join(sessionStoreDir, ".viewer", "threads");
@@ -172,7 +169,9 @@ export class ViewerStore {
 				);
 				stored.thread.lastActiveAt = stored.serverLastActiveAt;
 				delete stored.thread.updatedAt;
-				this.persist(stored);
+				const path = join(this.directory, `${stored.fileId}.json`);
+				writeFileSync(`${path}.tmp`, this.serialize(stored));
+				renameSync(`${path}.tmp`, path);
 			}
 			this.threads.set(stored.thread.id, stored);
 			this.indexSubagents(stored.thread.id, stored.subagents ?? []);
@@ -263,32 +262,53 @@ export class ViewerStore {
 
 	recordActivity(id: string): void {
 		let stored = this.threads.get(id);
+		let initialLog: string | undefined;
 		if (!stored) {
 			stored = this.createThread(id, null);
-			mkdirSync(this.directory, { recursive: true });
-			writeFileSync(join(this.directory, `${stored.logId}.jsonl`), "");
+			this.threads.set(id, stored);
+			initialLog = join(this.directory, `${stored.logId}.jsonl`);
 		}
 		stored.serverLastActiveAt = Date.now();
 		stored.thread.lastActiveAt = stored.serverLastActiveAt;
-		this.persist(stored);
-		this.emit(stored);
+		void this.enqueue(id, async () => {
+			await fs.mkdir(this.directory, { recursive: true });
+			const committed = this.threads.get(id);
+			if (initialLog && committed?.logId === stored.logId) await fs.writeFile(initialLog, "");
+			if (committed) {
+				await this.persist(committed);
+				await this.emit(committed);
+			}
+		}).catch((error: unknown) => {
+			console.error(`Failed to persist viewer activity for session ${id}:`, error);
+		});
 	}
 
-	refreshSession(id: string): void {
-		const session = getSession(id);
-		if (session && this.threads.get(id)?.subagents === undefined) {
-			this.indexSubagents(id, this.sessionMetadata(session).subagents ?? []);
-		}
-		this.refreshCatalog(id);
-		const listeners = this.listeners.get(id);
-		if (listeners?.size) {
-			const thread = this.get(id);
-			if (thread) {
-				const update: ViewerUpdate = { thread, replace: true, refresh: true, ...this.rounds(id, null) };
-				for (const listener of listeners) listener(update);
+	async flush(): Promise<void> {
+		while (this.pendingOperations.size) await Promise.allSettled(this.pendingOperations.values());
+	}
+
+	refreshSession(id: string): Promise<void> {
+		return this.enqueue(id, async () => {
+			const session = getSession(id);
+			if (session && this.threads.get(id)?.subagents === undefined) {
+				this.indexSubagents(id, this.sessionMetadata(session).subagents ?? []);
 			}
-		}
-		this.emitParents(id);
+			this.refreshCatalog(id);
+			const listeners = this.listeners.get(id);
+			if (listeners?.size) {
+				const thread = this.get(id);
+				if (thread) {
+					const update: ViewerUpdate = {
+						thread,
+						replace: true,
+						refresh: true,
+						...(await this.readThreadRounds(id, null)),
+					};
+					for (const listener of listeners) listener(update);
+				}
+			}
+			this.emitParents(id);
+		});
 	}
 
 	subscribe(id: string, listener: (update: ViewerUpdate) => void): () => void {
@@ -304,25 +324,44 @@ export class ViewerStore {
 		};
 	}
 
-	remove(id: string): void {
+	subscribeWithSnapshot(id: string, listener: (update: ViewerUpdate) => void): Promise<() => void> {
+		return this.enqueue(id, async () => {
+			const rounds = await this.readThreadRounds(id, null);
+			const thread = this.get(id)!;
+			const unsubscribe = this.subscribe(id, listener);
+			listener({ thread, replace: true, refresh: true, ...rounds });
+			return unsubscribe;
+		});
+	}
+
+	remove(id: string): Promise<void> {
 		const connection = this.connections.get(id);
 		if (connection) this.deletedConnections.add(connection.id);
 		this.connections.delete(id);
-		const stored = this.threads.get(id);
-		this.indexSubagents(id, []);
-		this.archiveMetadata.delete(id);
-		if (stored) {
-			rmSync(join(this.directory, `${stored.fileId}.json`), { force: true });
-			rmSync(join(this.directory, `${stored.logId}.jsonl`), { force: true });
-			this.threads.delete(id);
-		}
-		for (const listener of this.removedListeners) listener(id);
-		this.refreshCatalog(id, true);
-		this.emitParents(id);
-		this.indexedSubagents.delete(id);
+		return this.enqueue(id, async () => {
+			const stored = this.threads.get(id);
+			if (stored) {
+				await fs.rm(join(this.directory, `${stored.fileId}.json`), { force: true });
+				await fs.rm(join(this.directory, `${stored.logId}.jsonl`), { force: true });
+				this.threads.delete(id);
+			}
+			this.indexSubagents(id, []);
+			this.archiveMetadata.delete(id);
+			for (const listener of this.removedListeners) listener(id);
+			this.refreshCatalog(id, true);
+			this.emitParents(id);
+			this.indexedSubagents.delete(id);
+		});
 	}
 
-	rounds(id: string, before: string | null): { rounds: ViewerRound[]; nextCursor: string | null } {
+	rounds(id: string, before: string | null): Promise<{ rounds: ViewerRound[]; nextCursor: string | null }> {
+		return this.enqueue(id, () => this.readThreadRounds(id, before));
+	}
+
+	private async readThreadRounds(
+		id: string,
+		before: string | null,
+	): Promise<{ rounds: ViewerRound[]; nextCursor: string | null }> {
 		const stored = this.threads.get(id);
 		const session = getSession(id);
 		if (!stored || (stored.length === 0 && session?.entries.length)) {
@@ -356,14 +395,18 @@ export class ViewerStore {
 		const end = before === null ? stored.rounds.length : this.roundCursor(before, stored.rounds);
 		const start = Math.max(0, end - 5);
 		const offsets = stored.rounds.slice(start, end);
-		const rounds = this.readRounds(stored, offsets).map((round) => ({
+		const rounds = (await this.readRounds(stored, offsets)).map((round) => ({
 			...round,
 			messages: round.messages.map(browserMessage),
 		}));
 		return { rounds, nextCursor: start > 0 ? stored.rounds[start].id : null };
 	}
 
-	message(id: string, roundId: string, messageId: string): ViewerMessage | undefined {
+	message(id: string, roundId: string, messageId: string): Promise<ViewerMessage | undefined> {
+		return this.enqueue(id, () => this.readThreadMessage(id, roundId, messageId));
+	}
+
+	private async readThreadMessage(id: string, roundId: string, messageId: string): Promise<ViewerMessage | undefined> {
 		const stored = this.threads.get(id);
 		const session = getSession(id);
 		if (!stored || (stored.length === 0 && session?.entries.length)) {
@@ -379,27 +422,30 @@ export class ViewerStore {
 		}
 		const round = stored.rounds.find((round) => round.id === roundId);
 		return round
-			? this.readRounds(stored, [round])[0].messages.find((message) => message.id === messageId)
+			? (await this.readRounds(stored, [round]))[0].messages.find((message) => message.id === messageId)
 			: undefined;
 	}
 
-	private readRounds(stored: StoredThread, rounds: RoundOffset[]): ViewerRound[] {
-		const fd = openSync(join(this.directory, `${stored.logId}.jsonl`), "r");
+	private async readRounds(stored: StoredThread, rounds: RoundOffset[]): Promise<ViewerRound[]> {
+		if (rounds.length === 0) return [];
+		const file = await fs.open(join(this.directory, `${stored.logId}.jsonl`), "r");
 		try {
-			return rounds.map((round) => {
+			const result: ViewerRound[] = [];
+			for (const round of rounds) {
 				const buffer = Buffer.alloc(round.end - round.start);
-				readSync(fd, buffer, 0, buffer.length, round.start);
-				return {
+				await file.read(buffer, 0, buffer.length, round.start);
+				result.push({
 					id: round.id,
 					messages: buffer
 						.toString("utf8")
 						.trimEnd()
 						.split("\n")
 						.map((line) => JSON.parse(line) as ViewerMessage),
-				};
-			});
+				});
+			}
+			return result;
 		} finally {
-			closeSync(fd);
+			await file.close();
 		}
 	}
 
@@ -410,7 +456,9 @@ export class ViewerStore {
 		if (stored) {
 			stored.thread.status = "unknown";
 			stored.thread.live = { message: null, tools: [] };
-			this.emit(stored);
+			void this.enqueue(id, () => this.emit(stored)).catch((error: unknown) => {
+				console.error(`Failed to publish viewer session ${id}:`, error);
+			});
 		}
 		return {
 			connectionId,
@@ -421,69 +469,105 @@ export class ViewerStore {
 				if (!thread) return;
 				thread.thread.status = "disconnected";
 				thread.thread.live = { message: null, tools: [] };
-				this.emit(thread);
+				void this.enqueue(id, () => this.emit(thread)).catch((error: unknown) => {
+					console.error(`Failed to publish viewer session ${id}:`, error);
+				});
 			},
 		};
 	}
 
-	update(body: ObserverUpdate): void {
-		if (this.deletedConnections.has(body.connectionId)) throw new Error("Observer session deleted");
-		const connection = this.connections.get(body.sessionId);
-		if (connection?.id !== body.connectionId) throw new Error("Observer connection expired");
-		if (body.sequence <= connection.sequence) return;
-		let stored = this.threads.get(body.sessionId);
-		const created = !stored;
-		if (!stored) {
-			if (!body.replace || !body.cwd) throw new Error("First observer update requires cwd and replace");
-			stored = this.createThread(body.sessionId, body.cwd, body.title);
-		}
-		const metadataChanged =
-			(body.cwd !== undefined && body.cwd !== stored.thread.cwd) ||
-			(body.title !== undefined && body.title !== stored.thread.title);
-		const statusChanged = body.status !== undefined && body.status !== stored.thread.status;
-		if (body.cwd !== undefined) {
-			stored.thread.cwd = body.cwd;
-			stored.thread.projectId = body.cwd;
-		}
-		if (body.title !== undefined) stored.thread.title = body.title;
-		if (body.status !== undefined) stored.thread.status = body.status;
-		if (body.live !== undefined) stored.thread.live = body.live;
-		if (body.subagents !== undefined) {
-			this.indexSubagents(body.sessionId, body.subagents);
-			stored.subagents = body.subagents;
-		}
-		const messages = body.replace ?? body.append ?? [];
-		const replacesArchive =
-			stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
-		const oldLogId = stored.logId;
-		if (body.replace) {
-			stored.logId = randomUUID();
-			stored.rounds = [];
-			stored.length = 0;
-		}
-		const log = join(this.directory, `${stored.logId}.jsonl`);
-		if (created || body.replace || messages.length || metadataChanged) mkdirSync(this.directory, { recursive: true });
-		if (body.replace) writeFileSync(log, "");
-		for (const message of messages) {
-			if (!stored.rounds.length || message.role === "user")
-				stored.rounds.push({ id: message.id, start: stored.length, end: stored.length });
-			const line = `${JSON.stringify(message)}\n`;
-			appendFileSync(log, line);
-			stored.length += Buffer.byteLength(line);
-			stored.rounds[stored.rounds.length - 1].end = stored.length;
-		}
-		if (created || messages.length || body.replace || metadataChanged || body.subagents !== undefined) {
-			this.persist(stored);
+	update(body: ObserverUpdate): Promise<void> {
+		return this.enqueue(body.sessionId, async () => {
+			if (this.deletedConnections.has(body.connectionId)) throw new Error("Observer session deleted");
+			const connection = this.connections.get(body.sessionId);
+			if (connection?.id !== body.connectionId) throw new Error("Observer connection expired");
+			if (body.sequence <= connection.sequence) return;
+			const committed = this.threads.get(body.sessionId);
+			const created = !committed;
+			if (!committed && (!body.replace || !body.cwd))
+				throw new Error("First observer update requires cwd and replace");
+			const stored = committed
+				? {
+						...committed,
+						thread: { ...committed.thread },
+						rounds: body.append?.length ? committed.rounds.map((round) => ({ ...round })) : committed.rounds,
+					}
+				: this.createThread(body.sessionId, body.cwd!, body.title);
+			const metadataChanged =
+				(body.cwd !== undefined && body.cwd !== stored.thread.cwd) ||
+				(body.title !== undefined && body.title !== stored.thread.title);
+			const statusChanged = body.status !== undefined && body.status !== stored.thread.status;
+			if (body.cwd !== undefined) {
+				stored.thread.cwd = body.cwd;
+				stored.thread.projectId = body.cwd;
+			}
+			if (body.title !== undefined) stored.thread.title = body.title;
+			if (body.status !== undefined) stored.thread.status = body.status;
+			if (body.live !== undefined) stored.thread.live = body.live;
+			if (body.subagents !== undefined) stored.subagents = body.subagents;
+			const messages = body.replace ?? body.append ?? [];
+			const replacesArchive =
+				stored.length === 0 && messages.length > 0 && Boolean(getSession(body.sessionId)?.entries.length);
+			const oldLogId = stored.logId;
+			if (body.replace) {
+				stored.logId = randomUUID();
+				stored.rounds = [];
+				stored.length = 0;
+			}
+			const log = join(this.directory, `${stored.logId}.jsonl`);
+			const persisted =
+				created ||
+				messages.length > 0 ||
+				body.replace !== undefined ||
+				metadataChanged ||
+				body.subagents !== undefined;
+			if (persisted) await fs.mkdir(this.directory, { recursive: true });
+			const lines: string[] = [];
+			for (const message of messages) {
+				if (!stored.rounds.length || message.role === "user")
+					stored.rounds.push({ id: message.id, start: stored.length, end: stored.length });
+				const line = `${JSON.stringify(message)}\n`;
+				lines.push(line);
+				stored.length += Buffer.byteLength(line);
+				stored.rounds[stored.rounds.length - 1].end = stored.length;
+			}
+			try {
+				if (body.replace) await fs.writeFile(log, lines.join(""));
+				else if (lines.length) await fs.appendFile(log, lines.join(""));
+				if (persisted) await this.persist(stored);
+			} catch (error) {
+				try {
+					if (body.replace) await fs.rm(log, { force: true });
+					else if (lines.length) await fs.truncate(log, committed!.length);
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Viewer update failed to roll back its uncommitted log",
+					);
+				}
+				throw error;
+			}
+			const latest = this.threads.get(body.sessionId);
+			if (latest) {
+				stored.serverLastActiveAt = latest.serverLastActiveAt;
+				stored.thread.lastActiveAt = latest.thread.lastActiveAt;
+			}
+			if (this.connections.get(body.sessionId) !== connection) {
+				stored.thread.status = latest?.thread.status ?? "disconnected";
+				stored.thread.live = latest?.thread.live ?? { message: null, tools: [] };
+			}
+			this.threads.set(body.sessionId, stored);
+			if (body.subagents !== undefined) this.indexSubagents(body.sessionId, body.subagents);
+			connection.sequence = body.sequence;
+			await this.emit(
+				stored,
+				body.append,
+				body.replace !== undefined || replacesArchive,
+				created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
+			);
 			if (body.replace && oldLogId !== stored.logId)
-				rmSync(join(this.directory, `${oldLogId}.jsonl`), { force: true });
-		}
-		connection.sequence = body.sequence;
-		this.emit(
-			stored,
-			body.append,
-			body.replace !== undefined || replacesArchive,
-			created || messages.length > 0 || body.replace !== undefined || metadataChanged || statusChanged,
-		);
+				await fs.rm(join(this.directory, `${oldLogId}.jsonl`), { force: true });
+		});
 	}
 
 	private createThread(id: string, cwd: string | null, title = id): StoredThread {
@@ -504,20 +588,39 @@ export class ViewerStore {
 			rounds: [],
 			length: 0,
 		};
-		this.threads.set(id, stored);
 		return stored;
 	}
 
-	private persist(stored: StoredThread): void {
+	private serialize(stored: StoredThread): string {
+		return JSON.stringify({
+			...stored,
+			thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
+		});
+	}
+
+	private async persist(stored: StoredThread): Promise<void> {
 		const path = join(this.directory, `${stored.fileId}.json`);
-		writeFileSync(
-			`${path}.tmp`,
-			JSON.stringify({
-				...stored,
-				thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
-			}),
+		await fs.writeFile(`${path}.tmp`, this.serialize(stored));
+		await fs.rename(`${path}.tmp`, path);
+	}
+
+	private enqueue<T>(id: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.pendingOperations.get(id);
+		const run = async () => {
+			await setImmediate();
+			return operation();
+		};
+		const next = previous ? previous.then(run, run) : Promise.resolve().then(run);
+		this.pendingOperations.set(id, next);
+		void next.then(
+			() => {
+				if (this.pendingOperations.get(id) === next) this.pendingOperations.delete(id);
+			},
+			() => {
+				if (this.pendingOperations.get(id) === next) this.pendingOperations.delete(id);
+			},
 		);
-		renameSync(`${path}.tmp`, path);
+		return next;
 	}
 
 	private initializeCatalog(): void {
@@ -624,13 +727,13 @@ export class ViewerStore {
 		};
 	}
 
-	private emit(stored: StoredThread, append?: ViewerMessage[], replace = false, catalog = true): void {
+	private async emit(stored: StoredThread, append?: ViewerMessage[], replace = false, catalog = true): Promise<void> {
 		if (catalog) this.refreshCatalog(stored.thread.id);
 		const listeners = this.listeners.get(stored.thread.id);
 		if (listeners?.size) {
 			const thread = this.get(stored.thread.id)!;
 			const update: ViewerUpdate = replace
-				? { thread, replace: true, ...this.rounds(thread.id, null) }
+				? { thread, replace: true, ...(await this.readThreadRounds(thread.id, null)) }
 				: { thread, ...(append?.length ? { append: append.map(browserMessage) } : {}) };
 			for (const listener of listeners) listener(update);
 		}
