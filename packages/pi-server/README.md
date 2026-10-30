@@ -45,6 +45,12 @@ Account files default to `~/.pi/pi-server/accounts`. Set `PI_SERVER_ACCOUNT_STOR
 
 The authenticated `/api/accounts` endpoint exposes these two account snapshots. Their inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials. Ordinary built-in catalogs come from upstream pi.dev; other client provider configuration and login remain client-owned.
 
+## Anthropic Subscriptions
+
+Anthropic OAuth requests use Claude Code subscription request shaping on the server, based on [pi-anthropic-auth](https://github.com/gotgenes/pi-anthropic-auth). Continue using the client's existing `/login anthropic`; the client stores and refreshes its credentials and supplies the access token for each request. The server applies the same shaping to raw and simple chat streams, compaction, and cache warming.
+
+The server adds the billing system block using the native request's Claude Code version and shapes Pi's default prompt sections after client payload callbacks. Project instructions, custom prompts, tool definitions, and signed assistant content are preserved. This applies to the `anthropic` provider's OAuth requests; API keys and other providers retain their existing behavior. The first user message must contain text. Pi's client-side extra usage warning reflects OAuth login status rather than the server's request shaping; verify actual consumption in Claude's usage page.
+
 ## Connect A Client
 
 ```bash

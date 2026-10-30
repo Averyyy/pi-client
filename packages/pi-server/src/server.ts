@@ -58,6 +58,7 @@ import {
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
 import { accountProvider, ServerAccounts } from "./accounts.ts";
+import { withAnthropicSubscription } from "./anthropic-subscription.ts";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
@@ -157,15 +158,17 @@ interface SessionCompactBody {
 function createRequestModels(model: Model<any>, options: SimpleStreamOptions) {
 	const models = createModels();
 	const builtin = getBuiltinProviderForModel(model);
-	const requestApiStream: ProviderStreams["stream"] = (requestModel, context, streamOptions) =>
-		builtin
-			? builtin.stream(requestModel, context, streamOptions)
-			: streamApi(requestModel, context, streamOptions as ProviderStreamOptions | undefined);
+	const requestApiStream: ProviderStreams["stream"] = (requestModel, context, streamOptions) => {
+		const requestOptions = withAnthropicSubscription(requestModel, streamOptions ?? {});
+		return builtin
+			? builtin.stream(requestModel, context, requestOptions)
+			: streamApi(requestModel, context, requestOptions as ProviderStreamOptions);
+	};
 	const requestStream: ProviderStreams["streamSimple"] = (requestModel, context, streamOptions) => {
-		const requestOptions = {
+		const requestOptions = withAnthropicSubscription(requestModel, {
 			...streamOptions,
 			...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-		};
+		});
 		return builtin
 			? builtin.streamSimple(requestModel, context, requestOptions)
 			: streamSimple(requestModel, context, requestOptions);
