@@ -91,6 +91,44 @@ afterEach(() => {
 });
 
 describe("remote catalog provider", () => {
+	it.each([false, true])(
+		"applies catalog timestamps according to server mode %s during refresh and cache restore",
+		async (serverMode) => {
+			vi.stubEnv("PI_SERVER_MODE", String(serverMode));
+			const localGeneratedAt = Date.parse("2026-10-30T07:58:53.845Z");
+			const catalog = [model("gpt-6.1-terra"), { ...model("static"), contextWindow: 500 }];
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+				Response.json(catalog, {
+					headers: { "last-modified": "Thu, 29 Oct 2026 13:12:00 GMT" },
+				}),
+			);
+			const modelsStore = new InMemoryModelsStore();
+			const models = createModels({ modelsStore });
+			models.setProvider(testProvider(localGeneratedAt));
+			expect((await models.refresh()).errors.size).toBe(0);
+			expect(models.getAllModels().map((entry) => entry.id)).toEqual(
+				serverMode ? ["static", "gpt-6.1-terra"] : ["static"],
+			);
+			expect((await models.getAllAvailable()).map((entry) => entry.id)).toEqual(
+				serverMode ? ["static", "gpt-6.1-terra"] : ["static"],
+			);
+			expect(models.getModel("test-provider", "static")?.contextWindow).toBe(serverMode ? 500 : 1000);
+			const restored = createModels({ modelsStore });
+			restored.setProvider(testProvider(localGeneratedAt));
+			await restored.refresh({ allowNetwork: false });
+			expect(restored.getAllModels()).toEqual(models.getAllModels());
+			expect(fetchSpy).toHaveBeenCalledOnce();
+			if (serverMode) {
+				fetchSpy.mockResolvedValueOnce(new Response(null, { status: 304 }));
+				expect((await restored.refresh()).errors.size).toBe(0);
+				expect(restored.getAllModels()).toEqual(models.getAllModels());
+				fetchSpy.mockResolvedValueOnce(Response.json([]));
+				expect((await restored.refresh()).errors.size).toBe(0);
+				expect(restored.getAllModels()).toEqual([model("static")]);
+				expect((await modelsStore.read("test-provider"))?.models).toEqual([]);
+			}
+		},
+	);
 	it.each(["stored", "environment", "configuration"])(
 		"refreshes configured public catalogs using %s auth without resolving inference credentials",
 		async (source) => {
@@ -506,6 +544,36 @@ describe("remote catalog provider", () => {
 });
 
 describe("personalized catalog provider", () => {
+	it.each([false, true])("personalizes the catalog using server mode %s timestamp semantics", async (serverMode) => {
+		vi.stubEnv("PI_SERVER_MODE", String(serverMode));
+		const catalog = [model("public"), { ...model("static"), contextWindow: 500 }];
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+			Response.json(catalog, {
+				headers: { "last-modified": "Thu, 29 Oct 2026 13:12:00 GMT" },
+			}),
+		);
+		const personalize = vi.fn(async (models: readonly AnyModel[]) => models);
+		const provider = withPersonalizedCatalog(
+			builtinProvider(),
+			personalize,
+			undefined,
+			Date.parse("2026-10-30T07:58:53.845Z"),
+		);
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(serverMode ? ["static", "public"] : ["static"]);
+		expect(provider.getModels()[0].contextWindow).toBe(serverMode ? 500 : 1000);
+		expect(personalize.mock.calls[0]?.[0]).toEqual(provider.getModels());
+		const restored = withPersonalizedCatalog(
+			builtinProvider(),
+			personalize,
+			undefined,
+			Date.parse("2026-10-30T07:58:53.845Z"),
+		);
+		await refreshProvider(restored, store, { allowNetwork: false });
+		expect(restored.getModels()).toEqual(provider.getModels());
+		expect(personalize).toHaveBeenCalledOnce();
+	});
 	it("gets the public base from pi-server before client personalization", async () => {
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		vi.stubEnv("PI_SERVER_URL", "http://pi-server.test");

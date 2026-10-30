@@ -118,6 +118,7 @@ export function withRemoteCatalog(
 	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
 	localGeneratedAt?: number,
 ): Provider {
+	const catalogGeneratedAt = process.env.PI_SERVER_MODE === "true" ? undefined : localGeneratedAt;
 	let dynamicModels: readonly AnyModel[] = [];
 
 	return {
@@ -131,7 +132,7 @@ export function withRemoteCatalog(
 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
 			const stored = context.stored;
-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			const restored = remoteModels(stored, catalogGeneratedAt).filter((model) => model.provider === provider.id);
 			if (
 				!(await context.publish({
 					update: () => {
@@ -187,7 +188,7 @@ export function withRemoteCatalog(
 			const catalog = await readCatalog(provider.id, response);
 			if (context.signal.aborted) return;
 			const entry: ModelsStoreEntry = { ...catalog, checkedAt };
-			const published = remoteModels(entry, localGeneratedAt);
+			const published = remoteModels(entry, catalogGeneratedAt);
 			await context.publish({
 				persist: entry,
 				update: () => {
@@ -199,8 +200,9 @@ export function withRemoteCatalog(
 }
 
 /**
- * Like `withRemoteCatalog`, but on each network refresh the catalog (built-in models plus a newer
- * pi.dev catalog) is passed through `personalize` and the result is saved. The saved entry holds
+ * Like `withRemoteCatalog`, but on each network refresh the catalog is passed through `personalize`
+ * and the result is saved. Server catalogs overlay built-in models regardless of generation time;
+ * local Pi applies only newer pi.dev catalogs. The saved entry holds
  * the personalized list, not the pi.dev catalog, and replaces the catalog, including offline.
  * The refresh interval and etag revalidation are skipped. An empty list (nothing saved yet, or an
  * empty catalog saved by an older pi after a failed or missing pi.dev catalog) falls back to the
@@ -212,6 +214,7 @@ export function withPersonalizedCatalog(
 	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
 	localGeneratedAt?: number,
 ): Provider {
+	const catalogGeneratedAt = process.env.PI_SERVER_MODE === "true" ? undefined : localGeneratedAt;
 	let personalModels: readonly AnyModel[] = [];
 	const builtinModels = (): readonly AnyModel[] => provider.getAllModels?.() ?? provider.getModels();
 	const getAllModels = (): readonly AnyModel[] => (personalModels.length > 0 ? personalModels : builtinModels());
@@ -243,7 +246,7 @@ export function withPersonalizedCatalog(
 					throw new Error(`${source} request failed for ${provider.id}: ${response.status}`);
 				}
 				const catalog = await readCatalog(provider.id, response);
-				if (isNewer(catalog.lastModified, localGeneratedAt)) remote = catalog.models;
+				if (isNewer(catalog.lastModified, catalogGeneratedAt)) remote = catalog.models;
 			}
 			const personalized = await personalize(mergeModels(builtinModels(), remote), context);
 			if (context.signal.aborted) return;

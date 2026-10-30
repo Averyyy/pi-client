@@ -54,6 +54,9 @@ describe("ModelRuntime public catalog through pi-server HTTP", () => {
 		vi.stubEnv("PI_OFFLINE", undefined);
 		vi.stubEnv("OPENAI_API_KEY", undefined);
 		vi.stubEnv("HF_TOKEN", undefined);
+		vi.spyOn(builtinProviderCatalog, "getBuiltinModelDataGeneratedAt").mockReturnValue(
+			Date.parse("2026-10-30T07:58:53.845Z"),
+		);
 		vi.spyOn(builtinProviderCatalog, "builtinProviders").mockImplementation(() => [
 			openaiProvider(),
 			huggingfaceProvider(),
@@ -67,7 +70,7 @@ describe("ModelRuntime public catalog through pi-server HTTP", () => {
 			res.writeHead(status, {
 				"Content-Type": "application/json",
 				ETag: `"catalog-${revision}"`,
-				"Last-Modified": "Thu, 01 Jan 2099 00:00:00 GMT",
+				"Last-Modified": "Thu, 29 Oct 2026 13:12:00 GMT",
 			});
 			res.end(status === 304 ? undefined : JSON.stringify(catalogModels(`public-${revision}`)));
 		});

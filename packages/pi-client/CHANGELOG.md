@@ -2,6 +2,7 @@
 
 ### Fixed
 
+- Applied server-provided public model catalogs regardless of the bundled catalog's build timestamp, including cached models and OpenRouter personalization.
 - Read public model catalogs from pi-server's shared pi.dev cache only for providers with configured client authentication. Model availability and OpenRouter personalization remain client-owned; public catalog requests omit provider credentials. Transient catalog failures retain their cached models and ETag for the next refresh.
 - Restarted updated runtimes through `/reload` with the current session, branch, and startup options. Shared update generations let each active session switch runtimes, and runtime lookup or handoff errors remain visible without relaunching the old runtime.
 - Invoked npm through Node on Windows so global updates can start without a shell.
