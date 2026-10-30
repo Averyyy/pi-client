@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
 	type CompactionCacheRequestOptions,
@@ -64,6 +65,7 @@ import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { hashPiServerProviderMessages, type PiServerProviderCallbackRequest } from "./pi-server-protocol.ts";
+import { PublicCatalogRequestError, PublicModelCatalog } from "./public-model-catalog.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, type RequestVersion, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
@@ -1913,8 +1915,10 @@ export function createPiServer(
 	configOverride?: Partial<ServerConfig>,
 	streamModels?: Models,
 	accountsOverride?: ServerAccounts,
+	catalogOverride?: PublicModelCatalog,
 ): HttpServer {
 	const serverConfig = loadConfig(configOverride);
+	const catalog = catalogOverride ?? new PublicModelCatalog(join(serverConfig.sessionStoreDir, ".model-catalog"));
 	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(serverConfig.sessionStoreDir);
 	const viewer = new ViewerHttp(serverConfig, (ids) => deleteServerSessions(config, ids));
@@ -1953,6 +1957,43 @@ export function createPiServer(
 		}
 		if (authStatus !== 200) {
 			sendJson(res, authStatus, { error: authStatus === 423 ? "Viewer locked" : "Unauthorized" });
+			return;
+		}
+		const catalogMatch = /^\/api\/model-catalog\/providers\/([^/]+)$/.exec(url.pathname);
+		if (req.method === "GET" && catalogMatch) {
+			try {
+				const entry = await catalog.get(
+					catalogMatch[1],
+					url.searchParams.get("pi-version"),
+					url.searchParams.get("force") === "true",
+				);
+				const headers = {
+					"Content-Type": "application/json",
+					"Cache-Control": "no-cache",
+					...(entry.etag ? { ETag: entry.etag } : {}),
+					...(entry.lastModified ? { "Last-Modified": entry.lastModified } : {}),
+				};
+				const validators = req.headers["if-none-match"]
+					?.split(",")
+					.map((value) => value.trim().replace(/^W\//, ""));
+				if (
+					entry.status === 200 &&
+					entry.etag &&
+					(validators?.includes("*") || validators?.includes(entry.etag.replace(/^W\//, "")))
+				) {
+					res.writeHead(304, headers);
+					res.end();
+				} else {
+					res.writeHead(200, headers);
+					res.end(entry.body);
+				}
+			} catch (error) {
+				sendError(
+					res,
+					error instanceof PublicCatalogRequestError ? error.status : 502,
+					error instanceof Error ? error.message : String(error),
+				);
+			}
 			return;
 		}
 		if (req.method === "GET" && url.pathname === "/api/observer/connect") {
@@ -2139,8 +2180,9 @@ export function createPiServer(
 	server.close = function (callback) {
 		viewer.close();
 		const accountCleanup = config.accounts.close();
+		const catalogCleanup = catalog.close();
 		return close.call(this, (error) => {
-			void Promise.all([viewer.store.flush(), accountCleanup]).then(
+			void Promise.all([viewer.store.flush(), accountCleanup, catalogCleanup]).then(
 				() => callback?.(error),
 				(cleanupError: unknown) =>
 					callback?.(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))),

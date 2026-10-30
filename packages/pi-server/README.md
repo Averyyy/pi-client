@@ -43,7 +43,13 @@ PiServer owns Devin and Google Antigravity account login, credential persistence
 
 Account files default to `~/.pi/pi-server/accounts`. Set `PI_SERVER_ACCOUNT_STORE_DIR` to choose another directory. The server restores saved account catalogs on startup, refreshes them in the background, after successful login, and every four hours. Expiring OAuth tokens refresh when needed. Failed discovery keeps the saved catalog and reports the error. `/logout` cancels the selected account's pending work and deletes its credentials and catalog.
 
-The authenticated `/api/accounts` endpoint exposes these two account snapshots. Their inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials. Ordinary built-in catalogs come from upstream pi.dev; other client provider configuration and login remain client-owned.
+The authenticated `/api/accounts` endpoint exposes these two account snapshots. Their inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials. Other provider configuration and login remain client-owned.
+
+## Public Model Catalogs
+
+The authenticated `/api/model-catalog/providers/:provider?pi-version=<version>` endpoint serves shared public catalogs from pi.dev. Clients request only providers with configured authentication. The server fetches a provider on demand and shares its cached response across clients using the same Pi version. Catalog requests include chat, image, and classifier metadata without provider credentials; clients determine model availability from their own credentials and configuration.
+
+Catalogs are stored under `.model-catalog` inside the session store directory and remain fresh for four hours. Expired entries use ETag revalidation; concurrent requests share one upstream fetch. `force=true` requests revalidation immediately. Server startup does not fetch public catalogs. Failed refreshes report an error and retain the saved catalog for the next attempt. OpenRouter's credential-specific filtering remains on the client.
 
 ## Anthropic Subscriptions
 
@@ -63,7 +69,7 @@ With auth:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
-Use the same release version for client and server. The authenticated `/api/models` catalog reports chat, image, and classifier models with their precise availability. `/api/stream`, `/api/generate-images`, and `/api/classify` resolve server-side provider credentials or use credentials explicitly supplied by the client.
+Use the same release version for client and server. The authenticated `/api/models` endpoint reports the server's configured models. Client model selection uses the public catalog cache and client authentication. `/api/stream`, `/api/generate-images`, and `/api/classify` resolve server-side provider credentials or use credentials explicitly supplied by the client.
 
 Image generation and classification stream heartbeat responses and journal completed results for recovery without repeating the provider operation. Cancellation is acknowledged after provider cleanup finishes. Oversized operation payloads use `/api/request/chunk`, including when clients set a 64 KiB request-body limit.
 

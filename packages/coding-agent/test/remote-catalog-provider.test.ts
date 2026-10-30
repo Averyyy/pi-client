@@ -1,4 +1,5 @@
 import {
+	type AnyModel,
 	createModels,
 	createProvider,
 	type ImageModel,
@@ -40,7 +41,13 @@ function model(id: string): Model<"openai-completions"> {
 function builtinProvider(): Provider {
 	return createProvider({
 		id: "test-provider",
-		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+		auth: {
+			apiKey: {
+				name: "Test",
+				check: async () => ({ type: "api_key" }),
+				resolve: async () => ({ auth: {} }),
+			},
+		},
 		models: [model("static")],
 		api: {
 			stream: () => {
@@ -78,23 +85,116 @@ async function refreshProvider(
 	});
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+});
 
 describe("remote catalog provider", () => {
-	it("refreshes public models without credentials while keeping them unavailable for inference", async () => {
-		const resolve = vi.fn(async () => undefined);
-		const provider = withRemoteCatalog({ ...builtinProvider(), auth: { apiKey: { name: "Test", resolve } } });
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([model("public")])));
-		const models = createModels();
-		models.setProvider(provider);
+	it.each(["stored", "environment", "configuration"])(
+		"refreshes configured public catalogs using %s auth without resolving inference credentials",
+		async (source) => {
+			vi.stubEnv("PI_SERVER_MODE", "true");
+			vi.stubEnv("PI_SERVER_URL", "http://pi-server.test");
+			vi.stubEnv("PI_SERVER_AUTH_TOKEN", "server-token");
+			if (source === "environment") vi.stubEnv("CATALOG_TEST_KEY", "environment-key");
+			const resolve = vi.fn(async () => {
+				throw new Error("Inference auth must not resolve");
+			});
+			const base = withRemoteCatalog({
+				...builtinProvider(),
+				auth: {
+					apiKey: {
+						name: "Test",
+						check: async ({ ctx, credential }) =>
+							credential?.key || (await ctx.env("CATALOG_TEST_KEY")) ? { type: "api_key" } : undefined,
+						resolve,
+					},
+				},
+			});
+			const credentials = new InMemoryCredentialStore();
+			if (source === "stored")
+				await credentials.modify(base.id, async () => ({ type: "api_key", key: "client-key" }));
+			const config = await ModelConfig.load(undefined);
+			const provider = composeModelProvider(
+				base.id,
+				base,
+				config,
+				source === "configuration" ? { apiKey: "configured-key" } : undefined,
+			);
+			const models = createModels({ credentials });
+			models.setProvider(provider);
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async () => Response.json([model("public")]));
+			expect((await models.refresh()).errors.size).toBe(0);
+			expect(models.getModel(base.id, "public")).toBeDefined();
+			expect((await models.getAvailable(base.id)).map((entry) => entry.id)).toEqual(["static", "public"]);
+			expect(resolve).not.toHaveBeenCalled();
+			expect(fetchSpy).toHaveBeenCalledOnce();
+			expect(fetchSpy.mock.calls[0]?.[1]?.headers).toEqual({
+				"Content-Type": "application/json",
+				Authorization: "Bearer server-token",
+			});
+		},
+	);
 
-		expect((await models.refresh()).errors.size).toBe(0);
-		expect(models.getModel(provider.id, "public")).toBeDefined();
-		expect(resolve).not.toHaveBeenCalled();
+	it.each([404, 501, 502])("reports server status %s and retains the stored catalog", async (status) => {
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		const store = new InMemoryModelsStore();
+		const cached = { models: [model("cached")], lastModified: 0, checkedAt: 0, etag: '"cached"' };
+		await store.write("test-provider", cached);
+		const provider = testProvider();
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(Response.json({ error: "upstream failed" }, { status }));
+		const controller = new AbortController();
+		await expect(refreshProvider(provider, store, { signal: controller.signal })).rejects.toThrow(String(status));
+		expect(await store.read(provider.id)).toEqual(cached);
+		expect(fetchSpy.mock.calls[0]?.[1]?.headers).toMatchObject({ "if-none-match": '"cached"' });
+		expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
 		expect(fetchSpy).toHaveBeenCalledOnce();
-		expect(await models.getAvailable(provider.id)).toEqual([]);
-		expect(await models.getAuth(provider.id)).toBeUndefined();
 	});
+
+	it("reads the server on each network refresh and forwards forced refreshes", async () => {
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json([model("public")]));
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		await refreshProvider(provider, store);
+		await refreshProvider(provider, store, { force: true });
+		expect(fetchSpy).toHaveBeenCalledTimes(3);
+		expect(new URL(String(fetchSpy.mock.calls[2]?.[0])).searchParams.get("force")).toBe("true");
+	});
+
+	it.each([false, true])(
+		"restores cached models without requesting an unconfigured provider (server mode: %s)",
+		async (serverMode) => {
+			vi.stubEnv("PI_SERVER_MODE", String(serverMode));
+			const resolve = vi.fn(async () => undefined);
+			const check = vi.fn(async () => undefined);
+			const provider = withRemoteCatalog({
+				...builtinProvider(),
+				auth: { apiKey: { name: "Test", check, resolve } },
+			});
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(new Response(JSON.stringify([model("public")])));
+			const modelsStore = new InMemoryModelsStore();
+			await modelsStore.write(provider.id, { models: [model("cached")], lastModified: 0 });
+			const models = createModels({ modelsStore });
+			models.setProvider(provider);
+
+			expect((await models.refresh()).errors.size).toBe(0);
+			expect(models.getModel(provider.id, "cached")).toBeDefined();
+			expect(check).toHaveBeenCalledOnce();
+			expect(resolve).not.toHaveBeenCalled();
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(await models.getAvailable(provider.id)).toEqual([]);
+			expect(await models.getAuth(provider.id)).toBeUndefined();
+		},
+	);
 
 	it("refreshes a public catalog without refreshing expired OAuth", async () => {
 		const refresh = vi.fn(async () => {
@@ -133,7 +233,10 @@ describe("remote catalog provider", () => {
 
 	it("inherits public catalog auth only when an extension has no account catalog hooks", async () => {
 		const resolve = vi.fn(async () => undefined);
-		const base = withRemoteCatalog({ ...builtinProvider(), auth: { apiKey: { name: "Test", resolve } } });
+		const base = withRemoteCatalog({
+			...builtinProvider(),
+			auth: { apiKey: { name: "Test", check: async () => ({ type: "api_key" }), resolve } },
+		});
 		const config = await ModelConfig.load(undefined);
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
@@ -197,8 +300,10 @@ describe("remote catalog provider", () => {
 		expect(requested.searchParams.get("types")).toBe(REMOTE_CATALOG_MODEL_TYPES.join(","));
 	});
 
-	it("overlays image and classifier models and drops unknown model types", async () => {
-		vi.spyOn(globalThis, "fetch").mockImplementation(
+	it.each([false, true])("overlays all model types (server mode: %s)", async (serverMode) => {
+		vi.stubEnv("PI_SERVER_MODE", String(serverMode));
+		vi.stubEnv("PI_SERVER_URL", "http://pi-server.test");
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
 				new Response(
 					JSON.stringify({
@@ -242,6 +347,13 @@ describe("remote catalog provider", () => {
 		expect(models.getModel("test-provider", "flux")).toBeUndefined();
 		const stored = await store.read(provider.id);
 		expect(stored?.models.map((entry) => entry.id)).toEqual(["chat", "flux", "jev"]);
+		expect(fetchSpy).toHaveBeenCalledOnce();
+		const url = new URL(String(fetchSpy.mock.calls[0]?.[0]));
+		expect(url.origin).toBe(serverMode ? "http://pi-server.test" : "https://pi.dev");
+		expect(url.pathname).toBe(
+			serverMode ? "/api/model-catalog/providers/test-provider" : "/api/models/providers/test-provider",
+		);
+		if (serverMode) expect(url.searchParams.get("pi-version")).toBe(VERSION);
 	});
 
 	it("prefers the newer of the generated and remote catalogs", async () => {
@@ -394,6 +506,22 @@ describe("remote catalog provider", () => {
 });
 
 describe("personalized catalog provider", () => {
+	it("gets the public base from pi-server before client personalization", async () => {
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_URL", "http://pi-server.test");
+		const personalize = vi.fn(async (catalog: readonly AnyModel[], context: RefreshModelsContext) => {
+			expect(context.credential).toEqual({ type: "api_key" });
+			return catalog.filter((entry) => entry.id === "public");
+		});
+		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json([model("public")]));
+		await refreshProvider(provider, new InMemoryModelsStore());
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["public"]);
+		expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+			`http://pi-server.test/api/model-catalog/providers/test-provider?pi-version=${VERSION}`,
+		);
+		expect(personalize).toHaveBeenCalledOnce();
+	});
 	it("requires provider authentication before network discovery", async () => {
 		const resolve = vi.fn(async () => undefined);
 		const personalize = vi.fn(async () => [model("allowed")]);

@@ -1,6 +1,7 @@
 import { createProvider, InMemoryModelsStore, type Model } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VERSION } from "../src/config.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 
@@ -63,6 +64,28 @@ describe("ModelRuntime client-owned catalog in pi-server mode", () => {
 			...options,
 		});
 	}
+
+	it("refreshes public catalogs only for client-configured providers through pi-server", async () => {
+		vi.stubEnv("PI_OFFLINE", undefined);
+		const providers = builtinProviderCatalog
+			.builtinProviders()
+			.map((provider) => ({ ...provider, refreshModels: undefined }));
+		vi.mocked(builtinProviderCatalog.builtinProviders).mockReturnValue(providers);
+		const fetcher = vi.fn(async (_input: Parameters<typeof fetch>[0]) =>
+			Response.json([{ ...clientModel, id: "remote-model" }], {
+				headers: { "last-modified": "Thu, 01 Jan 2099 00:00:00 GMT" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetcher);
+		const runtime = await createRuntime({ allowModelNetwork: true });
+		expect(fetcher).toHaveBeenCalledOnce();
+		expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+			`http://pi-server.test/api/model-catalog/providers/client-provider?pi-version=${VERSION}`,
+		);
+		expect(runtime.getAvailableSnapshot().map((model) => model.id)).toEqual(["client-model", "remote-model"]);
+		expect(runtime.hasConfiguredAuth("huggingface")).toBe(false);
+		expect(runtime.getError()).toBeUndefined();
+	});
 
 	it.each(["server catalog", "server outage"])("starts and refreshes without consulting the %s", async (state) => {
 		const fetcher = vi.fn(async () => {

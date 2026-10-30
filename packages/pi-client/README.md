@@ -52,7 +52,7 @@ PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 
 Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin and Google Antigravity accounts store and resolve their credentials on the server.
 
-Ordinary built-in model catalogs come from upstream pi.dev, with availability tracked separately for chat, image, and classifier models. Devin and Google Antigravity account catalogs come from the server. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and other provider logins remain in the client process.
+Ordinary built-in model catalogs come from pi-server's shared pi.dev cache. The client requests catalogs only for providers with configured authentication and determines chat, image, and classifier availability from its own credentials and configuration. OpenRouter's credential-specific model filtering runs on the client. Devin and Google Antigravity account catalogs come from the server. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and other provider logins remain in the client process.
 
 `PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
 

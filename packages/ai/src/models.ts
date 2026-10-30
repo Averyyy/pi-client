@@ -194,7 +194,7 @@ export interface Provider<TApi extends Api = Api> {
 	 */
 	getAllModels?(): readonly ProviderModel<TApi>[];
 
-	/** Catalog refresh authentication; defaults to provider auth. Public catalogs use none. */
+	/** Catalog request authentication; public catalogs check configuration without refreshing credentials. */
 	readonly modelCatalogAuth?: "none" | "provider";
 
 	/**
@@ -292,8 +292,8 @@ export interface Models {
 
 	/**
 	 * Refresh selected dynamic providers concurrently (all when `providers` is omitted).
-	 * Provider errors and cancellation are returned without rejecting; static, unknown, and
-	 * providers requiring auth without configuration are skipped.
+	 * Provider errors and cancellation are returned without rejecting. Static and unknown providers
+	 * are ignored; unconfigured providers restore cached catalogs without network access.
 	 */
 	refresh(options?: ModelsRefreshOptions): Promise<ModelsRefreshResult>;
 
@@ -610,6 +610,10 @@ class ModelsImpl implements MutableModels {
 					await this.runProviderRefreshPhase(provider, storedCredential, false, undefined, generation, signal);
 					if (credentialError !== undefined) throw credentialError;
 					if (!allowNetwork || signal.aborted) return;
+					if (!requiresAuth) {
+						storedCredential = await this.readCredential(provider.id, signal);
+						if (!(await this.checkProviderAuth(provider, storedCredential, signal))) return;
+					}
 
 					const credential = requiresAuth
 						? await this.resolveRefreshCredential(provider, storedCredential, signal)

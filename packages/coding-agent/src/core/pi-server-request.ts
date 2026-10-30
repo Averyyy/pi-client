@@ -135,10 +135,10 @@ export class ChunkRequest {
 		this.options = options;
 	}
 
-	async getJson(endpoint: string): Promise<Response> {
+	async getJson(endpoint: string, headers?: Record<string, string>): Promise<Response> {
 		return fetch(`${this.options.serverUrl}${endpoint}`, {
 			method: "GET",
-			headers: makeHeaders(this.options.authToken),
+			headers: { ...makeHeaders(this.options.authToken), ...headers },
 			signal: this.options.signal,
 		});
 	}

@@ -910,51 +910,60 @@ describe("Models runtime", () => {
 		expect(await credentials.read("p1")).toBeUndefined();
 	});
 
-	it.each(["login", "logout"] as const)("rejects catalog publication from before %s", async (operation) => {
-		const credentials = new InMemoryCredentialStore();
-		const modelsStore = new InMemoryModelsStore();
-		await credentials.modify("dynamic", async () => ({ type: "api_key", key: "old-account" }));
-		const apiKey = envKeyAuth(undefined);
-		apiKey.login = async () => ({ type: "api_key", key: "new-account" });
-		const started = Promise.withResolvers<void>();
-		const blocked = Promise.withResolvers<void>();
-		const published = Promise.withResolvers<boolean>();
-		let state = "initial";
-		const models = createModels({ credentials, modelsStore });
-		models.setProvider(
-			testProvider({
-				id: "dynamic",
-				auth: { apiKey },
-				refreshModels: async (context) => {
-					if (!context.allowNetwork) return;
-					started.resolve();
-					await blocked.promise;
-					published.resolve(
-						context.publish({
-							persist: { models: [testModel("dynamic", "old-account-model")] },
-							update: () => {
-								state = "old-account";
-							},
-						}),
-					);
-				},
-			}),
-		);
-		const pending = models.refresh({ providers: ["dynamic"] });
-		await started.promise;
+	it.each([
+		["login", "provider"],
+		["logout", "provider"],
+		["login", "none"],
+		["logout", "none"],
+	] as const)(
+		"rejects catalog publication from before %s with catalog auth %s",
+		async (operation, modelCatalogAuth) => {
+			const credentials = new InMemoryCredentialStore();
+			const modelsStore = new InMemoryModelsStore();
+			await credentials.modify("dynamic", async () => ({ type: "api_key", key: "old-account" }));
+			const apiKey = envKeyAuth(undefined);
+			apiKey.login = async () => ({ type: "api_key", key: "new-account" });
+			const started = Promise.withResolvers<void>();
+			const blocked = Promise.withResolvers<void>();
+			const published = Promise.withResolvers<boolean>();
+			let state = "initial";
+			const models = createModels({ credentials, modelsStore });
+			models.setProvider({
+				...testProvider({
+					id: "dynamic",
+					auth: { apiKey },
+					refreshModels: async (context) => {
+						if (!context.allowNetwork) return;
+						started.resolve();
+						await blocked.promise;
+						published.resolve(
+							context.publish({
+								persist: { models: [testModel("dynamic", "old-account-model")] },
+								update: () => {
+									state = "old-account";
+								},
+							}),
+						);
+					},
+				}),
+				modelCatalogAuth,
+			});
+			const pending = models.refresh({ providers: ["dynamic"] });
+			await started.promise;
 
-		if (operation === "login") {
-			await models.login("dynamic", "api_key", { prompt: async () => "unused", notify: () => {} });
-		} else {
-			await models.logout("dynamic");
-		}
-		blocked.resolve();
+			if (operation === "login") {
+				await models.login("dynamic", "api_key", { prompt: async () => "unused", notify: () => {} });
+			} else {
+				await models.logout("dynamic");
+			}
+			blocked.resolve();
 
-		await expect(published.promise).rejects.toMatchObject({ name: "AbortError" });
-		expect((await pending).errors.size).toBe(0);
-		expect(state).toBe("initial");
-		expect(await modelsStore.read("dynamic")).toBeUndefined();
-	});
+			await expect(published.promise).rejects.toMatchObject({ name: "AbortError" });
+			expect((await pending).errors.size).toBe(0);
+			expect(state).toBe("initial");
+			expect(await modelsStore.read("dynamic")).toBeUndefined();
+		},
+	);
 
 	it.each([undefined, "env-key"])("rechecks availability after logout with ambient key %s", async (ambientKey) => {
 		const credentials = new InMemoryCredentialStore();

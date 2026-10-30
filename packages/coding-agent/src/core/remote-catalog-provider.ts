@@ -10,6 +10,7 @@ import {
 import { VERSION } from "../config.ts";
 import { fetchWithRetry } from "../utils/management-http.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { ChunkRequest } from "./pi-server-request.ts";
 
 const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
 const REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS = 4_000;
@@ -77,7 +78,18 @@ function requestCatalog(
 	catalogBaseUrl: string,
 	signal: AbortSignal,
 	validator?: string,
+	force?: boolean,
 ): Promise<Response> {
+	if (process.env.PI_SERVER_MODE === "true") {
+		return new ChunkRequest({
+			serverUrl: process.env.PI_SERVER_URL ?? "http://127.0.0.1:4217",
+			authToken: process.env.PI_SERVER_AUTH_TOKEN ?? "",
+			signal,
+		}).getJson(
+			`/api/model-catalog/providers/${encodeURIComponent(providerId)}?pi-version=${encodeURIComponent(VERSION)}${force ? "&force=true" : ""}`,
+			validator ? { "if-none-match": validator } : undefined,
+		);
+	}
 	const url = new URL(`/api/models/providers/${encodeURIComponent(providerId)}`, catalogBaseUrl);
 	url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
 	return fetchWithRetry(
@@ -134,6 +146,7 @@ export function withRemoteCatalog(
 			// An entry without lastModified (saved by an older pi, or after a failed first request) is
 			// always refetched: remoteModels() ignores it, so waiting would leave the overlay empty.
 			if (
+				process.env.PI_SERVER_MODE !== "true" &&
 				!context.force &&
 				stored?.checkedAt !== undefined &&
 				stored.lastModified !== undefined &&
@@ -145,7 +158,7 @@ export function withRemoteCatalog(
 			// Only revalidate when a cached body backs the validator, so a 304 can never
 			// leave the overlay empty.
 			const validator = stored && stored.models.length > 0 ? stored.etag : undefined;
-			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal, validator);
+			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal, validator, context.force);
 			if (context.signal.aborted) return;
 			const checkedAt = Date.now();
 			// Unchanged: dynamicModels already holds the stored overlay, so only the
@@ -154,7 +167,7 @@ export function withRemoteCatalog(
 				await context.publish({ persist: { ...stored, checkedAt } });
 				return;
 			}
-			if (response.status === 404 || response.status === 501) {
+			if (process.env.PI_SERVER_MODE !== "true" && (response.status === 404 || response.status === 501)) {
 				await context.publish({
 					persist: {
 						...(stored ?? { models: [] }),
@@ -165,10 +178,11 @@ export function withRemoteCatalog(
 				});
 				return;
 			}
-			if (!response.ok) {
+			if (!response.ok || (process.env.PI_SERVER_MODE === "true" && response.status !== 200)) {
 				// Transient failure: the cached body and its validator stay valid, so keep the
 				// etag and let the next refresh revalidate instead of downloading the catalog.
-				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+				const source = process.env.PI_SERVER_MODE === "true" ? "pi-server model catalog" : "Model catalog";
+				throw new Error(`${source} request failed for ${provider.id}: ${response.status}`);
 			}
 			const catalog = await readCatalog(provider.id, response);
 			if (context.signal.aborted) return;
@@ -220,11 +234,14 @@ export function withPersonalizedCatalog(
 			}
 			if (!context.allowNetwork || context.signal.aborted) return;
 
-			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal);
+			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal, undefined, context.force);
 			if (context.signal.aborted) return;
 			let remote: readonly AnyModel[] = [];
-			if (response.status !== 404 && response.status !== 501) {
-				if (!response.ok) throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+			if (process.env.PI_SERVER_MODE === "true" || (response.status !== 404 && response.status !== 501)) {
+				if (!response.ok || (process.env.PI_SERVER_MODE === "true" && response.status !== 200)) {
+					const source = process.env.PI_SERVER_MODE === "true" ? "pi-server model catalog" : "Model catalog";
+					throw new Error(`${source} request failed for ${provider.id}: ${response.status}`);
+				}
 				const catalog = await readCatalog(provider.id, response);
 				if (isNewer(catalog.lastModified, localGeneratedAt)) remote = catalog.models;
 			}
