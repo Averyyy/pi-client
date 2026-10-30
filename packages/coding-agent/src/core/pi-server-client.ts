@@ -265,7 +265,11 @@ export interface PiServerHistorySnapshot {
 	messages: Message[];
 }
 
-export interface PiServerStreamOptions extends SimpleStreamOptions {
+export interface PiServerAccountOptions {
+	authSource?: "server-account";
+}
+
+export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAccountOptions {
 	/** Monotonic start of run preparation or the last top-level tool completion; kept client-local. */
 	clientTiming?: { startedAt: number; boundary: "run_accepted" | "tool_end" | "message_start" };
 	requireCacheRetention?: boolean;
@@ -938,8 +942,11 @@ async function syncPiServerTreeWithRequest(
 	return recoverPiServerTreeDivergence(sessionId, context, syncTree, request, onHistoryReconciled);
 }
 
-function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStreamOptions {
+function serializeOptions(
+	options: (SimpleStreamOptions & PiServerAccountOptions) | undefined,
+): SimpleStreamOptions & PiServerAccountOptions {
 	return {
+		authSource: options?.authSource,
 		temperature: options?.temperature,
 		maxTokens: options?.maxTokens,
 		samplingParams: options?.samplingParams,
@@ -965,12 +972,13 @@ function serializeOptions(options: SimpleStreamOptions | undefined): SimpleStrea
 export function streamRawPiServer<TApi extends string>(
 	model: Model<TApi>,
 	context: Context,
-	options?: ModelsApiStreamOptions<TApi>,
+	options?: ModelsApiStreamOptions<TApi> & PiServerAccountOptions,
 ): Promise<PiServerEventStream> {
 	if (options?.transformPreparedStreamOptions) {
 		throw new Error("Prepared stream option transforms cannot execute on pi-server");
 	}
 	return streamPiServer(model, context, {
+		authSource: options?.authSource,
 		signal: options?.signal,
 		sessionId: options?.sessionId,
 		onProviderStreamEvent: options?.onProviderStreamEvent,
@@ -985,7 +993,7 @@ export function streamRawPiServer<TApi extends string>(
 export function fetchDeferredPiServer(
 	model: Model<string>,
 	handle: DeferredHandle,
-	options?: DeferredFetchOptions,
+	options?: DeferredFetchOptions & PiServerAccountOptions,
 ): Promise<PiServerEventStream> {
 	return streamPiServer(
 		model,
@@ -1002,7 +1010,7 @@ export function fetchDeferredPiServer(
 export async function cancelDeferredPiServer(
 	model: Model<string>,
 	handle: DeferredHandle,
-	options?: DeferredCancelOptions,
+	options?: DeferredCancelOptions & PiServerAccountOptions,
 ): Promise<void> {
 	assertNoCustomPiServerFetch(options);
 	const result = await postPiServerModelOperation<{ cancelled: true; stopReason: "stop" }, Model<string>>(
@@ -1015,7 +1023,7 @@ export async function cancelDeferredPiServer(
 		throw new Error("pi-server deferred cancellation did not complete");
 }
 
-export interface PiServerCompactOptions extends SimpleStreamOptions {
+export interface PiServerCompactOptions extends SimpleStreamOptions, PiServerAccountOptions {
 	ownerSessionId?: string;
 	customInstructions?: string;
 	settings?: unknown;
@@ -1631,7 +1639,7 @@ export async function fetchPiServerModels(options?: AuthOperationOptions): Promi
 export async function generateImagesPiServer(
 	model: ImageModel<ImageApi>,
 	context: ImagesContext,
-	options?: ImagesOptions,
+	options?: ImagesOptions & PiServerAccountOptions,
 ): Promise<AssistantImages> {
 	assertNoCustomPiServerFetch(options);
 	return postPiServerModelOperation<AssistantImages, ImageModel<ImageApi>>(
@@ -1640,6 +1648,7 @@ export async function generateImagesPiServer(
 			model,
 			context,
 			options: {
+				authSource: options?.authSource,
 				apiKey: options?.apiKey,
 				env: options?.env,
 				headers: options?.headers,
@@ -1658,7 +1667,7 @@ export async function generateImagesPiServer(
 export async function classifyPiServer(
 	model: ClassifierModel<ClassifierApi>,
 	context: ClassifierContext,
-	options?: ClassifierOptions,
+	options?: ClassifierOptions & PiServerAccountOptions,
 ): Promise<ClassifierResult> {
 	assertNoCustomPiServerFetch(options);
 	return postPiServerModelOperation<ClassifierResult, ClassifierModel<ClassifierApi>>(
@@ -1667,6 +1676,7 @@ export async function classifyPiServer(
 			model,
 			context,
 			options: {
+				authSource: options?.authSource,
 				apiKey: options?.apiKey,
 				env: options?.env,
 				headers: options?.headers,

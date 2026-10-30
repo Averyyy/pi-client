@@ -57,6 +57,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
+import { accountProvider, ServerAccounts } from "./accounts.ts";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
@@ -87,6 +88,7 @@ import type { ViewerDeleteResult } from "./viewer-types.ts";
 export { loadConfig, type ServerConfig } from "./config.ts";
 
 interface ServerRuntime extends ServerConfig {
+	accounts: ServerAccounts;
 	viewer: ViewerHttp;
 	deletingSessions: Map<string, Promise<void>>;
 	requestVersion: RequestVersion;
@@ -101,7 +103,7 @@ interface StreamRequestBody {
 	sessionId: string;
 	runId?: string;
 	model: Model<any>;
-	options?: SimpleStreamOptions;
+	options?: SimpleStreamOptions & { authSource?: "server-account" };
 	staticContext?: SessionStaticContext;
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
@@ -140,7 +142,7 @@ interface SessionCompactBody {
 	sessionId: string;
 	runId?: string;
 	model: Model<any>;
-	options?: SimpleStreamOptions;
+	options?: SimpleStreamOptions & { authSource?: "server-account" };
 	settings?: CompactionSettings;
 	preparation?: CompactionPreparationOptions;
 	customInstructions?: string;
@@ -1563,6 +1565,22 @@ async function handlePostRequest(
 	requestStartedAt: number,
 ): Promise<boolean> {
 	if (rejectDeletingSession(config, body, res, requestVersion)) return true;
+	if (pathname.startsWith("/api/accounts/")) {
+		await handleAccountRequest(config.accounts, pathname, body, res);
+		return true;
+	}
+	const accountRequest = body as {
+		model: AnyModel;
+		options?: SimpleStreamOptions & { authSource?: "server-account" };
+	} | null;
+	if (accountRequest?.options?.authSource === "server-account") {
+		await config.accounts.ready;
+		if (rejectDeletingSession(config, body, res, requestVersion)) return true;
+		const { apiKey: _apiKey, headers: _headers, env: _env, ...options } = accountRequest.options;
+		body = { ...accountRequest, model: config.accounts.resolve(accountRequest.model), options };
+		models = config.accounts.models;
+		streamModels = config.accounts.models;
+	}
 	if (pathname === "/api/provider-callback") {
 		handleProviderCallbackReply(body, res);
 		return true;
@@ -1637,6 +1655,88 @@ async function handlePostRequest(
 	return false;
 }
 
+async function handleAccountRequest(
+	accounts: ServerAccounts,
+	pathname: string,
+	body: unknown,
+	res: ServerResponse,
+): Promise<void> {
+	if (!body || typeof body !== "object") {
+		sendError(res, 400, "Account request must be an object", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	const request = body as { providerId?: unknown; loginId?: unknown; promptId?: unknown; value?: unknown };
+	if (pathname === "/api/accounts/refresh") {
+		sendJson(
+			res,
+			200,
+			await accounts.refresh(request.providerId === undefined ? undefined : accountProvider(request.providerId)),
+		);
+		return;
+	}
+	if (pathname === "/api/accounts/logout") {
+		sendJson(res, 200, await accounts.logout(accountProvider(request.providerId)));
+		return;
+	}
+	if (typeof request.loginId !== "string" || !request.loginId) {
+		sendError(res, 400, "loginId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		return;
+	}
+	const loginId = request.loginId;
+	if (pathname === "/api/accounts/login/cancel") {
+		await accounts.cancelLogin(loginId);
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	if (pathname === "/api/accounts/login/reply") {
+		if (typeof request.promptId !== "string" || typeof request.value !== "string") {
+			sendError(res, 400, "promptId and value are required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+			return;
+		}
+		accounts.reply(loginId, request.promptId, request.value);
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	if (pathname !== "/api/accounts/login") {
+		sendError(res, 404, "Not found", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	const providerId = accountProvider(request.providerId);
+	const controller = new AbortController();
+	res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+	res.flushHeaders();
+	res.write(STREAM_HEARTBEAT);
+	const emit = (event: string, data: unknown) => {
+		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, event, data);
+	};
+	const heartbeat = setInterval(() => {
+		if (!res.destroyed && !res.writableEnded) res.write(STREAM_HEARTBEAT);
+	}, STREAM_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+	res.once("close", () => {
+		if (!res.writableEnded) {
+			controller.abort(new DOMException("Account login connection closed", "AbortError"));
+			void accounts
+				.cancelLogin(loginId)
+				.catch((error: unknown) => console.error("Account login cancellation failed:", error));
+		}
+	});
+	try {
+		const snapshot = await accounts.login(
+			providerId,
+			loginId,
+			({ event, data }) => emit(event, data),
+			controller.signal,
+		);
+		emit("done", snapshot);
+	} catch (error) {
+		emit("error", { error: error instanceof Error ? error.message : String(error) });
+	} finally {
+		clearInterval(heartbeat);
+		endStreamResponse(res);
+	}
+}
+
 const CLASSIFIER_APIS: Record<string, ProviderClassifier> = {
 	"typesafe-system-one": typesafeSystemOneApi(),
 	"cloudflare-workers-ai-system-one": cloudflareWorkersAISystemOneApi(),
@@ -1650,7 +1750,7 @@ interface ImageOperationBody {
 	runId: string;
 	model: ImageModel<ImageApi>;
 	context: ImagesContext;
-	options?: ImagesOptions;
+	options?: ImagesOptions & { authSource?: "server-account" };
 }
 
 interface ClassifierOperationBody {
@@ -1659,7 +1759,7 @@ interface ClassifierOperationBody {
 	runId: string;
 	model: ClassifierModel<ClassifierApi>;
 	context: ClassifierContext;
-	options?: ClassifierOptions;
+	options?: ClassifierOptions & { authSource?: "server-account" };
 }
 
 interface DeferredCancelBody {
@@ -1668,7 +1768,7 @@ interface DeferredCancelBody {
 	runId: string;
 	model: Model<string>;
 	handle: DeferredHandle;
-	options?: DeferredCancelOptions;
+	options?: DeferredCancelOptions & { authSource?: "server-account" };
 }
 
 async function handleModelOperation(
@@ -1722,7 +1822,9 @@ async function handleModelOperation(
 			activityVersion = config.requestVersion;
 			recordSessionActivity(config, body.sessionId, activityVersion);
 			const requestModels =
-				body.kind === "deferred-cancel" ? models : resolveOperationModels(models, body.model, body.options);
+				body.options?.authSource === "server-account" || body.kind === "deferred-cancel"
+					? models
+					: resolveOperationModels(models, body.model, body.options);
 			const result =
 				body.kind === "deferred-cancel"
 					? await requestModels
@@ -1804,13 +1906,18 @@ function resolveOperationModels(models: Models, model: AnyModel, options?: Image
 	return requestModels;
 }
 
-export function createPiServer(configOverride?: Partial<ServerConfig>, streamModels?: Models): HttpServer {
+export function createPiServer(
+	configOverride?: Partial<ServerConfig>,
+	streamModels?: Models,
+	accountsOverride?: ServerAccounts,
+): HttpServer {
 	const serverConfig = loadConfig(configOverride);
 	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(serverConfig.sessionStoreDir);
 	const viewer = new ViewerHttp(serverConfig, (ids) => deleteServerSessions(config, ids));
 	const config: ServerRuntime = {
 		...serverConfig,
+		accounts: accountsOverride ?? new ServerAccounts(serverConfig.accountStoreDir),
 		viewer,
 		deletingSessions: new Map(),
 		requestVersion: { version: 0 },
@@ -1854,6 +1961,19 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 
 		if (req.method === "GET" && url.pathname === "/api/sessions") {
 			sendJson(res, 200, { sessions: listSessions() });
+			return;
+		}
+		if (req.method === "GET" && url.pathname === "/api/accounts") {
+			try {
+				sendJson(res, 200, await config.accounts.snapshot());
+			} catch (error) {
+				sendError(
+					res,
+					500,
+					error instanceof Error ? error.message : String(error),
+					PiServerErrorCode.INTERNAL_ERROR,
+				);
+			}
 			return;
 		}
 		if (req.method === "GET" && url.pathname === "/api/models") {
@@ -2015,8 +2135,13 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 	const close = server.close;
 	server.close = function (callback) {
 		viewer.close();
+		const accountCleanup = config.accounts.close();
 		return close.call(this, (error) => {
-			void viewer.store.flush().then(() => callback?.(error));
+			void Promise.all([viewer.store.flush(), accountCleanup]).then(
+				() => callback?.(error),
+				(cleanupError: unknown) =>
+					callback?.(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))),
+			);
 		});
 	};
 	return server;

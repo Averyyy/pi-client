@@ -50,9 +50,9 @@ If your server uses an auth token, set it on the client:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
-Use matching client and server releases. Provider credentials configured on the server are sufficient for chat, image generation, classifiers, and compaction. Client-side credentials, environment overrides, and request headers are forwarded when supplied.
+Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin and Google Antigravity accounts store and resolve their credentials on the server.
 
-The authenticated model catalog includes chat, image, and classifier models with availability tracked separately for each model type. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and provider login remain in the client process.
+Ordinary built-in model catalogs come from upstream pi.dev, with availability tracked separately for chat, image, and classifier models. Devin and Google Antigravity account catalogs come from the server. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and other provider logins remain in the client process.
 
 `PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
 
@@ -85,13 +85,19 @@ Update both `@averyyy/pi-client` and `@averyyy/pi-server` to a version with nati
 /model devin/swe-2-medium
 ```
 
-Login opens Devin's browser OAuth flow and saves the session token in Pi's normal credential store. The account catalog loads after login; `pi-client --list-models swe-2` lists the discovered SWE-2 variants. Choose the exact variant (for example `swe-2-high` or `swe-2-max`) to change effort. Known configured SWE-2 IDs remain selectable before account discovery finishes; successful discovery supplies the account's models and limits, and discovery failures are reported.
+Login displays Devin's browser authorization link. Complete sign-in and paste the full final redirect URL into the login prompt. PiServer exchanges the code and saves the session token in its account store. The account catalog loads after login; `pi-client --list-models swe-2` lists the discovered SWE-2 variants. Choose the exact variant (for example `swe-2-high` or `swe-2-max`) to change effort.
 
-Authentication and model discovery may contact Devin from the client. Model inference, including compaction, goes through `pi-client → pi-server → Devin`. Direct Devin inference rejects `PI_SERVER_MODE=true`. Pi continues to own tools, agent loops, session history, and subagents. No Devin CLI installation or provider extension is needed. Remove conflicting Devin extensions before enabling the native provider.
+Authentication, account model discovery, and inference run on PiServer. The server restores the saved catalog on startup, refreshes it in the background and after login, and refreshes it every four hours. Discovery failures retain the saved catalog and report the error. Pi continues to own tools, agent loops, session history, and subagents. No Devin CLI installation or provider extension is needed. Remove conflicting Devin extensions before enabling the native provider.
 
 The integration exposes concrete models, not Devin's Fusion/router harness. A revoked session requires `/login devin` again; no refresh endpoint or token lifetime is invented.
 
 Protocol references: [pi-devin](https://github.com/mizorewww/pi-devin), [pi-devin-provider](https://github.com/fadlee/pi-devin-provider), and the [Devin protocol descriptors](https://github.com/can1357/oh-my-pi/tree/main/packages/ai/src/providers/devin/proto).
+
+## Google Antigravity
+
+Run `/login google-antigravity`, complete browser authorization, and paste the full redirect URL into the login prompt. PiServer stores the OAuth credentials and project, refreshes expiring tokens, and discovers the account's exact model IDs. `pi-client --list-models google-antigravity` reads the server's saved account catalog.
+
+Both account providers use the server directory configured by `PI_SERVER_ACCOUNT_STORE_DIR`, defaulting to `~/.pi/pi-server/accounts`. `/logout` removes the selected server account and its catalog. Provider tokens stay on the server. Local Pi sessions use their local credential store.
 
 ## Update
 

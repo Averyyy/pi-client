@@ -43,7 +43,13 @@ export async function checkProviderAuth(
 	try {
 		const auth = await modelRuntime.checkAuth(provider);
 		if (!auth) return { status: "not_ready", provider, reason: "credentials_not_configured" };
-		if (options.refresh && !(await modelRuntime.getAuth(provider))) {
+		if (options.refresh && modelRuntime.isServerAccountProvider(provider)) {
+			const result = await modelRuntime.refresh({ providers: [provider], force: true, allowNetwork: true });
+			if (result.errors.size > 0) return { status: "invalid", provider, reason: "invalid_state" };
+			if (!(await modelRuntime.checkAuth(provider))) {
+				return { status: "not_ready", provider, reason: "credentials_not_configured" };
+			}
+		} else if (options.refresh && !(await modelRuntime.getAuth(provider))) {
 			return { status: "not_ready", provider, reason: "credentials_not_configured" };
 		}
 		return { status: "ready", provider, authType: auth.type };
@@ -58,6 +64,11 @@ export async function getProviderCredential(
 	credentials: CredentialStore,
 	options: { refresh: boolean },
 ): Promise<string | undefined> {
+	if (modelRuntime.isServerAccountProvider(providerId)) {
+		throw new AuthCommandError(
+			`Provider "${providerId}" credentials are managed by pi-server and cannot be exported`,
+		);
+	}
 	const credential = await credentials.read(providerId);
 	if (!options.refresh && credential?.type === "oauth") return credential.access;
 	return getAuthCredential(await modelRuntime.getAuth(providerId));

@@ -25,6 +25,7 @@ describe("viewer asset caching", () => {
 				port: 0,
 				authToken: "asset-fixture",
 				sessionStoreDir: directory,
+				accountStoreDir: join(directory, "accounts"),
 				uploadDir: directory,
 			},
 			async (ids) => ({ deletedIds: ids, deletedCount: ids.length, failed: [] }),

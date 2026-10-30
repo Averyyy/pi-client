@@ -446,23 +446,42 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
 			const remote = process.env.PI_SERVER_MODE === "true";
+			const serverAccount = modelRuntime.isServerAccountProvider(model.provider);
 			const requestClientTiming = clientTiming;
 			clientTiming = undefined;
 			const cacheIsCurrent =
 				options?.sessionId === sessionManager.getSessionId() ? cacheContextIsCurrent(model) : undefined;
 			if (remote && cacheIsCurrent) cacheWarmer.cancel();
-			const auth = remote
-				? await modelRuntime.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
-				: undefined;
-			const requestModel = auth?.auth.baseUrl ? { ...model, baseUrl: auth.auth.baseUrl } : model;
-			const requestOptions = buildRequestOptions(
-				remote
-					? {
-							...options,
-							env: auth?.env || options?.env ? { ...(auth?.env ?? {}), ...(options?.env ?? {}) } : undefined,
-						}
-					: options,
-			);
+			const auth =
+				remote && !serverAccount
+					? await modelRuntime.getAuth(model, {
+							apiKey: options?.apiKey,
+							env: options?.env,
+							signal: options?.signal,
+						})
+					: undefined;
+			const requestModel = serverAccount
+				? { ...model, headers: undefined }
+				: auth?.auth.baseUrl
+					? { ...model, baseUrl: auth.auth.baseUrl }
+					: model;
+			const requestOptions: ModelsSimpleStreamOptions & Pick<PiServerStreamOptions, "authSource"> = {
+				...buildRequestOptions(
+					remote
+						? {
+								...options,
+								apiKey: serverAccount ? undefined : options?.apiKey,
+								headers: serverAccount ? undefined : options?.headers,
+								env: serverAccount
+									? undefined
+									: auth?.env || options?.env
+										? { ...(auth?.env ?? {}), ...(options?.env ?? {}) }
+										: undefined,
+							}
+						: options,
+				),
+				...(serverAccount ? { authSource: "server-account" } : {}),
+			};
 			const activeAgentSession = agentSession;
 			const piServerContext = activeAgentSession
 				? buildPiServerContextSync(context.messages as Message[])
@@ -474,13 +493,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheIsCurrent);
 			}
 			if (remote) {
-				let headers = {
-					...getOpenCodeSessionHeaders(requestModel, options?.sessionId),
-					...model.headers,
-					...auth?.auth.headers,
-					...options?.headers,
-				};
-				if (headerRunner?.hasHandlers("before_provider_headers")) {
+				let headers = serverAccount
+					? {}
+					: {
+							...getOpenCodeSessionHeaders(requestModel, options?.sessionId),
+							...model.headers,
+							...auth?.auth.headers,
+							...options?.headers,
+						};
+				if (!serverAccount && headerRunner?.hasHandlers("before_provider_headers")) {
 					headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
 				}
 				return streamPiServer(requestModel, context, {
@@ -501,7 +522,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,
-					apiKey: options?.apiKey ?? auth?.auth.apiKey,
+					apiKey: serverAccount ? undefined : (options?.apiKey ?? auth?.auth.apiKey),
 					env: requestOptions.env,
 					headers,
 				});

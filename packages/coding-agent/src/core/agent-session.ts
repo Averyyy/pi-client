@@ -705,6 +705,9 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
+		if (this._modelRuntime.isServerAccountProvider(model.provider)) {
+			return { model: { ...model, headers: undefined } };
+		}
 		let result: AuthResult | undefined;
 		try {
 			result = await this._modelRuntime.getAuth(model, { signal });
@@ -3487,6 +3490,9 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						apiKey,
 						headers,
+						authSource: this._modelRuntime.isServerAccountProvider(requestModel.provider)
+							? "server-account"
+							: undefined,
 						customInstructions,
 						cacheContextHash: cacheInput.cacheContextHash,
 						cacheStaticContextHash: cacheInput.cacheStaticContextHash,
@@ -3897,6 +3903,9 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						apiKey,
 						headers,
+						authSource: this._modelRuntime.isServerAccountProvider(requestModel.provider)
+							? "server-account"
+							: undefined,
 						cacheContextHash: cacheInput.cacheContextHash,
 						cacheStaticContextHash: cacheInput.cacheStaticContextHash,
 						cacheFallbackReason: cacheInput.reason,

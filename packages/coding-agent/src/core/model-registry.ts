@@ -88,6 +88,11 @@ export class ModelRegistry {
 
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
 		try {
+			if (this.runtime.isServerAccountProvider(model.provider)) {
+				return this.runtime.hasConfiguredAuth(model.provider)
+					? { ok: true }
+					: { ok: false, error: `No pi-server account configured for "${model.provider}"` };
+			}
 			const resolution = await this.runtime.getAuth(model);
 			if (!resolution) {
 				const compatibility = this.runtime.getCompatibilityRequestConfig(model);

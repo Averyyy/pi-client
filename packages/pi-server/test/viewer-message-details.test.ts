@@ -109,7 +109,14 @@ describe("viewer committed message details", () => {
 
 	it("requires viewer authentication and returns 404 for missing detail identities", async () => {
 		const viewer = new ViewerHttp(
-			{ host: "127.0.0.1", port: 0, sessionStoreDir: directory, uploadDir: directory, authToken: "test-details" },
+			{
+				host: "127.0.0.1",
+				port: 0,
+				sessionStoreDir: directory,
+				accountStoreDir: join(directory, "accounts"),
+				uploadDir: directory,
+				authToken: "test-details",
+			},
 			async () => ({ deletedIds: [], deletedCount: 0, failed: [] }),
 		);
 		const connection = viewer.store.connect("thread");

@@ -32,6 +32,7 @@ import {
 	type ImagesOptions,
 	isModelType,
 	type LoginOptions,
+	type LoginResult,
 	lazyStream,
 	type Message,
 	type Model,
@@ -75,10 +76,21 @@ import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
+	isPiServerAccountProvider,
+	loginPiServerAccount,
+	logoutPiServerAccount,
+	type PiServerAccount,
+	type PiServerAccountProviderId,
+	type PiServerAccountsSnapshot,
+	readPiServerAccounts,
+	refreshPiServerAccounts,
+} from "./pi-server-accounts.ts";
+import {
 	cancelDeferredPiServer,
 	classifyPiServer,
 	fetchDeferredPiServer,
 	generateImagesPiServer,
+	type PiServerAccountOptions,
 	streamPiServer,
 	streamRawPiServer,
 } from "./pi-server-client.ts";
@@ -124,14 +136,14 @@ export interface CreateModelRuntimeOptions {
 	modelsPath?: string | null;
 	modelsStore?: ModelsStore;
 	modelsStorePath?: string;
-	/** Allow create() to refresh model catalogs over the network. Defaults to false. */
+	/** Allow create() to discover provider models over the network. Defaults to false. */
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
 	modelRefreshTimeoutMs?: number;
 	catalogBaseUrl?: string;
 	/** Optional caller cancellation for initial cache restoration and availability checks. */
 	signal?: AbortSignal;
-	/** Skip initial catalog and availability refresh. Static models remain available. */
+	/** Skip initial client catalog refresh. Remote mode still reads pi-server account snapshots. */
 	refreshOnCreate?: boolean;
 }
 
@@ -194,6 +206,9 @@ export class ModelRuntime implements Models {
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
 	private readonly piServerMode = process.env.PI_SERVER_MODE === "true";
+	private readonly serverAccounts = new Map<PiServerAccountProviderId, PiServerAccount>();
+	private serverAccountsSeq = 0;
+	private serverAccountsError: string | undefined;
 	private registrationRefresh: Promise<void> = Promise.resolve();
 	private readonly registrationRefreshErrors = new Map<string, string>();
 	private config: ModelConfig;
@@ -276,6 +291,13 @@ export class ModelRuntime implements Models {
 			if (options.refreshOnCreate !== false) {
 				const result = await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
 				if (runtime.piServerMode && result.aborted) signal?.throwIfAborted();
+			} else if (runtime.piServerMode) {
+				const result = await runtime.refresh({
+					allowNetwork: false,
+					providers: [...runtime.builtins.keys()].filter(isPiServerAccountProvider),
+					signal,
+				});
+				if (result.aborted) signal?.throwIfAborted();
 			}
 		} finally {
 			if (timeout) clearTimeout(timeout);
@@ -323,6 +345,31 @@ export class ModelRuntime implements Models {
 	/** The provider without virtual models, or undefined when nothing defines it. */
 	private composeProvider(providerId: string): Provider | undefined {
 		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
+		if (this.isServerAccountProvider(providerId) && base) {
+			const unavailable = async (): Promise<never> => {
+				throw new ModelsError("auth", `${providerId} credentials are managed by pi-server`);
+			};
+			return {
+				...base,
+				baseUrl: undefined,
+				headers: undefined,
+				auth: {
+					oauth: {
+						name: base.auth.oauth?.name ?? base.name,
+						isSubscription: base.auth.oauth?.isSubscription,
+						loginLabel: base.auth.oauth?.loginLabel,
+						login: unavailable,
+						refresh: unavailable,
+						toAuth: unavailable,
+					},
+				},
+				getModels: () => this.serverAccounts.get(providerId)?.models ?? [],
+				getAllModels: () => this.serverAccounts.get(providerId)?.models ?? [],
+				refreshModels: undefined,
+				filterModels: undefined,
+				filterAllModels: undefined,
+			};
+		}
 		const extension = this.extensionProviders.get(providerId);
 		if (!this.config.getProvider(providerId) && !extension) {
 			// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.
@@ -358,16 +405,16 @@ export class ModelRuntime implements Models {
 	private async runAvailabilityRefresh(seq: number, errorSeq: number, signal: AbortSignal): Promise<void> {
 		const providers = this.models.getProviders();
 		const [allAvailable, checks, credentials] = await Promise.all([
-			this.models.getAllAvailable(undefined, { signal }),
+			this.collectAllAvailable(undefined, { signal }),
 			Promise.all(
 				providers.map(
 					async (provider): Promise<[string, AuthCheck | undefined]> => [
 						provider.id,
-						await this.models.checkAuth(provider.id, { signal }),
+						await this.checkAuth(provider.id, { signal }),
 					],
 				),
 			),
-			this.credentials.list({ signal }),
+			this.listCredentials({ signal }),
 		]);
 		if (seq !== this.availabilityRefreshSeq) return;
 		const auth = new Map(checks);
@@ -409,9 +456,11 @@ export class ModelRuntime implements Models {
 		const errorSeq = ++this.availabilityErrorSeq;
 		try {
 			const [allAvailable, auth, credential] = await Promise.all([
-				this.models.getAllAvailable(providerId, { signal }),
-				this.models.checkAuth(providerId, { signal }),
-				this.credentials.read(providerId, { signal }),
+				this.collectAllAvailable(providerId, { signal }),
+				this.checkAuth(providerId, { signal }),
+				this.isServerAccountProvider(providerId)
+					? Promise.resolve(this.serverAccounts.get(providerId)?.loggedIn)
+					: this.credentials.read(providerId, { signal }),
 			]);
 			signal.throwIfAborted();
 			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
@@ -514,16 +563,41 @@ export class ModelRuntime implements Models {
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
-		await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-		return this.models.getAvailableOfType(type, providerId, options);
+		return (await this.getAllAvailable(providerId, options)).filter((model): model is ModelTypeMap[TType] =>
+			isModelType(model, type),
+		);
 	}
 
 	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
 		await raceWithAbortSignal(this.registrationRefresh, options?.signal);
-		return this.models.getAllAvailable(providerId, options);
+		return this.collectAllAvailable(providerId, options);
+	}
+
+	private async collectAllAvailable(
+		providerId?: string,
+		options?: AuthOperationOptions,
+	): Promise<readonly AnyModel[]> {
+		const providers = providerId ? [providerId] : this.models.getProviders().map((provider) => provider.id);
+		return (
+			await Promise.all(
+				providers.map(async (id) => {
+					if (this.isServerAccountProvider(id)) {
+						options?.signal?.throwIfAborted();
+						return this.serverAccounts.get(id)?.loggedIn ? this.getAllModels(id) : [];
+					}
+					return this.models.getAllAvailable(id, options);
+				}),
+			)
+		).flat();
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+		if (this.isServerAccountProvider(providerId)) {
+			options?.signal?.throwIfAborted();
+			return this.serverAccounts.get(providerId)?.loggedIn
+				? { type: "oauth", source: "pi-server account" }
+				: undefined;
+		}
 		return this.models.checkAuth(providerId, options);
 	}
 
@@ -532,7 +606,7 @@ export class ModelRuntime implements Models {
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
-				const available = await this.models.getAvailable(providerId, options);
+				const available = await this.getAvailableOfType("chat", providerId, options);
 				if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
 				return available;
 			} catch (error) {
@@ -558,6 +632,10 @@ export class ModelRuntime implements Models {
 			errors.push(`Provider "${providerId}": ${error}`);
 		}
 		if (this.availabilityError) errors.push(`Availability refresh: ${this.availabilityError}`);
+		if (this.serverAccountsError) errors.push(`pi-server accounts: ${this.serverAccountsError}`);
+		for (const account of this.serverAccounts.values()) {
+			if (account.error) errors.push(`Provider "${account.providerId}" account refresh: ${account.error}`);
+		}
 		for (const [providerId, error] of this.registrationRefreshErrors)
 			errors.push(`Provider "${providerId}" refresh: ${error}`);
 		return errors.length > 0 ? errors.join("\n\n") : undefined;
@@ -577,6 +655,7 @@ export class ModelRuntime implements Models {
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
+		if (this.isServerAccountProvider(model.provider)) return { authHeader: false };
 		return resolveCompatibilityRequestConfig(
 			model,
 			this.config.getProvider(model.provider),
@@ -596,12 +675,21 @@ export class ModelRuntime implements Models {
 		return this.snapshot.configuredProviders.has(providerId);
 	}
 
+	isServerAccountProvider(providerId: string): providerId is PiServerAccountProviderId {
+		return this.piServerMode && isPiServerAccountProvider(providerId);
+	}
+
 	getAuth(providerId: string, overrides?: ModelRuntimeAuthOverrides): Promise<AuthResult | undefined>;
 	getAuth(model: AnyModel, overrides?: ModelRuntimeAuthOverrides): Promise<AuthResult | undefined>;
 	async getAuth(
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
+		if (this.isServerAccountProvider(providerId)) {
+			overrides.signal?.throwIfAborted();
+			return undefined;
+		}
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -663,6 +751,9 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.isServerAccountProvider(providerId)) {
+			return Promise.reject(new ModelsError("auth", `${providerId} credentials are managed by pi-server`));
+		}
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.setRuntimeApiKey(providerId, apiKey);
@@ -676,6 +767,9 @@ export class ModelRuntime implements Models {
 	}
 
 	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.isServerAccountProvider(providerId)) {
+			return Promise.reject(new ModelsError("auth", `${providerId} credentials are managed by pi-server`));
+		}
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.removeRuntimeApiKey(providerId);
@@ -683,11 +777,24 @@ export class ModelRuntime implements Models {
 		});
 	}
 
-	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
-		return this.credentials.list(options);
+	async listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
+		const local = (await this.credentials.list(options)).filter(
+			(entry) => !this.isServerAccountProvider(entry.providerId),
+		);
+		return [
+			...local,
+			...[...this.serverAccounts.values()]
+				.filter((account) => account.loggedIn)
+				.map((account): CredentialInfo => ({ providerId: account.providerId, type: "oauth" })),
+		];
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
+		if (this.isServerAccountProvider(providerId)) {
+			return this.serverAccounts.get(providerId)?.loggedIn
+				? { configured: true, source: "server_account", label: "pi-server account" }
+				: { configured: false };
+		}
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		const configured = configuredRequestAuthStatus(
@@ -750,7 +857,10 @@ export class ModelRuntime implements Models {
 	private async prepareRemoteRequest<
 		TModel extends AnyModel,
 		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
-	>(model: TModel, options: TOptions | undefined): Promise<{ model: TModel; options: TOptions }> {
+	>(
+		model: TModel,
+		options: TOptions | undefined,
+	): Promise<{ model: TModel; options: TOptions & PiServerAccountOptions }> {
 		if (options?.fetch !== undefined)
 			throw new ModelsError("stream", "pi-server does not support custom fetch implementations");
 		if (
@@ -759,6 +869,19 @@ export class ModelRuntime implements Models {
 			options.transformPreparedStreamOptions !== undefined
 		)
 			throw new ModelsError("stream", "pi-server does not support client prepared stream option transforms");
+		if (this.isServerAccountProvider(model.provider)) {
+			return {
+				model: { ...model, headers: undefined },
+				options: {
+					...options,
+					apiKey: undefined,
+					env: undefined,
+					transformHeaders: undefined,
+					headers: undefined,
+					authSource: "server-account",
+				} as TOptions & PiServerAccountOptions,
+			};
+		}
 		const resolution = this.models.getProvider(model.provider)
 			? await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal })
 			: undefined;
@@ -950,9 +1073,15 @@ export class ModelRuntime implements Models {
 		type: AuthType,
 		interaction: AuthInteraction,
 		options?: LoginOptions,
-	): Promise<Credential> {
+	): Promise<LoginResult> {
 		const signal = operationSignal(interaction.signal);
-		return this.enqueueCredentialOperation(providerId, signal, async () => {
+		return this.enqueueCredentialOperation(providerId, signal, async (): Promise<LoginResult> => {
+			if (this.isServerAccountProvider(providerId)) {
+				if (type !== "oauth") throw new ModelsError("auth", `${providerId} requires an account login`);
+				this.applyServerAccounts(await loginPiServerAccount(providerId, { ...interaction, signal }));
+				await this.queueAvailabilityRefresh(signal);
+				return { type: "remote", providerId };
+			}
 			const credential = await this.models.login(providerId, type, { ...interaction, signal }, options);
 			await this.synchronizeCredentialState(providerId, "login", credential, signal);
 			return credential;
@@ -962,6 +1091,11 @@ export class ModelRuntime implements Models {
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			if (this.isServerAccountProvider(providerId)) {
+				this.applyServerAccounts(await logoutPiServerAccount(providerId, signal));
+				await this.queueAvailabilityRefresh(signal);
+				return;
+			}
 			await this.models.logout(providerId, { signal });
 			await this.synchronizeCredentialState(providerId, "logout", undefined, signal);
 		});
@@ -989,6 +1123,29 @@ export class ModelRuntime implements Models {
 		};
 		const result = await this.models.refresh(refreshOptions);
 		const errors = new Map(result.errors);
+		const serverProviders = [...this.builtins.keys()].filter(
+			(providerId): providerId is PiServerAccountProviderId =>
+				this.isServerAccountProvider(providerId) && (!options.providers || options.providers.includes(providerId)),
+		);
+		if (serverProviders.length > 0) {
+			const seq = ++this.serverAccountsSeq;
+			try {
+				const snapshot =
+					options.force && refreshOptions.allowNetwork
+						? await refreshPiServerAccounts(
+								serverProviders.length === 1 ? serverProviders[0] : undefined,
+								options.signal,
+							)
+						: await readPiServerAccounts(options.signal);
+				if (seq === this.serverAccountsSeq) this.applyServerAccounts(snapshot);
+			} catch (error) {
+				if (!options.signal?.aborted && seq === this.serverAccountsSeq) {
+					this.serverAccountsError = error instanceof Error ? error.message : String(error);
+					for (const id of serverProviders)
+						errors.set(id, error instanceof Error ? error : new Error(String(error)));
+				}
+			}
+		}
 		this.updateModelSnapshot();
 		if (options.providers) {
 			await Promise.all(
@@ -1014,6 +1171,14 @@ export class ModelRuntime implements Models {
 				this.registrationRefreshErrors.delete(id);
 		}
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
+	}
+
+	private applyServerAccounts(snapshot: PiServerAccountsSnapshot): void {
+		++this.serverAccountsSeq;
+		this.serverAccounts.clear();
+		for (const account of snapshot.accounts) this.serverAccounts.set(account.providerId, account);
+		this.serverAccountsError = undefined;
+		this.updateModelSnapshot();
 	}
 
 	private queueRegistrationRefresh(providerId: string): void {
@@ -1055,6 +1220,7 @@ export class ModelRuntime implements Models {
 		configuredStatus: AuthStatus | undefined,
 		type: AuthType,
 	): void {
+		if (this.isServerAccountProvider(providerId)) return;
 		if (!this.snapshot.storedProviders.has(providerId) && !configuredStatus?.configured) return;
 		const configuredProviders = new Set(this.snapshot.configuredProviders).add(providerId);
 		const auth = new Map(this.snapshot.auth);

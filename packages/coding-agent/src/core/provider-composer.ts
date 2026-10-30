@@ -111,7 +111,14 @@ export interface ProviderConfigInput {
 
 export type AuthStatus = {
 	configured: boolean;
-	source?: "stored" | "runtime" | "environment" | "fallback" | "models_json_key" | "models_json_command";
+	source?:
+		| "stored"
+		| "runtime"
+		| "environment"
+		| "fallback"
+		| "models_json_key"
+		| "models_json_command"
+		| "server_account";
 	label?: string;
 };
 

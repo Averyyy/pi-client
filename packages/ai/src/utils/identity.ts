@@ -185,6 +185,7 @@ export function withClientIdentity(models: Models, identity: ClientIdentity): Mo
 	if (!isMutableModels(models)) return wrapped;
 	const mutable: MutableModels = {
 		...wrapped,
+		login: (providerId, type, interaction, options) => models.login(providerId, type, interaction, options),
 		setProvider: (provider) => models.setProvider(provider),
 		deleteProvider: (id) => models.deleteProvider(id),
 		clearProviders: () => models.clearProviders(),

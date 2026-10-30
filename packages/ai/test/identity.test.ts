@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { stream as streamCompletions, streamSimple as streamSimpleCompletions } from "../src/api/openai-completions.ts";
-import { createModels, createProvider } from "../src/models.ts";
+import { createModels, createProvider, type Models } from "../src/models.ts";
 import type { FetchFunction, Model, ProviderHeaders } from "../src/types.ts";
 import {
 	type ClientIdentity,
@@ -66,6 +66,25 @@ function capturingFetch(): { fetch: FetchFunction; headers: () => Headers } {
 const context = normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] });
 
 describe("client identity", () => {
+	it("preserves a remote login result through an immutable Models wrapper", async () => {
+		const {
+			setProvider: _setProvider,
+			deleteProvider: _deleteProvider,
+			clearProviders: _clearProviders,
+			...delegates
+		} = withClientIdentity(createModels(), {});
+		const remote: Models = {
+			...delegates,
+			login: async (providerId) => ({ type: "remote", providerId }),
+		};
+		const wrapped = withClientIdentity(remote, { userAgent: "short" });
+
+		await expect(wrapped.login("devin", "oauth", { notify: () => {}, prompt: async () => "code" })).resolves.toEqual({
+			type: "remote",
+			providerId: "devin",
+		});
+	});
+
 	it("keeps the version constant in sync with package.json", () => {
 		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 		expect(PI_AI_VERSION).toBe(pkg.version);

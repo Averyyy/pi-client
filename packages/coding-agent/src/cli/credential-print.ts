@@ -58,6 +58,14 @@ export async function resolveCredentialForPrint(
 
 	const credentials: Array<{ providerId: string; value: string }> = [];
 	for (const provider of providers) {
+		if (modelRuntime.isServerAccountProvider(provider.id)) {
+			if (cliProvider) {
+				throw new AuthCommandError(
+					`Provider "${provider.id}" credentials are managed by pi-server and cannot be exported`,
+				);
+			}
+			continue;
+		}
 		const type = credentialTypes.get(provider.id);
 		if (kind === "api_key" && type === "oauth") continue;
 		if (kind === "bearer_token" && type !== "oauth") continue;

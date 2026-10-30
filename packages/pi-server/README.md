@@ -32,9 +32,18 @@ PI_SERVER_PORT=4217
 PI_SERVER_AUTH_TOKEN=your-token
 PI_SERVER_SESSION_STORE_DIR=/path/to/sessions
 PI_SERVER_UPLOAD_DIR=/path/to/upload_files
+PI_SERVER_ACCOUNT_STORE_DIR=/path/to/accounts
 ```
 
 Received files default to `~/.pi/upload_files`.
+
+## Account Providers
+
+PiServer owns Devin and Google Antigravity account login, credential persistence, token refresh, and model discovery. Connect with `pi-client`, run `/login devin` or `/login google-antigravity`, and complete the browser authorization and redirect prompt. The client receives account status and model metadata; credentials remain on the server.
+
+Account files default to `~/.pi/pi-server/accounts`. Set `PI_SERVER_ACCOUNT_STORE_DIR` to choose another directory. The server restores saved account catalogs on startup, refreshes them in the background, after successful login, and every four hours. Expiring OAuth tokens refresh when needed. Failed discovery keeps the saved catalog and reports the error. `/logout` cancels the selected account's pending work and deletes its credentials and catalog.
+
+The authenticated `/api/accounts` endpoint exposes these two account snapshots. Their inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials. Ordinary built-in catalogs come from upstream pi.dev; other client provider configuration and login remain client-owned.
 
 ## Connect A Client
 

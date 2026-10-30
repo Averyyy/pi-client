@@ -19,6 +19,11 @@ const ALLOWED_TARGETS = new Set([
 	"/api/cancel-deferred",
 	"/api/receive",
 	"/api/observer",
+	"/api/accounts/login",
+	"/api/accounts/login/reply",
+	"/api/accounts/login/cancel",
+	"/api/accounts/logout",
+	"/api/accounts/refresh",
 ]);
 
 export interface RequestChunkBody {

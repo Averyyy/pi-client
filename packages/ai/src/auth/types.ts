@@ -36,6 +36,9 @@ export interface OAuthCredential extends OAuthCredentials {
 /** One type-tagged credential per provider — the shape of today's auth.json. */
 export type Credential = ApiKeyCredential | OAuthCredential;
 
+/** A remote login acknowledges server-owned credentials without returning them. */
+export type LoginResult = Credential | { type: "remote"; providerId: string };
+
 /** Non-secret credential metadata for account/status enumeration. */
 export interface CredentialInfo {
 	providerId: string;
@@ -200,6 +203,8 @@ export interface ApiKeyAuth {
 
 /** App-supplied context for `Models.login`. */
 export interface LoginOptions {
+	/** Manual redirects let a remote host exchange the browser's authorization code. */
+	callbackMode?: "local" | "manual";
 	/**
 	 * Returns the stable ID of this app installation, e.g. sent to OpenAI as its
 	 * agent host ID. Called only by login flows that need it, so apps can create

@@ -17,6 +17,7 @@ import type {
 	Credential,
 	CredentialStore,
 	LoginOptions,
+	LoginResult,
 	ProviderAuth,
 } from "./auth/types.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "./models-store.ts";
@@ -324,8 +325,13 @@ export interface Models {
 	getAuth(providerId: string, overrides?: AuthResolutionOverrides): Promise<AuthResult | undefined>;
 	getAuth(model: AnyModel, overrides?: AuthResolutionOverrides): Promise<AuthResult | undefined>;
 
-	/** Run a provider-owned login flow and persist its returned credential. */
-	login(providerId: string, type: AuthType, interaction: AuthInteraction, options?: LoginOptions): Promise<Credential>;
+	/** Run login and persist credentials with their owning runtime. */
+	login(
+		providerId: string,
+		type: AuthType,
+		interaction: AuthInteraction,
+		options?: LoginOptions,
+	): Promise<LoginResult>;
 
 	/** Remove the stored credential for a provider. */
 	logout(providerId: string, options?: AuthOperationOptions): Promise<void>;
@@ -376,6 +382,8 @@ export interface Models {
 }
 
 export interface MutableModels extends Models {
+	/** Local provider collections persist and return the provider credential. */
+	login(providerId: string, type: AuthType, interaction: AuthInteraction, options?: LoginOptions): Promise<Credential>;
 	/** Upsert/replace by provider.id. Provider ids are unique. */
 	setProvider(provider: Provider): void;
 	deleteProvider(id: string): void;
@@ -801,7 +809,9 @@ class ModelsImpl implements MutableModels {
 			throw new ModelsError("auth", `${provider.name} does not support ${type} login`);
 		}
 		const loginOperation: Promise<Credential> = method.login({ ...interaction, signal }, options);
-		const credential = await raceWithAbortSignal(loginOperation, signal);
+		const credential =
+			options?.callbackMode === "manual" ? await loginOperation : await raceWithAbortSignal(loginOperation, signal);
+		signal.throwIfAborted();
 		let mutationStarted = false;
 		let markMutationStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {

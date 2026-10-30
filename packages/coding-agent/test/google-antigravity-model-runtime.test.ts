@@ -185,6 +185,9 @@ describe("Google Antigravity ModelRuntime", () => {
 				expect(new Headers(init?.headers).get("authorization")).toBe("Bearer server-token");
 				const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 				requests.push({ path: url.pathname, body });
+				if (url.pathname === "/api/accounts") {
+					return Response.json({ accounts: [{ providerId, loggedIn: true, models: [model] }] });
+				}
 				if (url.pathname === "/api/session/init") return Response.json({ sessionId: body.sessionId });
 				if (url.pathname === "/api/stream") {
 					return new Response(
@@ -211,8 +214,8 @@ describe("Google Antigravity ModelRuntime", () => {
 			allowModelNetwork: false,
 		});
 		expect(runtime.getModels(providerId)).toEqual([model]);
-		expect(await runtime.getAvailable(providerId)).toEqual(clientOAuth ? [model] : []);
-		expect(runtime.hasConfiguredAuth(providerId)).toBe(clientOAuth);
+		expect(await runtime.getAvailable(providerId)).toEqual([model]);
+		expect(runtime.hasConfiguredAuth(providerId)).toBe(true);
 		const stream =
 			entryPoint === "runtime"
 				? runtime.streamSimple(model, context, { sessionId: "antigravity-runtime" })
@@ -221,12 +224,10 @@ describe("Google Antigravity ModelRuntime", () => {
 		for await (const event of stream) events.push(event);
 		expect(await stream.result()).toEqual(message);
 		expect(events.find((event) => event.type === "toolcall_end")).toMatchObject({ toolCall });
-		expect(requests.map((request) => request.path)).toEqual(["/api/session/init", "/api/stream"]);
+		expect(requests.map((request) => request.path)).toEqual(["/api/accounts", "/api/session/init", "/api/stream"]);
 		const request = requests.find((request) => request.path === "/api/stream")?.body;
 		expect(request).toMatchObject({ model, contextOverlay: context.messages });
-		expect(request?.options).toMatchObject(
-			clientOAuth ? { apiKey: JSON.stringify({ token: "test", projectId: "test-project" }) } : {},
-		);
-		if (!clientOAuth) expect(request?.options).not.toHaveProperty("apiKey");
+		expect(request?.options).toMatchObject({ authSource: "server-account" });
+		expect(request?.options).not.toHaveProperty("apiKey");
 	});
 });

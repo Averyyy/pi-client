@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Model } from "../../types.ts";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
-import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { type OAuthCallbackServer, startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -133,30 +133,32 @@ async function exchangeCode(code: string, verifier: string, signal: AbortSignal)
 	};
 }
 
-async function login(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+async function login(interaction: ProviderAuthInteraction, options?: LoginOptions): Promise<OAuthCredential> {
 	const signal = AbortSignal.any([interaction.signal, AbortSignal.timeout(300_000)]);
 	signal.throwIfAborted();
 	const { verifier, challenge } = await generatePKCE();
 	const state = crypto.randomUUID();
 	let callback: OAuthCallbackServer<OAuthCredential> | undefined;
-	try {
-		callback = await startOAuthCallbackServer({
-			providerName: "Google Antigravity",
-			host: getProviderEnvValue("PI_OAUTH_CALLBACK_HOST") || "127.0.0.1",
-			redirectHost: "localhost",
-			port: 51121,
-			path: "/oauth-callback",
-			state,
-			signal,
-			complete: (code) => exchangeCode(code, verifier, signal),
-		});
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "EACCES" && code !== "EADDRINUSE") throw error;
-		interaction.notify({
-			type: "info",
-			message: `Cannot listen for the Antigravity callback on port 51121 (${code}). After sign-in, paste the full localhost redirect URL from your browser.`,
-		});
+	if (options?.callbackMode !== "manual") {
+		try {
+			callback = await startOAuthCallbackServer({
+				providerName: "Google Antigravity",
+				host: getProviderEnvValue("PI_OAUTH_CALLBACK_HOST") || "127.0.0.1",
+				redirectHost: "localhost",
+				port: 51121,
+				path: "/oauth-callback",
+				state,
+				signal,
+				complete: (code) => exchangeCode(code, verifier, signal),
+			});
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EACCES" && code !== "EADDRINUSE") throw error;
+			interaction.notify({
+				type: "info",
+				message: `Cannot listen for the Antigravity callback on port 51121 (${code}). After sign-in, paste the full localhost redirect URL from your browser.`,
+			});
+		}
 	}
 	try {
 		const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");

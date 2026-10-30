@@ -6057,7 +6057,12 @@ export class InteractiveMode {
 					id: providerId,
 					name: provider?.name ?? providerId,
 					authType: type,
-					status: { type, source: "stored credential" },
+					status: {
+						type,
+						source: this.session.modelRuntime.isServerAccountProvider(providerId)
+							? "pi-server account"
+							: "stored credential",
+					},
 					subscription: provider?.auth.oauth?.isSubscription === true,
 				};
 			})
@@ -6276,6 +6281,7 @@ export class InteractiveMode {
 						if (this.session.modelRuntime.hasConfiguredAuth(providerOption.id)) {
 							const authStatus = this.session.modelRuntime.getProviderAuthStatus(providerOption.id);
 							const sources = {
+								server_account: "a pi-server account",
 								stored: "stored credentials",
 								runtime: "a runtime API key",
 								environment: authStatus.label ? `environment (${authStatus.label})` : "environment credentials",
@@ -6315,6 +6321,9 @@ export class InteractiveMode {
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
+		const credentialLocation = this.session.modelRuntime.isServerAccountProvider(providerId)
+			? "Credentials saved on pi-server"
+			: `Credentials saved to ${getAuthPath()}`;
 
 		const session = this.session;
 		// Dynamic catalogs may be empty until the first authenticated network refresh.
@@ -6361,10 +6370,10 @@ export class InteractiveMode {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			if (selectedModel) {
-				this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. ${credentialLocation}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
 			} else {
-				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(`${actionLabel}. ${credentialLocation}`);
 				if (selectionError) {
 					this.showError(selectionError);
 				} else {
@@ -6373,7 +6382,7 @@ export class InteractiveMode {
 			}
 		};
 		if (deferSelection) {
-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`);
+			this.showStatus(`${actionLabel}. ${credentialLocation}. Refreshing model catalog…`);
 		} else {
 			await finishAuthentication();
 		}

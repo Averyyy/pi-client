@@ -8,6 +8,7 @@ export interface ServerConfig {
 	authToken: string | undefined;
 	sessionStoreDir: string;
 	uploadDir: string;
+	accountStoreDir: string;
 }
 
 const DEFAULT_CONFIG: ServerConfig = {
@@ -16,6 +17,7 @@ const DEFAULT_CONFIG: ServerConfig = {
 	authToken: undefined,
 	sessionStoreDir: resolve(".pi", "pi-server", "sessions"),
 	uploadDir: join(homedir(), ".pi", "upload_files"),
+	accountStoreDir: join(homedir(), ".pi", "pi-server", "accounts"),
 };
 
 function loadConfigFile(): Partial<ServerConfig> {
@@ -53,6 +55,12 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
 		),
 		uploadDir: resolve(
 			overrides?.uploadDir ?? process.env.PI_SERVER_UPLOAD_DIR ?? fileConfig.uploadDir ?? DEFAULT_CONFIG.uploadDir,
+		),
+		accountStoreDir: resolve(
+			overrides?.accountStoreDir ??
+				process.env.PI_SERVER_ACCOUNT_STORE_DIR ??
+				fileConfig.accountStoreDir ??
+				DEFAULT_CONFIG.accountStoreDir,
 		),
 	};
 }
