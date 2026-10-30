@@ -43,6 +43,7 @@ export class ViewerAuth {
 	private pendingStateOperation: Promise<void> = Promise.resolve();
 	private readonly cookies = new Map<string, number>();
 	private readonly responses = new Map<ServerResponse, string | undefined>();
+	private cookieTimer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(sessionStoreDir: string, token: string | undefined) {
 		this.directory = join(sessionStoreDir, ".viewer");
@@ -52,6 +53,26 @@ export class ViewerAuth {
 
 	get configured(): boolean {
 		return Boolean(this.token);
+	}
+
+	close(): void {
+		clearTimeout(this.cookieTimer);
+		this.cookieTimer = undefined;
+		this.cookies.clear();
+	}
+
+	private scheduleCookieExpiry(): void {
+		clearTimeout(this.cookieTimer);
+		this.cookieTimer = undefined;
+		const now = Date.now();
+		let next = Infinity;
+		for (const [cookie, expiry] of this.cookies) {
+			if (expiry <= now) this.cookies.delete(cookie);
+			else next = Math.min(next, expiry);
+		}
+		if (next === Infinity) return;
+		this.cookieTimer = setTimeout(() => this.scheduleCookieExpiry(), next - now);
+		this.cookieTimer.unref();
 	}
 
 	get remainingAttempts(): number {
@@ -75,6 +96,7 @@ export class ViewerAuth {
 		const current = await readState(this.directory);
 		if (current.generation !== this.state.generation || current.failures >= 10) {
 			this.cookies.clear();
+			this.scheduleCookieExpiry();
 			for (const response of this.responses.keys()) response.end();
 			this.responses.clear();
 		}
@@ -101,6 +123,7 @@ export class ViewerAuth {
 			await writeState(this.directory, this.state);
 			if (this.state.failures < 10) return 401;
 			this.cookies.clear();
+			this.scheduleCookieExpiry();
 			for (const response of this.responses.keys()) response.end();
 			this.responses.clear();
 			return 423;
@@ -110,6 +133,7 @@ export class ViewerAuth {
 	createCookie(req: IncomingMessage): string {
 		const cookie = randomBytes(32).toString("base64url");
 		this.cookies.set(cookie, Date.now() + 12 * 60 * 60 * 1000);
+		this.scheduleCookieExpiry();
 		return `pi_viewer=${cookie}; Path=/viewer; HttpOnly; SameSite=Strict; Max-Age=43200${this.secure(req) ? "; Secure" : ""}`;
 	}
 
@@ -117,6 +141,7 @@ export class ViewerAuth {
 		const cookie = this.cookie(req);
 		if (cookie) {
 			this.cookies.delete(cookie);
+			this.scheduleCookieExpiry();
 			for (const [response, boundCookie] of this.responses) if (boundCookie === cookie) response.end();
 		}
 		return `pi_viewer=; Path=/viewer; HttpOnly; SameSite=Strict; Max-Age=0${this.secure(req) ? "; Secure" : ""}`;
@@ -128,6 +153,7 @@ export class ViewerAuth {
 		if (!cookie || expires === undefined) return false;
 		if (expires <= Date.now()) {
 			this.cookies.delete(cookie);
+			this.scheduleCookieExpiry();
 			return false;
 		}
 		return true;

@@ -399,7 +399,7 @@ describe("server thread viewer", () => {
 			{ connectionId: "unrelated-expired-connection", sequence: 0 },
 			{ append: [message("unrelated")] },
 		);
-		expect(expired.status).toBe(409);
+		expect(expired.status).toBe(410);
 		expect(readdirSync(join(directory, ".viewer", "threads"))).toEqual([]);
 		const reopened = await connect("deleted");
 		expect(

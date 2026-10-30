@@ -127,6 +127,7 @@ export class ViewerHttp {
 	}
 
 	close(): void {
+		this.auth.close();
 		for (const stream of this.streams) stream.end();
 	}
 

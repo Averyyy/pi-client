@@ -63,7 +63,7 @@ import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { hashPiServerProviderMessages, type PiServerProviderCallbackRequest } from "./pi-server-protocol.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
-import { CHUNK_ENDPOINT, type RequestChunkBody, receiveRequestChunk } from "./request-chunks.ts";
+import { CHUNK_ENDPOINT, type RequestChunkBody, type RequestVersion, receiveRequestChunk } from "./request-chunks.ts";
 import { deletePersistedSession, loadPersistedSessions, savePersistedSession } from "./session-persistence.ts";
 import {
 	appendCompactionEntry,
@@ -89,8 +89,7 @@ export { loadConfig, type ServerConfig } from "./config.ts";
 interface ServerRuntime extends ServerConfig {
 	viewer: ViewerHttp;
 	deletingSessions: Map<string, Promise<void>>;
-	deleteVersion: number;
-	sessionDeleteVersions: Map<string, number>;
+	requestVersion: RequestVersion;
 }
 
 interface SessionInitBody {
@@ -292,9 +291,17 @@ function persistSession(config: ServerRuntime, session: SessionState): void {
 	});
 }
 
-function recordSessionActivity(config: ServerRuntime, sessionId: string, deleteVersion: number): void {
-	if (config.deletingSessions.has(sessionId) || (config.sessionDeleteVersions.get(sessionId) ?? 0) !== deleteVersion)
-		return;
+function sessionDeletedSince(sessionId: string, checkpoint: RequestVersion): boolean {
+	let deletion = checkpoint.deletion;
+	while (deletion) {
+		if (deletion.sessionId === sessionId) return true;
+		deletion = deletion.next.deletion;
+	}
+	return false;
+}
+
+function recordSessionActivity(config: ServerRuntime, sessionId: string, checkpoint: RequestVersion): void {
+	if (config.deletingSessions.has(sessionId) || sessionDeletedSince(sessionId, checkpoint)) return;
 	try {
 		config.viewer.store.recordActivity(sessionId);
 	} catch (error) {
@@ -606,10 +613,15 @@ async function deleteStreamRunsForSession(sessionId: string): Promise<void> {
 }
 
 async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promise<ViewerDeleteResult> {
+	const recordDeletion = (sessionId: string) => {
+		const next: RequestVersion = { version: config.requestVersion.version + 1 };
+		config.requestVersion.deletion = { sessionId, next };
+		config.requestVersion = next;
+	};
 	const operations = ids.map((id) => {
 		const existing = config.deletingSessions.get(id);
 		if (existing) return existing;
-		config.sessionDeleteVersions.set(id, ++config.deleteVersion);
+		recordDeletion(id);
 		const operation = Promise.resolve().then(async () => {
 			await deleteStreamRunsForSession(id);
 			deletePersistedSession(config.sessionStoreDir, id);
@@ -618,7 +630,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 		});
 		config.deletingSessions.set(id, operation);
 		const finish = () => {
-			config.sessionDeleteVersions.set(id, ++config.deleteVersion);
+			recordDeletion(id);
 			config.deletingSessions.delete(id);
 		};
 		void operation.then(finish, finish);
@@ -642,15 +654,14 @@ function rejectDeletingSession(
 	config: ServerRuntime,
 	body: unknown,
 	res: ServerResponse,
-	requestVersion: number,
+	requestVersion: RequestVersion,
 ): boolean {
 	if (
 		body &&
 		typeof body === "object" &&
 		"sessionId" in body &&
 		typeof body.sessionId === "string" &&
-		(config.deletingSessions.has(body.sessionId) ||
-			(config.sessionDeleteVersions.get(body.sessionId) ?? 0) > requestVersion)
+		(config.deletingSessions.has(body.sessionId) || sessionDeletedSince(body.sessionId, requestVersion))
 	) {
 		sendJson(res, 410, { error: "Session deleted", deleted: true });
 		return true;
@@ -1212,7 +1223,7 @@ async function handleSessionCompact(
 		run = startStreamRun(body.sessionId, body.runId, "compact");
 	}
 
-	const activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+	const activityVersion = config.requestVersion;
 	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (body.streamResponse) {
@@ -1466,7 +1477,7 @@ function handleStream(
 	heartbeat.unref();
 
 	let stream: AsyncIterable<AssistantMessageEvent>;
-	const activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+	const activityVersion = config.requestVersion;
 	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
@@ -1548,7 +1559,7 @@ async function handlePostRequest(
 	res: ServerResponse,
 	models: Models,
 	streamModels: Models | undefined,
-	requestVersion: number,
+	requestVersion: RequestVersion,
 	requestStartedAt: number,
 ): Promise<boolean> {
 	if (rejectDeletingSession(config, body, res, requestVersion)) return true;
@@ -1705,10 +1716,10 @@ async function handleModelOperation(
 		if (!res.destroyed && !res.writableEnded) res.write(STREAM_HEARTBEAT);
 	}, STREAM_HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
-	let activityVersion: number | undefined;
+	let activityVersion: RequestVersion | undefined;
 	try {
 		if (!run.operationResult) {
-			activityVersion = config.sessionDeleteVersions.get(body.sessionId) ?? 0;
+			activityVersion = config.requestVersion;
 			recordSessionActivity(config, body.sessionId, activityVersion);
 			const requestModels =
 				body.kind === "deferred-cancel" ? models : resolveOperationModels(models, body.model, body.options);
@@ -1802,13 +1813,12 @@ export function createPiServer(configOverride?: Partial<ServerConfig>, streamMod
 		...serverConfig,
 		viewer,
 		deletingSessions: new Map(),
-		deleteVersion: 0,
-		sessionDeleteVersions: new Map(),
+		requestVersion: { version: 0 },
 	};
 
 	const server = createServer(async (req, res) => {
 		const requestStartedAt = performance.now();
-		const requestVersion = config.deleteVersion;
+		const requestVersion = config.requestVersion;
 		const url = new URL(req.url ?? "/", "http://localhost");
 
 		if (req.method === "GET" && url.pathname === "/health") {

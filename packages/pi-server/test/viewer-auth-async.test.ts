@@ -12,6 +12,7 @@ vi.mock("node:fs/promises", { spy: true });
 describe("asynchronous viewer authentication", () => {
 	let directory: string;
 	const requests: IncomingMessage[] = [];
+	const auths: ViewerAuth[] = [];
 	function request(token?: string, cookie?: string): IncomingMessage {
 		const message = new IncomingMessage(new Socket());
 		if (token !== undefined) message.headers.authorization = `Bearer ${token}`;
@@ -23,6 +24,7 @@ describe("asynchronous viewer authentication", () => {
 		directory = mkdtempSync(join(tmpdir(), "pi-auth-async-"));
 	});
 	afterEach(() => {
+		for (const auth of auths.splice(0)) auth.close();
 		vi.restoreAllMocks();
 		for (const message of requests.splice(0)) message.destroy();
 		rmSync(directory, { recursive: true, force: true });
@@ -30,6 +32,7 @@ describe("asynchronous viewer authentication", () => {
 
 	it("preserves all concurrent failures, lockout, external unlock and cookie invalidation", async () => {
 		const auth = new ViewerAuth(directory, "fixture");
+		auths.push(auth);
 		const cookie = auth.createCookie(request()).split(";")[0];
 		const failures = await Promise.all(Array.from({ length: 10 }, () => auth.authenticate(request("wrong"))));
 		expect(failures.filter((status) => status === 401)).toHaveLength(9);
@@ -48,6 +51,7 @@ describe("asynchronous viewer authentication", () => {
 
 	it("awaits state reads without blocking the event loop and keeps missing credentials outside the failure budget", async () => {
 		const auth = new ViewerAuth(directory, "fixture");
+		auths.push(auth);
 		await unlockViewer(directory);
 		let release!: () => void;
 		let started!: () => void;

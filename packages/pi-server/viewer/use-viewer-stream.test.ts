@@ -422,6 +422,36 @@ describe("thread selection lifecycle", () => {
 		expect(viewer.thread?.status).toBe("disconnected");
 	});
 
+	it("coalesces suspended frames while preserving replacement history, ordered appends and pagination", async () => {
+		const events = stream();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => (url.endsWith("/projects") ? catalog() : events.response)),
+		);
+		runtime.flush();
+		events.send("snapshot", { thread, rounds: [{ id: "old", messages: [] }], nextCursor: "old-cursor" });
+		await settle();
+		const version = viewer.historyVersion;
+		events.send("update", {
+			thread,
+			append: [{ id: "discarded", role: "user", timestamp: 1, content: "discarded" }],
+		});
+		events.send("update", { thread, replace: true, rounds: [{ id: "branch", messages: [] }], nextCursor: "older" });
+		for (const id of ["first", "second"]) {
+			events.send("update", { thread, append: [{ id, role: "assistant", timestamp: 2, content: id }] });
+		}
+		for (let index = 0; index < 100; index++) events.send("update", { thread: { ...thread, title: String(index) } });
+		await settle();
+		expect(viewer.thread?.title).toBe(thread.title);
+		await vi.advanceTimersByTimeAsync(16);
+		await settle();
+		expect(viewer.thread?.title).toBe("99");
+		expect(viewer.rounds.map((round) => round.id)).toEqual(["branch"]);
+		expect(viewer.rounds[0].messages.map((message) => message.id)).toEqual(["first", "second"]);
+		expect(viewer.cursor).toBe("older");
+		expect(viewer.historyVersion).toBeGreaterThan(version);
+	});
+
 	it("invalidates pending older history when a snapshot replaces the active branch", async () => {
 		const events = stream();
 		let respond!: (response: Response) => void;

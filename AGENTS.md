@@ -77,6 +77,8 @@
 - Chunk upload may run with bounded parallelism, but chunk ack bodies must echo `requestId`, `chunkIndex`, and `totalChunks`; otherwise the client treats the response as the final target response.
 - Keep the legacy Base64 request-chunk pending budget at 1 GiB. It counts encoded chunk strings, so the previous 64 MiB budget rejected session-tree append bodies above roughly 48 MiB of raw JSON before the target request could run.
 - Keep request-chunk pending state bounded with TTL/byte cleanup and keep a short completed-request tombstone so retrying the completing chunk can return the original target body.
+- Expire request-chunk caches without new traffic, budget completed bodies separately, and retain only per-chunk checksums alongside completed JSON bodies. Clear the expiry timer when both caches are empty.
+- Release client pi-server synchronization tracking through session resource cleanup and temporary-request `finally` blocks. Keep unconfirmed cancellation records available for explicit retries.
 - Static context hashes must be real fixed-size digests over canonical `{systemPrompt, tools:[name,description,parameters]}` data, never the raw prompt/tools string.
 - Transient provider context such as extension overlays must travel as `ephemeralMessages`/`contextOverlay` on `/api/stream`; it must not be converted into durable pending tree entries or trigger full-tree sync.
 - Do not export Node-only pi-server protocol helpers from the browser-safe `@earendil-works/pi-agent-core` root entrypoint; keep them in Node-only package modules unless a browser-safe implementation exists.
@@ -133,6 +135,7 @@
 ## pi-client Web UI
 
 - Keep viewer persistence off the provider request path. Serialize asynchronous writes per thread, expose only committed content indexes to readers, order deletion after pending writes, and drain writes during shutdown.
+- Expire viewer login cookies while idle and release their timer on authentication shutdown. Coalesce pending render updates into the latest thread snapshot, latest history replacement, and its ordered committed messages so paused animation frames do not retain intermediate live snapshots.
 - Measure proxy response headers separately from the first non-empty text, thinking, or tool-call delta. Provider payload-to-response time includes network, queueing, retries, and prefill; it is not a direct measurement of model prefill.
 - Keep committed tool-result bodies out of viewer snapshots and append events; load them by exact thread, round, and message IDs when expanded. Parse large SSE frames incrementally without rescanning or flattening the accumulated frame on each network chunk.
 - Link tintinweb subagents through their exact manager record session IDs and lifecycle events. Keep active/completed task state separate from observer presence; idle or disconnected observers do not establish completion. The extension's public lifecycle excludes nested and workflow-owned agents.
@@ -149,6 +152,7 @@
 - Reconnect quietly after observer SSE socket termination (`TypeError: terminated` with `UND_ERR_SOCKET`); preserve diagnostics for handshake, update, and final-delivery failures.
 - Invalidate pending older-history requests when a viewer branch snapshot replaces their pagination base. Deleted observer connections receive terminal HTTP 410 as well as SSE notification so response ordering cannot restart the deleted projection.
 - Delete viewer sessions through the server's shared cancellation and persistence path. Mark every project target before awaiting cancellation, and retain each request's acceptance version through chunk assembly so requests accepted before deletion cannot restore deleted state.
+- Keep deletion checkpoints owned by in-flight requests and pending/completed chunk records; the server runtime retains only the current tail. Do not retain deleted session IDs in a permanent map or set.
 - Load older viewer rounds only on upward user navigation. Preserve an existing round's DOM position when prepending history so concurrent streaming at the bottom does not move the reader; branch replacements invalidate the pagination base and scroll anchor together.
 - In the standalone `packages/pi-webui` inspector, capture each send's session ID and history before the first await, and carry that target through append, stream, and finalization. Only render for the matching viewed session; loading guards must cover keyboard sends as well as buttons.
 - `pi-client web` is the remote-backend Tau entrypoint. It should launch the forked coding-agent CLI with `PI_SERVER_MODE=true`, `PI_SERVER_URL`, and `TAU_MIRROR_PORT=1838`; Tau remains the browser mirror, not the backend selector.

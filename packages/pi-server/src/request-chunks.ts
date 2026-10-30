@@ -30,28 +30,34 @@ export interface RequestChunkBody {
 	chunk: string;
 }
 
+export interface RequestVersion {
+	version: number;
+	deletion?: { sessionId: string; next: RequestVersion };
+}
+
 interface RequestChunk {
 	chunk: string;
 	sha256: string;
 }
 
 interface PendingRequest {
-	requestVersion: number;
+	requestVersion: RequestVersion;
 	target: string;
 	totalChunks: number;
 	chunks: Map<number, RequestChunk>;
 	receivedBytes: number;
-	updatedAtMs: number;
+	expiresAtMs: number;
 }
 
 interface CompletedRequest {
-	requestVersion: number;
+	requestVersion: RequestVersion;
 	target: string;
 	totalChunks: number;
 	bodyJson: string;
 	completedChunkIndex: number;
-	completedAtMs: number;
-	chunks: Map<number, RequestChunk>;
+	expiresAtMs: number;
+	retainedBytes: number;
+	chunks: Map<number, string>;
 }
 
 interface ChunkAck {
@@ -70,23 +76,27 @@ interface CompleteChunkResult {
 	complete: true;
 	target: string;
 	bodyJson: string;
-	requestVersion: number;
+	requestVersion: RequestVersion;
 }
 
 const pendingRequests = new Map<string, PendingRequest>();
 const completedRequests = new Map<string, CompletedRequest>();
 let pendingRequestBytes = 0;
+let completedRequestBytes = 0;
+let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
 
 export const REQUEST_CHUNK_PENDING_TTL_MS = 5 * 60 * 1000;
 export const REQUEST_CHUNK_MAX_PENDING_BYTES = 1024 * 1024 * 1024;
 export const REQUEST_CHUNK_COMPLETED_TTL_MS = 60 * 1000;
+export const REQUEST_CHUNK_MAX_COMPLETED_BYTES = 1024 * 1024 * 1024;
 
 interface ReceiveRequestChunkOptions {
-	requestVersion?: number;
+	requestVersion?: RequestVersion;
 	nowMs?: number;
 	pendingTtlMs?: number;
 	maxPendingBytes?: number;
 	completedTtlMs?: number;
+	maxCompletedBytes?: number;
 }
 
 function sha256(value: string): string {
@@ -128,17 +138,41 @@ function deletePendingRequest(requestId: string, pending: PendingRequest): void 
 	pendingRequestBytes -= pending.receivedBytes;
 }
 
-function cleanupExpiredRequests(nowMs: number, pendingTtlMs: number, completedTtlMs: number): void {
+function deleteCompletedRequest(requestId: string, completed: CompletedRequest): void {
+	completedRequests.delete(requestId);
+	completedRequestBytes -= completed.retainedBytes;
+}
+
+function cleanupExpiredRequests(nowMs: number): void {
 	for (const [requestId, pending] of pendingRequests) {
-		if (nowMs - pending.updatedAtMs > pendingTtlMs) {
+		if (pending.expiresAtMs <= nowMs) {
 			deletePendingRequest(requestId, pending);
 		}
 	}
 	for (const [requestId, completed] of completedRequests) {
-		if (nowMs - completed.completedAtMs > completedTtlMs) {
-			completedRequests.delete(requestId);
+		if (completed.expiresAtMs <= nowMs) {
+			deleteCompletedRequest(requestId, completed);
 		}
 	}
+}
+
+function scheduleCleanup(nowMs: number): void {
+	if (cleanupTimer) clearTimeout(cleanupTimer);
+	cleanupTimer = undefined;
+	let expiresAtMs = Number.POSITIVE_INFINITY;
+	for (const pending of pendingRequests.values()) expiresAtMs = Math.min(expiresAtMs, pending.expiresAtMs);
+	for (const completed of completedRequests.values()) expiresAtMs = Math.min(expiresAtMs, completed.expiresAtMs);
+	if (expiresAtMs === Number.POSITIVE_INFINITY) return;
+	cleanupTimer = setTimeout(
+		() => {
+			cleanupTimer = undefined;
+			const now = Date.now();
+			cleanupExpiredRequests(now);
+			scheduleCleanup(now);
+		},
+		Math.max(0, expiresAtMs - nowMs),
+	);
+	cleanupTimer.unref();
 }
 
 function cleanupForPendingBytes(extraBytes: number, maxPendingBytes: number, protectedRequestId: string): void {
@@ -160,11 +194,8 @@ export function receiveRequestChunk(
 	assertValidChunk(body);
 
 	const nowMs = options.nowMs ?? Date.now();
-	cleanupExpiredRequests(
-		nowMs,
-		options.pendingTtlMs ?? REQUEST_CHUNK_PENDING_TTL_MS,
-		options.completedTtlMs ?? REQUEST_CHUNK_COMPLETED_TTL_MS,
-	);
+	const requestVersion = options.requestVersion ?? { version: 0 };
+	cleanupExpiredRequests(nowMs);
 
 	const completed = completedRequests.get(body.requestId);
 	if (completed) {
@@ -172,10 +203,10 @@ export function receiveRequestChunk(
 			throw new Error("Chunk metadata does not match the completed request");
 		}
 		const existing = completed.chunks.get(body.chunkIndex);
-		if (!existing || existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
+		if (existing !== body.sha256) {
 			throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
 		}
-		completed.requestVersion = Math.min(completed.requestVersion, options.requestVersion ?? 0);
+		if (requestVersion.version < completed.requestVersion.version) completed.requestVersion = requestVersion;
 		if (body.chunkIndex === completed.completedChunkIndex) {
 			return {
 				complete: true,
@@ -197,53 +228,70 @@ export function receiveRequestChunk(
 			if (existing.chunk !== body.chunk || existing.sha256 !== body.sha256) {
 				throw new Error(`Duplicate chunk index does not match: ${body.chunkIndex}`);
 			}
-			pending.requestVersion = Math.min(pending.requestVersion, options.requestVersion ?? 0);
-			pending.updatedAtMs = nowMs;
+			if (requestVersion.version < pending.requestVersion.version) pending.requestVersion = requestVersion;
+			pending.expiresAtMs = nowMs + (options.pendingTtlMs ?? REQUEST_CHUNK_PENDING_TTL_MS);
+			scheduleCleanup(nowMs);
 			return makeAck(body);
 		}
-		pending.requestVersion = Math.min(pending.requestVersion, options.requestVersion ?? 0);
+		if (requestVersion.version < pending.requestVersion.version) pending.requestVersion = requestVersion;
 	}
 
 	const chunkBytes = Buffer.byteLength(body.chunk, "utf-8");
 	cleanupForPendingBytes(chunkBytes, options.maxPendingBytes ?? REQUEST_CHUNK_MAX_PENDING_BYTES, body.requestId);
 	if (!pending) {
 		pending = {
-			requestVersion: options.requestVersion ?? 0,
+			requestVersion,
 			target: body.target,
 			totalChunks: body.totalChunks,
 			chunks: new Map(),
 			receivedBytes: 0,
-			updatedAtMs: nowMs,
+			expiresAtMs: nowMs + (options.pendingTtlMs ?? REQUEST_CHUNK_PENDING_TTL_MS),
 		};
 		pendingRequests.set(body.requestId, pending);
 	}
 	pending.chunks.set(body.chunkIndex, { chunk: body.chunk, sha256: body.sha256 });
 	pending.receivedBytes += chunkBytes;
-	pending.updatedAtMs = nowMs;
+	pending.expiresAtMs = nowMs + (options.pendingTtlMs ?? REQUEST_CHUNK_PENDING_TTL_MS);
 	pendingRequestBytes += chunkBytes;
 
 	if (pending.chunks.size !== pending.totalChunks) {
+		scheduleCleanup(nowMs);
 		return makeAck(body);
 	}
 
 	const encodedChunks: string[] = [];
+	const completedChunks = new Map<number, string>();
 	for (let index = 0; index < pending.totalChunks; index++) {
 		const chunk = pending.chunks.get(index);
 		if (chunk === undefined) throw new Error(`Missing chunk index: ${index}`);
 		encodedChunks.push(chunk.chunk);
+		completedChunks.set(index, chunk.sha256);
 	}
 
 	deletePendingRequest(body.requestId, pending);
 	const bodyJson = Buffer.from(encodedChunks.join(""), "base64").toString("utf-8");
+	const retainedBytes = Buffer.byteLength(bodyJson, "utf-8") + pending.chunks.size * 64;
+	const maxCompletedBytes = options.maxCompletedBytes ?? REQUEST_CHUNK_MAX_COMPLETED_BYTES;
+	if (retainedBytes > maxCompletedBytes) {
+		scheduleCleanup(nowMs);
+		throw new Error("Request chunk completed bytes limit exceeded");
+	}
+	for (const [requestId, completed] of completedRequests) {
+		if (completedRequestBytes + retainedBytes <= maxCompletedBytes) break;
+		deleteCompletedRequest(requestId, completed);
+	}
 	completedRequests.set(body.requestId, {
 		requestVersion: pending.requestVersion,
 		target: pending.target,
 		totalChunks: pending.totalChunks,
 		bodyJson,
 		completedChunkIndex: body.chunkIndex,
-		completedAtMs: nowMs,
-		chunks: pending.chunks,
+		expiresAtMs: nowMs + (options.completedTtlMs ?? REQUEST_CHUNK_COMPLETED_TTL_MS),
+		retainedBytes,
+		chunks: completedChunks,
 	});
+	completedRequestBytes += retainedBytes;
+	scheduleCleanup(nowMs);
 	return {
 		complete: true,
 		target: pending.target,
@@ -253,7 +301,10 @@ export function receiveRequestChunk(
 }
 
 export function clearAllRequestChunks(): void {
+	if (cleanupTimer) clearTimeout(cleanupTimer);
+	cleanupTimer = undefined;
 	pendingRequests.clear();
 	completedRequests.clear();
 	pendingRequestBytes = 0;
+	completedRequestBytes = 0;
 }

@@ -122,7 +122,6 @@ export class ViewerStore {
 	private readonly directory: string;
 	private readonly threads = new Map<string, StoredThread>();
 	private readonly connections = new Map<string, { id: string; sequence: number }>();
-	private readonly deletedConnections = new Set<string>();
 	private readonly parents = new Map<string, Set<string>>();
 	private readonly indexedSubagents = new Map<string, ObserverSubagent[]>();
 	private readonly archiveMetadata = new Map<
@@ -335,8 +334,6 @@ export class ViewerStore {
 	}
 
 	remove(id: string): Promise<void> {
-		const connection = this.connections.get(id);
-		if (connection) this.deletedConnections.add(connection.id);
 		this.connections.delete(id);
 		return this.enqueue(id, async () => {
 			const stored = this.threads.get(id);
@@ -478,9 +475,13 @@ export class ViewerStore {
 
 	update(body: ObserverUpdate): Promise<void> {
 		return this.enqueue(body.sessionId, async () => {
-			if (this.deletedConnections.has(body.connectionId)) throw new Error("Observer session deleted");
 			const connection = this.connections.get(body.sessionId);
-			if (connection?.id !== body.connectionId) throw new Error("Observer connection expired");
+			if (connection?.id !== body.connectionId)
+				throw new Error(
+					!this.threads.has(body.sessionId) && !getSession(body.sessionId)
+						? "Observer session deleted"
+						: "Observer connection expired",
+				);
 			if (body.sequence <= connection.sequence) return;
 			const committed = this.threads.get(body.sessionId);
 			const created = !committed;

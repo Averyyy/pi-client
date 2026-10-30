@@ -35,6 +35,7 @@ import {
 	type ProviderRequestOptions,
 	type ProviderStreamOptions,
 	parseStreamingJson,
+	registerSessionResourceCleanup,
 	type SimpleStreamOptions,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -127,6 +128,10 @@ export function resetSessionTracking(sessionId: string): void {
 	sessionTreeLeafIds.delete(sessionId);
 	sessionHasTemporaryTree.delete(sessionId);
 }
+
+registerSessionResourceCleanup((sessionId) => {
+	if (sessionId !== undefined) resetSessionTracking(sessionId);
+});
 
 export function resetAllSessionTracking(): void {
 	sessionStaticContextHashes.clear();
@@ -1382,10 +1387,6 @@ export async function streamPiServer(
 				throw new Error("pi-server stream ended before a terminal response event");
 			}
 
-			if (isEphemeralSession) {
-				resetSessionTracking(sessionId);
-			}
-
 			stream.end();
 		} catch (error) {
 			let errorMessage = error instanceof Error ? error.message : String(error);
@@ -1490,6 +1491,7 @@ export async function streamPiServer(
 			});
 			stream.end();
 		} finally {
+			if (isEphemeralSession) resetSessionTracking(sessionId);
 			try {
 				await finishPiServerOperation(
 					operation,

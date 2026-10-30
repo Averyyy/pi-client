@@ -18,12 +18,16 @@ import * as persistence from "../src/session-persistence.ts";
 import { clearAllSessions, getSession } from "../src/session-store.ts";
 import type { ViewerCatalog, ViewerDeleteResult, ViewerThread } from "../src/viewer-types.ts";
 
-function chunks(sessionId: string): RequestChunkBody[] {
-	const encoded = Buffer.from(JSON.stringify({ sessionId })).toString("base64");
+function chunks(
+	sessionId: string,
+	target = "/api/session/init",
+	fields: Record<string, unknown> = {},
+): RequestChunkBody[] {
+	const encoded = Buffer.from(JSON.stringify({ sessionId, ...fields })).toString("base64");
 	const requestId = randomUUID();
 	return [encoded.slice(0, 4), encoded.slice(4)].map((chunk, chunkIndex) => ({
 		requestId,
-		target: "/api/session/init",
+		target,
 		chunkIndex,
 		totalChunks: 2,
 		sha256: createHash("sha256").update(chunk).digest("hex"),
@@ -271,6 +275,93 @@ describe("viewer server deletion", () => {
 		expect(getSession("late")).toBeUndefined();
 		expect((await post("/api/session/init", { sessionId: "late" })).status).toBe(200);
 		expect(getSession("late")).toBeDefined();
+	});
+
+	it("permits a held request for another session after deletion", async () => {
+		await seed("deleted-a");
+		await seed("held-b");
+		const held = await hold("/api/session/append", {
+			sessionId: "held-b",
+			messages: [{ role: "user", content: "Still active", timestamp: 2 }],
+		});
+		expect((await remove("threads/deleted-a")).status).toBe(200);
+		held.finish();
+		expect(await held.result).toBe(200);
+		expect(getSession("held-b")!.messages.at(-1)).toMatchObject({ content: "Still active" });
+	});
+
+	it("rejects old held requests and chunk uploads after explicit recreation", async () => {
+		await seed("recreated");
+		const held = await hold("/api/session/init", { sessionId: "recreated" });
+		const pending = chunks("recreated");
+		const completed = chunks("recreated");
+		expect((await post("/api/request/chunk", pending[0])).status).toBe(200);
+		expect((await post("/api/request/chunk", completed[0])).status).toBe(200);
+		expect((await post("/api/request/chunk", completed[1])).status).toBe(200);
+		expect((await remove("threads/recreated")).status).toBe(200);
+		await seed("recreated");
+		held.finish();
+		expect(await held.result).toBe(410);
+		expect((await post("/api/request/chunk", pending[1])).status).toBe(410);
+		expect((await post("/api/request/chunk", completed[1])).status).toBe(410);
+		const fresh = chunks("recreated");
+		expect((await post("/api/request/chunk", fresh[0])).status).toBe(200);
+		expect((await post("/api/request/chunk", fresh[1])).status).toBe(200);
+		expect(getSession("recreated")!.messages).toHaveLength(1);
+	});
+
+	it("rejects delayed observer updates after deletion and rejects old connections after explicit recreation", async () => {
+		await seed("observer-lifetime");
+		async function connect(): Promise<string> {
+			const controller = new AbortController();
+			controllers.push(controller);
+			const response = await fetch(`${base}/api/observer/connect?sessionId=observer-lifetime`, {
+				headers: bearer,
+				signal: controller.signal,
+			});
+			const first = await response.body!.getReader().read();
+			return (
+				JSON.parse(/^data: (.+)$/m.exec(new TextDecoder().decode(first.value))![1]) as { connectionId: string }
+			).connectionId;
+		}
+		const connectionId = await connect();
+		const update = { connectionId, sequence: 1, cwd: "D:/project", replace: [] };
+		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update })).status).toBe(200);
+		const held = await hold("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 2 });
+		const pending = chunks("observer-lifetime", "/api/observer", { ...update, sequence: 3 });
+		expect((await post("/api/request/chunk", pending[0])).status).toBe(200);
+		expect((await remove("threads/observer-lifetime")).status).toBe(200);
+		held.finish();
+		expect(await held.result).toBe(410);
+		expect((await post("/api/request/chunk", pending[1])).status).toBe(410);
+		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 4 })).status).toBe(
+			410,
+		);
+		expect(getSession("observer-lifetime")).toBeUndefined();
+		expect((await viewer("threads/observer-lifetime")).status).toBe(404);
+
+		await seed("observer-lifetime");
+		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 5 })).status).toBe(
+			409,
+		);
+		const replacement = await connect();
+		expect(
+			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, connectionId: replacement })).status,
+		).toBe(200);
+		const reconnected = await connect();
+		expect(
+			(
+				await post("/api/observer", {
+					sessionId: "observer-lifetime",
+					...update,
+					connectionId: replacement,
+					sequence: 2,
+				})
+			).status,
+		).toBe(409);
+		expect(
+			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, connectionId: reconnected })).status,
+		).toBe(200);
 	});
 
 	it("rejects uploads begun before deletion and completed-chunk retries after deletion", async () => {

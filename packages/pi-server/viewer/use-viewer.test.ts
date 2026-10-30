@@ -1,8 +1,57 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ViewerProject } from "../src/viewer-types.ts";
-import { CatalogRequest, OlderHistoryRequest, ProjectCache } from "./use-viewer.ts";
+import type { ViewerMessage, ViewerProject, ViewerThread } from "../src/viewer-types.ts";
+import { CatalogRequest, OlderHistoryRequest, ProjectCache, ViewerUpdateBuffer } from "./use-viewer.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("pending viewer updates", () => {
+	const thread: ViewerThread = {
+		id: "thread",
+		title: "Thread",
+		projectId: "project",
+		cwd: null,
+		status: "running",
+		lastActiveAt: null,
+		legacy: false,
+		live: { message: null, tools: [] },
+	};
+	const message = (id: string): ViewerMessage => ({ id, role: "user", content: id, timestamp: 1 });
+	it("retains only the latest live snapshot while preserving every committed message in order", () => {
+		const buffer = new ViewerUpdateBuffer();
+		const committed = [message("first"), message("second")];
+		buffer.push({ thread, append: [committed[0]] });
+		for (let index = 0; index < 1000; index++) {
+			buffer.push({
+				thread: { ...thread, title: String(index), live: { message: message(String(index)), tools: [] } },
+			});
+		}
+		buffer.push({ thread: { ...thread, title: "latest" }, append: [committed[1]] });
+		expect(buffer).toEqual({ thread: { ...thread, title: "latest" }, replacement: undefined, committed });
+		buffer.clear();
+		expect(buffer).toEqual({ thread: null, replacement: undefined, committed: [] });
+	});
+
+	it("replaces obsolete committed data and pagination without retaining the replacement's live snapshot", () => {
+		const buffer = new ViewerUpdateBuffer();
+		buffer.push({ thread, append: [message("discarded")] });
+		buffer.push({
+			thread,
+			replace: true,
+			rounds: [{ id: "branch", messages: [message("kept")] }],
+			nextCursor: "older",
+		});
+		buffer.push({ thread: { ...thread, title: "latest" }, append: [message("after")] });
+		expect(buffer.thread?.title).toBe("latest");
+		expect(buffer.replacement).toEqual({
+			rounds: [{ id: "branch", messages: [message("kept")] }],
+			nextCursor: "older",
+		});
+		expect(buffer.committed.map((item) => item.id)).toEqual(["after"]);
+		buffer.push({ thread, replace: true, rounds: [], nextCursor: null });
+		expect(buffer.replacement).toEqual({ rounds: [], nextCursor: null });
+		expect(buffer.committed).toEqual([]);
+	});
+});
 
 describe("older history requests", () => {
 	it("rejects an old branch page that resolves after an authoritative replacement", async () => {

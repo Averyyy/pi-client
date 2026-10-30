@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Reclaimed idle request-chunk caches, bounded completed request bodies, and retained chunk checksums without duplicate Base64 payloads.
+- Reclaimed expired viewer login cookies and deleted-session metadata, and coalesced background viewer updates while preserving committed message order.
 - Made viewer persistence, history and asset reads, and authentication state I/O asynchronous. Viewer notifications run outside inference dispatch, with ordered per-thread operations, committed history indexes, and shutdown draining.
 - Loaded committed viewer tool outputs on expansion and parsed large event-stream frames incrementally to reduce thread-opening transfer size and browser CPU work.
 - Ordered threads and projects by server-recorded operation activity, preserving order across reconnects, metadata changes, history synchronization, and completed-result replay without requiring client activity timestamps.

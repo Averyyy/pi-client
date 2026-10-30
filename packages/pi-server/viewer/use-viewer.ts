@@ -25,6 +25,26 @@ interface RoundPage {
 	nextCursor: string | null;
 }
 
+export class ViewerUpdateBuffer {
+	thread: ViewerThread | null = null;
+	replacement: RoundPage | undefined;
+	committed: ViewerMessage[] = [];
+
+	push(update: ViewerUpdate): void {
+		this.thread = update.thread;
+		if (update.replace) {
+			this.replacement = { rounds: update.rounds, nextCursor: update.nextCursor };
+			this.committed = [];
+		} else if (update.append) this.committed.push(...update.append);
+	}
+
+	clear(): void {
+		this.thread = null;
+		this.replacement = undefined;
+		this.committed = [];
+	}
+}
+
 export class OlderHistoryRequest {
 	private controller: AbortController | null = null;
 	private generation = 0;
@@ -411,7 +431,7 @@ export function useViewer() {
 		selectionController.current = controller;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let frame = 0;
-		let updates: ViewerUpdate[] = [];
+		const updates = new ViewerUpdateBuffer();
 		setThread(null);
 		commitRounds([]);
 		setCursor(null);
@@ -425,17 +445,9 @@ export function useViewer() {
 		function flushUpdates() {
 			frame = 0;
 			if (controller.signal.aborted) return;
-			const pending = updates;
-			updates = [];
-			setThread(pending[pending.length - 1].thread);
-			let replacement: Extract<ViewerUpdate, { replace: true }> | undefined;
-			let committed: ViewerMessage[] = [];
-			for (const update of pending) {
-				if (update.replace) {
-					replacement = update;
-					committed = [];
-				} else if (update.append) committed.push(...update.append);
-			}
+			setThread(updates.thread);
+			const { replacement, committed } = updates;
+			updates.clear();
 			if (replacement) {
 				const merged = mergeRecentRounds(roundsRef.current, replacement.rounds);
 				if (
@@ -460,7 +472,7 @@ export function useViewer() {
 						const snapshot = JSON.parse(data) as Snapshot;
 						cancelAnimationFrame(frame);
 						frame = 0;
-						updates = [];
+						updates.clear();
 						const merged = mergeRecentRounds(roundsRef.current, snapshot.rounds);
 						if (
 							!snapshot.rounds.length ||
@@ -485,7 +497,7 @@ export function useViewer() {
 					} else if (event === "deleted") {
 						deleted = true;
 						cancelAnimationFrame(frame);
-						updates = [];
+						updates.clear();
 						setThread(null);
 						commitRounds([]);
 						setLoadingThread(false);
@@ -510,7 +522,7 @@ export function useViewer() {
 			}
 			if (!controller.signal.aborted) {
 				cancelAnimationFrame(frame);
-				if (updates.length) flushUpdates();
+				if (updates.thread) flushUpdates();
 				setLoadingThread(false);
 				setThreadConnected(false);
 				setThread((old) => (old ? { ...old, status: "disconnected" } : old));
@@ -526,6 +538,7 @@ export function useViewer() {
 			olderHistory.cancel();
 			if (timer) clearTimeout(timer);
 			cancelAnimationFrame(frame);
+			updates.clear();
 		};
 	}, [current, canLoadThread, threadAttempt, fail, refreshCatalog, olderHistory, commitRounds]);
 	function select(id: string) {
