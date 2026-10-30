@@ -613,6 +613,8 @@ export function composeModelProvider(
 		baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl,
 		headers: base?.headers,
 		auth: { ...(apiKey ? { apiKey } : {}), ...(oauth ? { oauth } : {}) },
+		modelCatalogAuth:
+			extension?.refreshModels || extension?.oauth?.modifyModels ? "provider" : base?.modelCatalogAuth,
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels:

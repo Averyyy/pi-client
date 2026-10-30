@@ -41,6 +41,9 @@
 
 ## pi-client / pi-server Request Sync
 
+- Public pi.dev catalog refreshes use `Provider.modelCatalogAuth: "none"` and do not resolve inference credentials. Account discovery and extension catalog hooks require provider auth; catalog visibility does not imply model availability.
+- Transient pi.dev HTTP failures must not advance `checkedAt`; retain the cached catalog and ETag so the next ordinary refresh retries.
+
 - In `PI_SERVER_MODE`, chat, image, classifier, and deferred operations exposed by `ModelRuntime` and its `Provider` objects must use pi-server transport. Preserve client auth and header transforms. Model catalogs, metadata, availability, and provider capabilities are determined by client credentials, configuration, extensions, and native account discovery. Server credentials do not add or remove client model choices. MCP auth and provider login remain client-local.
 - Preserve model type and exact client model availability, including identical provider/id pairs across chat, image, and classifier operations. Ordinary model accessors reuse the initialized client catalog; explicit refresh updates it and preserves native account discovery.
 - Successful login/logout must supersede pending provider model refreshes so an old credential's catalog cannot publish afterward. Availability still includes models authenticated by client environment or configuration; logout feedback must identify the remaining client source.

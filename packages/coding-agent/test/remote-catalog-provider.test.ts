@@ -2,6 +2,7 @@ import {
 	createModels,
 	createProvider,
 	type ImageModel,
+	InMemoryCredentialStore,
 	InMemoryModelsStore,
 	type Model,
 	type ModelsPublication,
@@ -10,6 +11,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../src/config.ts";
+import { ModelConfig } from "../src/core/model-config.ts";
+import { composeModelProvider, type ProviderConfigInput } from "../src/core/provider-composer.ts";
 import {
 	type PersonalizeCatalog,
 	REMOTE_CATALOG_MODEL_TYPES,
@@ -78,6 +81,97 @@ async function refreshProvider(
 afterEach(() => vi.restoreAllMocks());
 
 describe("remote catalog provider", () => {
+	it("refreshes public models without credentials while keeping them unavailable for inference", async () => {
+		const resolve = vi.fn(async () => undefined);
+		const provider = withRemoteCatalog({ ...builtinProvider(), auth: { apiKey: { name: "Test", resolve } } });
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([model("public")])));
+		const models = createModels();
+		models.setProvider(provider);
+
+		expect((await models.refresh()).errors.size).toBe(0);
+		expect(models.getModel(provider.id, "public")).toBeDefined();
+		expect(resolve).not.toHaveBeenCalled();
+		expect(fetchSpy).toHaveBeenCalledOnce();
+		expect(await models.getAvailable(provider.id)).toEqual([]);
+		expect(await models.getAuth(provider.id)).toBeUndefined();
+	});
+
+	it("refreshes a public catalog without refreshing expired OAuth", async () => {
+		const refresh = vi.fn(async () => {
+			throw new Error("refresh_token_reused");
+		});
+		const provider = withRemoteCatalog({
+			...builtinProvider(),
+			auth: {
+				oauth: {
+					name: "Test OAuth",
+					login: async () => {
+						throw new Error("unused");
+					},
+					refresh,
+					toAuth: async (credential) => ({ apiKey: credential.access }),
+				},
+			},
+		});
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify(provider.id, async () => ({
+			type: "oauth",
+			access: "expired",
+			refresh: "expired",
+			expires: 0,
+		}));
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([model("public")])));
+		const models = createModels({ credentials });
+		models.setProvider(provider);
+
+		expect((await models.refresh()).errors.size).toBe(0);
+		expect(models.getModel(provider.id, "public")).toBeDefined();
+		expect(refresh).not.toHaveBeenCalled();
+		await expect(models.getAuth(provider.id)).rejects.toThrow();
+		expect(refresh).toHaveBeenCalledOnce();
+	});
+
+	it("inherits public catalog auth only when an extension has no account catalog hooks", async () => {
+		const resolve = vi.fn(async () => undefined);
+		const base = withRemoteCatalog({ ...builtinProvider(), auth: { apiKey: { name: "Test", resolve } } });
+		const config = await ModelConfig.load(undefined);
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response(JSON.stringify([model("public")])));
+		const inherited = composeModelProvider(base.id, base, config, { name: "Overlay" });
+		const models = createModels();
+		models.setProvider(inherited);
+		await models.refresh();
+		expect(inherited.modelCatalogAuth).toBe("none");
+		expect(fetchSpy).toHaveBeenCalledOnce();
+		expect(resolve).not.toHaveBeenCalled();
+
+		const refreshModels = vi.fn(async (_context: RefreshModelsContext) => []);
+		const extensions: ProviderConfigInput[] = [
+			{ refreshModels },
+			{
+				oauth: {
+					name: "Extension OAuth",
+					login: async () => {
+						throw new Error("unused");
+					},
+					refreshToken: async (credential) => credential,
+					getApiKey: (credential) => credential.access,
+					modifyModels: (models) => models,
+				},
+			},
+		];
+		for (const extension of extensions) {
+			const provider = composeModelProvider(base.id, base, config, extension);
+			models.setProvider(provider);
+			expect(provider.modelCatalogAuth).toBe("provider");
+			await models.refresh();
+		}
+		expect(fetchSpy).toHaveBeenCalledOnce();
+		expect(resolve).toHaveBeenCalledTimes(2);
+		expect(refreshModels).toHaveBeenCalledOnce();
+		expect(refreshModels.mock.calls[0]?.[0].allowNetwork).toBe(false);
+	});
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
@@ -231,13 +325,16 @@ describe("remote catalog provider", () => {
 		const store = new InMemoryModelsStore();
 
 		await refreshProvider(provider, store);
+		const cached = await store.read(provider.id);
+		await store.write(provider.id, { ...cached!, checkedAt: 0 });
 		await expect(refreshProvider(provider, store, { force: true })).rejects.toThrow(/429/);
 
 		const stored = await store.read(provider.id);
 		expect(stored?.etag).toBe('"catalog-1"');
 		expect(stored?.models.map((entry) => entry.id)).toEqual(["dynamic"]);
+		expect(stored?.checkedAt).toBe(0);
 
-		await refreshProvider(provider, store, { force: true });
+		await refreshProvider(provider, store);
 		expect(fetchSpy.mock.calls[4]?.[1]?.headers).toMatchObject({ "if-none-match": '"catalog-1"' });
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
 	});
@@ -297,6 +394,22 @@ describe("remote catalog provider", () => {
 });
 
 describe("personalized catalog provider", () => {
+	it("requires provider authentication before network discovery", async () => {
+		const resolve = vi.fn(async () => undefined);
+		const personalize = vi.fn(async () => [model("allowed")]);
+		const provider = withPersonalizedCatalog(
+			{ ...testProvider(), auth: { apiKey: { name: "Test", resolve } } },
+			personalize,
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const models = createModels();
+		models.setProvider(provider);
+		await models.refresh();
+		expect(provider.modelCatalogAuth).toBe("provider");
+		expect(resolve).toHaveBeenCalledOnce();
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(personalize).not.toHaveBeenCalled();
+	});
 	const imageModel: ImageModel<"openrouter-images"> = {
 		type: "image",
 		id: "image",

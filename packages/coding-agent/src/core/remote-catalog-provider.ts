@@ -110,6 +110,7 @@ export function withRemoteCatalog(
 
 	return {
 		...provider,
+		modelCatalogAuth: "none",
 		getModels: () =>
 			mergeModels(
 				provider.getModels(),
@@ -167,7 +168,6 @@ export function withRemoteCatalog(
 			if (!response.ok) {
 				// Transient failure: the cached body and its validator stay valid, so keep the
 				// etag and let the next refresh revalidate instead of downloading the catalog.
-				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
 			}
 			const catalog = await readCatalog(provider.id, response);
@@ -204,6 +204,7 @@ export function withPersonalizedCatalog(
 
 	return {
 		...provider,
+		modelCatalogAuth: "provider",
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels: async (context) => {

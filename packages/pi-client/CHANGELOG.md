@@ -2,6 +2,7 @@
 
 ### Fixed
 
+- Refreshed public model catalogs independently of inference credentials, while preserving authentication for account discovery and model requests. Transient catalog failures retain their cached models and ETag for the next refresh.
 - Restarted updated runtimes through `/reload` with the current session, branch, and startup options. Shared update generations let each active session switch runtimes, and runtime lookup or handoff errors remain visible without relaunching the old runtime.
 - Invoked npm through Node on Windows so global updates can start without a shell.
 - Reported upstream Pi 1.0.0 and its full source commit in package metadata.

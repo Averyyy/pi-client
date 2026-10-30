@@ -81,7 +81,7 @@ export interface ModelsPublication {
 }
 
 export interface RefreshModelsContext {
-	/** Effective configured credential. OAuth credentials are refreshed before network access. */
+	/** Provider-authenticated catalogs receive credentials refreshed before network access; public catalogs omit them. */
 	credential?: Credential;
 	/** Immutable provider-scoped catalog snapshot captured before this refresh phase. */
 	stored?: Readonly<ModelsStoreEntry>;
@@ -193,6 +193,9 @@ export interface Provider<TApi extends Api = Api> {
 	 */
 	getAllModels?(): readonly ProviderModel<TApi>[];
 
+	/** Catalog refresh authentication; defaults to provider auth. Public catalogs use none. */
+	readonly modelCatalogAuth?: "none" | "provider";
+
 	/**
 	 * Dynamic providers only: restore `context.stored` and optionally fetch a newer list using
 	 * the effective credential. Implementations retain their previous list on failure, publish
@@ -287,9 +290,9 @@ export interface Models {
 	getAllModels(provider?: string): readonly AnyModel[];
 
 	/**
-	 * Refresh selected configured dynamic providers concurrently (all when `providers` is omitted).
+	 * Refresh selected dynamic providers concurrently (all when `providers` is omitted).
 	 * Provider errors and cancellation are returned without rejecting; static, unknown, and
-	 * unconfigured providers are skipped.
+	 * providers requiring auth without configuration are skipped.
 	 */
 	refresh(options?: ModelsRefreshOptions): Promise<ModelsRefreshResult>;
 
@@ -581,15 +584,18 @@ class ModelsImpl implements MutableModels {
 
 		const refresh = Promise.all(
 			refreshable.map(async (provider) => {
+				const requiresAuth = provider.modelCatalogAuth !== "none";
 				const { generation, controller } = this.beginProviderRefresh(provider.id);
 				const signal = AbortSignal.any([callerSignal, controller.signal]);
 				const operation = (async () => {
 					let storedCredential: Credential | undefined;
 					let credentialError: unknown;
-					try {
-						storedCredential = await this.readCredential(provider.id, signal);
-					} catch (error) {
-						credentialError = error;
+					if (requiresAuth) {
+						try {
+							storedCredential = await this.readCredential(provider.id, signal);
+						} catch (error) {
+							credentialError = error;
+						}
 					}
 
 					// Restore cached provider state before auth resolution or network access.
@@ -597,8 +603,10 @@ class ModelsImpl implements MutableModels {
 					if (credentialError !== undefined) throw credentialError;
 					if (!allowNetwork || signal.aborted) return;
 
-					const credential = await this.resolveRefreshCredential(provider, storedCredential, signal);
-					if (!credential) return;
+					const credential = requiresAuth
+						? await this.resolveRefreshCredential(provider, storedCredential, signal)
+						: undefined;
+					if (requiresAuth && !credential) return;
 					await this.runProviderRefreshPhase(provider, credential, true, options.force, generation, signal);
 				})();
 
