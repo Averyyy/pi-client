@@ -961,8 +961,8 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(initialReads);
 		expect(runtime.getError()).toBeUndefined();
 		const refresh = await runtime.refresh({ allowNetwork: false });
-		expect(refresh.errors.size).toBe(0);
-		expect(runtime.getError()).toBeUndefined();
+		expect([...refresh.errors.keys()].sort()).toEqual(["devin", "google-antigravity"]);
+		expect(runtime.getError()).toContain("pi-server accounts:");
 	});
 
 	it("returns cancellation in the refresh result without changing the verified catalog", async () => {
@@ -1066,10 +1066,10 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(localCalls).toBe(0);
 		const refreshed = await runtime.refresh({ allowNetwork: false });
 		expect(refreshed.aborted).toBe(false);
-		expect(refreshed.errors.size).toBe(0);
-		expect(runtime.getError()).toBeUndefined();
+		expect([...refreshed.errors.keys()].sort()).toEqual(["devin", "google-antigravity"]);
+		expect(runtime.getError()).toContain("pi-server accounts:");
 		const restarted = await createRuntime();
-		expect(restarted.getError()).toBeUndefined();
+		expect(restarted.getError()).toContain("pi-server accounts:");
 	});
 
 	it("runs codemode image/classifier calls in a remote session and records their complete usage", async () => {

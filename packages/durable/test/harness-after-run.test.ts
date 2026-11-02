@@ -905,7 +905,7 @@ describe("afterRun", () => {
 		const state = probe();
 		state.gate = deferred();
 		install(setup, state);
-		setup.faux.setResponses([fauxAssistantMessage("done")]);
+		setup.faux.setResponses([fauxAssistantMessage("done"), fauxAssistantMessage("later answered")]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
 		await eventually(() => state.runs.length === 1);

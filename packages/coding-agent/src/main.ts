@@ -989,6 +989,9 @@ export async function main(args: string[], options?: MainOptions) {
 		reportDiagnostics(startupDiagnostics);
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
 		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
+		await runtime.dispose();
+		process.exitCode = 0;
+		if (process.platform === "win32") return;
 		process.exit(0);
 	}
 
@@ -1020,6 +1023,9 @@ export async function main(args: string[], options?: MainOptions) {
 		if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
 			console.error(chalk.yellow(EXTENSION_LOAD_FAILURE_HINT));
 		}
+		await runtime.dispose();
+		process.exitCode = 1;
+		if (process.platform === "win32") return;
 		process.exit(1);
 	}
 	time("createAgentSession");
@@ -1030,12 +1036,18 @@ export async function main(args: string[], options?: MainOptions) {
 			(session.model.provider === "unknown" && session.model.id === "unknown" && session.model.api === "unknown"))
 	) {
 		console.error(chalk.red(modelRuntime.getError() ?? formatNoModelsAvailableMessage()));
+		await runtime.dispose();
+		process.exitCode = 1;
+		if (process.platform === "win32") return;
 		process.exit(1);
 	}
 
 	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
 	if (startupBenchmark && appMode !== "interactive") {
 		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
+		await runtime.dispose();
+		process.exitCode = 1;
+		if (process.platform === "win32") return;
 		process.exit(1);
 	}
 

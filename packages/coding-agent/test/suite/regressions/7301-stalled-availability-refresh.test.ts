@@ -1,4 +1,3 @@
-import type { Models } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -108,18 +107,13 @@ describe("issue #7301 stalled availability refresh", () => {
 	it("does not let a stale provider-scoped failure overwrite a newer availability pass", async () => {
 		harness = await createHarness();
 		const runtime = harness.session.modelRuntime;
-		const models = Reflect.get(runtime, "models") as Models;
-		const originalGetAvailable = models.getAvailable.bind(models);
 		const started = createDeferred();
 		const gate = createDeferred();
-		let stall = true;
-		models.getAvailable = async (providerId, options) => {
-			if (!providerId || !stall) return originalGetAvailable(providerId, options);
-			stall = false;
+		vi.spyOn(runtime, "getAvailableOfType").mockImplementationOnce(async () => {
 			started.resolve();
 			await gate.promise;
 			throw new Error("stale provider availability failure");
-		};
+		});
 
 		const staleRefresh = runtime.getAvailable(harness.getModel().provider);
 		await started.promise;

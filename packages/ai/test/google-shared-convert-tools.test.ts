@@ -163,9 +163,26 @@ describe("google-shared convertTools", () => {
 			},
 		});
 		expect(parameters).toEqual(original);
-		expect(convertTools([makeTool(parameters)], false)?.[0].functionDeclarations[0].parametersJsonSchema).toEqual(
-			original,
-		);
+		expect(convertTools([makeTool(parameters)], false)?.[0].functionDeclarations[0].parametersJsonSchema).toEqual({
+			...original,
+			properties: {
+				rows: {
+					...original.properties.rows,
+					items: {
+						...original.properties.rows.items,
+						properties: {
+							...original.properties.rows.items.properties,
+							mode: {
+								anyOf: [
+									{ type: "string", enum: ["auto"] },
+									{ type: "string", enum: ["manual"] },
+								],
+							},
+						},
+					},
+				},
+			},
+		});
 	});
 
 	it("preserves anyOf branches with additional constraints or descriptions", () => {

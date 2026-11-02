@@ -377,7 +377,7 @@ describe("data-only writes", () => {
 				taskId: expect.any(Number),
 				inputs: [input.id],
 				reason: "model_error",
-				detail: "invalid request",
+				detail: "insufficient_quota",
 				first: expect.any(Number),
 			},
 		});

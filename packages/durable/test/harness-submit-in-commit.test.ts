@@ -37,7 +37,7 @@ import { deferred } from "./task-support.ts";
 const MODEL = { provider: "faux", modelId: "faux-1" } as const;
 
 const failure = (): AssistantMessage =>
-	fauxAssistantMessage([], { stopReason: "error", errorMessage: "Invalid request" });
+	fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" });
 
 /** A host's own conversation document. */
 const Sent = defineDoc<{ ids: number[] }>({

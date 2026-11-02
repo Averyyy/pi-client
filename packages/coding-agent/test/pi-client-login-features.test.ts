@@ -124,6 +124,7 @@ describe("pi-client interactive login features", () => {
 				modelRuntime: {
 					getProviders: () => providers,
 					getProvider: (id: string) => providers.find((provider) => provider.id === id),
+					isServerAccountProvider: () => false,
 					getProviderAuthStatus: () => ({ configured, source: "stored", label: "stored credential" }),
 					isUsingOAuth: () => configured,
 					getAvailableSnapshot: () => [model],

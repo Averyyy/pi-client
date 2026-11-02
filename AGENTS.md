@@ -207,6 +207,7 @@ Binding for `packages/chord/src/next/` and its tests, when writing and when revi
 
 ## Commands
 
+- Runtime commands that exit before a prompt must dispose the session and observer; on Windows, set the exit code and return so Node drains asynchronous handle cleanup.
 - Help/version and invalid built-in CLI options must exit before model services contact the server. Help must still load trusted extension resources so their registered flags remain visible.
 - On Windows with Node 26, `spawnSync("npm.cmd", ...)` can fail with `EINVAL`; release scripts that spawn npm must invoke npm's CLI through `process.execPath` instead.
 - Windows PowerShell service loops must redirect native stdout and stderr through `cmd.exe` so stderr remains in the log and does not terminate the loop under `$ErrorActionPreference = 'Stop'`.

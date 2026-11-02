@@ -5,7 +5,6 @@
 ### Breaking Changes
 
 - Errors in input, context, agent preparation, and provider request/header transformation handlers stop the affected request instead of continuing with original or partially transformed data.
-- `pi.exec()` rejects command startup failures instead of returning an empty failed result.
 
 ### Added
 
@@ -17,6 +16,7 @@
 
 ### Fixed
 
+- Closed session observers before runtime command exits and drained Windows handle cleanup.
 - Fixed steering and follow-up messages queued during manual pi-server compaction failing to send when compaction completed.
 - Released pi-server synchronization tracking when sessions are disposed and temporary streams finish, including failures, cancellation, and recovered responses.
 - Fixed session resume hints being truncated by interactive exit before terminal output completed.

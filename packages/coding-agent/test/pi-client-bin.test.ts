@@ -227,12 +227,14 @@ describe("coding-agent bins", () => {
 				return { status, stdout, stderr };
 			}
 			const listed = await runCli(["--list-models", "-ne", "--no-mcp", "--no-context-files"]);
-			expect(listed.status, listed.stderr).toBe(0);
+			expect(listed.status, JSON.stringify(listed)).toBe(0);
 			expect(listed.stdout).toContain("client-owned");
 			expect(listed.stdout).toContain("client-non-hf");
 			expect(listed.stdout).toContain("32.8K");
 			expect(listed.stdout).not.toContain("server-hf-only");
-			expect(serverPaths).toEqual([]);
+			expect(serverPaths).toContain("/api/accounts");
+			expect(serverPaths).not.toContain("/api/models");
+			expect(serverPaths).not.toContain("/api/stream");
 			const prompted = await runCli([
 				"-p",
 				"--no-session",
@@ -295,7 +297,7 @@ describe("coding-agent bins", () => {
 	it.each([
 		{ selection: "without an explicit model", args: [] },
 		{ selection: "with an explicit model", args: ["--model", "unavailable/model"] },
-	])("reports unavailable client models $selection without a server catalog error", ({ args }) => {
+	])("reports unavailable client models $selection with account discovery diagnostics", ({ args }) => {
 		const root = mkdtempSync(join(tmpdir(), "pi-client-unavailable-server-"));
 		try {
 			const result = spawnSync(
@@ -342,7 +344,7 @@ describe("coding-agent bins", () => {
 			if (args.length > 0) {
 				expect(result.stderr).toContain("unavailable/model");
 			} else {
-				expect(result.stderr).toContain("No models available");
+				expect(result.stderr).toContain("pi-server accounts:");
 			}
 			expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|node:internal|\n\s+at /i);
 		} finally {

@@ -134,7 +134,7 @@ import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../.
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { ensurePngTranscoder } from "../../utils/image-convert.ts";
-import { getCwdRelativePath, shortenHomePath } from "../../utils/paths.ts";
+import { getCwdRelativePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
@@ -1507,8 +1507,12 @@ export class InteractiveMode {
 	// =========================================================================
 
 	private formatDisplayPath(p: string): string {
-		const shortened = shortenHomePath(p);
-		return shortened === p ? p : shortened.replaceAll("\\", "/");
+		const home = os.homedir().replaceAll("\\", "/").replace(/\/$/, "");
+		const normalizedPath = p.replaceAll("\\", "/");
+		if (normalizedPath === home || normalizedPath.startsWith(`${home}/`)) {
+			return `~${normalizedPath.slice(home.length)}`;
+		}
+		return p;
 	}
 
 	private formatExtensionDisplayPath(path: string): string {

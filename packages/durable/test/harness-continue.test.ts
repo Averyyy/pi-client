@@ -73,7 +73,7 @@ async function open(path: string, setup: ChatSetup) {
 }
 
 const failure = (): AssistantMessage =>
-	fauxAssistantMessage([], { stopReason: "error", errorMessage: "Invalid request" });
+	fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" });
 
 /** A response step that records the roles of the context it was asked with, then answers `text`. */
 function answering(text: string, seen: Message["role"][][]): FauxResponseStep {

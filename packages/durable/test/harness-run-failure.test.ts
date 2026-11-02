@@ -29,7 +29,7 @@ function failingOnce() {
 	const step: FauxResponseStep = async () => {
 		reached.resolve();
 		await gate.promise;
-		return fauxAssistantMessage([], { stopReason: "error", errorMessage: "Invalid request" });
+		return fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" });
 	};
 	return { step, gate, reached };
 }
@@ -38,19 +38,19 @@ describe("pi.live.runFailure", () => {
 	it("records a model error with its text, and a later run clears it", async () => {
 		const setup = chatSetup();
 		setup.faux.setResponses([
-			fauxAssistantMessage([], { stopReason: "error", errorMessage: "Invalid request" }),
+			fauxAssistantMessage([], { stopReason: "error", errorMessage: "insufficient_quota" }),
 			fauxAssistantMessage([fauxText("fine")]),
 		]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const submission = await root.submit({ type: "input", content: "hi" }, context);
 		const settled = await submission.wait(context);
-		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: "Invalid request" });
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: "insufficient_quota" });
 		const failure = (await live(harness, root)).runFailure;
 		expect(failure).toEqual({
 			taskId: expect.any(Number),
 			inputs: [submission.id],
 			reason: "model_error",
-			detail: "Invalid request",
+			detail: "insufficient_quota",
 			first: expect.any(Number),
 		} satisfies RunFailure);
 		const next = await root.submit({ type: "input", content: "again" }, context);
