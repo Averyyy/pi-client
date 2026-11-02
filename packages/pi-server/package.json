@@ -29,8 +29,8 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@0.84.2-piclient.1",
-		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@0.84.2-piclient.1"
+		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@1.4.0-piclient.19",
+		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@1.4.0-piclient.19"
 	},
 	"keywords": [
 		"pi-server",
@@ -58,6 +58,6 @@
 		"react-dom": "19.3.1",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
-		"vitest": "4.1.9"
+		"vitest": "4.1.12"
 	}
 }

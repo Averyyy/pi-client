@@ -30,6 +30,7 @@ import {
 	type PrepareNextTurnContext,
 	runToolCall,
 	type SessionTreeEntry,
+	type StreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -181,6 +182,18 @@ import {
 	VIRTUAL_MODEL_STATE_ENTRY,
 	type VirtualModelStateData,
 } from "./virtual-models.ts";
+
+/**
+ * Stream functions that resolve auth through a given ModelRuntime themselves, such as the one
+ * createAgentSession installs. Summaries sent through them must not pass pre-resolved credentials:
+ * the runtime would take them as an explicit API key instead of the stored OAuth login (#11520).
+ */
+const runtimeStreamFunctions = new WeakMap<StreamFn, ModelRuntime>();
+
+/** Mark `streamFn` as resolving auth through `modelRuntime` on its own. */
+export function markRuntimeStreamFunction(streamFn: StreamFn, modelRuntime: ModelRuntime): void {
+	runtimeStreamFunctions.set(streamFn, modelRuntime);
+}
 
 // ============================================================================
 // Skill Block Parsing
@@ -743,6 +756,7 @@ export class AgentSession {
 	private async _getSummarizationRequestAuth(
 		selectedModel: Model<any>,
 		signal?: AbortSignal,
+		streamFn?: StreamFn,
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
@@ -758,7 +772,10 @@ export class AgentSession {
 					signal,
 				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
-		if (isPiServerMode() || this.agent.streamFunction === streamSimple) {
+		if (streamFn && runtimeStreamFunctions.get(streamFn) === this._modelRuntime) {
+			return { model, thinkingLevel };
+		}
+		if (isPiServerMode() || streamFn === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
 
@@ -1902,9 +1919,14 @@ export class AgentSession {
 	 * the registered, non-hidden ones; they are declared to the model. Active tools with a
 	 * `prepareLoadout` hook can change the declared descriptions and hide declarations from
 	 * requests (see {@link _installHiddenDeclarationsProjection}).
+	 *
+	 * The active tools are a set: tools that stay active keep their current order and newly active
+	 * ones are appended, so reordering the same names does not change the prompt (#11495).
 	 */
 	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
-		const tools = [...new Set(toolNames)].flatMap((name) => {
+		const requested = new Set(toolNames);
+		const kept = this.getActiveToolNames().filter((name) => requested.has(name));
+		const tools = [...new Set([...kept, ...requested])].flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
 			return tool && this._getToolExposure(name) !== "hidden" && this._isActivatable(name) ? [tool] : [];
 		});
@@ -3577,7 +3599,11 @@ export class AgentSession {
 					headers,
 					env,
 					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(model, this._compactionAbortController.signal);
+				} = await this._getSummarizationRequestAuth(
+					model,
+					this._compactionAbortController.signal,
+					this.agent.streamFunction,
+				);
 				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const result = await compact(
 					preparation,
@@ -3990,7 +4016,7 @@ export class AgentSession {
 					headers,
 					env,
 					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(model, abortController.signal);
+				} = await this._getSummarizationRequestAuth(model, abortController.signal, this.agent.streamFunction);
 				abortController.signal.throwIfAborted();
 				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const compactResult = await compact(
@@ -5062,7 +5088,7 @@ export class AgentSession {
 				const signal = this._branchSummaryAbortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
-					...(await this._getSummarizationRequestAuth(this.model!, signal)),
+					...(await this._getSummarizationRequestAuth(this.model!, signal, this.agent.streamFunction)),
 					signal,
 					customInstructions,
 					replaceInstructions,
@@ -5363,7 +5389,7 @@ export class AgentSession {
 			throw new Error("No model selected");
 		}
 		return generateBugReportSummary({
-			...(await this._getSummarizationRequestAuth(model, options.signal)),
+			...(await this._getSummarizationRequestAuth(model, options.signal, this.agent.streamFunction)),
 			messages: this.messages,
 			hint: options.hint,
 			signal: options.signal,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Based on upstream Pi 1.5.0, including JSON Schema tool validation, bounded extension command output, and branch summaries that preserve context edits and thinking settings.
+
 ### Added
 
 - Added an authenticated public pi.dev catalog cache with on-demand fetching, shared concurrent requests, version-specific persistence, and four-hour ETag revalidation. Clients retain provider authentication and model availability decisions.

@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- Based on upstream Pi 1.5.0, including JSON Schema tool validation, bounded extension command output, and branch summaries that preserve context edits and thinking settings.
+
 ### Fixed
 
 - Applied server-provided public model catalogs regardless of the bundled catalog's build timestamp, including cached models and OpenRouter personalization.

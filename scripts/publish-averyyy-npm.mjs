@@ -13,6 +13,7 @@ const versionPattern = /^\d+\.\d+\.\d+-piclient\.\d+$/;
 const buildWorkspaces = [
 	"packages/tui",
 	"packages/telemetry",
+	"packages/schema",
 	"packages/ai",
 	"packages/chord",
 	"packages/codemode",

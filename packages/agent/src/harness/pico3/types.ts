@@ -19,6 +19,7 @@ import type {
 	Message as ModelMessage,
 	Model as ModelOf,
 	TextContent,
+	Tool,
 	ToolCall,
 	ToolResultMessage,
 	UserMessage,
@@ -66,19 +67,12 @@ export interface Conversation {
 	readonly sections?: readonly SectionSeed[];
 }
 
-/**
- * System instructions and the tool loadout ride inside `messages` (pi-ai PR #9116, shimmed
- * here until it lands): a SystemMessage at its historical position.
- */
-export interface SystemMessage {
-	role: "system";
-	content: string;
-	toolsAdded?: { name: string; description: string; parameters: TSchema }[];
-	toolsRemoved?: { name: string }[];
-	timestamp: number;
-}
+/** Native system messages with JSON tool schemas at durable positions. */
+export type SystemMessage = Omit<Extract<ModelMessage, { role: "system" }>, "toolsAdded"> & {
+	toolsAdded?: Tool<JsonObject>[];
+};
 export type Message = ModelMessage | SystemMessage;
-export type StoredMessage = Stored<Message>;
+export type StoredMessage = Stored<Exclude<Message, { role: "system" }> | SystemMessage>;
 export type Model = ModelOf<Api>;
 
 export interface ContextEdit {

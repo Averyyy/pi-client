@@ -5,11 +5,16 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import type { Model, Usage } from "@earendil-works/pi-ai/compat";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
-import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
+import {
+	type ContextEditEntry,
+	projectContextEntry,
+	type ReadonlySessionManager,
+	type SessionEntry,
+} from "../session-manager.ts";
 import { estimateTokens, summarizeMessages } from "./compaction.ts";
 import {
 	computeFileLists,
@@ -67,6 +72,8 @@ export interface GenerateBranchSummaryOptions {
 	env?: Record<string, string>;
 	/** Abort signal for cancellation */
 	signal: AbortSignal;
+	/** Thinking level for reasoning-capable models */
+	thinkingLevel?: ThinkingLevel;
 	/** Optional custom instructions for summarization */
 	customInstructions?: string;
 	/** If true, customInstructions replaces the default prompt instead of being appended */
@@ -145,14 +152,15 @@ export function collectEntriesForBranchSummary(
  * Extract AgentMessage from a session entry.
  * Similar to getMessageFromEntry in compaction.ts but also handles compaction entries.
  */
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
+function getMessageFromEntry(entry: SessionEntry, edit?: ContextEditEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
 			// Skip tool results - context is in assistant's tool call
 			if (entry.message.role === "toolResult") return undefined;
-			return entry.message;
+			return edit ? projectContextEntry(entry, edit)[0] : entry.message;
 
 		case "custom_message":
+			if (edit) return projectContextEntry(entry, edit)[0];
 			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
 
 		case "branch_summary":
@@ -207,10 +215,16 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
+	// Context edits hide or replace earlier entries in model context; honor the latest edit per target.
+	const edits = new Map<string, ContextEditEntry>();
+	for (const entry of entries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+	}
+
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
-		const message = getMessageFromEntry(entry);
+		const message = getMessageFromEntry(entry, edits.get(entry.id));
 		if (!message) continue;
 
 		// Extract file ops from assistant messages (tool calls)
@@ -298,8 +312,19 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
-	const { model, apiKey, headers, env, signal, customInstructions, replaceInstructions, streamFn, retry, callbacks } =
-		options;
+	const {
+		model,
+		apiKey,
+		headers,
+		env,
+		signal,
+		thinkingLevel,
+		customInstructions,
+		replaceInstructions,
+		streamFn,
+		retry,
+		callbacks,
+	} = options;
 
 	const { messages, fileOps } = prepareBranchEntries(entries);
 
@@ -329,7 +354,7 @@ export async function generateBranchSummary(
 			headers,
 			env,
 			signal,
-			undefined,
+			thinkingLevel,
 			streamFn,
 			instructions,
 			updateInstructions,

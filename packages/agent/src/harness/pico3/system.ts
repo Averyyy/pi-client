@@ -13,6 +13,7 @@ import type {
 	Stored,
 	SystemMessage,
 } from "./types.ts";
+import { toStored } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Sections (pico §12.1). A section is a stable key plus a pure renderer. Only
@@ -295,11 +296,7 @@ export async function planManagedEntry(
 	const toolOf = (t: AnyToolDeclaration) => ({
 		name: t.name,
 		description: t.description,
-		parameters: structuredClone(t.parameters) as Stored<SystemMessage>["toolsAdded"] extends (infer X)[] | undefined
-			? X extends { parameters: infer PP }
-				? PP
-				: never
-			: never,
+		parameters: toStored(t.parameters),
 	});
 
 	// Previous effective tools: those declared by the newest managed entry chain (we recompute from canonical's owner: the tail message).
