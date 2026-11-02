@@ -3509,6 +3509,7 @@ export class AgentSession {
 				);
 				const result = await this._applyPiServerCompactionResult(piServerResult, "manual", false);
 				this._lastServerCompactionTimestamp = Date.now();
+				this._clearManualCompactionState();
 				this._emit({
 					type: "compaction_end",
 					reason: "manual",

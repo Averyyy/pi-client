@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Fixed steering and follow-up messages queued during manual pi-server compaction failing to send when compaction completed.
 - Released pi-server synchronization tracking when sessions are disposed and temporary streams finish, including failures, cancellation, and recovered responses.
 - Fixed session resume hints being truncated by interactive exit before terminal output completed.
 - Kept pi-server observer socket reconnections quiet while preserving connection, update, and shutdown failure diagnostics.
