@@ -5,6 +5,7 @@
 ### Changed
 
 - Based on upstream Pi 1.5.0, including JSON Schema tool validation, bounded extension command output, and branch summaries that preserve context edits and thinking settings.
+- Accepted event-triggered observer POSTs with publisher identity and sequence numbers, without client presence connections or heartbeats. Persisted explicit completion states and retained browser event streams.
 
 ### Added
 
@@ -15,7 +16,7 @@
 - Displayed the pi-server package version on the viewer login and conversation pages.
 - Added a browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.
 - Added project and thread context menus for folding and confirmed server deletion, automatic history loading at the top, and project ordering by the latest thread activity.
-- Added an independent observer store and streaming endpoints without changing provider requests or authoritative session trees.
+- Added an independent observer store and event update endpoint without changing provider requests or authoritative session trees.
 - Reported the resolved cache-retention policy before provider dispatch and retained it for same-run recovery and replay, without returning server credentials or environment values.
 - Added an authenticated mixed model catalog and image/classifier endpoints with heartbeat streaming, completed-run recovery, and acknowledged cancellation.
 - Added correlated provider lifecycle callbacks so client extensions can inspect responses and replace request payloads before provider dispatch.

@@ -304,34 +304,19 @@ export class ViewerHttp {
 		return true;
 	}
 
-	connect(req: IncomingMessage, res: ServerResponse, sessionId: string | null): void {
-		if (!sessionId) {
-			json(res, 400, { error: "sessionId is required" });
-			return;
-		}
-		const connection = this.store.connect(sessionId);
-		const send = this.events(req, res, false);
-		const removed = (id: string) => {
-			if (id === sessionId) {
-				send("deleted", { id });
-				res.end();
-			}
-		};
-		this.store.removedListeners.add(removed);
-		res.once("close", () => {
-			this.store.removedListeners.delete(removed);
-			connection.close();
-		});
-		send("connected", { connectionId: connection.connectionId });
-	}
-
-	async observe(value: unknown, res: ServerResponse): Promise<void> {
+	async observe(value: unknown, res: ServerResponse, isDeleted: (sessionId: string) => boolean): Promise<void> {
 		try {
 			const body = object(value);
-			if (typeof body.sessionId !== "string" || !body.sessionId || typeof body.connectionId !== "string")
-				throw new Error("sessionId and connectionId are required");
+			if (
+				typeof body.sessionId !== "string" ||
+				!body.sessionId ||
+				typeof body.observerId !== "string" ||
+				!body.observerId
+			)
+				throw new Error("sessionId and observerId are required");
 			if (!Number.isSafeInteger(body.sequence) || Number(body.sequence) < 1)
 				throw new Error("sequence must be a positive integer");
+			if (typeof body.create !== "boolean") throw new Error("create must be a boolean");
 			if (body.cwd !== undefined && (typeof body.cwd !== "string" || !body.cwd))
 				throw new Error("cwd must be a non-empty string");
 			if (body.title !== undefined && typeof body.title !== "string") throw new Error("title must be a string");
@@ -341,8 +326,9 @@ export class ViewerHttp {
 				throw new Error("replace and append are exclusive");
 			const update: ObserverUpdate = {
 				sessionId: body.sessionId,
-				connectionId: body.connectionId,
+				observerId: body.observerId,
 				sequence: body.sequence as number,
+				create: body.create,
 				...(body.cwd !== undefined ? { cwd: body.cwd as string } : {}),
 				...(body.title !== undefined ? { title: body.title as string } : {}),
 				...(body.status !== undefined ? { status: body.status as "running" | "idle" } : {}),
@@ -351,20 +337,21 @@ export class ViewerHttp {
 				...(body.live !== undefined ? { live: live(body.live) } : {}),
 				...(body.subagents !== undefined ? { subagents: subagents(body.subagents) } : {}),
 			};
-			await this.store.update(update);
+			await this.store.update(update, () => isDeleted(update.sessionId));
 			json(res, 200, { accepted: true });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "Invalid observer request";
 			if (message === "Observer session deleted") json(res, 410, { error: message, deleted: true });
-			else json(res, message === "Observer connection expired" ? 409 : 400, { error: message });
+			else if (message === "Observer snapshot required") json(res, 409, { error: message, snapshotRequired: true });
+			else json(res, 400, { error: message });
 		}
 	}
 
-	private events(req: IncomingMessage, res: ServerResponse, cookie = true): (event: string, value: unknown) => void {
+	private events(req: IncomingMessage, res: ServerResponse): (event: string, value: unknown) => void {
 		securityHeaders(res);
 		res.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive", "X-Accel-Buffering": "no" });
 		res.flushHeaders();
-		this.auth.track(res, cookie ? req : undefined);
+		this.auth.track(res, req);
 		this.streams.add(res);
 		let blocked = false;
 		res.on("drain", () => {
@@ -383,7 +370,7 @@ export class ViewerHttp {
 			if (checkingAuth) return;
 			checkingAuth = true;
 			try {
-				if ((await this.auth.isLocked()) || (cookie && !this.auth.hasCookie(req))) {
+				if ((await this.auth.isLocked()) || !this.auth.hasCookie(req)) {
 					res.end();
 					return;
 				}

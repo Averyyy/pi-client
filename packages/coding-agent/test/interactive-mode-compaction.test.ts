@@ -144,7 +144,7 @@ describe("InteractiveMode compaction events", () => {
 		};
 		const fakeThis = {
 			isInitialized: true,
-			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
+			session: { isAborting: false, isWorking: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			programStatus: { handleEvent: vi.fn() },
 			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
@@ -159,7 +159,7 @@ describe("InteractiveMode compaction events", () => {
 			showError: vi.fn(),
 			showStatus: vi.fn(),
 			clearStatusIndicator: vi.fn(),
-			restoreWorkingStatusIndicatorIfStreaming: vi.fn(),
+			restoreWorkingStatusIndicator: vi.fn(),
 			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
 			settingsManager: { getShowTerminalProgress: () => false },
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
@@ -205,15 +205,15 @@ describe("InteractiveMode compaction events", () => {
 			usage,
 		});
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
-		expect(fakeThis.restoreWorkingStatusIndicatorIfStreaming).toHaveBeenCalledTimes(1);
+		expect(fakeThis.restoreWorkingStatusIndicator).toHaveBeenCalledTimes(1);
 	});
 
 	test("restores the working indicator after compaction while the agent is still streaming", () => {
-		const restoreWorkingStatusIndicatorIfStreaming = Reflect.get(
+		const restoreWorkingStatusIndicator = Reflect.get(
 			InteractiveMode.prototype,
-			"restoreWorkingStatusIndicatorIfStreaming",
+			"restoreWorkingStatusIndicator",
 		) as (this: {
-			session: { isStreaming: boolean };
+			session: { isWorking: boolean };
 			workingVisible: boolean;
 			activeStatusIndicator: { kind: string } | undefined;
 			showWorkingStatusIndicator: ReturnType<typeof vi.fn>;
@@ -222,9 +222,9 @@ describe("InteractiveMode compaction events", () => {
 		}) => void;
 
 		const createFakeThis = (
-			overrides: { isStreaming?: boolean; workingVisible?: boolean; activeStatusIndicator?: { kind: string } } = {},
+			overrides: { isWorking?: boolean; workingVisible?: boolean; activeStatusIndicator?: { kind: string } } = {},
 		) => ({
-			session: { isStreaming: overrides.isStreaming ?? true },
+			session: { isWorking: overrides.isWorking ?? true },
 			workingVisible: overrides.workingVisible ?? true,
 			activeStatusIndicator: overrides.activeStatusIndicator,
 			showWorkingStatusIndicator: vi.fn(),
@@ -233,30 +233,30 @@ describe("InteractiveMode compaction events", () => {
 		});
 
 		const streaming = createFakeThis();
-		restoreWorkingStatusIndicatorIfStreaming.call(streaming);
+		restoreWorkingStatusIndicator.call(streaming);
 		expect(streaming.showWorkingStatusIndicator).toHaveBeenCalledTimes(1);
 		expect(streaming.ui.terminal.setProgress).toHaveBeenCalledWith(true);
 
 		const alreadyWorking = createFakeThis({ activeStatusIndicator: { kind: "working" } });
-		restoreWorkingStatusIndicatorIfStreaming.call(alreadyWorking);
+		restoreWorkingStatusIndicator.call(alreadyWorking);
 		expect(alreadyWorking.showWorkingStatusIndicator).not.toHaveBeenCalled();
 		expect(alreadyWorking.ui.terminal.setProgress).toHaveBeenCalledWith(true);
 
 		const hidden = createFakeThis({ workingVisible: false });
-		restoreWorkingStatusIndicatorIfStreaming.call(hidden);
+		restoreWorkingStatusIndicator.call(hidden);
 		expect(hidden.showWorkingStatusIndicator).not.toHaveBeenCalled();
 		expect(hidden.ui.terminal.setProgress).toHaveBeenCalledWith(true);
 
-		const idle = createFakeThis({ isStreaming: false });
-		restoreWorkingStatusIndicatorIfStreaming.call(idle);
+		const idle = createFakeThis({ isWorking: false });
+		restoreWorkingStatusIndicator.call(idle);
 		expect(idle.showWorkingStatusIndicator).not.toHaveBeenCalled();
 		expect(idle.ui.terminal.setProgress).not.toHaveBeenCalled();
 	});
 
-	test("clears the working indicator on agent_settled instead of agent_end", async () => {
+	test("clears the working indicator when session work finishes", async () => {
 		const fakeThis = {
 			isInitialized: true,
-			session: { isAborting: false, isStreaming: false, isCompacting: false, isRetrying: false },
+			session: { isAborting: false, isWorking: false, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 			streamingComponent: undefined,
@@ -270,7 +270,7 @@ describe("InteractiveMode compaction events", () => {
 		};
 		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
 			this: typeof fakeThis,
-			event: { type: "agent_end" | "agent_settled" },
+			event: { type: "agent_end" | "agent_settled" } | { type: "working_state_changed"; working: boolean },
 		) => Promise<void>;
 
 		await handleEvent.call(fakeThis, { type: "agent_end" });
@@ -278,7 +278,9 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.ui.terminal.setProgress).not.toHaveBeenCalled();
 
 		await handleEvent.call(fakeThis, { type: "agent_settled" });
-		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith("working", true);
+		expect(fakeThis.clearStatusIndicator).not.toHaveBeenCalled();
+		await handleEvent.call(fakeThis, { type: "working_state_changed", working: false });
+		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith(undefined, true);
 		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(false);
 		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});
@@ -286,14 +288,14 @@ describe("InteractiveMode compaction events", () => {
 	test("restores the working indicator after a retry indicator while still streaming", async () => {
 		const fakeThis = {
 			isInitialized: true,
-			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
+			session: { isAborting: false, isWorking: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			programStatus: { handleEvent: vi.fn(), setBlocked: vi.fn() },
 			retryEscapeHandler: undefined as (() => void) | undefined,
 			defaultEditor: { onEscape: vi.fn() },
 			clearStatusIndicator: vi.fn(),
 			showError: vi.fn(),
-			restoreWorkingStatusIndicatorIfStreaming: vi.fn(),
+			restoreWorkingStatusIndicator: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};
 		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
@@ -304,14 +306,14 @@ describe("InteractiveMode compaction events", () => {
 		await handleEvent.call(fakeThis, { type: "auto_retry_end", success: true, attempt: 1 });
 
 		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith("retry");
-		expect(fakeThis.restoreWorkingStatusIndicatorIfStreaming).toHaveBeenCalledTimes(1);
+		expect(fakeThis.restoreWorkingStatusIndicator).toHaveBeenCalledTimes(1);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});
 
 	test("updates the working state when the same agent run resumes after compaction", async () => {
 		const fakeThis = {
 			isInitialized: true,
-			session: { isAborting: false, isStreaming: true, isCompacting: false, isRetrying: false },
+			session: { isAborting: false, isWorking: true, isCompacting: false, isRetrying: false },
 			footer: { invalidate: vi.fn() },
 			programStatus: { handleEvent: vi.fn() },
 			activeStatusIndicator: undefined,

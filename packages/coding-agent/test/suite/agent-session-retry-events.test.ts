@@ -7,6 +7,7 @@ import { createHarness, type Harness } from "./harness.ts";
 function normalizeEventOrder(events: Harness["events"]): string[] {
 	const normalized: string[] = [];
 	for (const event of events) {
+		if (event.type === "working_state_changed") continue;
 		const label =
 			event.type === "message_start" || event.type === "message_end"
 				? `${event.type}:${event.message.role}`
@@ -378,7 +379,8 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("hi");
 
 		expect(harness.eventsOfType("agent_end")).toHaveLength(1);
-		expect(harness.events[harness.events.length - 1]?.type).toBe("agent_settled");
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+		expect(harness.session.isWorking).toBe(false);
 	});
 
 	it("emits agent_end for aborted runs and persists the aborted assistant message", async () => {

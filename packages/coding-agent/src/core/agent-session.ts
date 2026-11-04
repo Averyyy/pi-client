@@ -239,6 +239,7 @@ export type AgentSessionEvent =
 	  }
 	| { type: "agent_settled"; aborted: boolean }
 	| { type: "run_state_changed"; running: boolean }
+	| { type: "working_state_changed"; working: boolean }
 	| { type: "session_tree_changed" }
 	| { type: "session_disposed" }
 	| { type: "abort_start" }
@@ -533,6 +534,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _lastWorkingState = false;
+	private _pendingAgentSettlements = 0;
 	/** True while before_agent_start and pre-run compaction prepare a run that has sent no request yet. */
 	private _isPreparingRun = false;
 	private _agentRunAbortRequested = false;
@@ -1279,31 +1282,46 @@ export class AgentSession {
 	private _setAgentRunActive(running: boolean): void {
 		if (this._isAgentRunActive === running) return;
 		this._isAgentRunActive = running;
+		this._emitWorkingStateChanged();
 		this._emit({ type: "run_state_changed", running });
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
-		this._cacheWarmer?.onAgentSettled();
-		this._setAgentRunActive(false);
-		this._isEmittingAgentSettled = true;
-		try {
-			const aborted = this._agentRunAbortRequested;
-			await this._extensionRunner.emit({ type: "agent_settled", aborted });
-			this._emit({ type: "agent_settled", aborted });
-		} finally {
-			this._isEmittingAgentSettled = false;
-		}
+	private _emitWorkingStateChanged(): void {
+		const working = this.isWorking;
+		if (working === this._lastWorkingState) return;
+		this._lastWorkingState = working;
+		this._emit({ type: "working_state_changed", working });
+	}
 
-		const deferred = this._deferredSettledActions.splice(0);
-		if (deferred.length > 0) {
+	private async _emitAgentSettled(): Promise<void> {
+		// Settled handlers can schedule another run before this run's cleanup returns.
+		this._pendingAgentSettlements++;
+		try {
+			this._cacheWarmer?.onAgentSettled();
+			this._setAgentRunActive(false);
+			this._isEmittingAgentSettled = true;
 			try {
-				for (const action of deferred) await action();
+				const aborted = this._agentRunAbortRequested;
+				await this._extensionRunner.emit({ type: "agent_settled", aborted });
+				this._emit({ type: "agent_settled", aborted });
 			} finally {
-				this._resolveIdleWaitIfIdle();
+				this._isEmittingAgentSettled = false;
 			}
-			return;
+
+			const deferred = this._deferredSettledActions.splice(0);
+			if (deferred.length > 0) {
+				try {
+					for (const action of deferred) await action();
+				} finally {
+					this._resolveIdleWaitIfIdle();
+				}
+				return;
+			}
+			this._resolveIdleWaitIfIdle();
+		} finally {
+			this._pendingAgentSettlements--;
+			this._emitWorkingStateChanged();
 		}
-		this._resolveIdleWaitIfIdle();
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1811,6 +1829,18 @@ export class AgentSession {
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
 		return !this._isAgentRunActive && !this.isCompacting;
+	}
+
+	/** Whether session work or cancellation cleanup is active, including asynchronous run settlement. */
+	get isWorking(): boolean {
+		return (
+			!this.isIdle ||
+			this.isRetrying ||
+			this.isBashRunning ||
+			this._compactionCompletionPromise !== undefined ||
+			this._pendingAgentSettlements > 0 ||
+			this._isAborting
+		);
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -3056,6 +3086,7 @@ export class AgentSession {
 		if (continueAfterAbort) {
 			this._startQueuedAgentRunAfterAbort();
 		}
+		this._emitWorkingStateChanged();
 	}
 
 	/**
@@ -3076,6 +3107,7 @@ export class AgentSession {
 		} else {
 			this._isAborting = true;
 		}
+		this._emitWorkingStateChanged();
 		const abortPromise = this._performAbort();
 		this._abortPromise = abortPromise;
 		this._emit({ type: "abort_start" });
@@ -3481,6 +3513,7 @@ export class AgentSession {
 			resolveCompactionCompletion = resolve;
 		});
 		this._compactionCompletionPromise = compactionCompletion;
+		this._emitWorkingStateChanged();
 
 		try {
 			this._emit({ type: "compaction_start", reason: "manual" });
@@ -3703,6 +3736,7 @@ export class AgentSession {
 				this._compactionCompletionPromise = undefined;
 			}
 			resolveCompactionCompletion?.();
+			this._emitWorkingStateChanged();
 		}
 	}
 
@@ -3898,6 +3932,7 @@ export class AgentSession {
 			if (isPiServerMode()) {
 				abortController = new AbortController();
 				this._autoCompactionAbortController = abortController;
+				this._emitWorkingStateChanged();
 				started = true;
 				this._emit({ type: "compaction_start", reason });
 				abortController.signal.throwIfAborted();
@@ -3971,6 +4006,7 @@ export class AgentSession {
 
 			abortController = new AbortController();
 			this._autoCompactionAbortController = abortController;
+			this._emitWorkingStateChanged();
 			started = true;
 			this._emit({ type: "compaction_start", reason });
 			abortController.signal.throwIfAborted();
@@ -4124,6 +4160,7 @@ export class AgentSession {
 				// Keep unconfirmed cancellation terminal until an explicit abort retry.
 				this._agentRunAbortRequested = true;
 				this._isAborting = true;
+				this._emitWorkingStateChanged();
 				this._continueAfterAbortRequested ||= this.agent.hasQueuedMessages();
 				this._abortError = message;
 				this._abortPromise = undefined;
@@ -4136,6 +4173,7 @@ export class AgentSession {
 			if (this._autoCompactionAbortController === abortController) {
 				this._autoCompactionAbortController = undefined;
 			}
+			this._emitWorkingStateChanged();
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -4802,6 +4840,7 @@ export class AgentSession {
 
 		// Wait with exponential backoff (abortable)
 		this._retryAbortController = new AbortController();
+		this._emitWorkingStateChanged();
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
@@ -4810,6 +4849,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._retryAbortController = undefined;
+			this._emitWorkingStateChanged();
 		}
 
 		return true;
@@ -4864,6 +4904,7 @@ export class AgentSession {
 			resolveBashCompletion = resolve;
 		});
 		this._bashCompletionPromises.add(bashCompletion);
+		this._emitWorkingStateChanged();
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -4890,6 +4931,7 @@ export class AgentSession {
 			this._bashAbortControllers.delete(abortController);
 			this._bashCompletionPromises.delete(bashCompletion);
 			resolveBashCompletion?.();
+			this._emitWorkingStateChanged();
 		}
 	}
 
@@ -5046,6 +5088,7 @@ export class AgentSession {
 			resolveBranchSummaryCompletion = resolve;
 		});
 		this._branchSummaryCompletionPromise = branchSummaryCompletion;
+		this._emitWorkingStateChanged();
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5186,6 +5229,7 @@ export class AgentSession {
 				this._branchSummaryCompletionPromise = undefined;
 			}
 			resolveBranchSummaryCompletion?.();
+			this._emitWorkingStateChanged();
 			this._resolveIdleWaitIfIdle();
 		}
 	}

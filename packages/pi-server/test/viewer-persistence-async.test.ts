@@ -36,11 +36,12 @@ describe("asynchronous viewer persistence", () => {
 	});
 
 	it("serializes reads with pending appends and preserves committed message order", async () => {
-		const connection = store.connect("thread");
+		const connection = { observerId: "publisher" };
 		await store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/fixture",
 			replace: [{ id: "user", role: "user", content: "question", timestamp: 1 }],
 		});
@@ -54,14 +55,16 @@ describe("asynchronous viewer persistence", () => {
 		});
 		const first = store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			append: [{ id: "tool", role: "toolResult", content: "first", timestamp: 2 }],
 		});
 		const second = store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 3,
+			create: false,
 			append: [{ id: "answer", role: "assistant", content: "second", timestamp: 3 }],
 		});
 		await entered.promise;
@@ -84,11 +87,12 @@ describe("asynchronous viewer persistence", () => {
 	});
 
 	it("finishes a pending replacement before deletion without recreating its files", async () => {
-		const connection = store.connect("thread");
+		const connection = { observerId: "publisher" };
 		await store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/fixture",
 			replace: [{ id: "old", role: "user", content: "old", timestamp: 1 }],
 		});
@@ -104,8 +108,9 @@ describe("asynchronous viewer persistence", () => {
 		});
 		const replacement = store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			replace: [{ id: "new", role: "user", content: "new", timestamp: 2 }],
 		});
 		await entered.promise;
@@ -119,7 +124,13 @@ describe("asynchronous viewer persistence", () => {
 		expect(new ViewerStore(directory).get("thread")).toBeUndefined();
 		expect(readdirSync(join(directory, ".viewer", "threads"))).toEqual([]);
 		await expect(
-			store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 3, append: [] }),
+			store.update({
+				sessionId: "thread",
+				observerId: connection.observerId,
+				sequence: 3,
+				create: false,
+				append: [],
+			}),
 		).rejects.toThrow("deleted");
 	});
 
@@ -193,11 +204,12 @@ describe("asynchronous viewer persistence", () => {
 	it.each(["append", "replace"] as const)(
 		"keeps the committed log after a failed %s index rename",
 		async (operation) => {
-			const connection = store.connect("thread");
+			const connection = { observerId: "publisher" };
 			await store.update({
 				sessionId: "thread",
-				connectionId: connection.connectionId,
+				observerId: connection.observerId,
 				sequence: 1,
+				create: true,
 				cwd: "D:/fixture",
 				replace: [{ id: "old", role: "user", content: "committed", timestamp: 1 }],
 			});
@@ -205,8 +217,9 @@ describe("asynchronous viewer persistence", () => {
 			await expect(
 				store.update({
 					sessionId: "thread",
-					connectionId: connection.connectionId,
+					observerId: connection.observerId,
 					sequence: 2,
+					create: false,
 					[operation]: [{ id: "new", role: "assistant", content: "uncommitted", timestamp: 2 }],
 				}),
 			).rejects.toThrow("index rename failed");
@@ -222,11 +235,12 @@ describe("asynchronous viewer persistence", () => {
 	);
 
 	it("sends the committed snapshot before updates queued during its disk read", async () => {
-		const connection = store.connect("thread");
+		const connection = { observerId: "publisher" };
 		await store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/fixture",
 			replace: [{ id: "old", role: "user", content: "committed", timestamp: 1 }],
 		});
@@ -249,8 +263,9 @@ describe("asynchronous viewer persistence", () => {
 		await entered.promise;
 		const update = store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			append: [{ id: "new", role: "assistant", content: "answer", timestamp: 2 }],
 		});
 		try {

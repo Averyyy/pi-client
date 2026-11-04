@@ -259,14 +259,15 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		const entry = user("archive", null);
 		expect((await post("tree/sync", { sessionId: "observed", entries: [entry], leafId: entry.id })).status).toBe(200);
 		const store = refresh.mock.contexts[0] as ViewerStore;
-		const connection = store.connect("observed");
+		const connection = { observerId: "publisher" };
 		const updates: ViewerUpdate[] = [];
 		const unsubscribe = store.subscribe("observed", (update) => updates.push(update));
 		const first = { id: "observer", role: "user", content: "Observer history", timestamp: 1000 };
 		await store.update({
 			sessionId: "observed",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/observer",
 			replace: [first],
 		});
@@ -275,19 +276,27 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		const second = { id: "next", role: "user", content: "Next observer round", timestamp: 2000 };
 		await store.update({
 			sessionId: "observed",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			append: [second],
 		});
 		expect((await post("tree/append", { sessionId: "observed", entries: [entry], leafId: entry.id })).status).toBe(
 			200,
 		);
 		const live = { message: { id: "live", role: "assistant", content: "Streaming", timestamp: 3000 }, tools: [] };
-		await store.update({ sessionId: "observed", connectionId: connection.connectionId, sequence: 3, live });
 		await store.update({
 			sessionId: "observed",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
+			sequence: 3,
+			create: false,
+			live,
+		});
+		await store.update({
+			sessionId: "observed",
+			observerId: connection.observerId,
 			sequence: 4,
+			create: false,
 			replace: [second],
 		});
 		expect(refresh).not.toHaveBeenCalled();
@@ -297,7 +306,6 @@ describe("viewer updates from persisted remote HTTP sessions", () => {
 		expect(updates[2]).toMatchObject({ thread: { live } });
 		expect(updates[3]).toMatchObject({ replace: true, rounds: [{ id: "next" }] });
 		unsubscribe();
-		connection.close();
 	});
 
 	it("reports a viewer projection failure while preserving the successful persisted session result", async () => {

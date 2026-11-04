@@ -89,7 +89,7 @@ it("publishes a client tool run through the real observer transport and server v
 		expect(original.entries).toEqual([]);
 		expect(original.revision).toBe(0);
 		observer.dispose();
-		await vi.waitFor(async () => expect((await thread()).status).toBe("disconnected"));
+		await vi.waitFor(async () => expect((await thread()).status).toBe("idle"));
 		const restored = new ViewerStore(directory);
 		expect(await restored.rounds(harness.session.sessionId, null)).toEqual(history);
 	} finally {

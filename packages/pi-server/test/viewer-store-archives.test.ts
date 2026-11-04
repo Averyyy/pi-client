@@ -234,11 +234,12 @@ describe("server session archives in the viewer", () => {
 		replaceSessionTree("server", [user("u", null, "Server conversation")], "u");
 		setStaticContext("second", { systemPrompt: "Instructions\nCurrent working directory: D:/qhk/jev" });
 		const store = new ViewerStore(directory);
-		const connection = store.connect("server");
+		const connection = { observerId: "publisher" };
 		await store.update({
 			sessionId: "server",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "C:/local-observer",
 			title: "Observer title",
 			replace: [],
@@ -249,8 +250,9 @@ describe("server session archives in the viewer", () => {
 		store.subscribe("server", (update) => updates.push(update));
 		await store.update({
 			sessionId: "server",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			append: [{ id: "observer", role: "user", content: "Observer history", timestamp: 1000 }],
 		});
 		expect(updates[0]).toMatchObject({ replace: true, rounds: [{ id: "observer" }] });

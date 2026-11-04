@@ -40,8 +40,9 @@ interface ObserverTool {
 
 export interface ObserverUpdate {
 	sessionId: string;
-	connectionId: string;
+	observerId: string;
 	sequence: number;
+	create: boolean;
 	cwd: string;
 	title: string;
 	subagents?: ObserverSubagent[];
@@ -124,17 +125,15 @@ export class PiServerObserver {
 	private readonly unsubscribe: () => void;
 	private controller?: AbortController;
 	private timer?: ReturnType<typeof setTimeout>;
-	private reconnectTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
 	private closing = false;
 	private closePromise?: Promise<void>;
-	private connectionReady?: Promise<void>;
 	private deletedSessionId?: string;
-	private connectionId?: string;
-	private connectedSessionId?: string;
+	private observerId = "";
 	private sequence = 0;
+	private published = false;
 	private sending = false;
-	private flushPromise?: Promise<void>;
+	private flushPromise?: Promise<boolean>;
 	private dirty = true;
 	private historyDirty = true;
 	private replace = true;
@@ -144,7 +143,7 @@ export class PiServerObserver {
 	private liveMessage: AgentMessage | null = null;
 	private liveMessageId = "";
 	private readonly tools = new Map<string, ObserverTool>();
-	private disconnected = false;
+	private deliveryFailed = false;
 	private observedSessionId?: string;
 	private readonly subagents: PiServerSubagents;
 	private sentSubagentVersion = -1;
@@ -165,7 +164,7 @@ export class PiServerObserver {
 				this.reportError(error);
 			}
 		});
-		void this.connect();
+		this.schedule(0);
 	}
 
 	private handleEvent(event: AgentSessionEvent): void {
@@ -174,9 +173,9 @@ export class PiServerObserver {
 			case "session_disposed":
 				this.dispose();
 				return;
-			case "run_state_changed":
+			case "working_state_changed":
 				resolvePiServerSubagents();
-				if (!event.running) {
+				if (!event.working) {
 					this.liveMessage = null;
 					this.tools.clear();
 				}
@@ -192,7 +191,7 @@ export class PiServerObserver {
 				break;
 			case "entry_appended":
 			case "message_committed":
-				if (this.connectionId && !this.historyDirty) {
+				if (!this.historyDirty) {
 					this.pendingEntries.push(event.entry);
 					if (this.pendingEntries.length > 64) {
 						this.pendingEntries = [];
@@ -204,14 +203,6 @@ export class PiServerObserver {
 			case "history_reconciled":
 			case "session_tree_changed":
 				this.subagents.restore();
-				if (this.deletedSessionId && this.deletedSessionId !== this.session.sessionId) {
-					this.deletedSessionId = undefined;
-					void this.connect();
-				}
-				if (this.connectedSessionId && this.connectedSessionId !== this.session.sessionId) {
-					this.connectionId = undefined;
-					this.controller?.abort();
-				}
 				this.replace = true;
 				this.historyDirty = true;
 				break;
@@ -248,7 +239,7 @@ export class PiServerObserver {
 		}
 		this.dirty = true;
 		this.schedule(
-			event.type === "run_state_changed" || event.type === "compaction_start" || event.type === "compaction_end"
+			event.type === "working_state_changed" || event.type === "compaction_start" || event.type === "compaction_end"
 				? 0
 				: 80,
 		);
@@ -256,7 +247,16 @@ export class PiServerObserver {
 
 	private syncSession(): void {
 		if (this.observedSessionId === this.session.sessionId) return;
+		this.controller?.abort();
 		this.observedSessionId = this.session.sessionId;
+		this.observerId = randomUUID();
+		this.sequence = 0;
+		this.published = false;
+		this.deletedSessionId = undefined;
+		this.deliveryFailed = false;
+		this.dirty = true;
+		this.historyDirty = true;
+		this.replace = true;
 		this.subagents.syncSession();
 		this.sentSubagentVersion = -1;
 		this.sentEntryId = undefined;
@@ -272,7 +272,6 @@ export class PiServerObserver {
 			this.closing ||
 			this.deletedSessionId === this.session.sessionId ||
 			!this.dirty ||
-			!this.connectionId ||
 			this.sending ||
 			this.timer
 		)
@@ -285,22 +284,20 @@ export class PiServerObserver {
 	}
 
 	private reportError(error: unknown): void {
-		if (this.disposed || this.disconnected) return;
-		this.disconnected = true;
-		console.error(`pi-server observer disconnected: ${error instanceof Error ? error.message : String(error)}`);
+		if (this.disposed || this.deliveryFailed) return;
+		this.deliveryFailed = true;
+		console.error(`pi-server observer update failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
 	private stopDeletedSession(sessionId: string, controller: AbortController): void {
 		if (sessionId === this.session.sessionId) {
 			this.deletedSessionId = sessionId;
-			this.connectionId = undefined;
+			this.dirty = false;
 			this.pendingEntries = [];
 			this.liveMessage = null;
 			this.tools.clear();
 			clearTimeout(this.timer);
 			this.timer = undefined;
-			clearTimeout(this.reconnectTimer);
-			this.reconnectTimer = undefined;
 		}
 		controller.abort();
 	}
@@ -313,96 +310,7 @@ export class PiServerObserver {
 		});
 	}
 
-	private async connect(): Promise<void> {
-		if (this.disposed || this.deletedSessionId === this.session.sessionId) return;
-		this.syncSession();
-		const controller = new AbortController();
-		this.controller = controller;
-		const sessionId = this.session.sessionId;
-		this.connectedSessionId = sessionId;
-		let resolveConnection: (() => void) | undefined;
-		this.connectionReady = new Promise<void>((resolve) => {
-			resolveConnection = resolve;
-		});
-		const timeout = setTimeout(() => controller.abort(new Error("connection timed out")), 10000);
-		timeout.unref();
-		try {
-			const response = await this.request(controller.signal).getJson(
-				`/api/observer/connect?sessionId=${encodeURIComponent(sessionId)}`,
-			);
-			if (response.status === 410) {
-				this.stopDeletedSession(sessionId, controller);
-				return;
-			}
-			if (!response.ok || !response.headers.get("content-type")?.includes("text/event-stream") || !response.body) {
-				throw new Error(`connection failed (HTTP ${response.status})`);
-			}
-			const reader = response.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-			let event = "";
-			try {
-				while (!this.disposed) {
-					const { done, value } = await reader.read();
-					if (done) throw new Error("connection closed");
-					buffer += decoder.decode(value, { stream: true });
-					let newline = buffer.indexOf("\n");
-					while (newline !== -1) {
-						const line = buffer.slice(0, newline).replace(/\r$/, "");
-						buffer = buffer.slice(newline + 1);
-						if (line.startsWith("event:")) event = line.slice(6).trim();
-						if (event === "deleted" && line.startsWith("data:")) {
-							this.stopDeletedSession(sessionId, controller);
-							return;
-						}
-						if (event === "connected" && !this.connectionId && line.startsWith("data:")) {
-							const connected = JSON.parse(line.slice(5)) as { connectionId: string };
-							this.connectionId = connected.connectionId;
-							this.sequence = 0;
-							this.sentSubagentVersion = -1;
-							clearTimeout(timeout);
-							this.replace = true;
-							this.historyDirty = true;
-							this.dirty = true;
-							this.schedule(0);
-							resolveConnection?.();
-						}
-						newline = buffer.indexOf("\n");
-					}
-				}
-			} finally {
-				await reader.cancel();
-				reader.releaseLock();
-			}
-		} catch (error) {
-			if (
-				error instanceof TypeError &&
-				error.message === "terminated" &&
-				error.cause instanceof Error &&
-				"code" in error.cause &&
-				error.cause.code === "UND_ERR_SOCKET"
-			)
-				return;
-			if (sessionId === this.session.sessionId && this.deletedSessionId !== sessionId) this.reportError(error);
-		} finally {
-			resolveConnection?.();
-			clearTimeout(timeout);
-			controller.abort();
-			if (this.controller === controller) this.connectionId = undefined;
-			if (this.controller === controller && !this.disposed && !this.closing && this.deletedSessionId !== sessionId) {
-				this.reconnectTimer = setTimeout(
-					() => {
-						this.reconnectTimer = undefined;
-						void this.connect();
-					},
-					sessionId === this.session.sessionId ? 2000 : 0,
-				);
-				this.reconnectTimer.unref();
-			}
-		}
-	}
-
-	private flush(): Promise<void> {
+	private flush(): Promise<boolean> {
 		if (this.flushPromise) return this.flushPromise;
 		const promise = this.sendUpdate();
 		this.flushPromise = promise;
@@ -412,82 +320,104 @@ export class PiServerObserver {
 		return promise;
 	}
 
-	private async sendUpdate(): Promise<void> {
+	private async sendUpdate(): Promise<boolean> {
 		this.subagents.resolve();
-		const connectionId = this.connectionId;
-		const sessionId = this.connectedSessionId;
-		const controller = this.controller;
-		if (
-			!connectionId ||
-			!sessionId ||
-			sessionId !== this.session.sessionId ||
-			!controller ||
-			this.disposed ||
-			this.deletedSessionId === sessionId ||
-			this.sending ||
-			!this.dirty
-		)
-			return;
+		const sessionId = this.session.sessionId;
+		if (this.disposed || this.deletedSessionId === sessionId || this.sending || !this.dirty) return true;
+		const observerId = this.observerId;
+		const controller = new AbortController();
+		this.controller = controller;
 		this.sending = true;
-		this.dirty = false;
+		let schedulePending = false;
 		try {
-			const branch = this.historyDirty ? this.session.sessionManager.getBranch() : undefined;
-			const sentIndex = branch && this.sentEntryId ? branch.findIndex((entry) => entry.id === this.sentEntryId) : -1;
-			const replace = this.replace || (branch !== undefined && this.sentEntryId !== undefined && sentIndex === -1);
-			this.historyDirty = false;
-			this.replace = false;
-			const entries = branch ? (replace ? branch : branch.slice(sentIndex + 1)) : this.pendingEntries;
-			this.pendingEntries = [];
-			const messages = projectObserverEntries(entries);
-			if (replace) this.firstUserTitle = "";
-			if (!this.firstUserTitle) {
-				const firstUserContent = messages.find((message) => message.role === "user")?.content;
-				this.firstUserTitle = (
-					typeof firstUserContent === "string"
-						? firstUserContent
-						: (firstUserContent
-								?.filter((part) => part.type === "text")
-								.map((part) => part.text)
-								.join("") ?? "")
-				).slice(0, 120);
+			for (let attempt = 0; attempt < 2; attempt++) {
+				this.dirty = false;
+				const branch = this.historyDirty ? this.session.sessionManager.getBranch() : undefined;
+				const sentIndex =
+					branch && this.sentEntryId ? branch.findIndex((entry) => entry.id === this.sentEntryId) : -1;
+				const replace =
+					this.replace || (branch !== undefined && this.sentEntryId !== undefined && sentIndex === -1);
+				this.historyDirty = false;
+				this.replace = false;
+				const entries = branch ? (replace ? branch : branch.slice(sentIndex + 1)) : this.pendingEntries;
+				this.pendingEntries = [];
+				const messages = projectObserverEntries(entries);
+				if (replace) this.firstUserTitle = "";
+				if (!this.firstUserTitle) {
+					const firstUserContent = messages.find((message) => message.role === "user")?.content;
+					this.firstUserTitle = (
+						typeof firstUserContent === "string"
+							? firstUserContent
+							: (firstUserContent
+									?.filter((part) => part.type === "text")
+									.map((part) => part.text)
+									.join("") ?? "")
+					).slice(0, 120);
+				}
+				const subagentVersion = this.subagents.version;
+				const update: ObserverUpdate = {
+					sessionId,
+					observerId,
+					sequence: ++this.sequence,
+					create: !this.published,
+					cwd: this.session.sessionManager.getCwd(),
+					title: this.session.sessionManager.getSessionName() ?? this.firstUserTitle,
+					...(subagentVersion !== this.sentSubagentVersion ? { subagents: this.subagents.snapshot() } : {}),
+					...(replace ? { replace: messages } : messages.length ? { append: messages } : {}),
+					status: this.session.isWorking ? "running" : "idle",
+					live: {
+						message: this.liveMessage ? (projectMessage(this.liveMessageId, this.liveMessage) ?? null) : null,
+						tools: [...this.tools.values()],
+					},
+				};
+				const response = await this.request(controller.signal).postJson("/api/observer", update);
+				if (observerId !== this.observerId) return false;
+				if (response.status === 410) {
+					this.stopDeletedSession(sessionId, controller);
+					return true;
+				}
+				if (response.status === 409 && attempt === 0) {
+					const result = (await response.json()) as { snapshotRequired?: boolean };
+					if (observerId !== this.observerId) return false;
+					if (result.snapshotRequired) {
+						this.replace = true;
+						this.historyDirty = true;
+						this.sentSubagentVersion = -1;
+						continue;
+					}
+				}
+				if (!response.ok) throw new Error(`update failed (HTTP ${response.status})`);
+				const result = (await response.json()) as { accepted: boolean };
+				if (!result.accepted) throw new Error("update was not accepted");
+				if (observerId !== this.observerId) return false;
+				this.published = true;
+				this.sentSubagentVersion = subagentVersion;
+				if (entries.length > 0) this.sentEntryId = entries.at(-1)?.id;
+				else if (replace) this.sentEntryId = undefined;
+				if (this.deliveryFailed) {
+					this.deliveryFailed = false;
+					console.error("pi-server observer delivery resumed");
+				}
+				schedulePending = true;
+				return true;
 			}
-			const subagentVersion = this.subagents.version;
-			const update: ObserverUpdate = {
-				sessionId,
-				connectionId,
-				sequence: ++this.sequence,
-				cwd: this.session.sessionManager.getCwd(),
-				title: this.session.sessionManager.getSessionName() ?? this.firstUserTitle,
-				...(subagentVersion !== this.sentSubagentVersion ? { subagents: this.subagents.snapshot() } : {}),
-				...(replace ? { replace: messages } : messages.length ? { append: messages } : {}),
-				status: this.session.isIdle ? "idle" : "running",
-				live: {
-					message: this.liveMessage ? (projectMessage(this.liveMessageId, this.liveMessage) ?? null) : null,
-					tools: [...this.tools.values()],
-				},
-			};
-			const response = await this.request(controller.signal).postJson("/api/observer", update);
-			if (response.status === 410) {
-				this.stopDeletedSession(sessionId, controller);
-				return;
-			}
-			if (!response.ok) throw new Error(`update failed (HTTP ${response.status})`);
-			const result = (await response.json()) as { accepted: boolean };
-			if (!result.accepted) throw new Error("update was not accepted");
-			if (sessionId !== this.session.sessionId) return;
-			this.sentSubagentVersion = subagentVersion;
-			if (entries.length > 0) this.sentEntryId = entries.at(-1)?.id;
-			else if (replace) this.sentEntryId = undefined;
-			if (this.disconnected) {
-				this.disconnected = false;
-				console.error("pi-server observer connected");
-			}
+			return false;
 		} catch (error) {
-			if (sessionId === this.session.sessionId && this.deletedSessionId !== sessionId) this.reportError(error);
+			schedulePending = this.dirty;
+			if (observerId === this.observerId && this.deletedSessionId !== sessionId) {
+				this.dirty = true;
+				this.historyDirty = true;
+				this.replace = true;
+				this.pendingEntries = [];
+				this.sentSubagentVersion = -1;
+				this.reportError(error);
+			}
 			controller.abort();
+			return false;
 		} finally {
 			this.sending = false;
-			this.schedule(80);
+			if (this.controller === controller) this.controller = undefined;
+			if (schedulePending || observerId !== this.observerId) this.schedule(80);
 		}
 	}
 
@@ -501,18 +431,15 @@ export class PiServerObserver {
 		this.closing = true;
 		clearTimeout(this.timer);
 		this.timer = undefined;
-		clearTimeout(this.reconnectTimer);
 		try {
 			await raceWithAbortSignal(
 				(async () => {
 					if (this.deletedSessionId === this.session.sessionId) return;
-					if (!this.connectionId && this.controller?.signal.aborted) void this.connect();
-					await this.connectionReady;
 					await this.flushPromise;
-					if (!this.connectionId) throw new Error("final transcript was not delivered: observer is disconnected");
-					while (this.dirty && this.connectionId && !this.disposed) await this.flush();
-					if (this.controller?.signal.aborted && this.deletedSessionId !== this.session.sessionId)
-						throw new Error("final transcript was not delivered: observer update failed");
+					while (this.dirty && !this.disposed) {
+						if (!(await this.flush()))
+							throw new Error("final transcript was not delivered: observer update failed");
+					}
 				})(),
 				AbortSignal.timeout(10000),
 			);
@@ -528,7 +455,6 @@ export class PiServerObserver {
 		this.unsubscribe();
 		this.subagents.dispose();
 		clearTimeout(this.timer);
-		clearTimeout(this.reconnectTimer);
 		this.controller?.abort();
 		observers.delete(this.session);
 	}

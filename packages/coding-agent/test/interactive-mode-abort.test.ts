@@ -84,13 +84,16 @@ describe("InteractiveMode cancellation boundary", () => {
 			}),
 			checkShutdownRequested: vi.fn().mockResolvedValue(undefined),
 		};
-		const handleEvent = getPrivateMethod<(event: { type: string }) => Promise<void>>("handleEvent");
+		const handleEvent =
+			getPrivateMethod<(event: { type: string; working?: boolean }) => Promise<void>>("handleEvent");
 
 		await handleEvent.call(mode, { type: "agent_end" });
 		expect(mode.activeStatusIndicator).toBe(activeIndicator);
 
 		session.isStreaming = false;
 		await handleEvent.call(mode, { type: "agent_settled" });
+		expect(mode.activeStatusIndicator).toBe(activeIndicator);
+		await handleEvent.call(mode, { type: "working_state_changed", working: false });
 		expect(mode.activeStatusIndicator).toBeUndefined();
 		expect(activeIndicator.dispose).toHaveBeenCalledTimes(1);
 	});

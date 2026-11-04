@@ -25,15 +25,15 @@ describe("viewer subagent relationships", () => {
 	});
 
 	async function observe(store: ViewerStore, id: string, subagents?: ObserverSubagent[]) {
-		const connection = store.connect(id);
+		const observerId = `publisher-${id}`;
 		let sequence = 0;
 		const update = async (body: Partial<ObserverUpdate>) =>
-			await store.update({ sessionId: id, connectionId: connection.connectionId, sequence: ++sequence, ...body });
+			await store.update({ sessionId: id, observerId, create: sequence === 0, sequence: ++sequence, ...body });
 		await update({ cwd: "D:/project", replace: [], status: "idle", ...(subagents ? { subagents } : {}) });
-		return { update, close: connection.close };
+		return { update };
 	}
 
-	it("uses exact session IDs, task lifecycle, and observer connection state independently", async () => {
+	it("uses exact session IDs, task lifecycle, and reported execution state independently", async () => {
 		const store = new ViewerStore(directory);
 		const parent = await observe(store, "parent", [relation]);
 		expect(store.get("parent")?.subagents).toEqual([]);
@@ -41,8 +41,8 @@ describe("viewer subagent relationships", () => {
 		expect(store.get("parent")?.subagents).toEqual([
 			{ id: "child", title: "Inspect source", status: "idle", taskStatus: "running", lifecycle: "active" },
 		]);
-		child.close();
-		expect(store.get("parent")?.subagents?.[0]).toMatchObject({ status: "disconnected", lifecycle: "active" });
+		await child.update({ status: "idle" });
+		expect(store.get("parent")?.subagents?.[0]).toMatchObject({ status: "idle", lifecycle: "active" });
 		for (const [taskStatus, outcome] of [
 			["completed", "completed"],
 			["steered", "completed"],
@@ -59,19 +59,19 @@ describe("viewer subagent relationships", () => {
 		expect(store.page("D:/project", null).threads.every((thread) => !("subagents" in thread))).toBe(true);
 	});
 
-	it("publishes parent metadata updates on child creation, status, disconnect and deletion", async () => {
+	it("publishes parent metadata updates on child creation, status and deletion", async () => {
 		const store = new ViewerStore(directory);
 		await observe(store, "parent", [relation]);
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("parent", (update) => updates.push(update));
 		const child = await observe(store, "child");
 		await child.update({ status: "running" });
-		child.close();
+		await child.update({ status: "idle" });
 		await store.remove("child");
 		expect(updates.map((update) => update.thread.subagents?.[0]?.status)).toEqual([
 			"idle",
 			"running",
-			"disconnected",
+			"idle",
 			undefined,
 		]);
 		expect(updates.every((update) => Object.keys(update).length === 1)).toBe(true);
@@ -83,7 +83,7 @@ describe("viewer subagent relationships", () => {
 		await observe(store, "child");
 		const restored = new ViewerStore(directory);
 		expect(restored.get("parent")?.subagents?.[0]).toMatchObject({
-			status: "disconnected",
+			status: "idle",
 			lifecycle: "completed",
 			outcome: "completed",
 		});

@@ -121,7 +121,7 @@ function staticPromptCwd(prompt: string): string | undefined {
 export class ViewerStore {
 	private readonly directory: string;
 	private readonly threads = new Map<string, StoredThread>();
-	private readonly connections = new Map<string, { id: string; sequence: number }>();
+	private readonly observers = new Map<string, { id: string; sequence: number }>();
 	private readonly parents = new Map<string, Set<string>>();
 	private readonly indexedSubagents = new Map<string, ObserverSubagent[]>();
 	private readonly archiveMetadata = new Map<
@@ -157,7 +157,7 @@ export class ViewerStore {
 			const log = join(this.directory, `${stored.logId}.jsonl`);
 			if (statSync(log).size < stored.length) throw new Error("Viewer log is shorter than committed index");
 			truncateSync(log, stored.length);
-			stored.thread.status = "disconnected";
+			if (stored.thread.status === "running") stored.thread.status = "unknown";
 			stored.thread.live = { message: null, tools: [] };
 			if (stored.serverLastActiveAt === undefined) {
 				const lines = readFileSync(log, "utf8").trimEnd();
@@ -334,8 +334,8 @@ export class ViewerStore {
 	}
 
 	remove(id: string): Promise<void> {
-		this.connections.delete(id);
 		return this.enqueue(id, async () => {
+			this.observers.delete(id);
 			const stored = this.threads.get(id);
 			if (stored) {
 				await fs.rm(join(this.directory, `${stored.fileId}.json`), { force: true });
@@ -446,44 +446,15 @@ export class ViewerStore {
 		}
 	}
 
-	connect(id: string): { connectionId: string; close: () => void } {
-		const connectionId = randomUUID();
-		this.connections.set(id, { id: connectionId, sequence: 0 });
-		const stored = this.threads.get(id);
-		if (stored) {
-			stored.thread.status = "unknown";
-			stored.thread.live = { message: null, tools: [] };
-			void this.enqueue(id, () => this.emit(stored)).catch((error: unknown) => {
-				console.error(`Failed to publish viewer session ${id}:`, error);
-			});
-		}
-		return {
-			connectionId,
-			close: () => {
-				if (this.connections.get(id)?.id !== connectionId) return;
-				this.connections.delete(id);
-				const thread = this.threads.get(id);
-				if (!thread) return;
-				thread.thread.status = "disconnected";
-				thread.thread.live = { message: null, tools: [] };
-				void this.enqueue(id, () => this.emit(thread)).catch((error: unknown) => {
-					console.error(`Failed to publish viewer session ${id}:`, error);
-				});
-			},
-		};
-	}
-
-	update(body: ObserverUpdate): Promise<void> {
+	update(body: ObserverUpdate, isDeleted?: () => boolean): Promise<void> {
 		return this.enqueue(body.sessionId, async () => {
-			const connection = this.connections.get(body.sessionId);
-			if (connection?.id !== body.connectionId)
-				throw new Error(
-					!this.threads.has(body.sessionId) && !getSession(body.sessionId)
-						? "Observer session deleted"
-						: "Observer connection expired",
-				);
-			if (body.sequence <= connection.sequence) return;
+			if (isDeleted?.()) throw new Error("Observer session deleted");
 			const committed = this.threads.get(body.sessionId);
+			if (!committed && !getSession(body.sessionId) && !body.create) throw new Error("Observer session deleted");
+			const observer = this.observers.get(body.sessionId);
+			if (observer?.id !== body.observerId && body.replace === undefined)
+				throw new Error("Observer snapshot required");
+			if (observer?.id === body.observerId && body.sequence <= observer.sequence) return;
 			const created = !committed;
 			if (!committed && (!body.replace || !body.cwd))
 				throw new Error("First observer update requires cwd and replace");
@@ -521,6 +492,7 @@ export class ViewerStore {
 				messages.length > 0 ||
 				body.replace !== undefined ||
 				metadataChanged ||
+				statusChanged ||
 				body.subagents !== undefined;
 			if (persisted) await fs.mkdir(this.directory, { recursive: true });
 			const lines: string[] = [];
@@ -553,13 +525,9 @@ export class ViewerStore {
 				stored.serverLastActiveAt = latest.serverLastActiveAt;
 				stored.thread.lastActiveAt = latest.thread.lastActiveAt;
 			}
-			if (this.connections.get(body.sessionId) !== connection) {
-				stored.thread.status = latest?.thread.status ?? "disconnected";
-				stored.thread.live = latest?.thread.live ?? { message: null, tools: [] };
-			}
 			this.threads.set(body.sessionId, stored);
 			if (body.subagents !== undefined) this.indexSubagents(body.sessionId, body.subagents);
-			connection.sequence = body.sequence;
+			this.observers.set(body.sessionId, { id: body.observerId, sequence: body.sequence });
 			await this.emit(
 				stored,
 				body.append,
@@ -595,7 +563,7 @@ export class ViewerStore {
 	private serialize(stored: StoredThread): string {
 		return JSON.stringify({
 			...stored,
-			thread: { ...stored.thread, status: "disconnected", live: { message: null, tools: [] } },
+			thread: { ...stored.thread, live: { message: null, tools: [] } },
 		});
 	}
 

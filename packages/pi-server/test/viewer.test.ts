@@ -70,24 +70,13 @@ describe("server thread viewer", () => {
 		if (!header) throw new Error("Missing viewer cookie");
 		return header.split(";")[0];
 	}
-	async function connect(
-		id: string,
-	): Promise<{ connectionId: string; sequence: number; abort: () => void; events: Events }> {
-		const controller = new AbortController();
-		controllers.push(controller);
-		const response = await fetch(`${base}/api/observer/connect?sessionId=${encodeURIComponent(id)}`, {
-			headers: bearer,
-			signal: controller.signal,
-		});
-		expect(response.status).toBe(200);
-		const events = new Events(response);
-		const event = await events.next();
-		expect(event?.event).toBe("connected");
-		return { connectionId: String(event?.data.connectionId), sequence: 0, abort: () => controller.abort(), events };
+	let publisher = 0;
+	async function connect(_id: string): Promise<{ observerId: string; sequence: number }> {
+		return { observerId: `publisher-${++publisher}`, sequence: 0 };
 	}
 	async function observe(
 		id: string,
-		connection: { connectionId: string; sequence: number },
+		connection: { observerId: string; sequence: number },
 		update: Record<string, unknown>,
 	): Promise<Response> {
 		return fetch(`${base}/api/observer`, {
@@ -95,7 +84,8 @@ describe("server thread viewer", () => {
 			headers: { ...bearer, "Content-Type": "application/json" },
 			body: JSON.stringify({
 				sessionId: id,
-				connectionId: connection.connectionId,
+				observerId: connection.observerId,
+				create: connection.sequence === 0,
 				sequence: ++connection.sequence,
 				...update,
 			}),
@@ -215,9 +205,19 @@ describe("server thread viewer", () => {
 		expect(await failed.json()).toMatchObject({ remainingAttempts: 9 });
 	});
 
-	it("closes observer and browser event streams before the HTTP server closes", async () => {
+	it("has no observer connection endpoint and requires a snapshot for a new publisher", async () => {
+		expect((await fetch(`${base}/api/observer/connect?sessionId=post-only`, { headers: bearer })).status).toBe(404);
+		const publisher = await connect("post-only");
+		const incremental = await observe("post-only", publisher, { cwd: "/work", append: [message("u")] });
+		expect(incremental.status).toBe(409);
+		expect(await incremental.json()).toEqual({ error: "Observer snapshot required", snapshotRequired: true });
+		expect(
+			(await observe("post-only", publisher, { create: true, cwd: "/work", replace: [message("u")] })).status,
+		).toBe(200);
+	});
+
+	it("closes browser event streams before the HTTP server closes", async () => {
 		const authCookie = await cookie();
-		await connect("closing");
 		const controller = new AbortController();
 		controllers.push(controller);
 		const events = new Events(
@@ -357,13 +357,12 @@ describe("server thread viewer", () => {
 			{ type: "attachment", label: "image" },
 		]);
 		expect(getSession("live")).toEqual(durable);
-		connection.abort();
-		const disconnected = await events.next();
-		expect((disconnected?.data.thread as ViewerThread).status).toBe("disconnected");
 		const resumed = await connect("live");
-		expect((await observe("live", connection, { status: "idle" })).status).toBe(409);
+		const missing = await observe("live", resumed, { status: "idle" });
+		expect(missing.status).toBe(409);
+		expect(await missing.json()).toEqual({ error: "Observer snapshot required", snapshotRequired: true });
 		await observe("live", resumed, { replace: [message("resumed")], status: "idle" });
-		expect((await events.next())?.data.thread).toMatchObject({ status: "unknown" });
+		expect((await observe("live", connection, { status: "idle" })).status).toBe(409);
 		const replaced = await events.next();
 		expect(replaced?.data.replace).toBe(true);
 		expect((replaced?.data.rounds as ViewerRound[])[0].id).toBe("resumed");
@@ -391,13 +390,11 @@ describe("server thread viewer", () => {
 		expect(await deleted.json()).toEqual({ error: "Observer session deleted", deleted: true });
 		expect((await events.next())?.event).toBe("deleted");
 		expect(await events.next()).toBeNull();
-		expect(await connection.events.next()).toEqual({ event: "deleted", data: { id: "deleted" } });
-		expect(await connection.events.next()).toBeNull();
 		expect((await viewer("threads/deleted", authCookie)).status).toBe(404);
 		const expired = await observe(
 			"deleted",
-			{ connectionId: "unrelated-expired-connection", sequence: 0 },
-			{ append: [message("unrelated")] },
+			{ observerId: "unrelated-expired-connection", sequence: 0 },
+			{ create: false, append: [message("unrelated")] },
 		);
 		expect(expired.status).toBe(410);
 		expect(readdirSync(join(directory, ".viewer", "threads"))).toEqual([]);
@@ -459,29 +456,65 @@ describe("server thread viewer", () => {
 });
 
 describe("viewer projection persistence", () => {
+	it("persists final idle status and restores unfinished execution as unknown", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-viewer-state-"));
+		try {
+			const store = new ViewerStore(directory);
+			for (const sessionId of ["finished", "unfinished"]) {
+				await store.update({
+					sessionId,
+					observerId: sessionId,
+					sequence: 1,
+					create: true,
+					cwd: "/work",
+					replace: [],
+					status: "running",
+				});
+			}
+			await store.update({
+				sessionId: "finished",
+				observerId: "finished",
+				sequence: 2,
+				create: false,
+				status: "idle",
+			});
+			const restarted = new ViewerStore(directory);
+			expect(restarted.get("finished")?.status).toBe("idle");
+			expect(restarted.get("unfinished")?.status).toBe("unknown");
+			await expect(
+				restarted.update({ sessionId: "finished", observerId: "finished", sequence: 3, create: false, append: [] }),
+			).rejects.toThrow("Observer snapshot required");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("replays updates once and recovers only committed log offsets after restart and replacement", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-viewer-store-"));
 		try {
 			const store = new ViewerStore(directory);
-			const { connectionId } = store.connect("thread/../../id");
+			const observerId = "publisher";
 			await store.update({
 				sessionId: "thread/../../id",
-				connectionId,
+				observerId,
 				sequence: 1,
+				create: true,
 				cwd: "/work",
 				replace: [message("original")],
 				status: "idle",
 			});
 			await store.update({
 				sessionId: "thread/../../id",
-				connectionId,
+				observerId,
 				sequence: 2,
+				create: false,
 				append: [message("tail", "assistant")],
 			});
 			await store.update({
 				sessionId: "thread/../../id",
-				connectionId,
+				observerId,
 				sequence: 2,
+				create: false,
 				append: [message("tail", "assistant")],
 			});
 			expect((await store.rounds("thread/../../id", null)).rounds[0].messages).toHaveLength(2);
@@ -493,13 +526,14 @@ describe("viewer projection persistence", () => {
 			const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { logId: string; length: number };
 			appendFileSync(join(metadataDir, `${metadata.logId}.jsonl`), `${JSON.stringify(message("uncommitted"))}\n`);
 			const restarted = new ViewerStore(directory);
-			expect(restarted.get("thread/../../id")?.status).toBe("disconnected");
-			const next = restarted.connect("thread/../../id");
+			expect(restarted.get("thread/../../id")?.status).toBe("idle");
+			const next = { observerId: "restarted-publisher" };
 			await restarted.update({
 				sessionId: "thread/../../id",
-				connectionId: next.connectionId,
+				observerId: next.observerId,
 				sequence: 1,
-				append: [message("committed", "assistant")],
+				create: true,
+				replace: [message("original"), message("tail", "assistant"), message("committed", "assistant")],
 			});
 			expect((await restarted.rounds("thread/../../id", null)).rounds[0].messages.map((entry) => entry.id)).toEqual([
 				"original",
@@ -508,8 +542,9 @@ describe("viewer projection persistence", () => {
 			]);
 			await restarted.update({
 				sessionId: "thread/../../id",
-				connectionId: next.connectionId,
+				observerId: next.observerId,
 				sequence: 2,
+				create: false,
 				replace: [message("replacement")],
 			});
 			const final = new ViewerStore(directory);
@@ -525,7 +560,7 @@ describe("viewer projection persistence", () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-viewer-live-"));
 		try {
 			const store = new ViewerStore(directory);
-			const { connectionId } = store.connect("thread");
+			const observerId = "publisher";
 			let catalogs = 0;
 			let updates = 0;
 			store.catalogListeners.add(() => {
@@ -536,8 +571,9 @@ describe("viewer projection persistence", () => {
 			});
 			await store.update({
 				sessionId: "thread",
-				connectionId,
+				observerId,
 				sequence: 1,
+				create: true,
 				cwd: "/work",
 				title: "Title",
 				replace: [],
@@ -548,8 +584,9 @@ describe("viewer projection persistence", () => {
 			const initial = readFileSync(path, "utf8");
 			await store.update({
 				sessionId: "thread",
-				connectionId,
+				observerId,
 				sequence: 2,
+				create: false,
 				cwd: "/work",
 				title: "Title",
 				status: "running",

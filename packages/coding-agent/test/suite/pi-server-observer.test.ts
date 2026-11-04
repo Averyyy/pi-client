@@ -1,4 +1,4 @@
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -15,14 +15,13 @@ import { createHarness, type Harness } from "./harness.ts";
 interface ObserverFixture {
 	server: Server;
 	updates: ObserverUpdate[];
-	sockets: ServerResponse[];
 	rawSizes: number[];
 	chunkTargets: string[];
 	connectRequests: number;
-	closed: number;
 	fail: boolean;
 	deleted: boolean;
-	terminateHandshake: boolean;
+	snapshotRequired: boolean;
+	postRequests: number;
 	holdResponse?: Promise<void>;
 }
 
@@ -31,14 +30,13 @@ async function createFixture(): Promise<ObserverFixture> {
 	const fixture: ObserverFixture = {
 		server: createServer(),
 		updates: [],
-		sockets: [],
 		rawSizes: [],
 		chunkTargets: [],
 		connectRequests: 0,
-		closed: 0,
 		fail: false,
 		deleted: false,
-		terminateHandshake: false,
+		snapshotRequired: false,
+		postRequests: 0,
 	};
 	fixture.server.on("request", async (request, response) => {
 		if (request.headers.authorization !== "Bearer observer-test") {
@@ -47,24 +45,10 @@ async function createFixture(): Promise<ObserverFixture> {
 		}
 		if (request.method === "GET") {
 			fixture.connectRequests++;
-			if (fixture.terminateHandshake) {
-				response.destroy();
-				return;
-			}
-			response.on("close", () => {
-				fixture.closed++;
-			});
-			if (fixture.deleted) {
-				response.writeHead(410, { "Content-Type": "application/json" }).end('{"deleted":true}');
-				return;
-			}
-			response.writeHead(200, { "Content-Type": "text/event-stream" });
-			response.write(
-				`event: connected\r\ndata: ${JSON.stringify({ connectionId: `connection-${fixture.sockets.length}` })}\r\n\r\n`,
-			);
-			fixture.sockets.push(response);
+			response.writeHead(404).end();
 			return;
 		}
+		fixture.postRequests++;
 		const buffers: Buffer[] = [];
 		for await (const chunk of request) buffers.push(Buffer.from(chunk));
 		const raw = Buffer.concat(buffers);
@@ -80,7 +64,7 @@ async function createFixture(): Promise<ObserverFixture> {
 			return;
 		}
 		if (fixture.fail) {
-			response.writeHead(503).end();
+			response.destroy();
 			return;
 		}
 		let body: unknown = JSON.parse(raw.toString());
@@ -110,6 +94,13 @@ async function createFixture(): Promise<ObserverFixture> {
 			body = JSON.parse(Buffer.from(parts.join(""), "base64").toString());
 			chunks.delete(envelope.requestId);
 		}
+		if (fixture.snapshotRequired && !(body as ObserverUpdate).replace) {
+			response
+				.writeHead(409, { "Content-Type": "application/json" })
+				.end('{"error":"Observer snapshot required","snapshotRequired":true}');
+			return;
+		}
+		fixture.snapshotRequired = false;
 		fixture.updates.push(body as ObserverUpdate);
 		await fixture.holdResponse;
 		response.writeHead(200, { "Content-Type": "application/json" }).end('{"accepted":true}');
@@ -149,7 +140,6 @@ describe("pi-server observer", () => {
 		for (const observer of observers.splice(0)) observer.dispose();
 		for (const harness of harnesses.splice(0)) harness.cleanup();
 		for (const fixture of fixtures.splice(0)) {
-			for (const socket of fixture.sockets) socket.destroy();
 			fixture.server.closeAllConnections();
 			await new Promise<void>((resolve, reject) =>
 				fixture.server.close((error) => (error ? reject(error) : resolve())),
@@ -251,6 +241,7 @@ describe("pi-server observer", () => {
 		observers.push(new PiServerObserver(harness.session));
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
 		const update = fixture.updates[0]!;
+		expect(update.create).toBe(true);
 		expect(update.cwd).toBe(manager.getCwd());
 		expect(update.status).toBe("idle");
 		expect(update.replace?.map((message) => message.role)).toEqual(["user", "compaction", "user"]);
@@ -330,9 +321,10 @@ describe("pi-server observer", () => {
 			content: [{ type: "text", text: "final" }],
 		});
 		expect(fixture.updates.slice(1).every((update) => update.replace === undefined)).toBe(true);
-		expect(harness.eventsOfType("run_state_changed")).toEqual([
-			{ type: "run_state_changed", running: true },
-			{ type: "run_state_changed", running: false },
+		expect(fixture.updates.slice(1).every((update) => update.create === false)).toBe(true);
+		expect(harness.eventsOfType("working_state_changed")).toEqual([
+			{ type: "working_state_changed", working: true },
+			{ type: "working_state_changed", working: false },
 		]);
 	});
 
@@ -484,7 +476,7 @@ describe("pi-server observer", () => {
 		).toBe(true);
 	});
 
-	it("replaces the viewed branch and updates names, then closes the old socket on session disposal", async () => {
+	it("replaces the viewed branch and stops publishing after session disposal", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const firstId = harness.sessionManager.appendMessage({ role: "user", content: "first", timestamp: 1 });
@@ -499,10 +491,10 @@ describe("pi-server observer", () => {
 		await harness.session.navigateTree(firstId);
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.replace).toEqual([]));
 		harness.session.dispose();
-		await vi.waitFor(() => expect(fixture.closed).toBe(1));
+		expect(fixture.connectRequests).toBe(0);
 	});
 
-	it("reconnects quietly after repeated presence socket termination and publishes the current branch", async () => {
+	it("publishes no idle requests, heartbeats, or timed retries after a network failure", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const fixture = await createFixture();
@@ -510,70 +502,43 @@ describe("pi-server observer", () => {
 		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
 		observers.push(new PiServerObserver(harness.session));
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
-		for (let attempt = 0; attempt < 2; attempt++) {
-			fixture.sockets[attempt]!.destroy();
-			harness.setResponses([fauxAssistantMessage(`response ${attempt}`)]);
-			await harness.session.prompt(`prompt ${attempt}`);
-			await vi.waitFor(() => expect(fixture.sockets).toHaveLength(attempt + 2), { timeout: 4000 });
-			await vi.waitFor(() =>
-				expect(fixture.updates.at(-1)?.replace?.at(-1)?.content).toEqual([
-					{ type: "text", text: `response ${attempt}` },
-				]),
-			);
-			expect(fixture.updates.at(-1)?.replace).toHaveLength((attempt + 1) * 2);
-			expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
-			expect(diagnostic).not.toHaveBeenCalled();
-		}
-	});
-
-	it("reports socket termination before the presence handshake", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const fixture = await createFixture();
-		fixtures.push(fixture);
-		fixture.terminateHandshake = true;
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-		observers.push(new PiServerObserver(harness.session));
-		await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: fetch failed"));
-		expect(fixture.updates).toEqual([]);
-	});
-
-	it("reports presence authentication failures", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const fixture = await createFixture();
-		fixtures.push(fixture);
-		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "wrong-token");
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-		observers.push(new PiServerObserver(harness.session));
-		await vi.waitFor(() =>
-			expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: connection failed (HTTP 401)"),
-		);
-		expect(fixture.updates).toEqual([]);
-	});
-
-	it("isolates observer transport failure from prompts and reconnects with a fresh branch", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const fixture = await createFixture();
-		fixtures.push(fixture);
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-		observers.push(new PiServerObserver(harness.session));
-		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+		await vi.advanceTimersByTimeAsync(120000);
+		expect(fixture.postRequests).toBe(1);
+		expect(fixture.connectRequests).toBe(0);
+		vi.useRealTimers();
 		fixture.fail = true;
 		harness.setResponses([fauxAssistantMessage("completed despite observer failure")]);
 		await harness.session.prompt("go");
-		await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledTimes(1));
-		expect(diagnostic).toHaveBeenCalledWith("pi-server observer disconnected: update failed (HTTP 503)");
+		await vi.waitFor(() => expect(diagnostic).toHaveBeenCalled());
 		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		const failedRequests = fixture.postRequests;
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+		await vi.advanceTimersByTimeAsync(120000);
+		expect(fixture.postRequests).toBe(failedRequests);
+		expect(fixture.connectRequests).toBe(0);
+		vi.useRealTimers();
 		fixture.fail = false;
-		await vi.waitFor(() => expect(fixture.sockets).toHaveLength(2), { timeout: 4000 });
-		await vi.waitFor(() =>
-			expect(fixture.updates.at(-1)?.replace?.at(-1)?.content).toEqual([
-				{ type: "text", text: "completed despite observer failure" },
-			]),
-		);
-		await vi.waitFor(() => expect(diagnostic).toHaveBeenLastCalledWith("pi-server observer connected"));
+		harness.session.setSessionName("recovered");
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.title).toBe("recovered"));
+		expect(fixture.updates.at(-1)?.replace?.at(-1)?.content).toEqual([
+			{ type: "text", text: "completed despite observer failure" },
+		]);
+	});
+
+	it("resends the complete current branch after a snapshot-required response", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		fixture.snapshotRequired = true;
+		harness.session.setSessionName("resynchronized");
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(2));
+		expect(fixture.postRequests).toBe(3);
+		expect(fixture.updates[1]).toMatchObject({ title: "resynchronized", replace: [] });
+		expect(fixture.updates[1]?.observerId).toBe(fixture.updates[0]?.observerId);
 	});
 
 	it("keeps cancellation running until tool cleanup finishes", async () => {
@@ -618,7 +583,7 @@ describe("pi-server observer", () => {
 		expect(fixture.updates.at(-1)?.live).toEqual({ message: null, tools: [] });
 	});
 
-	it("moves presence to the new session immediately when its manager changes", async () => {
+	it("publishes a new session snapshot when its manager changes", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.sessionManager.appendMessage({ role: "user", content: "old session", timestamp: 1 });
@@ -630,13 +595,76 @@ describe("pi-server observer", () => {
 		harness.sessionManager.newSession();
 		harness.session.refreshContext();
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).not.toBe(oldId));
-		expect(fixture.closed).toBe(1);
+		expect(fixture.connectRequests).toBe(0);
 		expect(fixture.updates.at(-1)).toMatchObject({
 			sessionId: harness.session.sessionId,
 			sequence: 1,
 			title: "",
 			replace: [],
 		});
+	});
+
+	it("isolates a reopened session publisher from its older in-flight acknowledgement", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		let release: (() => void) | undefined;
+		fixture.holdResponse = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		const old = fixture.updates[0]!;
+		harness.sessionManager.newSession();
+		harness.session.refreshContext();
+		harness.session.setSessionName("new session");
+		vi.spyOn(harness.sessionManager, "getSessionId").mockReturnValue(old.sessionId);
+		harness.session.refreshContext();
+		fixture.holdResponse = undefined;
+		release?.();
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.observerId).not.toBe(old.observerId));
+		const current = fixture.updates.at(-1)!;
+		expect(current).toMatchObject({ title: "new session", sequence: 1, replace: [] });
+		expect(current.observerId).not.toBe(old.observerId);
+	});
+
+	it("keeps working through asynchronous settled hooks and publishes idle after they finish", async () => {
+		let release: (() => void) | undefined;
+		let entered = false;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						entered = true;
+						await gate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
+		harness.setResponses([fauxAssistantMessage("settled response")]);
+		const run = harness.session.prompt("go");
+		await vi.waitFor(() => expect(entered).toBe(true));
+		expect(harness.session.isWorking).toBe(true);
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("running"));
+		expect(harness.eventsOfType("working_state_changed")).toEqual([{ type: "working_state_changed", working: true }]);
+		release?.();
+		await run;
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		expect(harness.session.isWorking).toBe(false);
+		expect(harness.eventsOfType("working_state_changed")).toEqual([
+			{ type: "working_state_changed", working: true },
+			{ type: "working_state_changed", working: false },
+		]);
 	});
 
 	it("delivers entries committed while an older update is awaiting acknowledgement", async () => {
@@ -740,10 +768,46 @@ describe("pi-server observer", () => {
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("running"));
 		expect(harness.session.isStreaming).toBe(false);
 		expect(harness.session.isIdle).toBe(false);
+		expect(harness.session.isWorking).toBe(true);
 		release?.();
 		await compact;
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
 		expect(fixture.updates.at(-1)?.append?.at(-1)).toMatchObject({ role: "compaction", content: "manual summary" });
+		expect(harness.session.isWorking).toBe(false);
+	});
+
+	it("reports branch summary work until tree navigation finishes", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", async () => {
+						await gate;
+						return { summary: { summary: "branch summary" } };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const target = harness.sessionManager.appendMessage({ role: "user", content: "first branch", timestamp: 1 });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("reply"));
+		harness.sessionManager.appendMessage({ role: "user", content: "other branch", timestamp: 2 });
+		const fixture = await createFixture();
+		fixtures.push(fixture);
+		observers.push(new PiServerObserver(harness.session));
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		const navigation = harness.session.navigateTree(target, { summarize: true });
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("running"));
+		expect(harness.session.isWorking).toBe(true);
+		release?.();
+		const result = await navigation;
+		expect(result.summaryEntry?.summary).toBe("branch summary");
+		await vi.waitFor(() => expect(fixture.updates.at(-1)?.status).toBe("idle"));
+		expect(harness.session.isWorking).toBe(false);
 	});
 
 	it("drains an in-flight update and final message through immediate print-mode runtime disposal", async () => {
@@ -766,7 +830,7 @@ describe("pi-server observer", () => {
 		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(false));
 		await vi.waitFor(() => expect(harness.session.messages.at(-1)?.role).toBe("assistant"));
 		expect(finished).toBe(false);
-		expect(fixture.closed).toBe(0);
+		expect(fixture.connectRequests).toBe(0);
 		fixture.holdResponse = undefined;
 		release?.();
 		expect(await print).toBe(0);
@@ -774,7 +838,7 @@ describe("pi-server observer", () => {
 		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
 		expect(messages.at(-1)?.content).toEqual([{ type: "text", text: "printed final response" }]);
 		expect(fixture.updates.at(-1)?.status).toBe("idle");
-		await vi.waitFor(() => expect(fixture.closed).toBe(1));
+		expect(fixture.connectRequests).toBe(0);
 	});
 
 	it("bounds print-mode observer shutdown and reports delivery failure without changing the prompt result", async () => {
@@ -798,7 +862,7 @@ describe("pi-server observer", () => {
 		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
-	it("delivers the final print response when shutdown begins before the observer handshake finishes", async () => {
+	it("delivers the final print response when shutdown begins before the initial observer update finishes", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("fast final response")]);
@@ -812,74 +876,26 @@ describe("pi-server observer", () => {
 		expect(fixture.updates.at(-1)?.status).toBe("idle");
 	});
 
-	it("stops mirroring a deleted session until another session is opened", async () => {
+	it("stops publishing a deleted session until another session opens", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const fixture = await createFixture();
 		fixtures.push(fixture);
 		observers.push(new PiServerObserver(harness.session));
 		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-		fixture.sockets[0]?.end(`event: deleted\ndata: ${JSON.stringify({ id: harness.session.sessionId })}\n\n`);
-		await vi.waitFor(() => expect(fixture.closed).toBe(1));
-		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-		harness.session.setSessionName("deleted thread");
-		await vi.advanceTimersByTimeAsync(2500);
-		expect(fixture.sockets).toHaveLength(1);
-		expect(fixture.updates).toHaveLength(1);
-		expect(diagnostic).not.toHaveBeenCalled();
-		vi.useRealTimers();
-		harness.sessionManager.newSession();
-		harness.session.refreshContext();
-		await vi.waitFor(() => expect(fixture.sockets).toHaveLength(2));
-		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).toBe(harness.session.sessionId));
-	});
-
-	it("stops reconnecting when the presence handshake reports deletion", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const fixture = await createFixture();
-		fixtures.push(fixture);
-		fixture.deleted = true;
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-		observers.push(new PiServerObserver(harness.session));
-		await vi.waitFor(() => expect(fixture.closed).toBe(1));
-		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-		harness.session.setSessionName("deleted thread");
-		await vi.advanceTimersByTimeAsync(5000);
-		expect(fixture.connectRequests).toBe(1);
-		expect(fixture.updates).toEqual([]);
-		expect(diagnostic).not.toHaveBeenCalled();
-		vi.useRealTimers();
-		fixture.deleted = false;
-		harness.sessionManager.newSession();
-		harness.session.refreshContext();
-		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).toBe(harness.session.sessionId));
-		expect(fixture.connectRequests).toBe(2);
-	});
-
-	it("treats HTTP 410 as deletion when it arrives before the presence deletion event", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const fixture = await createFixture();
-		fixtures.push(fixture);
-		observers.push(new PiServerObserver(harness.session));
-		await vi.waitFor(() => expect(fixture.updates).toHaveLength(1));
-		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
 		fixture.deleted = true;
 		harness.session.setSessionName("deleted thread");
-		await vi.waitFor(() => expect(fixture.closed).toBe(1));
-		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		await vi.waitFor(() => expect(fixture.postRequests).toBe(2));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		harness.session.setSessionName("still deleted");
-		await vi.advanceTimersByTimeAsync(2500);
-		expect(fixture.sockets).toHaveLength(1);
-		expect(fixture.updates).toHaveLength(1);
-		expect(diagnostic).not.toHaveBeenCalled();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		await vi.advanceTimersByTimeAsync(120000);
+		expect(fixture.postRequests).toBe(2);
+		expect(fixture.connectRequests).toBe(0);
 		vi.useRealTimers();
 		fixture.deleted = false;
 		harness.sessionManager.newSession();
 		harness.session.refreshContext();
-		await vi.waitFor(() => expect(fixture.sockets).toHaveLength(2));
 		await vi.waitFor(() => expect(fixture.updates.at(-1)?.sessionId).toBe(harness.session.sessionId));
 	});
 });

@@ -92,8 +92,9 @@ export type ViewerUpdate = { thread: ViewerThread } & (
 
 export interface ObserverUpdate {
 	sessionId: string;
-	connectionId: string;
+	observerId: string;
 	sequence: number;
+	create: boolean;
 	cwd?: string;
 	title?: string;
 	replace?: ViewerMessage[];

@@ -165,19 +165,14 @@ describe("viewer server deletion", () => {
 		await seed("thread");
 		const controller = new AbortController();
 		controllers.push(controller);
-		const observer = await fetch(`${base}/api/observer/connect?sessionId=thread`, {
-			headers: bearer,
-			signal: controller.signal,
-		});
-		const observerReader = observer.body!.getReader();
-		const connected = new TextDecoder().decode((await observerReader.read()).value);
-		const connectionId = (JSON.parse(/^data: (.+)$/m.exec(connected)![1]) as { connectionId: string }).connectionId;
+		const observerId = "publisher";
 		expect(
 			(
 				await post("/api/observer", {
 					sessionId: "thread",
-					connectionId,
+					observerId,
 					sequence: 1,
+					create: true,
 					cwd: "D:/project",
 					replace: [{ id: "u", role: "user", content: "Observer question", timestamp: 1 }],
 				})
@@ -197,10 +192,10 @@ describe("viewer server deletion", () => {
 		expect(await deleted.json()).toEqual({ deletedIds: ["thread"], deletedCount: 1, failed: [] });
 		expect(new TextDecoder().decode((await reader.read()).value)).toContain('event: deleted\ndata: {"id":"thread"}');
 		expect((await reader.read()).done).toBe(true);
-		expect(new TextDecoder().decode((await observerReader.read()).value)).toContain("event: deleted");
-		expect((await post("/api/observer", { sessionId: "thread", connectionId, sequence: 2, append: [] })).status).toBe(
-			410,
-		);
+		expect(
+			(await post("/api/observer", { sessionId: "thread", observerId, sequence: 2, create: false, append: [] }))
+				.status,
+		).toBe(410);
 		expect(existsSync(persisted)).toBe(false);
 		expect(existsSync(`${persisted}.wal`)).toBe(false);
 		expect((await viewer("threads/thread/rounds?before=u")).status).toBe(404);
@@ -312,20 +307,8 @@ describe("viewer server deletion", () => {
 
 	it("rejects delayed observer updates after deletion and rejects old connections after explicit recreation", async () => {
 		await seed("observer-lifetime");
-		async function connect(): Promise<string> {
-			const controller = new AbortController();
-			controllers.push(controller);
-			const response = await fetch(`${base}/api/observer/connect?sessionId=observer-lifetime`, {
-				headers: bearer,
-				signal: controller.signal,
-			});
-			const first = await response.body!.getReader().read();
-			return (
-				JSON.parse(/^data: (.+)$/m.exec(new TextDecoder().decode(first.value))![1]) as { connectionId: string }
-			).connectionId;
-		}
-		const connectionId = await connect();
-		const update = { connectionId, sequence: 1, cwd: "D:/project", replace: [] };
+		const observerId = "publisher";
+		const update = { observerId, sequence: 1, create: true, cwd: "D:/project", replace: [] };
 		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update })).status).toBe(200);
 		const held = await hold("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 2 });
 		const pending = chunks("observer-lifetime", "/api/observer", { ...update, sequence: 3 });
@@ -334,33 +317,44 @@ describe("viewer server deletion", () => {
 		held.finish();
 		expect(await held.result).toBe(410);
 		expect((await post("/api/request/chunk", pending[1])).status).toBe(410);
-		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 4 })).status).toBe(
-			410,
-		);
+		expect(
+			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, create: false, sequence: 4 }))
+				.status,
+		).toBe(410);
 		expect(getSession("observer-lifetime")).toBeUndefined();
 		expect((await viewer("threads/observer-lifetime")).status).toBe(404);
 
 		await seed("observer-lifetime");
-		expect((await post("/api/observer", { sessionId: "observer-lifetime", ...update, sequence: 5 })).status).toBe(
-			409,
-		);
-		const replacement = await connect();
 		expect(
-			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, connectionId: replacement })).status,
+			(
+				await post("/api/observer", {
+					sessionId: "observer-lifetime",
+					observerId,
+					sequence: 5,
+					create: false,
+					append: [],
+				})
+			).status,
+		).toBe(409);
+		const replacement = "replacement";
+		expect(
+			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, observerId: replacement })).status,
 		).toBe(200);
-		const reconnected = await connect();
+		const reconnected = "replacement-again";
 		expect(
 			(
 				await post("/api/observer", {
 					sessionId: "observer-lifetime",
 					...update,
-					connectionId: replacement,
+					observerId: "old-publisher",
 					sequence: 2,
+					create: false,
+					replace: undefined,
 				})
 			).status,
 		).toBe(409);
 		expect(
-			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, connectionId: reconnected })).status,
+			(await post("/api/observer", { sessionId: "observer-lifetime", ...update, observerId: reconnected })).status,
 		).toBe(200);
 	});
 
@@ -447,7 +441,18 @@ describe("viewer server deletion", () => {
 		const during = await hold("/api/session/init", { sessionId: "active-a" });
 		for (const id of ["active-a", "active-b"]) {
 			expect((await post("/api/session/init", { sessionId: id })).status).toBe(410);
-			expect((await fetch(`${base}/api/observer/connect?sessionId=${id}`, { headers: bearer })).status).toBe(410);
+			expect(
+				(
+					await post("/api/observer", {
+						sessionId: id,
+						observerId: "during",
+						sequence: 1,
+						create: true,
+						cwd: "D:/project",
+						replace: [],
+					})
+				).status,
+			).toBe(410);
 		}
 		for (const release of releases) release();
 		expect((await deletion).status).toBe(200);

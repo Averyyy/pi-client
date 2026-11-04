@@ -16,13 +16,14 @@
 
 ### Fixed
 
+- Shared execution lifecycle state between TUI working indicators and event-triggered pi-server observer reports, including preparation failures, asynchronous completion handlers, branch summaries, and cancellation acknowledgement.
 - Closed session observers before runtime command exits and drained Windows handle cleanup.
 - Fixed steering and follow-up messages queued during manual pi-server compaction failing to send when compaction completed.
 - Released pi-server synchronization tracking when sessions are disposed and temporary streams finish, including failures, cancellation, and recovered responses.
 - Fixed session resume hints being truncated by interactive exit before terminal output completed.
-- Kept pi-server observer socket reconnections quiet while preserving connection, update, and shutdown failure diagnostics.
+- Published pi-server observer updates through event-triggered POSTs without persistent connections, heartbeats, or timed retries, while preserving delivery and shutdown diagnostics.
 - Used entry commit times for saved observer messages and isolated pending observer responses when switching sessions.
-- Stopped viewer observer reconnection when the server's presence handshake reports that the session was deleted.
+- Stopped viewer observer updates when the server reports that the session was deleted.
 - Preserved client identity and attribution settings across pi-server chat, compaction, image, classifier, and deferred requests.
 - Normalized home-directory separators in resource displays and applied the configured home directory consistently to resource exclusion patterns.
 - Preserved configured model scopes across credential and catalog changes while excluding unavailable models from selection, autocomplete, and cycling; cycling uses current model metadata.

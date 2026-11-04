@@ -1570,6 +1570,14 @@ async function handlePostRequest(
 	requestStartedAt: number,
 ): Promise<boolean> {
 	if (rejectDeletingSession(config, body, res, requestVersion)) return true;
+	if (pathname === "/api/observer") {
+		await config.viewer.observe(
+			body,
+			res,
+			(sessionId) => config.deletingSessions.has(sessionId) || sessionDeletedSince(sessionId, requestVersion),
+		);
+		return true;
+	}
 	if (pathname.startsWith("/api/accounts/")) {
 		await handleAccountRequest(config.accounts, pathname, body, res);
 		return true;
@@ -1996,13 +2004,6 @@ export function createPiServer(
 			}
 			return;
 		}
-		if (req.method === "GET" && url.pathname === "/api/observer/connect") {
-			if (rejectDeletingSession(config, { sessionId: url.searchParams.get("sessionId") }, res, requestVersion))
-				return;
-			viewer.connect(req, res, url.searchParams.get("sessionId"));
-			return;
-		}
-
 		if (req.method === "GET" && url.pathname === "/api/sessions") {
 			sendJson(res, 200, { sessions: listSessions() });
 			return;
@@ -2097,12 +2098,6 @@ export function createPiServer(
 					sendJson(res, 200, chunkResult.ack);
 					return;
 				}
-				if (chunkResult.target === "/api/observer") {
-					const observerBody = JSON.parse(chunkResult.bodyJson) as unknown;
-					if (rejectDeletingSession(config, observerBody, res, chunkResult.requestVersion)) return;
-					await viewer.observe(observerBody, res);
-					return;
-				}
 				const handled = await handlePostRequest(
 					config,
 					chunkResult.target,
@@ -2131,11 +2126,6 @@ export function createPiServer(
 		if (req.method === "POST") {
 			try {
 				const body = JSON.parse(await readBody(req)) as unknown;
-				if (url.pathname === "/api/observer") {
-					if (rejectDeletingSession(config, body, res, requestVersion)) return;
-					await viewer.observe(body, res);
-					return;
-				}
 				if (
 					await handlePostRequest(
 						config,

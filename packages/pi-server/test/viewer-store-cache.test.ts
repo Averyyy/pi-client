@@ -123,11 +123,12 @@ describe("viewer catalog indexes", () => {
 	it("indexes observer activity and removal without invalidating the catalog for live deltas", async () => {
 		const store = new ViewerStore(directory);
 		store.projects();
-		const connection = store.connect("observer");
+		const connection = { observerId: "publisher" };
 		await store.update({
 			sessionId: "observer",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/a",
 			replace: [],
 			status: "running",
@@ -136,23 +137,30 @@ describe("viewer catalog indexes", () => {
 		expect(running.running.map((thread) => thread.id)).toEqual(["observer"]);
 		await store.update({
 			sessionId: "observer",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 2,
+			create: false,
 			live: { message: { id: "a", role: "assistant", content: "Streaming text", timestamp: 1 }, tools: [] },
 		});
 		expect(store.projects()).toBe(running);
-		connection.close();
+
 		await store.flush();
-		const disconnected = store.projects();
-		expect(disconnected.running).toEqual([]);
-		expect(disconnected.projects[0].revision).not.toBe(running.projects[0].revision);
-		const reconnected = store.connect("observer");
-		await store.flush();
-		expect(store.page("D:/a", null).threads[0].status).toBe("unknown");
 		await store.update({
 			sessionId: "observer",
-			connectionId: reconnected.connectionId,
+			observerId: connection.observerId,
+			sequence: 3,
+			create: false,
+			status: "idle",
+		});
+		const idle = store.projects();
+		expect(idle.running).toEqual([]);
+		expect(idle.projects[0].revision).not.toBe(running.projects[0].revision);
+		await store.update({
+			sessionId: "observer",
+			observerId: "replacement",
 			sequence: 1,
+			create: true,
+			replace: [],
 			cwd: "D:/b",
 			status: "idle",
 		});

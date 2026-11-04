@@ -979,11 +979,7 @@ export class InteractiveMode {
 		nextUi.start();
 		this.themeController.rebindTui();
 		this.rebindExtensionTerminalInputListeners();
-		if (
-			restoreProgress &&
-			this.settingsManager.getShowTerminalProgress() &&
-			(this.session.isStreaming || this.session.isCompacting)
-		) {
+		if (restoreProgress && this.settingsManager.getShowTerminalProgress() && this.session.isWorking) {
 			terminal.setProgress(true);
 		}
 		return true;
@@ -2528,8 +2524,8 @@ export class InteractiveMode {
 		);
 	}
 
-	private restoreWorkingStatusIndicatorIfStreaming(): void {
-		if (!this.session.isStreaming) {
+	private restoreWorkingStatusIndicator(): void {
+		if (!this.session.isWorking) {
 			return;
 		}
 		if (this.workingVisible && this.activeStatusIndicator?.kind !== "working") {
@@ -2551,7 +2547,7 @@ export class InteractiveMode {
 			this.ui.requestRender();
 			return;
 		}
-		if (this.session.isStreaming && this.activeStatusIndicator?.kind !== "working") {
+		if (this.session.isWorking && !this.activeStatusIndicator) {
 			this.showWorkingStatusIndicator();
 		}
 		this.ui.requestRender();
@@ -2562,7 +2558,8 @@ export class InteractiveMode {
 			this.showAbortingStatusIndicator();
 			return;
 		}
-		if (this.session.isStreaming) {
+		if (this.session.isWorking) {
+			if (this.activeStatusIndicator && this.activeStatusIndicator.kind !== "working") return;
 			if (this.workingVisible) {
 				this.showStatusIndicator(
 					new WorkingStatusIndicator(
@@ -3642,6 +3639,7 @@ export class InteractiveMode {
 		this.unsubscribe = this.session.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
+		void this.handleEvent({ type: "working_state_changed", working: this.session.isWorking });
 	}
 
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
@@ -3653,6 +3651,19 @@ export class InteractiveMode {
 		this.programStatus.handleEvent(event);
 
 		switch (event.type) {
+			case "working_state_changed":
+				if (event.working) {
+					this.refreshStatusIndicator();
+				} else {
+					this.clearStatusIndicator(undefined, true);
+				}
+				if (this.settingsManager.getShowTerminalProgress()) {
+					this.ui.terminal.setProgress(event.working);
+				}
+				this.ui.requestRender();
+				if (!event.working) await this.checkShutdownRequested();
+				break;
+
 			case "agent_start":
 				this.pendingTools.clear();
 				// Restore main escape handler if retry handler is still active
@@ -3697,10 +3708,7 @@ export class InteractiveMode {
 				break;
 
 			case "abort_end":
-				this.refreshStatusIndicator();
-				if (!this.session.isStreaming && !this.session.isCompacting && !this.session.isRetrying) {
-					this.ui.terminal.setProgress(false);
-				}
+				if (this.session.isWorking) this.refreshStatusIndicator();
 				this.ui.requestRender();
 				break;
 
@@ -3929,20 +3937,6 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 
-			case "agent_settled":
-				if (this.session.isAborting) {
-					this.showAbortingStatusIndicator();
-				} else if (this.session.isStreaming) {
-					this.refreshStatusIndicator();
-				} else if (!this.session.isCompacting && !this.session.isRetrying) {
-					if (this.settingsManager.getShowTerminalProgress()) {
-						this.ui.terminal.setProgress(false);
-					}
-					this.clearStatusIndicator("working", true);
-				}
-				await this.checkShutdownRequested();
-				break;
-
 			case "compaction_start": {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
@@ -3964,9 +3958,6 @@ export class InteractiveMode {
 			}
 
 			case "compaction_end": {
-				if (this.settingsManager.getShowTerminalProgress()) {
-					this.ui.terminal.setProgress(false);
-				}
 				if (this.autoCompactionEscapeHandler) {
 					this.defaultEditor.onEscape = this.autoCompactionEscapeHandler;
 					this.autoCompactionEscapeHandler = undefined;
@@ -4012,8 +4003,8 @@ export class InteractiveMode {
 				}
 				if (this.session.isAborting) {
 					this.showAbortingStatusIndicator();
-				} else if (this.session.isStreaming) {
-					this.restoreWorkingStatusIndicatorIfStreaming();
+				} else if (this.session.isWorking) {
+					this.restoreWorkingStatusIndicator();
 				}
 				if (!event.aborted && !this.session.isAborting) {
 					void this.flushCompactionQueue({ willRetry: event.willRetry });
@@ -4048,8 +4039,8 @@ export class InteractiveMode {
 				}
 				if (this.session.isAborting) {
 					this.showAbortingStatusIndicator();
-				} else if (this.session.isStreaming) {
-					this.restoreWorkingStatusIndicatorIfStreaming();
+				} else if (this.session.isWorking) {
+					this.restoreWorkingStatusIndicator();
 				}
 				this.ui.requestRender();
 				break;

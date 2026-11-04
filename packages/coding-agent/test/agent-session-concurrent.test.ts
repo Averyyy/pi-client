@@ -199,6 +199,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const abortPromise = session.abort();
 		expect(session.isAborting).toBe(true);
+		expect(session.isWorking).toBe(true);
 		expect(session.abort()).toBe(abortPromise);
 		await session.steer("Steering after abort");
 		await session.followUp("Follow-up after abort");
@@ -212,6 +213,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.pendingMessageCount).toBe(0);
 		expect(session.isAborting).toBe(false);
 		expect(session.isStreaming).toBe(false);
+		expect(session.isWorking).toBe(false);
 	});
 
 	it("keeps queued intent when cancellation fails and resumes after retry", async () => {
@@ -236,6 +238,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 			await expect(session.abort()).rejects.toThrow("remote cancellation failed");
 			expect(session.isAborting).toBe(true);
+			expect(session.isWorking).toBe(true);
 			expect(session.abortError).toBe("remote cancellation failed");
 			await session.steer("Steering after failed abort");
 
@@ -247,6 +250,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(abortErrors).toEqual(["remote cancellation failed"]);
 			expect(session.abortError).toBeUndefined();
 			expect(session.isAborting).toBe(false);
+			expect(session.isWorking).toBe(false);
 			expect(session.pendingMessageCount).toBe(0);
 			expect(created.getCallCount()).toBe(2);
 			expect(fetchSpy).not.toHaveBeenCalled();

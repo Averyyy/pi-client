@@ -32,17 +32,24 @@ describe("viewer committed message details", () => {
 
 	it("defers tool content in snapshots and appends while retaining full persisted content across restart", async () => {
 		const store = new ViewerStore(directory);
-		const connection = store.connect("thread");
+		const connection = { observerId: "publisher" };
 		const updates: ViewerUpdate[] = [];
 		store.subscribe("thread", (update) => updates.push(update));
 		await store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/project",
 			replace: [user, tool],
 		});
-		await store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 2, append: [bash] });
+		await store.update({
+			sessionId: "thread",
+			observerId: connection.observerId,
+			sequence: 2,
+			create: false,
+			append: [bash],
+		});
 		expect(updates[0]).toMatchObject({
 			rounds: [{ messages: [user, { ...tool, content: [], contentDeferred: true }] }],
 		});
@@ -65,7 +72,13 @@ describe("viewer committed message details", () => {
 		expect(Buffer.byteLength(JSON.stringify(await store.rounds("thread", null)))).toBeLessThan(1000);
 		expect(await store.message("thread", "other-round", "tool")).toBeUndefined();
 		expect(await store.message("thread", "round", "missing")).toBeUndefined();
-		await store.update({ sessionId: "thread", connectionId: connection.connectionId, sequence: 3, replace: [user] });
+		await store.update({
+			sessionId: "thread",
+			observerId: connection.observerId,
+			sequence: 3,
+			create: false,
+			replace: [user],
+		});
 		expect(await store.message("thread", "round", "tool")).toBeUndefined();
 		await store.remove("thread");
 		expect(await store.message("thread", "round", "round")).toBeUndefined();
@@ -119,11 +132,12 @@ describe("viewer committed message details", () => {
 			},
 			async () => ({ deletedIds: [], deletedCount: 0, failed: [] }),
 		);
-		const connection = viewer.store.connect("thread");
+		const connection = { observerId: "publisher" };
 		await viewer.store.update({
 			sessionId: "thread",
-			connectionId: connection.connectionId,
+			observerId: connection.observerId,
 			sequence: 1,
+			create: true,
 			cwd: "D:/project",
 			replace: [user, tool],
 		});
