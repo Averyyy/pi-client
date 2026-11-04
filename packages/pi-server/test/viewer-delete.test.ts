@@ -210,12 +210,31 @@ describe("viewer server deletion", () => {
 	it("deletes every project session, including unloaded pages, while retaining other projects", async () => {
 		for (let index = 0; index < 7; index++) await seed(`a-${index}`);
 		await seed("other", "D:/other");
+		expect(
+			(
+				await post("/api/observer", {
+					sessionId: "a-0",
+					observerId: "parent-publisher",
+					sequence: 1,
+					create: true,
+					cwd: "D:/project",
+					replace: [],
+					subagents: [{ agentId: "worker", sessionId: "a-6", title: "Inspect source", taskStatus: "running" }],
+				})
+			).status,
+		).toBe(200);
 		const first = (await (await viewer(`threads?project=${encodeURIComponent("D:/project")}`)).json()) as {
 			threads: ViewerThread[];
 			nextCursor: string;
 		};
 		expect(first.threads).toHaveLength(5);
 		expect(first.nextCursor).toBeTruthy();
+		expect(first.threads.map((thread) => thread.id)).not.toContain("a-6");
+		expect(
+			((await (await viewer("projects")).json()) as ViewerCatalog).projects.find(
+				(project) => project.id === "D:/project",
+			)?.threadCount,
+		).toBe(6);
 		const deleted = await remove(`projects/${encodeURIComponent("D:/project")}`);
 		expect(deleted.status).toBe(200);
 		const result = (await deleted.json()) as ViewerDeleteResult;

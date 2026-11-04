@@ -188,8 +188,12 @@ export class ViewerStore {
 	}
 
 	projectThreadIds(project: string): string[] {
-		this.initializeCatalog();
-		return this.projectIndex.get(project)?.threads.map((thread) => thread.id) ?? [];
+		const ids = new Set([...listSessions().map((session) => session.sessionId), ...this.threads.keys()]);
+		return [...ids]
+			.map((id) => this.summary(id)!)
+			.filter((summary) => summary.projectId === project)
+			.sort(compareThreads)
+			.map((summary) => summary.id);
 	}
 
 	page(project: string, cursor: string | null): { threads: ThreadSummary[]; nextCursor: string | null } {
@@ -594,9 +598,17 @@ export class ViewerStore {
 
 	private initializeCatalog(): void {
 		if (this.catalogInitialized) return;
-		this.catalogInitialized = true;
 		const ids = new Set([...listSessions().map((session) => session.sessionId), ...this.threads.keys()]);
 		for (const id of ids) {
+			const session = getSession(id);
+			this.indexSubagents(
+				id,
+				this.threads.get(id)?.subagents ?? (session ? this.sessionMetadata(session).subagents : undefined) ?? [],
+			);
+		}
+		this.catalogInitialized = true;
+		for (const id of ids) {
+			if (this.parents.has(id)) continue;
 			const summary = this.summary(id)!;
 			this.indexedSummaries.set(id, summary);
 			let project = this.projectIndex.get(summary.projectId);
@@ -636,7 +648,7 @@ export class ViewerStore {
 			return;
 		}
 		const previous = this.indexedSummaries.get(id);
-		const next = removed ? undefined : this.summary(id);
+		const next = removed || this.parents.has(id) ? undefined : this.summary(id);
 		if (
 			previous?.title === next?.title &&
 			previous?.projectId === next?.projectId &&
@@ -711,7 +723,11 @@ export class ViewerStore {
 
 	private indexSubagents(id: string, next: ObserverSubagent[]): void {
 		if (this.indexedSubagents.get(id) === next) return;
-		for (const child of this.indexedSubagents.get(id) ?? []) {
+		const previous = this.indexedSubagents.get(id) ?? [];
+		const children = new Map(
+			[...previous, ...next].map((child) => [child.sessionId, this.parents.has(child.sessionId)]),
+		);
+		for (const child of previous) {
 			const parents = this.parents.get(child.sessionId);
 			parents?.delete(id);
 			if (parents?.size === 0) this.parents.delete(child.sessionId);
@@ -725,6 +741,9 @@ export class ViewerStore {
 			parents.add(id);
 		}
 		this.indexedSubagents.set(id, next);
+		if (this.catalogInitialized)
+			for (const [childId, wasChild] of children)
+				if (wasChild !== this.parents.has(childId)) this.refreshCatalog(childId);
 	}
 
 	private emitParents(id: string): void {

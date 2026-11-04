@@ -117,7 +117,7 @@ describe("viewer catalog indexes", () => {
 			["D:/c", 30],
 			["D:/a", 10],
 		]);
-		expect(list).toHaveBeenCalledTimes(1);
+		expect(list).toHaveBeenCalledTimes(2);
 	});
 
 	it("indexes observer activity and removal without invalidating the catalog for live deltas", async () => {
