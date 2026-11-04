@@ -167,8 +167,21 @@ const Round = memo(function Round({
 	loadMessage: LoadMessage;
 }) {
 	const split = partitionRound(round.messages);
-	const [processChoice, setProcessOpen] = useState<boolean | undefined>();
-	const processOpen = processChoice ?? active;
+	const [processOpen, setProcessOpen] = useState(false);
+	let processText = "";
+	for (let index = split.process.length; index >= 0 && !processText; index--) {
+		const message = index === split.process.length ? live?.message : split.process[index];
+		if (message?.role !== "assistant") continue;
+		const parts = messageParts(message);
+		for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
+			const part = parts[partIndex];
+			if (part.type === "text" && part.text.trim()) {
+				processText = part.text;
+				break;
+			}
+		}
+	}
+	const processLabel = processText || (active ? "正在处理" : "处理过程");
 	const liveToolIds = new Set(live?.tools.map((tool) => tool.id));
 	const liveMessage = live?.message
 		? {
@@ -205,7 +218,9 @@ const Round = memo(function Round({
 						onClick={() => setProcessOpen(!processOpen)}
 					>
 						{active ? <span className="status-dot running" /> : <Icon name="spark" size={15} />}
-						<span>{active ? "正在处理" : "处理过程"}</span>
+						<span className={`process-summary${active ? " is-running" : ""}`} title={processLabel}>
+							{processLabel}
+						</span>
 						<Icon name="chevron" size={13} className={processOpen ? "rotate" : ""} />
 					</button>
 					{processOpen ? (
@@ -262,7 +277,7 @@ const Round = memo(function Round({
 			{active && processCount === 0 ? (
 				<div className="waiting">
 					<span className="status-dot running" />
-					正在处理
+					<span className="process-summary is-running">正在处理</span>
 				</div>
 			) : null}
 		</article>

@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Collapsed viewer thinking and commands into one process section by default, showing the latest assistant text with a shimmer while running.
 - Based on upstream Pi 1.5.0, including JSON Schema tool validation, bounded extension command output, and branch summaries that preserve context edits and thinking settings.
 - Accepted event-triggered observer POSTs with publisher identity and sequence numbers, without client presence connections or heartbeats. Persisted explicit completion states and retained browser event streams.
 

@@ -863,11 +863,34 @@ pre {
 }
 .process-toggle {
 	padding: 7px 0;
+	max-width: 100%;
 	display: flex;
 	align-items: center;
 	gap: 9px;
 	color: #999ba2;
 	font-size: 12px;
+	text-align: left;
+}
+.process-summary {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.process-summary.is-running {
+	background: linear-gradient(110deg, #8b8e96 35%, #d5d7dc 50%, #8b8e96 65%);
+	background-size: 240% 100%;
+	background-clip: text;
+	color: transparent;
+	animation: process-shimmer 2s linear infinite;
+}
+@keyframes process-shimmer {
+	from {
+		background-position: 100% 0;
+	}
+	to {
+		background-position: -100% 0;
+	}
 }
 .process-toggle:hover {
 	color: #5e626a;
@@ -1341,6 +1364,9 @@ pre {
 	}
 }
 @media (prefers-reduced-motion: reduce) {
+	.process-summary.is-running {
+		animation: none;
+	}
 	* {
 		transition: none !important;
 		scroll-behavior: auto !important;
