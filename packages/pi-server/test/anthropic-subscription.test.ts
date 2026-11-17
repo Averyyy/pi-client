@@ -199,6 +199,17 @@ describe("Anthropic subscription shaping", () => {
 		},
 	);
 
+	it("keeps tool-only continuations without a system or billing block", async () => {
+		const payload = {
+			thread: { type: "continue", previous_message_id: "msg_real" },
+			messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "done" }] }],
+		};
+		const { body, transport } = await capture(payload);
+		expect(transport).toHaveBeenCalledOnce();
+		expect(body).toEqual(payload);
+		expect(body).not.toHaveProperty("system");
+	});
+
 	it("retains an upstream network rejection", async () => {
 		const error = new TypeError("fixture network failure");
 		const transport = vi.fn<typeof fetch>().mockRejectedValue(error);

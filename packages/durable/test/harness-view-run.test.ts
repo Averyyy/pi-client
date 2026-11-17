@@ -1,9 +1,10 @@
 // What a renderer sees of a run through the conversation view: the transcript window and `pi.live`, every change a
 // commit makes, rebuilt from operations alone. This replaced the event stream (`watchEvents`, #11327).
 
+import { setImmediate } from "node:timers/promises";
 import { GCProfiler, getHeapStatistics, setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
-import type { Draft } from "@earendil-works/chord";
+import type { Draft } from "@earendil-works/chord/delta";
 import { applyImmutable, type Op } from "@earendil-works/chord/delta";
 import {
 	type AssistantMessage,
@@ -23,7 +24,7 @@ import {
 	MemoryStorage,
 } from "@earendil-works/pi-durable";
 import { num, obj } from "@earendil-works/pi-schema";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChatSetup, chatSetup, openChat, textOf, waitFor } from "./chat-support.ts";
 import { addTool } from "./harness-support.ts";
 import { slotsOf, viewHistory } from "./live-support.ts";
@@ -56,7 +57,7 @@ async function listen(conversation: Conversation, check = true) {
 const liveOf = (view: ConversationView) => (view.docs["pi.live"] ?? {}) as LiveState;
 
 async function drained(): Promise<void> {
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await setImmediate();
 }
 
 function slow(): ChatSetup {
@@ -502,6 +503,19 @@ async function heapInUse(): Promise<number> {
 
 // #9265
 describe("streamed partials", () => {
+	beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] }));
+	afterEach(() => vi.useRealTimers());
+
+	/** Advance the streaming clock through each scheduled chunk until the operation completes. */
+	async function finish<T>(promise: Promise<T>): Promise<T> {
+		let pending = true;
+		const result = promise.finally(() => {
+			pending = false;
+		});
+		while (pending) await vi.advanceTimersToNextTimerAsync();
+		return result;
+	}
+
 	it("streams a tool-call partial as appends at its argument paths", async () => {
 		const setup = chatSetup({ tokensPerSecond: 500, tokenSize: { min: 1, max: 1 } });
 		setup.settings.progress = { partialIntervalMs: 20, outputIntervalMs: 100 };
@@ -518,7 +532,7 @@ describe("streamed partials", () => {
 			{ advance: (call) => call.kind === "value" && ops.push(...call.ops), end: () => {} },
 			context,
 		);
-		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+		await finish((await root.submit({ type: "input", content: "go" }, context)).wait(context));
 		observation.detach();
 		const MESSAGE = ["docs", "pi.live", "generation", "message"];
 		// Operations on the in-flight message, with their paths relative to it.
@@ -566,7 +580,7 @@ describe("streamed partials", () => {
 			let commits = 0;
 			followCommits(harness, () => commits++);
 			const bytes = await allocatedBytes(async () => {
-				await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+				await finish((await root.submit({ type: "input", content: "go" }, context)).wait(context));
 			});
 			await harness.close(context);
 			return { bytes, commits };
@@ -603,11 +617,11 @@ describe("streamed partials", () => {
 		};
 		const retained: number[] = [];
 		// Measure while the text, then the tool call, is almost complete: the watcher's view holds the most then.
-		await waitFor(async () => (await shown(0)) > text.length * 0.95, 30_000);
+		await finish(waitFor(async () => (await shown(0)) > text.length * 0.95, 30_000));
 		retained.push((await heapInUse()) - before);
-		await waitFor(async () => (await shown(1)) > content.length * 0.95, 30_000);
+		await finish(waitFor(async () => (await shown(1)) > content.length * 0.95, 30_000));
 		retained.push((await heapInUse()) - before);
-		await submission.wait(context);
+		await finish(submission.wait(context));
 		const commits = frames.length;
 		expect(commits).toBeGreaterThan(500);
 		// The two 140 KB strings, the watcher's recorded frames and the rest of the stream: about 3 MB. Sliced append ops

@@ -83,6 +83,7 @@ describe("InteractiveMode cancellation boundary", () => {
 				mode.activeStatusIndicator = undefined;
 			}),
 			checkShutdownRequested: vi.fn().mockResolvedValue(undefined),
+			flushPendingBashComponents: vi.fn(),
 		};
 		const handleEvent =
 			getPrivateMethod<(event: { type: string; working?: boolean }) => Promise<void>>("handleEvent");

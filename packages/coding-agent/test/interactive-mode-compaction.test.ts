@@ -265,6 +265,7 @@ describe("InteractiveMode compaction events", () => {
 			chatContainer: { removeChild: vi.fn() },
 			clearStatusIndicator: vi.fn(),
 			checkShutdownRequested: vi.fn().mockResolvedValue(undefined),
+			flushPendingBashComponents: vi.fn(),
 			settingsManager: { getShowTerminalProgress: () => true },
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
 		};
@@ -282,7 +283,7 @@ describe("InteractiveMode compaction events", () => {
 		await handleEvent.call(fakeThis, { type: "working_state_changed", working: false });
 		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledWith(undefined, true);
 		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(false);
-		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(1);
+		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(2);
 	});
 
 	test("restores the working indicator after a retry indicator while still streaming", async () => {

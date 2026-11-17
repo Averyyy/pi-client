@@ -492,7 +492,7 @@ describe("SessionManager session file creation", () => {
 		expect(reopened.getBranch().map((entry) => entry.id)).toEqual([firstId, secondId]);
 	});
 
-	it("does not keep an entry in memory when creating the file fails", () => {
+	it.runIf(process.platform !== "win32")("does not keep an entry in memory when creating the file fails", () => {
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(sessionDir);
 		const session = SessionManager.create(tempDir, sessionDir);

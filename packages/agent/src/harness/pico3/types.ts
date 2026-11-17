@@ -8,8 +8,9 @@
  * Single process. A storage path has one owning process and one owning Session at a time.
  * Two processes opening the same JSONL directory is unsupported.
  */
-import type { JsonValue as ChordJsonValue, Context, JsonRepresentation } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Op } from "@earendil-works/chord/delta";
+import type { JsonValue as ChordJsonValue, JsonRepresentation } from "@earendil-works/chord/json";
 import type {
 	Api,
 	AssistantMessage,

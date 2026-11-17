@@ -38,6 +38,8 @@ export {
 } from "./harness.ts";
 export { JsonlStorage } from "./jsonl.ts";
 export { MemoryStorage } from "./memory.ts";
+export type { MutableReplicatedState, ReplicatedState, ReplicatedStateDelivery } from "./replicated-state.ts";
+export { replicatedState } from "./replicated-state.ts";
 export type { SystemSection } from "./system.ts";
 export { defineSystemSection, systemSections } from "./system.ts";
 export type {

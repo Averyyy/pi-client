@@ -1,4 +1,4 @@
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import type { AssistantMessage, StopReason, Usage } from "@earendil-works/pi-ai";
 import type { AgentMessage, QueueMode, ThinkingLevel } from "../../types.ts";
 import type { BranchPreparation } from "../compaction/branch-summarization.ts";
@@ -7,7 +7,7 @@ import type { Context } from "../context.ts";
 import type { AgentHarnessStreamOptions } from "../types.ts";
 import type { ListElement, ListReadOptions, ListWrite, StoredValue, Value, ValueList, ValueWrite } from "./values.ts";
 
-export type { JsonValue } from "@earendil-works/chord";
+export type { JsonValue } from "@earendil-works/chord/json";
 
 export type SettledAssistantMessage = AssistantMessage & {
 	stopReason: Exclude<StopReason, "pending">;

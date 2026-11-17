@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { isDeepStrictEqual } from "node:util";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { apply } from "@earendil-works/chord/delta";
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
 import { onTestFinished, test } from "vitest";

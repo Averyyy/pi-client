@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { AssistantMessage, ToolCall } from "@earendil-works/pi-ai";
 import { type CoreKind, type HookInfo, type Id, type Stored, toStored } from "../types.ts";
 import type { ToolTaskResult } from "./tool.ts";

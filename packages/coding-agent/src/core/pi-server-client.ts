@@ -955,6 +955,7 @@ function serializeOptions(
 		env: options?.env,
 		reasoning: options?.reasoning,
 		cacheRetention: options?.cacheRetention,
+		disableContinuation: options?.disableContinuation,
 		sessionId: options?.sessionId,
 		apiKey: options?.apiKey,
 		headers: options?.headers,

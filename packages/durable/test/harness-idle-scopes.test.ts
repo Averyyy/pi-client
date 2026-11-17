@@ -1,6 +1,7 @@
 // Idle checks without per-commit scans: a task change settles only the conversations above it (idle waiters and kept
 // context ranges), expiry runs oldest first from an ordered index, and `wake()` reads only sleeping tasks while work
 // is active. Every case checks the incremental idle state against a full recompute (`SCHEDULER_IDLE_STATE`).
+import { setImmediate } from "node:timers/promises";
 import { createModels } from "@earendil-works/pi-ai";
 import {
 	type Conversation,
@@ -18,7 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SCHEDULER_IDLE_STATE } from "../src/harness/harness.ts";
 import { commitWrites } from "../src/testing/commit-writes.ts";
 import { ROOT_CONVERSATION_ID, type StorageWrite } from "../src/types.ts";
-import { ControlledStorage, context, flush } from "./session-support.ts";
+import { ControlledStorage, context } from "./session-support.ts";
 import { aborted, type Deferred, deferred, eventually, openTasks, settled } from "./task-support.ts";
 
 const gates = new Map<string, Deferred<void>>();
@@ -150,7 +151,7 @@ async function open(options: { clock?: () => number; retention?: () => number; t
 
 /** Flush until scheduler passes started by the last changes settled. */
 async function quiet(): Promise<void> {
-	for (let round = 0; round < 4; round++) await flush();
+	for (let round = 0; round < 4; round++) await setImmediate();
 }
 
 describe("idle waiters by scope", () => {

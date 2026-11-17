@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { replicatedState } from "@earendil-works/chord";
 import { onTestFinished, test } from "vitest";
 import {
 	attachChordView,
 	createPicoConversationService,
 	type PublishedConversationView,
 } from "../../../src/harness/pico3/chord.ts";
+import { replicatedState } from "../../../src/harness/pico3/replicated-state.ts";
 import type { Envelope, JsonObject } from "../../../src/harness/pico3/types.ts";
 import { ctx, open, sleep } from "./helpers.ts";
 

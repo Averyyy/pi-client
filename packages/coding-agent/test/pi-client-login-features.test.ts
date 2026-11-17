@@ -287,8 +287,8 @@ describe("pi-client interactive login features", () => {
 			() => {},
 		);
 		const text = stripAnsi(selector.render(200).join("\n"));
-		expect(text).toContain("Radius [account]");
-		expect(text).toContain("Radius [API key] • account configured");
+		expect(text).toContain("Radius \u2726 [account]");
+		expect(text).toContain("Radius \u2726 [API key] • account configured");
 		expect(text).toContain("Subscription fixture [subscription]");
 		expect(text).toContain("Subscription fixture [API key] • subscription configured");
 		expect(globalThis.fetch).not.toHaveBeenCalled();

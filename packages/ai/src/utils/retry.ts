@@ -182,9 +182,7 @@ export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	const errorMessage = message.errorMessage;
 	if (/^(?:this operation was aborted|request was cancel(?:led|ed))$/i.test(errorMessage.trim())) return false;
-	// Keep the fork's broad transport retry behavior while honoring upstream's
-	// explicit account-limit patterns. Unknown provider errors remain retryable;
-	// the caller still applies its retry budget and phase-specific safeguards.
+	// Account limits are terminal; other errors use the caller's retry budget and phase policy.
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
 	// Azure peak-load responses mention usage size while still representing a
 	// transient capacity failure (upstream regression #9669).

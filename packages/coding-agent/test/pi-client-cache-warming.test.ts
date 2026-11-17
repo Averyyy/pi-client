@@ -396,8 +396,11 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		};
 	}
 
-	it("warms the exact provider prefix during a long tool in default streaming mode, then stops on settlement", async () => {
-		const { session, runtime, calls, requests, toolStarted, releaseTool, rejected } = await fixture({ tool: true });
+	it("warms the exact provider prefix during a long tool in streaming mode, then stops on settlement", async () => {
+		const { session, runtime, calls, requests, toolStarted, releaseTool, rejected } = await fixture({
+			tool: true,
+			mode: "streaming",
+		});
 		expect(await runtime.getAuth(model)).toEqual({ auth: { headers: model.headers } });
 		const run = session.prompt(largeText);
 		try {

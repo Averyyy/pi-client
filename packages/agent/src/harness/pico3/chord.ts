@@ -1,6 +1,7 @@
-import type { Context, Draft, MutableReplicatedState, ReplicatedState } from "@earendil-works/chord";
-import type { Op, Path, Seg } from "@earendil-works/chord/delta";
+import type { Context } from "@earendil-works/chord/context";
+import type { Draft, Op, Path, Seg } from "@earendil-works/chord/delta";
 import type { ConversationHandle, Harness } from "./harness.ts";
+import type { MutableReplicatedState, ReplicatedState } from "./replicated-state.ts";
 import type {
 	ConversationSpec,
 	ConversationView,
@@ -32,7 +33,7 @@ export interface PicoConversationService {
 	entries(scan: EntryScan, ctx: Context): Promise<Entry[]>;
 }
 
-/** Typed service identifier; Chord no longer provides `defineService()`. */
+/** Typed identifier for a local or remote Pico service. */
 export interface PicoServiceId<T> {
 	readonly id: string;
 	readonly local: boolean;

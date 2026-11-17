@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { ContextEdit, ContextView, Entry, Id, RequestMessage, Storage, StoredMessage } from "./types.ts";
 
 /**

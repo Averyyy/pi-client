@@ -1,4 +1,4 @@
-import type { Context, ContextKey } from "@earendil-works/chord";
+import type { Context, ContextKey } from "@earendil-works/chord/context";
 import {
 	awaitWithContext,
 	BACKGROUND_CONTEXT,

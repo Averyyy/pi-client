@@ -7,6 +7,14 @@
 - Preserved uncommitted steering and follow-up messages when next-turn preparation fails, keeping queue order and explicit queue clears.
 - Preserved active telemetry parents across experimental harness provider requests, summaries, deferred polls, and cancellation.
 
+## [1.5.2] - 2026-11-10
+
+## [1.5.1] - 2026-11-09
+
+### Added
+
+- Added `disableContinuation` forwarding in `streamProxy()` so proxied requests can opt out of server-side continuation state such as Anthropic message threads ([#11545](https://github.com/earendil-works/pi/pull/11545))
+
 ## [1.5.0] - 2026-11-02
 
 ### Breaking Changes

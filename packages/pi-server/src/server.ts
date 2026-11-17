@@ -26,6 +26,7 @@ import {
 	type ClassifierOptions,
 	type ClassifierResult,
 	type Context,
+	cleanupSessionResources,
 	createModels,
 	createProvider,
 	type DeferredCancelOptions,
@@ -634,6 +635,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 			deletePersistedSession(config.sessionStoreDir, id);
 			await config.viewer.store.remove(id);
 			deleteSessionFromStore(id);
+			cleanupSessionResources(id);
 		});
 		config.deletingSessions.set(id, operation);
 		const finish = () => {

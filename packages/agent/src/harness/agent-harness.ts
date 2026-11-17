@@ -1,4 +1,4 @@
-import type { JsonRepresentation } from "@earendil-works/chord";
+import type { JsonRepresentation } from "@earendil-works/chord/json";
 import type {
 	Api,
 	AssistantMessage,

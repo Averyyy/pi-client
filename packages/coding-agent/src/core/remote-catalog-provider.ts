@@ -130,6 +130,8 @@ export function withRemoteCatalog(
 				dynamicModels.filter((model) => isModelType(model, "chat")),
 			),
 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+		// pi.dev serves the catalog, so a stale provider login must not block or fail its refresh.
+		refreshModelsAuth: "configured",
 		refreshModels: async (context) => {
 			const stored = context.stored;
 			const restored = remoteModels(stored, catalogGeneratedAt).filter((model) => model.provider === provider.id);

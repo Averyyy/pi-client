@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { applyImmutable, isBase, type Op } from "@earendil-works/chord/delta";
 import type {
 	Conversation,

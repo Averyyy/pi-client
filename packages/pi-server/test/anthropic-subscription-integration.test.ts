@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { lazyStream, type Model } from "@earendil-works/pi-ai";
+import { type Context, lazyStream, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheWarmer } from "../../coding-agent/src/core/cache-warmer.ts";
 import { resetAllSessionTracking, streamPiServer } from "../../coding-agent/src/core/pi-server-client.ts";
@@ -15,6 +15,8 @@ interface Payload {
 	system: Array<{ type: string; text: string; cache_control?: unknown }>;
 	messages: Array<{ role: string; content: unknown }>;
 	max_tokens: number;
+	thread?: { type: "create" } | { type: "continue"; previous_message_id: string };
+	tools?: unknown[];
 }
 
 const prompt = "Reply with the word ok.";
@@ -27,6 +29,7 @@ describe("Anthropic subscription wire requests", () => {
 	let server: Server;
 	let baseUrl: string;
 	let model: Model<"anthropic-messages">;
+	let toolReply: boolean;
 	let calls: Array<{ headers: Record<string, string | string[] | undefined>; body: Payload }>;
 
 	async function listen(listener: Server): Promise<string> {
@@ -41,6 +44,7 @@ describe("Anthropic subscription wire requests", () => {
 		clearAllSessions();
 		directory = mkdtempSync(join(tmpdir(), "pi-anthropic-subscription-"));
 		calls = [];
+		toolReply = false;
 		upstream = createServer(async (req, res) => {
 			const chunks: Buffer[] = [];
 			for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -50,7 +54,7 @@ describe("Anthropic subscription wire requests", () => {
 				{
 					type: "message_start",
 					message: {
-						id: "msg_fixture",
+						id: `msg_fixture_${calls.length}`,
 						type: "message",
 						role: "assistant",
 						model: "claude-haiku-4-5",
@@ -59,12 +63,22 @@ describe("Anthropic subscription wire requests", () => {
 						usage: { input_tokens: 20, output_tokens: 0 },
 					},
 				},
-				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+				{
+					type: "content_block_start",
+					index: 0,
+					content_block: toolReply
+						? { type: "tool_use", id: "call_1", name: "read", input: {} }
+						: { type: "text", text: "" },
+				},
+				{
+					type: "content_block_delta",
+					index: 0,
+					delta: toolReply ? { type: "input_json_delta", partial_json: "{}" } : { type: "text_delta", text: "ok" },
+				},
 				{ type: "content_block_stop", index: 0 },
 				{
 					type: "message_delta",
-					delta: { stop_reason: "end_turn", stop_sequence: null },
+					delta: { stop_reason: toolReply ? "tool_use" : "end_turn", stop_sequence: null },
 					usage: { output_tokens: 1 },
 				},
 				{ type: "message_stop" },
@@ -210,6 +224,86 @@ describe("Anthropic subscription wire requests", () => {
 		expect(warm.headers.authorization).toBe(real.headers.authorization);
 		expect(warm.body.system).toEqual(real.body.system);
 		expect(warm.body.messages).toEqual(real.body.messages);
+	});
+
+	it("continues a tool-only turn from the real response after cache warming", async () => {
+		vi.stubEnv("PI_SERVER_URL", baseUrl);
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture-token");
+		model = { ...model, compat: { supportsMessageThreads: true } };
+		const context: Context = {
+			systemPrompt: "Tool thread policy",
+			tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+			messages: [{ role: "user", content: prompt, timestamp: 1 }],
+		};
+		const options: SimpleStreamOptions = { apiKey: oauth, sessionId: "subscription-tool-thread", maxTokens: 32 };
+		toolReply = true;
+		const real = await (await streamPiServer(model, context, options)).result();
+		expect(real.stopReason).toBe("toolUse");
+		toolReply = false;
+		const runtime = {
+			streamSimple: (requestModel: Model<string>, requestContext: Context, requestOptions?: SimpleStreamOptions) =>
+				lazyStream(requestModel, () => streamPiServer(requestModel, requestContext, requestOptions)),
+		};
+		const manager = SessionManager.inMemory();
+		manager.appendMessage(real);
+		const warmer = new CacheWarmer(
+			runtime,
+			manager,
+			() => "streaming",
+			async () => "warm",
+		);
+		warmer.start({ model: { ...model, promptCache: { short: 60 } }, context, options }, () => true);
+		const internal = warmer as unknown as {
+			run: { timer?: ReturnType<typeof setTimeout> };
+			refresh(run: object): Promise<void>;
+		};
+		clearTimeout(internal.run.timer);
+		try {
+			await internal.refresh(internal.run);
+		} finally {
+			warmer.cancel();
+		}
+		const continuedContext: Context = {
+			...context,
+			messages: [
+				...context.messages,
+				real,
+				{
+					role: "toolResult",
+					toolCallId: "call_1",
+					toolName: "read",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+		};
+		const result = await (await streamPiServer(model, continuedContext, options)).result();
+		expect(result.stopReason).toBe("stop");
+		expect(calls).toHaveLength(3);
+		expect(calls[0].body.thread).toEqual({ type: "create" });
+		expect(calls[1].body).not.toHaveProperty("thread");
+		expect(calls[1].body.system).toEqual(calls[0].body.system);
+		expect(calls[2].body.thread).toEqual({ type: "continue", previous_message_id: "msg_fixture_1" });
+		expect(calls[2].body).not.toHaveProperty("system");
+		expect(calls[2].body).not.toHaveProperty("tools");
+		expect(calls[2].body.messages).toMatchObject([
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "call_1" }] },
+		]);
+		const deleted = await fetch(`${baseUrl}/api/session/${options.sessionId}`, { method: "DELETE", headers });
+		expect(deleted.status).toBe(200);
+		const rebuilt = await (
+			await streamPiServer(
+				model,
+				{
+					...continuedContext,
+					messages: [...continuedContext.messages, result, { role: "user", content: "Continue", timestamp: 3 }],
+				},
+				options,
+			)
+		).result();
+		expect(rebuilt.stopReason).toBe("stop");
+		expect(calls[3].body.thread).toEqual({ type: "create" });
 	});
 
 	it("shapes the callback replacement before the SDK sends it", async () => {

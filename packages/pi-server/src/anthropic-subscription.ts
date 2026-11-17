@@ -54,6 +54,7 @@ interface PayloadMessage {
 interface MessagesPayload {
 	messages: PayloadMessage[];
 	system?: string | ContentBlock[];
+	thread?: { type: "create" } | { type: "continue"; previous_message_id: string };
 	[key: string]: unknown;
 }
 
@@ -137,6 +138,8 @@ function shapePayload(payload: MessagesPayload, version: string): MessagesPayloa
 		});
 		return content.length > 0 || message.output_config !== undefined ? [{ ...message, content }] : [];
 	});
+	// Continuations reuse the create request's system and billing block on Anthropic's server.
+	if (payload.thread?.type === "continue") return { ...payload, messages };
 	const system = (
 		typeof payload.system === "string" ? [{ type: "text", text: payload.system }] : (payload.system ?? [])
 	)
