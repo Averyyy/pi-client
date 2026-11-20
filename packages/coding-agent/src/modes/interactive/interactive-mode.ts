@@ -1206,7 +1206,8 @@ export class InteractiveMode {
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
-			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
+			void this.session.modelRuntime
+				.refresh({ signal: controller.signal })
 				.then((result) => {
 					this.updateAvailableProviderCount();
 					if (result.aborted) return;

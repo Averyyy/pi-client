@@ -18,6 +18,7 @@
 - Reported upload HTTP and connection failures with the target, response metadata, and a bounded, token-redacted body excerpt instead of JSON or network stack traces.
 - Handled malformed `settings.json` when checking for the Tau Codex extension instead of crashing `pi-client web`.
 - Used `--legacy-peer-deps` for npm-global fork updates and documented installs so existing upstream Pi installs do not trigger peer override warnings for forked prerelease aliases.
+- Refreshed PiServer-owned Antigravity and Devin model catalogs when opening the interactive model picker and reported account refresh failures.
 
 ### Added
 

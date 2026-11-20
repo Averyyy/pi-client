@@ -7,6 +7,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ModelConfig } from "../src/core/model-config.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { resetAllSessionTracking } from "../src/core/pi-server-client.ts";
 
@@ -43,6 +44,7 @@ describe("Google Antigravity ModelRuntime", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
 		vi.unstubAllEnvs();
 		resetAllSessionTracking();
@@ -134,6 +136,98 @@ describe("Google Antigravity ModelRuntime", () => {
 		expect(runtime.getModels(providerId)).toEqual([model]);
 		expect(await runtime.getAvailable(providerId)).toEqual([model]);
 		expect((await modelsStore.read(providerId))?.models).toEqual([model]);
+	});
+
+	it("reports server account discovery errors and replaces the retained catalog after a successful refresh", async () => {
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_URL", "https://pi-server.test");
+		let discoveryError: string | undefined;
+		let accountModels = [model];
+		const requests: { path: string; method: string | undefined }[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				const path = new URL(String(input)).pathname;
+				requests.push({ path, method: init?.method });
+				if (path !== "/api/accounts" && path !== "/api/accounts/refresh") {
+					throw new Error(`Unexpected pi-server request: ${path}`);
+				}
+				return Response.json({
+					accounts: [
+						{ providerId, loggedIn: true, models: accountModels, error: discoveryError },
+						{ providerId: "devin", loggedIn: true, models: [], error: "Unrelated account failure" },
+					],
+				});
+			}),
+		);
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsStore: new InMemoryModelsStore(),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		discoveryError = "Account catalog unavailable";
+		const failed = await runtime.refresh({
+			providers: [providerId],
+			allowNetwork: true,
+			refreshServerAccounts: true,
+		});
+		expect([...failed.errors.keys()]).toEqual([providerId]);
+		expect(failed.errors.get(providerId)?.message).toBe(discoveryError);
+		expect(await runtime.getAvailable(providerId)).toEqual([model]);
+		expect(runtime.getError()).toContain(discoveryError);
+
+		discoveryError = undefined;
+		accountModels = [{ ...model, id: "new-account-model", name: "New Account Model" }];
+		const refreshed = await runtime.refresh({
+			providers: [providerId],
+			allowNetwork: true,
+			refreshServerAccounts: true,
+		});
+		expect(refreshed.errors.size).toBe(0);
+		expect(await runtime.getAvailable(providerId)).toEqual(accountModels);
+		expect(runtime.getError()).not.toContain("Account catalog unavailable");
+		expect(requests).toEqual([
+			{ path: "/api/accounts", method: "GET" },
+			{ path: "/api/accounts/refresh", method: "POST" },
+			{ path: "/api/accounts/refresh", method: "POST" },
+		]);
+	});
+
+	it("keeps an explicit account refresh when startup reaches the server snapshot later", async () => {
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_URL", "https://pi-server.test");
+		const updatedModel = { ...model, id: "new-account-model", name: "New Account Model" };
+		const remoteRefresh = Promise.withResolvers<Response>();
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const path = new URL(String(input)).pathname;
+			if (path === "/api/accounts/refresh") return remoteRefresh.promise;
+			if (path === "/api/accounts") {
+				return Response.json({ accounts: [{ providerId, loggedIn: true, models: [model] }] });
+			}
+			throw new Error(`Unexpected pi-server request: ${path}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsStore: new InMemoryModelsStore(),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const config = await ModelConfig.load(undefined);
+		const startupConfig = Promise.withResolvers<ModelConfig>();
+		const load = vi.spyOn(ModelConfig, "load").mockReturnValueOnce(startupConfig.promise);
+		const startup = runtime.refresh({ allowNetwork: false });
+		await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
+		const explicit = runtime.refresh({ providers: [providerId], allowNetwork: true, refreshServerAccounts: true });
+		await vi.waitFor(() =>
+			expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/api/accounts/refresh"))).toBe(true),
+		);
+		startupConfig.resolve(config);
+		await startup;
+		remoteRefresh.resolve(Response.json({ accounts: [{ providerId, loggedIn: true, models: [updatedModel] }] }));
+		expect((await explicit).errors.size).toBe(0);
+		expect(await runtime.getAvailable(providerId)).toEqual([updatedModel]);
 	});
 
 	it.each([

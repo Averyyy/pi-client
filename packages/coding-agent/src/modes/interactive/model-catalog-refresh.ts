@@ -19,7 +19,7 @@ class ModelCatalogRefreshCoordinator {
 		if (!active) {
 			const controller = new AbortController();
 			let created!: ActiveModelCatalogRefresh;
-			const operation = modelRuntime.refresh({ signal: controller.signal });
+			const operation = modelRuntime.refresh({ refreshServerAccounts: true, signal: controller.signal });
 			const promise = raceWithAbortSignal(operation, controller.signal).finally(() => {
 				if (this.activeByRuntime.get(modelRuntime) === created) {
 					this.activeByRuntime.delete(modelRuntime);
@@ -42,7 +42,7 @@ class ModelCatalogRefreshCoordinator {
 
 const modelCatalogRefreshCoordinator = new ModelCatalogRefreshCoordinator();
 
-/** Share concurrent interactive all-catalog refreshes while keeping each caller's cancellation independent. */
+/** Refresh interactive catalogs and server accounts, sharing concurrent callers with independent cancellation. */
 export function refreshModelCatalogs(
 	modelRuntime: ModelCatalogRuntime,
 	signal: AbortSignal,

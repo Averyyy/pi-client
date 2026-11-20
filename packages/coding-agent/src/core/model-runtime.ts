@@ -1127,8 +1127,15 @@ export class ModelRuntime implements Models {
 		});
 	}
 
-	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+	async refresh(
+		options: ModelsRefreshOptions & { refreshServerAccounts?: boolean } = {},
+	): Promise<ModelsRefreshResult> {
 		if (options.signal?.aborted) return { aborted: true, errors: new Map() };
+		const serverProviders = [...this.builtins.keys()].filter(
+			(providerId): providerId is PiServerAccountProviderId =>
+				this.isServerAccountProvider(providerId) && (!options.providers || options.providers.includes(providerId)),
+		);
+		const serverAccountsSeq = serverProviders.length > 0 ? ++this.serverAccountsSeq : this.serverAccountsSeq;
 		try {
 			await raceWithAbortSignal(this.registrationRefresh, options.signal);
 		} catch (error) {
@@ -1149,23 +1156,25 @@ export class ModelRuntime implements Models {
 		};
 		const result = await this.models.refresh(refreshOptions);
 		const errors = new Map(result.errors);
-		const serverProviders = [...this.builtins.keys()].filter(
-			(providerId): providerId is PiServerAccountProviderId =>
-				this.isServerAccountProvider(providerId) && (!options.providers || options.providers.includes(providerId)),
-		);
 		if (serverProviders.length > 0) {
-			const seq = ++this.serverAccountsSeq;
 			try {
 				const snapshot =
-					options.force && refreshOptions.allowNetwork
+					(options.force || options.refreshServerAccounts) && refreshOptions.allowNetwork
 						? await refreshPiServerAccounts(
 								serverProviders.length === 1 ? serverProviders[0] : undefined,
 								options.signal,
 							)
 						: await readPiServerAccounts(options.signal);
-				if (seq === this.serverAccountsSeq) this.applyServerAccounts(snapshot);
+				if (serverAccountsSeq === this.serverAccountsSeq) {
+					this.applyServerAccounts(snapshot);
+					for (const account of snapshot.accounts) {
+						if (serverProviders.includes(account.providerId) && account.error) {
+							errors.set(account.providerId, new Error(account.error));
+						}
+					}
+				}
 			} catch (error) {
-				if (!options.signal?.aborted && seq === this.serverAccountsSeq) {
+				if (!options.signal?.aborted && serverAccountsSeq === this.serverAccountsSeq) {
 					this.serverAccountsError = error instanceof Error ? error.message : String(error);
 					for (const id of serverProviders)
 						errors.set(id, error instanceof Error ? error : new Error(String(error)));

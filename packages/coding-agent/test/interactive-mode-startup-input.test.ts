@@ -160,6 +160,7 @@ describe("InteractiveMode startup model catalog", () => {
 		}));
 
 		await vi.waitFor(() => expect(context.showWarning).toHaveBeenCalledTimes(2));
+		expect(context.session.modelRuntime.refresh).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
 		expect(context.showWarning).toHaveBeenCalledWith(
 			"Could not refresh google-antigravity model catalog: 503 Service Unavailable",
 		);

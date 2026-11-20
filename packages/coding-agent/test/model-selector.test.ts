@@ -1,4 +1,5 @@
 import type { ModelsRefreshResult } from "@earendil-works/pi-ai";
+import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
@@ -27,11 +28,13 @@ describe("model selector", () => {
 
 	beforeEach(() => {
 		setKeybindings(new KeybindingsManager());
+		vi.spyOn(builtinProviderCatalog, "builtinProviders").mockReturnValue([]);
 	});
 
 	afterEach(() => {
 		harness?.cleanup();
 		harness = undefined;
+		vi.restoreAllMocks();
 	});
 
 	it("keeps the current model marked while browsing", async () => {
@@ -160,6 +163,28 @@ describe("model selector", () => {
 			const rendered = stripAnsi(selector.render(120).join("\n"));
 			expect(rendered).toContain("Could not refresh 2 model catalogs (openai, anthropic); showing cached models.");
 		});
+	});
+
+	it("shows the provider error when one catalog fails to refresh", async () => {
+		harness = await createHarness();
+		vi.spyOn(harness.session.modelRuntime, "refresh").mockResolvedValue({
+			aborted: false,
+			errors: new Map([["google-antigravity", new Error("Account catalog unavailable")]]),
+		});
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			harness.getModel(),
+			harness.session.modelRuntime,
+			[],
+			() => {},
+			() => {},
+		);
+		await vi.waitFor(() => {
+			expect(stripAnsi(selector.render(160).join("\n"))).toContain(
+				"Could not refresh google-antigravity: Account catalog unavailable; showing cached models.",
+			);
+		});
+		selector.dispose();
 	});
 
 	// #9109

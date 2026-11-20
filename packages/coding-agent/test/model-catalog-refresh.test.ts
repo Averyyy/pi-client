@@ -30,6 +30,7 @@ describe("interactive model catalog refresh", () => {
 		const second = refreshModelCatalogs(runtime, secondController.signal);
 
 		expect(runtime.refresh).toHaveBeenCalledOnce();
+		expect(runtime.refresh).toHaveBeenCalledWith({ refreshServerAccounts: true, signal: expect.any(AbortSignal) });
 		deferred.resolve(successfulRefresh());
 		await expect(first).resolves.toEqual(successfulRefresh());
 		await expect(second).resolves.toEqual(successfulRefresh());
