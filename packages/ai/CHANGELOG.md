@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Grouped Google Antigravity effort variants into one model per model id and sent the official CLI request envelope, including its identity prompt prose, whose absence the backend answered with a bare `429 RESOURCE_EXHAUSTED`.
 - Fixed Google Antigravity Claude tool declarations rejecting JSON Schema constants, exclusive numeric bounds, and pattern properties, including nested array items and unions.
 - Stopped pending model refreshes from publishing catalogs after login replaces or logout removes their credentials.
 - Kept Google Antigravity inference runtime loading lazy when listing models or using other providers.

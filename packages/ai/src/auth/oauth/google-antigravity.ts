@@ -1,4 +1,10 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { ANTIGRAVITY_USER_AGENT } from "../../api/google-antigravity-client.ts";
+import type {
+	AntigravityRoute,
+	AntigravityRouteLevel,
+	GoogleAntigravityModel,
+} from "../../api/google-antigravity-model.ts";
 import type { Model } from "../../types.ts";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
@@ -11,7 +17,7 @@ const CLIENT_SECRET = "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";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 const API_BASE_URL = "https://daily-cloudcode-pa.googleapis.com";
-const USER_AGENT = "antigravity/hub/2.23.0 darwin/arm64";
+const USER_AGENT = ANTIGRAVITY_USER_AGENT;
 const SCOPES = [
 	"https://www.googleapis.com/auth/cloud-platform",
 	"https://www.googleapis.com/auth/userinfo.email",
@@ -242,22 +248,26 @@ export const googleAntigravityOAuth: OAuthAuth = {
 	},
 };
 
-const VARIANT_THINKING_LEVELS: Record<string, Model<"google-antigravity">["thinkingLevelMap"]> = {
-	"gemini-3.1-pro-high": { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
-	"gemini-3.1-pro-low": { off: null, minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null },
-	"gemini-3.8-flash-high": { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
-	"gemini-3.8-flash-medium": {
-		off: null,
-		minimal: null,
-		low: null,
-		medium: "medium",
-		high: null,
-		xhigh: null,
-		max: null,
-	},
-	"gemini-3.8-flash-low": { off: null, minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null },
-};
+/** Runtime ids end with the reasoning effort the model was cataloged for. */
+const EFFORT_SUFFIX = /^(.*)-(low|medium|high|xhigh)$/;
+const MODEL_ENUM = /^MODEL_[A-Z0-9_]+$/;
 
+interface CatalogEntry {
+	/** Runtime id the backend expects for this effort variant. */
+	id: string;
+	name: string;
+	maxTokens: number;
+	maxOutputTokens: number;
+	supportsImages: boolean;
+	supportsThinking: boolean;
+	modelEnum?: string;
+	level?: AntigravityRouteLevel;
+}
+
+/**
+ * Discover the account's agent models. Effort variants of one model id are grouped into a
+ * single pi model whose `thinkingLevelMap` selects the matching runtime id per request.
+ */
 export async function discoverGoogleAntigravityModels(
 	credential: OAuthCredential,
 	signal: AbortSignal,
@@ -272,6 +282,7 @@ export async function discoverGoogleAntigravityModels(
 			string,
 			{
 				displayName: string;
+				model?: string;
 				maxTokens: number;
 				maxOutputTokens: number;
 				supportsImages?: boolean;
@@ -285,7 +296,7 @@ export async function discoverGoogleAntigravityModels(
 		authenticatedRequest(credential.access, { project: credential.projectId }, signal),
 	);
 	if (!catalog.agentModelSorts) throw new Error("Antigravity returned no agent model selections");
-	const models: Model<"google-antigravity">[] = [];
+	const groups = new Map<string, CatalogEntry[]>();
 	const ids = new Set(catalog.agentModelSorts.flatMap((sort) => sort.groups.flatMap((group) => group.modelIds)));
 	for (const id of ids) {
 		const entry = catalog.models[id];
@@ -294,22 +305,89 @@ export async function discoverGoogleAntigravityModels(
 		if (!entry.displayName || !(entry.maxTokens > 0) || !(entry.maxOutputTokens > 0)) {
 			throw new Error(`Antigravity returned incomplete model metadata for ${id}`);
 		}
-		models.push({
+		const suffix = EFFORT_SUFFIX.exec(id);
+		const level = entry.supportsThinking === true && suffix ? (suffix[2] as AntigravityRouteLevel) : undefined;
+		const baseId = level ? suffix![1]! : id;
+		const catalogEntry: CatalogEntry = {
 			id,
 			name: entry.displayName,
-			provider: "google-antigravity",
-			api: "google-antigravity",
-			baseUrl,
-			reasoning: entry.supportsThinking === true,
-			input: entry.supportsImages ? ["text", "image"] : ["text"],
-			...(entry.supportsThinking && VARIANT_THINKING_LEVELS[id]
-				? { thinkingLevelMap: VARIANT_THINKING_LEVELS[id] }
-				: {}),
-			contextWindow: entry.maxTokens,
-			maxTokens: entry.maxOutputTokens,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		});
+			maxTokens: entry.maxTokens,
+			maxOutputTokens: entry.maxOutputTokens,
+			supportsImages: entry.supportsImages === true,
+			supportsThinking: entry.supportsThinking === true,
+			...(typeof entry.model === "string" && MODEL_ENUM.test(entry.model) ? { modelEnum: entry.model } : {}),
+			...(level ? { level } : {}),
+		};
+		const group = groups.get(baseId);
+		if (group) group.push(catalogEntry);
+		else groups.set(baseId, [catalogEntry]);
+	}
+	const models: Model<"google-antigravity">[] = [];
+	for (const [baseId, entries] of groups) {
+		// A group with an unsuffixed member mixes conversation ids; keep those as their own models.
+		if (entries.some((entry) => entry.level === undefined)) {
+			for (const entry of entries) models.push(singleModel(entry, baseUrl));
+			continue;
+		}
+		models.push(groupedModel(baseId, entries, baseUrl));
 	}
 	if (!models.length) throw new Error("Antigravity returned no available agent models for this account");
 	return models;
+}
+
+/** One model and its per-effort wire routes. */
+function groupedModel(baseId: string, entries: CatalogEntry[], baseUrl: string): GoogleAntigravityModel {
+	const levels: Partial<Record<AntigravityRouteLevel, AntigravityRoute>> = {};
+	for (const entry of entries) {
+		if (levels[entry.level!]) throw new Error(`Antigravity returned duplicate effort variants for ${baseId}`);
+		levels[entry.level!] = { runtimeId: entry.id, ...(entry.modelEnum ? { modelEnum: entry.modelEnum } : {}) };
+	}
+	const fallback = levels.low ?? levels.medium ?? levels.high ?? levels.xhigh;
+	if (!fallback) throw new Error(`Antigravity returned no effort variant for ${baseId}`);
+	return {
+		id: baseId,
+		name: entries[0]!.name.replace(/\s*\((?:low|medium|high|xhigh)\)\s*$/i, ""),
+		provider: "google-antigravity",
+		api: "google-antigravity",
+		baseUrl,
+		reasoning: true,
+		input: entries.every((entry) => entry.supportsImages) ? ["text", "image"] : ["text"],
+		thinkingLevelMap: {
+			off: null,
+			minimal: null,
+			low: levels.low ? "low" : null,
+			medium: levels.medium ? "medium" : null,
+			high: levels.high ? "high" : null,
+			xhigh: levels.xhigh ? "xhigh" : null,
+			max: null,
+		},
+		contextWindow: Math.min(...entries.map((entry) => entry.maxTokens)),
+		maxTokens: Math.min(...entries.map((entry) => entry.maxOutputTokens)),
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		antigravityRoutes: { default: fallback, levels },
+	};
+}
+
+/** A catalog model without effort variants; its own runtime id is the only route. */
+function singleModel(entry: CatalogEntry, baseUrl: string): GoogleAntigravityModel {
+	return {
+		id: entry.id,
+		name: entry.name,
+		provider: "google-antigravity",
+		api: "google-antigravity",
+		baseUrl,
+		reasoning: entry.supportsThinking,
+		input: entry.supportsImages ? ["text", "image"] : ["text"],
+		contextWindow: entry.maxTokens,
+		maxTokens: entry.maxOutputTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		...(entry.modelEnum
+			? {
+					antigravityRoutes: {
+						default: { runtimeId: entry.id, modelEnum: entry.modelEnum },
+						levels: {},
+					},
+				}
+			: {}),
+	};
 }

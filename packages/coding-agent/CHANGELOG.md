@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Grouped Google Antigravity effort variants into one model per model id with switchable pi reasoning levels, and matched the official CLI request envelope and system prompt prose, whose absence the backend answered with a bare `429 RESOURCE_EXHAUSTED`.
 - Preserved queued image resizing across provisional message selection and delivery retries.
 - Preserved Anthropic message threads through pi-server cache warming and tool-result continuations, and released provider state when server sessions are deleted.
 - Shared execution lifecycle state between TUI working indicators and event-triggered pi-server observer reports, including preparation failures, asynchronous completion handlers, branch summaries, and cancellation acknowledgement.

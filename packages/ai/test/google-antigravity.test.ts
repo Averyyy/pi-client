@@ -1,9 +1,11 @@
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAntigravity, streamSimple as streamSimpleAntigravity } from "../src/api/google-antigravity.ts";
+import { ANTIGRAVITY_SESSION_ID } from "../src/api/google-antigravity-client.ts";
+import type { AntigravityRoutes, GoogleAntigravityModel } from "../src/api/google-antigravity-model.ts";
 import { stream, streamSimple } from "../src/compat.ts";
 import type { AssistantMessageEvent, Context, Model } from "../src/types.ts";
-import { normalizeContext } from "../src/utils/transcript.ts";
+import { getCurrentSystemPrompt, normalizeContext } from "../src/utils/transcript.ts";
 
 const model: Model<"google-antigravity"> = {
 	id: "claude-sonnet-4-5",
@@ -58,7 +60,7 @@ describe("Google Antigravity protocol", () => {
 		expect(result.stopReason).toBe("stop");
 		const payload = JSON.parse(String(transport.mock.calls[0][1]?.body));
 		expect(payload.model).toBe("claude-opus-4-6-thinking");
-		expect(payload.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 16384 });
+		expect(payload.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "HIGH" });
 		expect(payload.request.tools).toEqual([
 			{
 				functionDeclarations: [
@@ -137,7 +139,7 @@ describe("Google Antigravity protocol", () => {
 		expect(url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
 		const headers = new Headers(init?.headers);
 		expect(headers.get("authorization")).toBe("Bearer test-token");
-		expect(headers.get("user-agent")).toBe("antigravity/hub/2.23.0 darwin/arm64");
+		expect(headers.get("user-agent")).toMatch(/^antigravity\/cli\/1\.5\.9 \(aidev_client; os_type=/);
 		expect(headers.get("anthropic-beta")).toBe("interleaved-thinking-2025-05-14");
 		expect(headers.get("x-model")).toBe("model");
 		expect(headers.get("x-caller")).toBe("caller");
@@ -146,15 +148,19 @@ describe("Google Antigravity protocol", () => {
 			model: model.id,
 			userAgent: "antigravity",
 			requestType: "agent",
-			requestId: expect.stringMatching(/^agent-/),
+			requestId: expect.stringMatching(/^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/0$/),
 			request: {
-				sessionId: "session",
-				systemInstruction: { parts: [{ text: "Initial instructions\n\nCurrent instructions" }] },
+				sessionId: ANTIGRAVITY_SESSION_ID,
+				systemInstruction: {
+					role: "user",
+					parts: [{ text: "Initial instructions\n\nCurrent instructions" }],
+				},
 				contents: [{ role: "user", parts: [{ text: "Hello" }] }],
 				tools: [{ functionDeclarations: [{ name: "read", parameters: { type: "object", required: ["path"] } }] }],
 				toolConfig: { functionCallingConfig: { mode: "ANY" } },
 			},
 		});
+		expect(JSON.parse(String(init?.body)).request.labels).toBeUndefined();
 		expect(onPayload).toHaveBeenCalledOnce();
 		expect(onResponse).toHaveBeenCalledWith(
 			{ status: 200, headers: { "content-type": "text/event-stream" } },
@@ -314,10 +320,8 @@ describe("Google Antigravity protocol", () => {
 			context,
 			{ apiKey, fetch: transport },
 		).result();
-		expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toMatchObject({
-			request: { generationConfig: { thinkingConfig: { thinkingLevel: "LOW" } } },
-		});
-		expect(String(transport.mock.calls[0][1]?.body)).not.toContain("includeThoughts");
+		// The CLI omits the thinking config when the request asks for no effort.
+		expect(String(transport.mock.calls[0][1]?.body)).not.toContain("thinkingConfig");
 	});
 
 	it("uses shared retry policy on the same endpoint and reports response hooks for each attempt", async () => {
@@ -454,5 +458,177 @@ describe("Google Antigravity protocol", () => {
 		}).result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toMatch(/timeout/i);
+	});
+});
+
+describe("Antigravity catalog routes and prompt adaptation", () => {
+	const piOpening =
+		"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+	const routes: AntigravityRoutes = {
+		default: { runtimeId: "gemini-4-neon-low", modelEnum: "MODEL_PLACEHOLDER_M534" },
+		levels: {
+			low: { runtimeId: "gemini-4-neon-low", modelEnum: "MODEL_PLACEHOLDER_M534" },
+			medium: { runtimeId: "gemini-4-neon-medium", modelEnum: "MODEL_PLACEHOLDER_M533" },
+			high: { runtimeId: "gemini-4-neon-high", modelEnum: "MODEL_PLACEHOLDER_M532" },
+			xhigh: { runtimeId: "gemini-4-neon-xhigh", modelEnum: "MODEL_PLACEHOLDER_M535" },
+		},
+	};
+	const groupedModel: GoogleAntigravityModel = {
+		id: "gemini-4-neon",
+		name: "Gemini 4 Neon",
+		api: "google-antigravity",
+		provider: "google-antigravity",
+		baseUrl: "",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: 1048576,
+		maxTokens: 262144,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		thinkingLevelMap: {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: null,
+		},
+		antigravityRoutes: routes,
+	};
+
+	it("sends the runtime id and labels for the requested effort", async () => {
+		const transport = vi.fn<typeof fetch>(async () => sse([stopped]));
+		await streamSimple(groupedModel, context, {
+			apiKey,
+			reasoning: "xhigh",
+			sessionId: "01a1f7ea-6a7f-7138-a821-739ad8983fa6",
+			fetch: transport,
+		}).result();
+
+		const payload = JSON.parse(String(transport.mock.calls[0][1]?.body));
+		expect(payload.model).toBe("gemini-4-neon-xhigh");
+		expect(payload.request.generationConfig.thinkingConfig).toEqual({
+			includeThoughts: true,
+			thinkingLevel: "XHIGH",
+		});
+		expect(payload.request.sessionId).toBe(ANTIGRAVITY_SESSION_ID);
+		expect(payload.request.labels).toMatchObject({
+			cascade_id: "01a1f7ea-6a7f-7138-a821-739ad8983fa6",
+			root_cascade_id: "01a1f7ea-6a7f-7138-a821-739ad8983fa6",
+			model_enum: "MODEL_PLACEHOLDER_M535",
+			used_claude: "false",
+			used_claude_conservative: "false",
+			used_non_gemini_model: "false",
+		});
+		expect(payload.requestId).toMatch(/^agent\/01a1f7ea-6a7f-7138-a821-739ad8983fa6\/\d+\/[0-9a-f-]{36}\/0$/);
+	});
+
+	it("switches the wire runtime id with the pi effort", async () => {
+		const low = vi.fn<typeof fetch>(async () => sse([stopped]));
+		const medium = vi.fn<typeof fetch>(async () => sse([stopped]));
+		await streamSimple(groupedModel, context, { apiKey, reasoning: "low", fetch: low }).result();
+		await streamSimple(groupedModel, context, { apiKey, reasoning: "medium", fetch: medium }).result();
+
+		expect(JSON.parse(String(low.mock.calls[0][1]?.body)).model).toBe("gemini-4-neon-low");
+		expect(JSON.parse(String(medium.mock.calls[0][1]?.body)).model).toBe("gemini-4-neon-medium");
+	});
+
+	it("adapts the prompt on the wire only, so another model still gets the original pi request", async () => {
+		const systemMessage = {
+			role: "system" as const,
+			content: "",
+			sections: {
+				preamble: piOpening,
+				tools: "- read: Read file contents\n\nAdditional tools may be available.",
+				rules: "- Be concise in your responses",
+			},
+			timestamp: 0,
+		};
+		const transcript = normalizeContext({ messages: [systemMessage, context.messages[0]!] });
+		const originalPrompt = getCurrentSystemPrompt(transcript.messages);
+		const transport = vi.fn<typeof fetch>(async () => sse([stopped]));
+
+		await streamAntigravity(model, transcript, { apiKey, fetch: transport }).result();
+
+		const text = JSON.parse(String(transport.mock.calls[0][1]?.body)).request.systemInstruction.parts[0].text;
+		expect(text.startsWith("You are Antigravity, a powerful agentic AI coding assistant")).toBe(true);
+		expect(text).toContain("- read: View the contents of a file");
+		expect(text).toContain("- Keep responses concise");
+		expect(text).not.toContain("inside pi");
+		expect(getCurrentSystemPrompt(transcript.messages)).toBe(originalPrompt);
+		expect(originalPrompt).toContain(piOpening);
+	});
+});
+
+describe("Antigravity tool envelope", () => {
+	it("sends one declaration wrapper per tool and an empty array without tools", async () => {
+		const withTools = vi.fn<typeof fetch>(async () => sse([stopped]));
+		const parameters = Type.Object({ path: Type.String() });
+		await streamAntigravity(
+			model,
+			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
+			{ apiKey, fetch: withTools },
+		).result();
+		expect(JSON.parse(String(withTools.mock.calls[0][1]?.body)).request.tools).toEqual([]);
+
+		const twoTools = vi.fn<typeof fetch>(async () => sse([stopped]));
+		const contextWithTools = normalizeContext({
+			messages: [
+				{
+					role: "system",
+					content: "",
+					toolsAdded: [
+						{ name: "read", description: "Read", parameters },
+						{ name: "bash", description: "Bash", parameters },
+					],
+					timestamp: 0,
+				},
+				{ role: "user", content: "Hello", timestamp: 1 },
+			],
+		});
+		await streamAntigravity(model, contextWithTools, { apiKey, fetch: twoTools }).result();
+		const tools = JSON.parse(String(twoTools.mock.calls[0][1]?.body)).request.tools;
+		expect(
+			tools.map((wrapper: { functionDeclarations: { name: string }[] }) => wrapper.functionDeclarations.length),
+		).toEqual([1, 1]);
+		expect(
+			tools.map((wrapper: { functionDeclarations: { name: string }[] }) => wrapper.functionDeclarations[0]?.name),
+		).toEqual(["read", "bash"]);
+	});
+});
+
+describe("Antigravity rendered prompt adaptation", () => {
+	it("rewrites a rendered prompt that carries no structured sections", async () => {
+		const piOpening =
+			"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+		const rendered = [
+			piOpening,
+			"",
+			"<tools>",
+			"- read: Read file contents",
+			"",
+			"Additional tools may be available.",
+			"</tools>",
+			"<rules>",
+			"- Be concise in your responses",
+			"</rules>",
+		].join("\n");
+		const transport = vi.fn<typeof fetch>(async () => sse([stopped]));
+
+		await streamAntigravity(
+			model,
+			normalizeContext({
+				systemPrompt: rendered,
+				messages: [{ role: "user", content: "Name this session", timestamp: 1 }],
+			}),
+			{ apiKey, fetch: transport },
+		).result();
+
+		const text = JSON.parse(String(transport.mock.calls[0][1]?.body)).request.systemInstruction.parts[0].text;
+		expect(text.startsWith("You are Antigravity, a powerful agentic AI coding assistant")).toBe(true);
+		expect(text).toContain("- read: View the contents of a file");
+		expect(text).toContain("- Keep responses concise");
+		expect(text).not.toContain("Read file contents");
+		expect(text).not.toContain("Be concise in your responses");
 	});
 });

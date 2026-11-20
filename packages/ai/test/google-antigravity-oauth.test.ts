@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { antigravityRoutes } from "../src/api/google-antigravity-model.ts";
 import * as callbackModule from "../src/auth/oauth/callback-server.ts";
 import { discoverGoogleAntigravityModels, googleAntigravityOAuth } from "../src/auth/oauth/google-antigravity.ts";
 import type { OAuthCredential } from "../src/auth/types.ts";
@@ -260,17 +261,18 @@ describe.sequential("Google Antigravity OAuth", () => {
 		});
 		vi.stubGlobal("fetch", fetchMock);
 		const models = await discoverGoogleAntigravityModels(credential, signal);
-		expect(models.map((model) => model.id)).toEqual(["new-account-model", "gemini-3.8-flash-high"]);
+		expect(models.map((model) => model.id)).toEqual(["new-account-model", "gemini-3.8-flash"]);
 		expect(models[0]).toMatchObject({
 			reasoning: false,
 			input: ["text"],
 		});
 		expect(models[1]).toMatchObject({
-			id: "gemini-3.8-flash-high",
+			id: "gemini-3.8-flash",
 			name: "Account Gemini Flash",
 			contextWindow: 1048576,
 			maxTokens: 65536,
 		});
+		expect(getSupportedThinkingLevels(models[1]!)).toEqual(["high"]);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -296,7 +298,8 @@ describe.sequential("Google Antigravity OAuth", () => {
 					],
 					models: {
 						"gemini-3.8-flash-high": {
-							displayName: "Gemini 3.8 Flash High",
+							displayName: "Gemini 3.8 Flash (High)",
+							model: "MODEL_PLACEHOLDER_M_HIGH",
 							maxTokens: 1048576,
 							maxOutputTokens: 65536,
 							supportsImages: true,
@@ -304,7 +307,8 @@ describe.sequential("Google Antigravity OAuth", () => {
 							thinkingBudget: -1,
 						},
 						"gemini-3.8-flash-medium": {
-							displayName: "Gemini 3.8 Flash Medium",
+							displayName: "Gemini 3.8 Flash (Medium)",
+							model: "MODEL_PLACEHOLDER_M_MEDIUM",
 							maxTokens: 1048576,
 							maxOutputTokens: 65536,
 							supportsImages: true,
@@ -312,7 +316,8 @@ describe.sequential("Google Antigravity OAuth", () => {
 							thinkingBudget: 4000,
 						},
 						"gemini-3.8-flash-low": {
-							displayName: "Gemini 3.8 Flash Low",
+							displayName: "Gemini 3.8 Flash (Low)",
+							model: "MODEL_PLACEHOLDER_M_LOW",
 							maxTokens: 1048576,
 							maxOutputTokens: 65536,
 							supportsImages: true,
@@ -324,16 +329,25 @@ describe.sequential("Google Antigravity OAuth", () => {
 			),
 		);
 		const models = await discoverGoogleAntigravityModels(credential, signal);
-		expect(models).toHaveLength(3);
+		expect(models).toHaveLength(1);
 		expect(models[0]).toMatchObject({
-			id: "gemini-3.8-flash-high",
+			id: "gemini-3.8-flash",
+			name: "Gemini 3.8 Flash",
 			provider: "google-antigravity",
 			reasoning: true,
 			input: ["text", "image"],
 			contextWindow: 1048576,
 			maxTokens: 65536,
 		});
-		expect(models.map((model) => getSupportedThinkingLevels(model))).toEqual([["high"], ["medium"], ["low"]]);
+		expect(getSupportedThinkingLevels(models[0]!)).toEqual(["low", "medium", "high"]);
+		expect(antigravityRoutes(models[0]!)).toEqual({
+			default: { runtimeId: "gemini-3.8-flash-low", modelEnum: "MODEL_PLACEHOLDER_M_LOW" },
+			levels: {
+				low: { runtimeId: "gemini-3.8-flash-low", modelEnum: "MODEL_PLACEHOLDER_M_LOW" },
+				medium: { runtimeId: "gemini-3.8-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M_MEDIUM" },
+				high: { runtimeId: "gemini-3.8-flash-high", modelEnum: "MODEL_PLACEHOLDER_M_HIGH" },
+			},
+		});
 	});
 
 	it("rejects account-selected model IDs without metadata", async () => {
