@@ -66,6 +66,7 @@ import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
 import { hashPiServerProviderMessages, type PiServerProviderCallbackRequest } from "./pi-server-protocol.ts";
+import { logProviderFailure } from "./provider-failure-log.ts";
 import { PublicCatalogRequestError, PublicModelCatalog } from "./public-model-catalog.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
 import { CHUNK_ENDPOINT, type RequestChunkBody, type RequestVersion, receiveRequestChunk } from "./request-chunks.ts";
@@ -1028,6 +1029,19 @@ async function completeSessionCompact(
 	prepared: PreparedSessionCompact,
 	run?: StreamRunRecord,
 ): Promise<SessionCompactHttpResponse> {
+	const startedAt = performance.now();
+	const failure = {
+		operation: "compact" as const,
+		phase: "result" as const,
+		sessionId: body.sessionId,
+		runId: body.runId,
+		model: body.model,
+		authSource: body.options?.authSource,
+		reasoning: prepared.options.reasoning,
+		maxTokens: body.model.maxTokens,
+		messageCount: prepared.session.messages.length,
+		toolCount: prepared.session.staticContext?.tools?.length ?? 0,
+	};
 	const result = await compactLegacy(
 		prepared.preparation,
 		prepared.models,
@@ -1040,8 +1054,18 @@ async function completeSessionCompact(
 		prepared.cacheContext,
 		prepared.options as CompactionCacheRequestOptions,
 		prepared.cacheFallbackReason,
-	);
+	).catch((error: unknown) => {
+		if (!run?.cancelRequested) logProviderFailure({ ...failure, elapsedMs: performance.now() - startedAt, error });
+		throw error;
+	});
 	if (!result.ok) {
+		if (!run?.cancelRequested && result.error.code !== "aborted")
+			logProviderFailure({
+				...failure,
+				elapsedMs: performance.now() - startedAt,
+				code: result.error.code,
+				error: result.error,
+			});
 		return { status: 500, body: { error: result.error.message, code: PiServerErrorCode.INTERNAL_ERROR } };
 	}
 	if (run?.cancelRequested || run?.controller.signal.aborted) {
@@ -1425,6 +1449,36 @@ function handleStream(
 
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
 	const providerCallbacks = run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {};
+	let upstreamStatus: number | undefined;
+	let upstreamResponses = 0;
+	let terminalSeen = false;
+	const logFailure = (
+		phase: "dispatch" | "stream" | "result",
+		error?: unknown,
+		assistant?: AssistantMessage,
+		code?: string,
+	) => {
+		if (terminalSeen || run?.cancelRequested || assistant?.stopReason === "aborted") return;
+		logProviderFailure({
+			operation: "stream",
+			phase,
+			sessionId: body.sessionId,
+			runId: body.runId,
+			model: resolvedModel,
+			elapsedMs: performance.now() - requestStartedAt,
+			requestKind: body.requestKind ?? "simple",
+			authSource: body.options?.authSource,
+			reasoning: body.options?.reasoning,
+			maxTokens: body.options?.maxTokens,
+			messageCount: context.messages.length,
+			toolCount: context.tools?.length ?? 0,
+			upstreamStatus,
+			upstreamResponses: upstreamResponses || undefined,
+			code,
+			error,
+			assistant,
+		});
+	};
 	const streamOptions: ModelsSimpleStreamOptions = {
 		...(body.options ?? {}),
 		transformPreparedStreamOptions: (prepared) => {
@@ -1441,6 +1495,12 @@ function handleStream(
 		},
 		...(run ? { signal: run.controller.signal } : {}),
 		...providerCallbacks,
+		onResponse: async (response: ProviderResponse, model: Model<string>) => {
+			upstreamStatus = response.status;
+			upstreamResponses++;
+			if (timing) timing.upstreamHeadersMs ??= performance.now() - requestStartedAt;
+			await providerCallbacks.onResponse?.(response, model);
+		},
 		...(timing
 			? {
 					onPayload: async (payload: unknown, model: Model<string>) => {
@@ -1449,10 +1509,6 @@ function handleStream(
 							: undefined;
 						timing.upstreamRequestMs ??= performance.now() - requestStartedAt;
 						return result;
-					},
-					onResponse: async (response: ProviderResponse, model: Model<string>) => {
-						timing.upstreamHeadersMs ??= performance.now() - requestStartedAt;
-						await providerCallbacks.onResponse?.(response, model);
 					},
 				}
 			: {}),
@@ -1501,6 +1557,7 @@ function handleStream(
 		}
 	} catch (err) {
 		clearInterval(heartbeat);
+		logFailure("dispatch", err);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
 		recordSessionActivity(config, body.sessionId, activityVersion);
@@ -1538,18 +1595,24 @@ function handleStream(
 					writeStreamEvent(res, proxyEvent);
 				}
 				if (event.type === "done") {
+					terminalSeen = true;
 					completeStreamRun(run, event.message);
 				} else if (event.type === "error") {
+					logFailure("result", undefined, event.error);
+					terminalSeen = true;
 					failStreamRun(run, event.error.errorMessage ?? event.reason, event.error);
 				}
 			}
 		} catch (err) {
+			logFailure("stream", err);
+			terminalSeen = true;
 			const message = err instanceof Error ? err.message : String(err);
 			failStreamRun(run, message);
 			sendTiming();
 			writeStreamError(res, message);
 		} finally {
 			clearInterval(heartbeat);
+			if (!terminalSeen) logFailure("stream", undefined, undefined, "stream_ended_without_terminal");
 			if (run?.status === "running") {
 				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
 			}
@@ -1832,10 +1895,38 @@ async function handleModelOperation(
 	}, STREAM_HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
 	let activityVersion: RequestVersion | undefined;
+	const startedAt = performance.now();
+	let upstreamStatus: number | undefined;
+	let upstreamResponses = 0;
+	const logFailure = (phase: "dispatch" | "result", error?: unknown) => {
+		if (run.cancelRequested) return;
+		logProviderFailure({
+			operation: body.kind,
+			phase,
+			sessionId: body.sessionId,
+			runId: body.runId,
+			model: body.model,
+			authSource: body.options?.authSource,
+			elapsedMs: performance.now() - startedAt,
+			upstreamStatus,
+			upstreamResponses: upstreamResponses || undefined,
+			error,
+		});
+	};
 	try {
 		if (!run.operationResult) {
 			activityVersion = config.requestVersion;
 			recordSessionActivity(config, body.sessionId, activityVersion);
+			const callbacks = createProviderCallbacks<AnyModel>(run, res, body.callbacks);
+			const options = {
+				onPayload: callbacks.onPayload,
+				onResponse: async (response: ProviderResponse, model: AnyModel) => {
+					upstreamStatus = response.status;
+					upstreamResponses++;
+					await callbacks.onResponse?.(response, model);
+				},
+				signal: run.controller.signal,
+			};
 			const requestModels =
 				body.options?.authSource === "server-account" || body.kind === "deferred-cancel"
 					? models
@@ -1843,23 +1934,12 @@ async function handleModelOperation(
 			const result =
 				body.kind === "deferred-cancel"
 					? await requestModels
-							.cancelDeferred(body.model, body.handle, {
-								...body.options,
-								...createProviderCallbacks<Model<string>>(run, res, body.callbacks),
-								signal: run.controller.signal,
-							})
+							.cancelDeferred(body.model, body.handle, { ...body.options, ...options })
 							.then(() => ({ cancelled: true as const, stopReason: "stop" as const }))
 					: body.kind === "image"
-						? await requestModels.generateImages(body.model, body.context, {
-								...body.options,
-								...createProviderCallbacks<ImageModel<ImageApi>>(run, res, body.callbacks),
-								signal: run.controller.signal,
-							})
-						: await requestModels.classify(body.model, body.context, {
-								...body.options,
-								...createProviderCallbacks<ClassifierModel<ClassifierApi>>(run, res, body.callbacks),
-								signal: run.controller.signal,
-							});
+						? await requestModels.generateImages(body.model, body.context, { ...body.options, ...options })
+						: await requestModels.classify(body.model, body.context, { ...body.options, ...options });
+			if (result.stopReason === "error") logFailure("result");
 			run.operationResult = run.cancelRequested
 				? { ...result, stopReason: "aborted", errorMessage: "Model operation aborted" }
 				: result;
@@ -1874,6 +1954,7 @@ async function handleModelOperation(
 		}
 		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "result", run.operationResult);
 	} catch (error) {
+		if (activityVersion !== undefined && !run.operationResult) logFailure("dispatch", error);
 		const message = error instanceof Error ? error.message : String(error);
 		failStreamRun(run, message);
 		if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "error", { error: message });

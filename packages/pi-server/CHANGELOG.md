@@ -13,6 +13,7 @@
 - Added an authenticated public pi.dev catalog cache with on-demand fetching, shared concurrent requests, version-specific persistence, and four-hour ETag revalidation. Clients retain provider authentication and model availability decisions.
 - Added server-side Anthropic OAuth subscription request shaping for chat, compaction, and cache warming while retaining client-owned login and token refresh.
 - Added opt-in request timing that separates server preparation, upstream response headers, and first content, with client preparation and transport timings enabled by `PI_TIMING=1`.
+- Added structured provider failure logs on stderr with session and run IDs, request metadata, and available upstream status and error codes.
 - Added a collapsible parent-thread sidebar for tintinweb subagents, grouped by active and completed task state with live updates and persisted session links.
 - Displayed the pi-server package version on the viewer login and conversation pages.
 - Added a browser viewer with project folders, five-item pagination, conversation folding, live thread activity, and persistent token lockout with local CLI unlock.

@@ -343,6 +343,46 @@ describe("Google Antigravity protocol", () => {
 		expect(transport).toHaveBeenCalledOnce();
 	});
 
+	it.each(["http", "stream"])("preserves safe Google RPC details on a %s error", async (transport) => {
+		const error = {
+			code: 429,
+			status: "RESOURCE_EXHAUSTED",
+			message: "Provider text with private request data",
+			details: [
+				{
+					"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+					reason: "QUOTA_EXHAUSTED",
+					metadata: { project: "private-project" },
+				},
+				{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "2.125s" },
+				{
+					"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+					violations: [{ subject: "private-account" }],
+				},
+			],
+		};
+		const result = await stream(model, context, {
+			apiKey,
+			maxRetries: 0,
+			fetch: async () => (transport === "http" ? Response.json({ error }, { status: 429 }) : sse([{ error }])),
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(error.message);
+		expect(result.diagnostics).toEqual([
+			{
+				type: "google_antigravity_response_failure",
+				timestamp: expect.any(Number),
+				details: {
+					status: 429,
+					rpcStatus: "RESOURCE_EXHAUSTED",
+					reason: "QUOTA_EXHAUSTED",
+					retryDelay: "2.125s",
+					quotaViolations: 1,
+				},
+			},
+		]);
+	});
+
 	it.each([
 		["invalid JSON", "data: {\n\n"],
 		["missing response", "data: {}\n\n"],

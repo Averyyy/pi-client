@@ -83,6 +83,12 @@ Server fields are cumulative milliseconds from receipt of the HTTP request: `bod
 
 `providerDispatchMs` to `upstreamRequestMs` covers provider authentication, loading, and payload preparation on the server. `upstreamRequestMs` to `firstContentMs` includes HTTP setup, network transit, upstream queueing, retries, and model processing. `upstreamHeadersMs` separates the first upstream HTTP response from the remaining wait for content. These intervals do not measure model prefill separately. HTTP headers, heartbeat bytes, and empty stream events do not count as model content.
 
+## Provider Failure Logs
+
+PiServer writes a JSON `provider_failure` event to stderr when a chat stream, compaction, image generation, classification, or deferred operation fails. Search the service log by `sessionId`, `runId`, or model ID. The event shows the operation, failure phase, elapsed time, and available upstream status and error codes. Chat failures also report request shape, including message and tool counts and the requested reasoning level when supplied.
+
+Google Antigravity errors can include the structured RPC status, reason, retry delay, and quota violation count returned by Google. Logging uses metadata fields and excludes the raw provider error text, request bodies, headers, and credentials.
+
 ## Thread Viewer
 
 Open the server's root URL and sign in with `PI_SERVER_AUTH_TOKEN`. The home page groups threads by their client working directory and lists running threads first. Threads are ordered by their latest activity; projects use their most recently active thread. The server records activity when it starts and finishes inference, compaction, image, classifier, and deferred operations. Reading history, reconnecting, synchronizing existing history, renaming, and replaying completed results do not advance that time. Archived sessions use their saved conversation timestamps until the server records a new operation. Cache warming uses the same provider request protocol and counts as activity. Sessions without activity appear last.

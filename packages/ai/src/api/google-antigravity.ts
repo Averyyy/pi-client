@@ -12,6 +12,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
@@ -62,7 +63,14 @@ interface AntigravityRequest {
 
 interface AntigravityChunk {
 	response?: GenerateContentResponse;
-	error?: { code?: number; message?: string; status?: string };
+	error?: AntigravityError;
+}
+
+interface AntigravityError {
+	code?: number;
+	message?: string;
+	status?: unknown;
+	details?: unknown;
 }
 
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
@@ -160,7 +168,10 @@ export const stream: StreamFunction<"google-antigravity", GoogleAntigravityOptio
 			};
 			for await (const chunk of parseStream(response, signal)) {
 				await options.onProviderStreamEvent?.(chunk, model);
-				if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
+				if (chunk.error) {
+					appendAntigravityFailure(output, chunk.error.code, chunk.error);
+					throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
+				}
 				if (!chunk.response) throw new Error("Google Antigravity stream event has no response");
 				const data = chunk.response;
 				output.responseId ||= data.responseId;
@@ -255,13 +266,69 @@ export const stream: StreamFunction<"google-antigravity", GoogleAntigravityOptio
 			events.push({ type: "done", reason: output.stopReason, message: output });
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			const failure = normalizeProviderError(error);
+			if (failure.status !== undefined) {
+				let upstream: AntigravityError | undefined;
+				if (failure.body) {
+					try {
+						upstream = (JSON.parse(failure.body) as { error?: AntigravityError } | null)?.error;
+					} catch {
+						// Non-JSON HTTP errors still carry the response status.
+					}
+				}
+				appendAntigravityFailure(output, failure.status, upstream);
+			}
+			output.errorMessage = formatProviderError(failure);
 			events.push({ type: "error", reason: output.stopReason, error: output });
 		}
 		events.end();
 	})();
 	return events;
 };
+
+const RPC_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function appendAntigravityFailure(
+	message: AssistantMessage,
+	status: number | undefined,
+	upstream?: AntigravityError,
+): void {
+	const details: JsonObject = {};
+	if (status !== undefined) details.status = status;
+	// Google RPC detail metadata and messages can contain the request and account identifiers.
+	if (typeof upstream?.status === "string" && RPC_CODE_PATTERN.test(upstream.status)) {
+		details.rpcStatus = upstream.status;
+	}
+	if (Array.isArray(upstream?.details)) {
+		for (const entry of upstream.details as ({
+			"@type": string;
+			reason?: unknown;
+			retryDelay?: unknown;
+			violations?: unknown;
+		} | null)[]) {
+			switch (entry?.["@type"]) {
+				case "type.googleapis.com/google.rpc.ErrorInfo":
+					if (typeof entry.reason === "string" && RPC_CODE_PATTERN.test(entry.reason)) {
+						details.reason = entry.reason;
+					}
+					break;
+				case "type.googleapis.com/google.rpc.RetryInfo":
+					if (typeof entry.retryDelay === "string" && /^\d{1,10}(?:\.\d{1,9})?s$/.test(entry.retryDelay)) {
+						details.retryDelay = entry.retryDelay;
+					}
+					break;
+				case "type.googleapis.com/google.rpc.QuotaFailure":
+					if (Array.isArray(entry.violations)) details.quotaViolations = entry.violations.length;
+					break;
+			}
+		}
+	}
+	appendAssistantMessageDiagnostic(message, {
+		type: "google_antigravity_response_failure",
+		timestamp: Date.now(),
+		details,
+	});
+}
 
 export const streamSimple: StreamFunction<"google-antigravity", SimpleStreamOptions> = (model, context, options) => {
 	if (!options?.apiKey) throw new Error("Google Antigravity requires OAuth authentication. Use /login.");
