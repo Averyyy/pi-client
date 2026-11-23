@@ -27,8 +27,13 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
-import { classifierErrorResult, imageErrorResult } from "@earendil-works/pi-ai/utils/model-operations";
-import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./model-config.ts";
+import {
+	applyModelOverride,
+	classifierErrorResult,
+	imageErrorResult,
+	mergeModelCompat,
+} from "@earendil-works/pi-ai/utils/model-operations";
+import type { ModelConfig, ModelsJsonModel, ModelsJsonProvider } from "./model-config.ts";
 import {
 	clearConfigValueCache,
 	getConfigValueEnvVarNames,
@@ -128,94 +133,6 @@ function getAllProviderModels(provider: Provider | undefined): readonly AnyModel
 	return provider ? (provider.getAllModels?.() ?? provider.getModels()) : [];
 }
 
-function mergeCompat(
-	base: Model<Api>["compat"],
-	override: Model<Api>["compat"] | ModelsJsonModelOverride["compat"],
-): Model<Api>["compat"] {
-	if (!override) return base;
-	const merged = { ...base, ...override } as NonNullable<Model<Api>["compat"]>;
-	const baseNested = base as Record<string, unknown> | undefined;
-	const overrideNested = override as Record<string, unknown>;
-	const mergedNested = merged as Record<string, unknown>;
-	for (const key of ["openRouterRouting", "vercelGatewayRouting", "chatTemplateKwargs", "chatTemplateArgs"] as const) {
-		const baseValue = baseNested?.[key];
-		const overrideValue = overrideNested[key];
-		if (
-			(typeof baseValue === "object" && baseValue !== null) ||
-			(typeof overrideValue === "object" && overrideValue !== null)
-		) {
-			mergedNested[key] = { ...(baseValue as object | undefined), ...(overrideValue as object | undefined) };
-		}
-	}
-	return merged;
-}
-
-function mergeInputLimits(
-	base: Model<Api>["inputLimits"],
-	override: ModelsJsonModelOverride["inputLimits"],
-): Model<Api>["inputLimits"] {
-	if (!override) return base;
-	return {
-		...base,
-		...override,
-		images: override.images
-			? {
-					...base?.images,
-					...override.images,
-					resize: override.images.resize
-						? { ...base?.images?.resize, ...override.images.resize }
-						: base?.images?.resize,
-				}
-			: base?.images,
-	};
-}
-
-function mergeSamplingParamsByThinkingLevel(
-	base: Model<Api>["samplingParamsByThinkingLevel"],
-	override: Model<Api>["samplingParamsByThinkingLevel"],
-): Model<Api>["samplingParamsByThinkingLevel"] {
-	if (!override) return base;
-	const merged = { ...base };
-	for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
-		const params = override[level];
-		if (params) merged[level] = { ...base?.[level], ...params };
-	}
-	return merged;
-}
-
-function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride): Model<Api> {
-	return {
-		...model,
-		name: override.name ?? model.name,
-		reasoning: override.reasoning ?? model.reasoning,
-		thinkingLevelMap: override.thinkingLevelMap
-			? { ...model.thinkingLevelMap, ...override.thinkingLevelMap }
-			: model.thinkingLevelMap,
-		input: (override.input as ("text" | "image")[] | undefined) ?? model.input,
-		inputLimits: mergeInputLimits(model.inputLimits, override.inputLimits),
-		cost: override.cost
-			? {
-					input: override.cost.input ?? model.cost.input,
-					output: override.cost.output ?? model.cost.output,
-					cacheRead: override.cost.cacheRead ?? model.cost.cacheRead,
-					cacheWrite: override.cost.cacheWrite ?? model.cost.cacheWrite,
-					tiers: override.cost.tiers ?? model.cost.tiers,
-				}
-			: model.cost,
-		promptCache: override.promptCache ? { ...model.promptCache, ...override.promptCache } : model.promptCache,
-		contextWindow: override.contextWindow ?? model.contextWindow,
-		maxTokens: override.maxTokens ?? model.maxTokens,
-		samplingParams: override.samplingParams
-			? { ...model.samplingParams, ...override.samplingParams }
-			: model.samplingParams,
-		samplingParamsByThinkingLevel: mergeSamplingParamsByThinkingLevel(
-			model.samplingParamsByThinkingLevel,
-			override.samplingParamsByThinkingLevel,
-		),
-		compat: mergeCompat(model.compat, override.compat),
-	};
-}
-
 function modelFromJson(
 	providerId: string,
 	definition: ModelsJsonModel,
@@ -253,7 +170,7 @@ function modelFromJson(
 		samplingParams: definition.samplingParams,
 		samplingParamsByThinkingLevel: definition.samplingParamsByThinkingLevel,
 		headers: undefined,
-		compat: mergeCompat(providerConfig.compat, definition.compat),
+		compat: mergeModelCompat(providerConfig.compat, definition.compat),
 	};
 }
 
@@ -333,7 +250,8 @@ function applyModelsJson(
 
 	const models: AnyModel[] = baseModels.map((model) => {
 		const baseUrl = config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl);
-		if (isModelType(model, "chat")) return { ...model, baseUrl, compat: mergeCompat(model.compat, config.compat) };
+		if (isModelType(model, "chat"))
+			return { ...model, baseUrl, compat: mergeModelCompat(model.compat, config.compat) };
 		// Classifier APIs read their own compat fields, such as how a System One service takes images.
 		if (isModelType(model, "classifier") && config.compat) {
 			return { ...model, baseUrl, compat: { ...model.compat, ...config.compat } };

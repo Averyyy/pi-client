@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { devinProvider } from "@earendil-works/pi-ai/providers/devin";
 import { googleAntigravityProvider } from "@earendil-works/pi-ai/providers/google-antigravity";
+import { applyModelOverride, type ModelOverride } from "@earendil-works/pi-ai/utils/model-operations";
 
 export const ACCOUNT_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 export const ACCOUNT_REFRESH_TIMEOUT_MS = 60_000;
@@ -319,7 +320,7 @@ export class ServerAccounts {
 		return this.snapshot();
 	}
 
-	resolve<T extends AnyModel>(model: T): T {
+	resolve<T extends AnyModel>(model: T & { accountModelOverride?: ModelOverride }): T {
 		const providerId = accountProvider(model.provider);
 		const file = this.files.get(providerId)!;
 		if (!file.credential) throw new Error(`No server account is logged in for ${providerId}`);
@@ -327,7 +328,8 @@ export class ServerAccounts {
 			(candidate) => (candidate.type ?? "chat") === (model.type ?? "chat") && candidate.id === model.id,
 		);
 		if (!selected) throw new Error(`Model is not in the server account catalog: ${providerId}/${model.id}`);
-		return selected as T;
+		const override = model.accountModelOverride;
+		return (override && isModelType(selected, "chat") ? applyModelOverride(selected, override) : selected) as T;
 	}
 
 	async close(): Promise<void> {

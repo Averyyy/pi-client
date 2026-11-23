@@ -63,6 +63,7 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
 import {
+	applyModelOverride,
 	assertChatModel,
 	assertClassifierInputSupported,
 	assertClassifierModel,
@@ -346,6 +347,18 @@ export class ModelRuntime implements Models {
 	private composeProvider(providerId: string): Provider | undefined {
 		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
 		if (this.isServerAccountProvider(providerId) && base) {
+			const modelOverrides = this.config.getProvider(providerId)?.modelOverrides;
+			const getModels = () => {
+				const models = this.serverAccounts.get(providerId)?.models ?? [];
+				if (!modelOverrides) return models;
+				return models.map((model) => {
+					const configured = modelOverrides[model.id];
+					if (!configured) return model;
+					// PiServer applies the same metadata to its current catalog entry at dispatch.
+					const { headers: _headers, ...accountModelOverride } = configured;
+					return { ...applyModelOverride(model, accountModelOverride), accountModelOverride };
+				});
+			};
 			const unavailable = async (): Promise<never> => {
 				throw new ModelsError("auth", `${providerId} credentials are managed by pi-server`);
 			};
@@ -363,8 +376,8 @@ export class ModelRuntime implements Models {
 						toAuth: unavailable,
 					},
 				},
-				getModels: () => this.serverAccounts.get(providerId)?.models ?? [],
-				getAllModels: () => this.serverAccounts.get(providerId)?.models ?? [],
+				getModels,
+				getAllModels: getModels,
 				refreshModels: undefined,
 				filterModels: undefined,
 				filterAllModels: undefined,

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,6 +61,7 @@ describe("pi-server account ownership over HTTP", () => {
 	let loginFlow: (interaction: ProviderAuthInteraction) => Promise<OAuthCredential>;
 	let catalog: Model<"account-fixture">[];
 	let calls: StreamOptions[];
+	let requestModels: Model<string>[];
 	let requests: string[];
 	let localCredentials: AuthStorage;
 	let originalFetch: typeof fetch;
@@ -70,6 +71,7 @@ describe("pi-server account ownership over HTTP", () => {
 		resetAllSessionTracking();
 		catalog = [accountModel];
 		calls = [];
+		requestModels = [];
 		requests = [];
 		loginFlow = async (interaction) => {
 			interaction.notify({ type: "auth_url", url: "https://auth.example.invalid/authorize" });
@@ -80,6 +82,7 @@ describe("pi-server account ownership over HTTP", () => {
 		let current: Model<"account-fixture">[] = [];
 		const fixtureStream: Provider["stream"] = (model, _context, options) => {
 			calls.push(options ?? {});
+			requestModels.push(model);
 			const stream = createAssistantMessageEventStream();
 			const message: AssistantMessage = {
 				role: "assistant",
@@ -175,10 +178,10 @@ describe("pi-server account ownership over HTTP", () => {
 		vi.unstubAllEnvs();
 	});
 
-	function runtime() {
+	function runtime(modelsPath: string | null = null) {
 		return ModelRuntime.create({
 			credentials: localCredentials,
-			modelsPath: null,
+			modelsPath,
 			modelsStore: new InMemoryModelsStore(),
 		});
 	}
@@ -281,12 +284,28 @@ describe("pi-server account ownership over HTTP", () => {
 		await login(client);
 	});
 
-	it("uses server account auth for chat, compaction, and replay", async () => {
-		const client = await runtime();
+	it("applies client model overrides over the current server account model for chat, compaction, and replay", async () => {
+		const modelsPath = join(directory, "models.json");
+		const override = { contextWindow: 64_000, maxTokens: 800, promptCache: { short: 120 } };
+		writeFileSync(
+			modelsPath,
+			JSON.stringify({ providers: { devin: { modelOverrides: { [accountModel.id]: override } } } }),
+		);
+		const client = await runtime(modelsPath);
 		await login(client);
+		const model = client.getModel("devin", accountModel.id)!;
+		expect(client.getAvailableSnapshot()).toMatchObject([
+			{
+				...override,
+				promptCache: { short: 120, long: 300 },
+			},
+		]);
+		catalog = [{ ...accountModel, baseUrl: "https://updated.invalid", promptCache: { short: 90, long: 600 } }];
+		await accounts.refresh("devin");
+
 		const chat = await client
 			.streamSimple(
-				accountModel,
+				model,
 				{ messages: [{ role: "user", content: "Hello", timestamp: 1 }] },
 				{
 					sessionId: "account-chat",
@@ -298,7 +317,7 @@ describe("pi-server account ownership over HTTP", () => {
 			.result();
 		expect(chat.stopReason).toBe("stop");
 		const compact = await compactPiServer(
-			accountModel,
+			model,
 			{
 				messages: [
 					{ role: "user", content: "Summarize this conversation", timestamp: 1 },
@@ -317,7 +336,7 @@ describe("pi-server account ownership over HTTP", () => {
 		);
 		expect(compact.compaction.summary).toContain("Fixture summary");
 		const warm = await streamPiServer(
-			accountModel,
+			model,
 			{ messages: [] },
 			{
 				sessionId: "account-chat",
@@ -329,11 +348,22 @@ describe("pi-server account ownership over HTTP", () => {
 		);
 		expect((await warm.result()).stopReason).toBe("stop");
 		expect(calls.length).toBeGreaterThanOrEqual(3);
+		for (const requestModel of requestModels) {
+			expect(requestModel).toMatchObject({
+				...override,
+				baseUrl: "https://updated.invalid",
+				promptCache: { short: 120, long: 600 },
+			});
+		}
+		expect((await accounts.snapshot()).accounts[0].models).toEqual(catalog);
 		for (const options of calls) {
 			expect(options.apiKey).toBe(credential.access);
 			expect(options.headers?.Authorization).toBeUndefined();
 			expect(options.env?.CLIENT_TOKEN).toBeUndefined();
 		}
+		writeFileSync(modelsPath, JSON.stringify({ providers: {} }));
+		await client.refresh({ providers: ["devin"], allowNetwork: false });
+		expect(client.getAvailableSnapshot()).toEqual(catalog);
 	});
 
 	it("keeps server auth through the SDK's scheduled cache warming request", async () => {

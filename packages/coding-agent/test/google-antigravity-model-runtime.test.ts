@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	type AssistantMessage,
 	InMemoryCredentialStore,
@@ -6,7 +9,7 @@ import {
 	normalizeContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ModelConfig } from "../src/core/model-config.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { resetAllSessionTracking } from "../src/core/pi-server-client.ts";
@@ -301,26 +304,48 @@ describe("Google Antigravity ModelRuntime", () => {
 		);
 		const modelsStore = new InMemoryModelsStore();
 		await modelsStore.write(providerId, { models: [model], checkedAt: 1 });
+		const directory = mkdtempSync(join(tmpdir(), "antigravity-overrides-"));
+		onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+		const modelsPath = join(directory, "models.json");
+		const override = { contextWindow: 262_144, maxTokens: 8192 };
+		writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					[providerId]: {
+						modelOverrides: {
+							[model.id]: { ...override, headers: { Authorization: "client-only" } },
+							"unknown-model": override,
+						},
+					},
+				},
+			}),
+		);
 		const runtime = await ModelRuntime.create({
 			credentials: clientOAuth ? await credentialsWithOAuth() : new InMemoryCredentialStore(),
 			modelsStore,
-			modelsPath: null,
+			modelsPath,
 			allowModelNetwork: false,
 		});
-		expect(runtime.getModels(providerId)).toEqual([model]);
-		expect(await runtime.getAvailable(providerId)).toEqual([model]);
+		const selected = runtime.getModel(providerId, model.id)!;
+		expect(runtime.getModels(providerId)).toMatchObject([{ ...model, ...override }]);
+		expect(await runtime.getAvailable(providerId)).toEqual([selected]);
 		expect(runtime.hasConfiguredAuth(providerId)).toBe(true);
 		const stream =
 			entryPoint === "runtime"
-				? runtime.streamSimple(model, context, { sessionId: "antigravity-runtime" })
-				: runtime.getProvider(providerId)!.stream(model, context, { sessionId: "antigravity-runtime" });
+				? runtime.streamSimple(selected, context, { sessionId: "antigravity-runtime" })
+				: runtime.getProvider(providerId)!.stream(selected, context, { sessionId: "antigravity-runtime" });
 		const events = [];
 		for await (const event of stream) events.push(event);
 		expect(await stream.result()).toEqual(message);
 		expect(events.find((event) => event.type === "toolcall_end")).toMatchObject({ toolCall });
 		expect(requests.map((request) => request.path)).toEqual(["/api/accounts", "/api/session/init", "/api/stream"]);
 		const request = requests.find((request) => request.path === "/api/stream")?.body;
-		expect(request).toMatchObject({ model, contextOverlay: context.messages });
+		expect(request).toMatchObject({
+			model: { ...model, ...override, accountModelOverride: override },
+			contextOverlay: context.messages,
+		});
+		expect(request?.model).not.toHaveProperty("accountModelOverride.headers");
 		expect(request?.options).toMatchObject({ authSource: "server-account" });
 		expect(request?.options).not.toHaveProperty("apiKey");
 	});
