@@ -1,5 +1,6 @@
 import type { ModelsRefreshResult } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSessionRuntimeDiagnostic } from "../src/core/agent-session-runtime.ts";
 import * as crashLog from "../src/core/crash-log.ts";
 import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { InteractiveMode, type InteractiveModeOptions } from "../src/modes/interactive/interactive-mode.ts";
@@ -47,6 +48,8 @@ type StartupRunContext = {
 	updateAvailableProviderCount: () => void;
 	showWarning: (message: string) => void;
 	showError: (message: string) => void;
+	showStatus: (message: string) => void;
+	showRuntimeDiagnostics: (diagnostics: readonly AgentSessionRuntimeDiagnostic[]) => void;
 	getUserInput: () => Promise<string>;
 };
 
@@ -55,6 +58,7 @@ type InteractiveModePrivate = {
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	getUserInput(this: InputContext): Promise<string>;
 	run(this: StartupRunContext): Promise<void>;
+	showRuntimeDiagnostics(this: StartupRunContext, diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
@@ -142,6 +146,8 @@ describe("InteractiveMode startup model catalog", () => {
 			updateAvailableProviderCount: vi.fn(),
 			showWarning: vi.fn(),
 			showError: vi.fn(),
+			showStatus: vi.fn(),
+			showRuntimeDiagnostics: interactiveModePrototype.showRuntimeDiagnostics,
 			getUserInput: async () => {
 				throw inputClosed;
 			},

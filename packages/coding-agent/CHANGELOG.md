@@ -34,6 +34,7 @@
 - Identified remaining credential sources in logout feedback.
 - Updated Xiaomi API and token-plan defaults to the available `mimo-v2.6-pro` model.
 - Updated the GitHub Copilot default to the available `gpt-6.1-sol` model.
+- Updated the Mistral default to `mistral-medium-latest`.
 - Preserved explicit pi-server operation errors without querying disconnected-run recovery, including compaction, image generation, and classification.
 - Stopped cache warming on failed extension decisions or provider requests and exposed the failure reason in `/session`.
 - Propagated system-prompt file read failures instead of using the file path as prompt text.
