@@ -164,6 +164,7 @@ export const stream: StreamFunction<"google-antigravity", GoogleAntigravityOptio
 				{ maxRetries: options.maxRetries ?? 2, maxRetryDelayMs: options.maxRetryDelayMs, signal: options.signal },
 			);
 			events.push({ type: "start", partial: output });
+			let promptTokens: number | undefined;
 			let current: TextContent | ThinkingContent | undefined;
 			const endBlock = () => {
 				if (!current) return;
@@ -257,9 +258,11 @@ export const stream: StreamFunction<"google-antigravity", GoogleAntigravityOptio
 				}
 				if (data.usageMetadata) {
 					const usage = data.usageMetadata;
-					output.usage.input = (usage.promptTokenCount ?? 0) - (usage.cachedContentTokenCount ?? 0);
+					// Later SSE frames may omit prompt counters already reported for this request.
+					promptTokens = usage.promptTokenCount ?? promptTokens;
+					output.usage.cacheRead = usage.cachedContentTokenCount ?? output.usage.cacheRead;
+					output.usage.input = promptTokens === undefined ? 0 : promptTokens - output.usage.cacheRead;
 					output.usage.output = (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0);
-					output.usage.cacheRead = usage.cachedContentTokenCount ?? 0;
 					output.usage.reasoning = usage.thoughtsTokenCount ?? 0;
 					output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead;
 					calculateCost(model, output.usage);
@@ -470,8 +473,10 @@ async function* parseStream(response: Response, signal: AbortSignal): AsyncGener
 	const decoder = new TextDecoder();
 	let buffer = "";
 	const data: string[] = [];
+	let cancellation: Promise<void> | undefined;
 	const abort = () => {
-		void reader.cancel(signal.reason);
+		// Fetch may have already errored the body. The read path reports the request's abort reason.
+		cancellation = reader.cancel(signal.reason).catch(() => {});
 	};
 	signal.addEventListener("abort", abort, { once: true });
 	try {
@@ -499,7 +504,10 @@ async function* parseStream(response: Response, signal: AbortSignal): AsyncGener
 		}
 	} finally {
 		signal.removeEventListener("abort", abort);
-		await reader.cancel();
-		reader.releaseLock();
+		try {
+			await (cancellation ?? reader.cancel());
+		} finally {
+			reader.releaseLock();
+		}
 	}
 }

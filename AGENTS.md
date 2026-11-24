@@ -118,6 +118,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 ## pi-client / pi-server Compact and Resilience
 
 - When provider usage includes cache counts, compute `totalTokens` from input, output, cacheRead, and cacheWrite so footer context usage and threshold compaction account for cached prompts.
+- Merge Antigravity SSE prompt and cached-input counters by field within each request. An omitted counter in a later frame retains its last value; an explicit zero updates it.
 - Devin's live Token Usage metric reports cache hits as `cached_input_tokens`, separate from uncached `input_tokens`. Preserve per-metric reports across frames, treat an omitted numeric scalar in a present protobuf metric as zero, and verify repeated SWE-2 prompts against wire usage before claiming a usage fix.
 - Preserve providers' native `refreshModels` implementations instead of wrapping them with the static pi.dev catalog overlay. Devin's account catalog is not published by pi.dev. Keep Node bundle entries and Bun static registration in sync with new Node-only provider/OAuth loaders; source-only smoke tests do not prove packaged loaders resolve.
 
@@ -147,6 +148,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 - Tree/branch summaries are part of the same compaction family: use the shared chunked summarizer instead of pre-dropping old branch messages or sending a single oversized summary request.
 - When merging upstream summarization safeguards into the fork's chunked path, carry tool-call/length-stop validation and routing session IDs through every chunk while preserving context-overflow recursion.
 - Auto-compaction cancellation and failure paths must notify `session_compact_failed`; cancellation errors are terminal and must not enter provider retry.
+- In fetch SSE adapters, observe the cancellation promise when the abort listener starts it and release the reader lock even if cancellation rejects. Fetch can error the body before the listener runs, so `reader.cancel()` can reject with the same timeout already reported by the request.
 - Before overflow retry after a terminal assistant message (`error`, `aborted`, or `length`), detach that terminal assistant from the active branch/context while preserving it in full history. Retrying from an assistant leaf will fail or resend the bad context.
 - Do not clear pi-server sync tracking for normal retry. Keep the known server tree state so retry can append the detached terminal assistant entry and then append the successful assistant instead of full-syncing the tree again.
 - Session tree append must be idempotent for identical duplicate entries from retries. Identical duplicates are no-ops; divergent duplicate ids should still throw.

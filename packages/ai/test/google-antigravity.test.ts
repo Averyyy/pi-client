@@ -237,6 +237,23 @@ describe("Google Antigravity protocol", () => {
 		expect(onProviderStreamEvent.mock.calls.map(([chunk]) => chunk)).toEqual(chunks);
 	});
 
+	it.each([
+		{ terminalUsage: { promptTokenCount: 100 }, cacheRead: 80 },
+		{ terminalUsage: {}, cacheRead: 80 },
+		{ terminalUsage: { cachedContentTokenCount: 0 }, cacheRead: 0 },
+	])("keeps reported prompt usage across sparse frames ($terminalUsage)", async ({ terminalUsage, cacheRead }) => {
+		const result = await stream(model, context, {
+			apiKey,
+			fetch: async () =>
+				sse([
+					{ response: { usageMetadata: { promptTokenCount: 100, cachedContentTokenCount: 80 } } },
+					{ response: { ...stopped.response, usageMetadata: { ...terminalUsage, candidatesTokenCount: 10 } } },
+				]),
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 100 - cacheRead, cacheRead, output: 10, totalTokens: 110 });
+	});
+
 	it("keeps distinct signed parts and replays them on the next request", async () => {
 		const result = await stream(model, context, {
 			apiKey,
@@ -458,6 +475,28 @@ describe("Google Antigravity protocol", () => {
 		}).result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toMatch(/timeout/i);
+	});
+
+	it("releases the reader when fetch errors the body on timeout", async () => {
+		const transport = vi.fn<typeof fetch>(async (_url, init) => {
+			const signal = init?.signal;
+			if (!signal) throw new Error("Expected a request timeout signal");
+			const body = new ReadableStream({
+				start(controller) {
+					signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+				},
+			});
+			return new Response(body);
+		});
+		const result = await streamAntigravity(model, normalizeContext(context), {
+			apiKey,
+			timeoutMs: 10,
+			fetch: transport,
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/timeout/i);
+		const response = await transport.mock.results[0].value;
+		expect(response.body?.locked).toBe(false);
 	});
 });
 
