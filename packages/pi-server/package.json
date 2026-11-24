@@ -29,8 +29,8 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@1.4.0-piclient.19",
-		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@1.4.0-piclient.19"
+		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@1.5.2-piclient.4",
+		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@1.5.2-piclient.4"
 	},
 	"keywords": [
 		"pi-server",

@@ -150,9 +150,9 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		}) as typeof process.exit);
 		const stdoutWrite = vi.spyOn(process.stdout, "write").mockImplementation(((
 			_chunk: string,
-			callback: () => void,
+			callback?: () => void,
 		) => {
-			callback();
+			callback?.();
 			return true;
 		}) as typeof process.stdout.write);
 		setStdoutIsTTY(true);
@@ -164,8 +164,8 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 		expect(stdoutWrite).toHaveBeenCalledWith(
-			`${chalk.dim("To resume this session:")} pi-client --session test-session\n`,
-			expect.any(Function),
+			// Command on its own line (#12237).
+			`${chalk.dim("To resume this session:")}\npi-client --session test-session\n`,
 		);
 	});
 
@@ -195,6 +195,10 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		let finishWrite: (() => void) | undefined;
 		const stdout = new Writable({
 			write(chunk: Buffer, _encoding, callback) {
+				if (chunk.length === 0) {
+					callback();
+					return;
+				}
 				finishWrite = () => {
 					output.push(chunk.toString());
 					callback();
@@ -215,7 +219,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		finishWrite();
 		await shutdown;
 
-		expect(output).toEqual([`${chalk.dim("To resume this session:")} pi-client --session test-session\n`]);
+		expect(output).toEqual([`${chalk.dim("To resume this session:")}\npi-client --session test-session\n`]);
 		expect(exit).toHaveBeenCalledWith(0);
 	});
 

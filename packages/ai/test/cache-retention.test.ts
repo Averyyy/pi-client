@@ -248,6 +248,8 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			"gpt-6-luna",
 			"gpt-6-sol",
 			"gpt-6.1-terra",
+			"gpt-6.2-astra",
+			"gpt-6.2-sol",
 		] as const)("does not enable cache warming from the documented TTL alone for %s", (modelId) => {
 			expect(getModel("openai", modelId).promptCache).toBeUndefined();
 		});
@@ -513,8 +515,6 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			// Keep coverage for the retired model's explicit compatibility contract.
 			{ ...MODELS.opencode["deepseek-v4.1-flash"], compat: { supportsLongCacheRetention: false } },
 			MODELS.opencode["deepseek-v4-pro"],
-			MODELS.opencode["kimi-k2.5"],
-			MODELS.opencode["kimi-k2.6"],
 			MODELS.opencode["minimax-m2.7"],
 		] as const)("should omit long cache retention for $provider/$id", async (metadata) => {
 			const model = metadata as Model<"openai-completions">;

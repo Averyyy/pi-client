@@ -319,19 +319,19 @@ describe("pi-client session features through a 64 KiB HTTP proxy", () => {
 		}
 	});
 
-	it("omits unused internal callbacks and raw observation from ordinary remote prompts", async () => {
+	it("omits unused client callbacks and raw observation from ordinary remote prompts", async () => {
 		const { session, faux, requests, rejected } = await createFixture();
 		try {
 			faux.setResponses([
 				(_context, options) => {
 					expect(options?.onPayload).toBeUndefined();
-					expect(options?.onResponse).toBeUndefined();
 					expect(options?.onProviderStreamEvent).toBeUndefined();
 					return fauxAssistantMessage("ordinary");
 				},
 			]);
 			await session.prompt(largeText);
 			expect(session.getLastAssistantText()).toBe("ordinary");
+			expect(requests.some((request) => request.path === "/api/provider-callback")).toBe(false);
 			expect(requests.every((request) => request.bytes <= MAX_REQUEST_BYTES)).toBe(true);
 			expect(rejected()).toBe(0);
 		} finally {

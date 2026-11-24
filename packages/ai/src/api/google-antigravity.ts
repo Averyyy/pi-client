@@ -32,7 +32,6 @@ import {
 	convertMessages,
 	convertTools,
 	isThinkingPart,
-	mapStopReasonString,
 	resolveGoogleFunctionCallingMode,
 	retainThoughtSignature,
 	supportsGoogleStrictToolSampling,
@@ -251,9 +250,15 @@ export const stream: StreamFunction<"google-antigravity", GoogleAntigravityOptio
 				}
 				if (candidate?.finishReason) {
 					output.rawStopReason = candidate.finishReason;
-					output.stopReason = mapStopReasonString(candidate.finishReason);
-					if (output.stopReason === "stop" && output.content.some((part) => part.type === "toolCall")) {
-						output.stopReason = "toolUse";
+					switch (candidate.finishReason) {
+						case "STOP":
+							output.stopReason = output.content.some((part) => part.type === "toolCall") ? "toolUse" : "stop";
+							break;
+						case "MAX_TOKENS":
+							output.stopReason = "length";
+							break;
+						default:
+							output.stopReason = "error";
 					}
 				}
 				if (data.usageMetadata) {

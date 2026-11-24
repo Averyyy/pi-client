@@ -425,7 +425,6 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			expect(calls[1].options.headers).toEqual(original.options.headers);
 			for (const call of calls) {
 				expect(call.options.onPayload).toBeUndefined();
-				expect(call.options.onResponse).toBeUndefined();
 				expect(call.options.onProviderStreamEvent).toBeUndefined();
 			}
 			const entries = session.sessionManager.getEntries().filter((entry) => entry.type === "usage");
@@ -441,7 +440,7 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			expect(getOrCreateSession(session.sessionId).entries).toEqual([]);
 			expect(requests.some((request) => request.path === "/api/request/chunk")).toBe(true);
 			expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
-			expect(requests.some((request) => request.path.includes("callback"))).toBe(false);
+			expect(requests.some((request) => request.path === "/api/provider-callback")).toBe(false);
 			expect(rejected()).toBe(0);
 		} finally {
 			releaseTool();

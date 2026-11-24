@@ -261,7 +261,7 @@ export type BashRenderState = {
 const BASH_PREVIEW_LINES = 5;
 type BashResultRenderState = {
 	cachedWidth: number | undefined;
-	cachedLines: string[] | undefined;
+	cachedLines: readonly string[] | undefined;
 	cachedSkipped: number | undefined;
 };
 

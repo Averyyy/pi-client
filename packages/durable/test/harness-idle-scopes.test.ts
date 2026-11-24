@@ -8,6 +8,7 @@ import {
 	type ConversationId,
 	createRegistry,
 	defineExtension,
+	defineSignal,
 	defineTask,
 	Harness,
 	MemoryStorage,
@@ -15,6 +16,7 @@ import {
 	type Storage,
 	type TaskId,
 } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { afterEach, describe, expect, it } from "vitest";
 import { SCHEDULER_IDLE_STATE } from "../src/harness/harness.ts";
 import { commitWrites } from "../src/testing/commit-writes.ts";
@@ -66,6 +68,28 @@ const Work = defineTask<{ name: string; read?: number }, { phase: "run" }, null>
 		runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
 });
 
+const Wake = defineSignal({ name: "test.idle.wake", version: 1, schema: obj({}) });
+
+/** Reads the context of conversation `read`, then parks on `Wake` until a delivery, and completes. */
+const Parker = defineTask<{ read: number }, { phase: "run" } | { phase: "woke" }, null>({
+	name: "test.idle.parker",
+	version: 1,
+	initial: () => ({ phase: "run" }),
+	phases: {
+		run: async (task, runtime, ctx) => {
+			await runtime.context(task.input.read as ConversationId, ctx);
+			await runtime.commit(
+				() => ({ status: "sleeping", checkpoint: { phase: "woke" }, signals: [Wake.key("go")] }),
+				ctx,
+			);
+		},
+		woke: (_task, runtime, ctx) =>
+			runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx),
+	},
+	abort: async (_task, runtime, ctx) =>
+		runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+});
+
 type IdleState = Record<"contexts" | "idleContexts" | "idleMismatches" | "fullIdleChecks", number>;
 
 function idleState(harness: Harness): IdleState {
@@ -100,7 +124,7 @@ async function open(options: { clock?: () => number; retention?: () => number; t
 		},
 	});
 	const registry = createRegistry();
-	registry.install(defineExtension({ name: "tasks", tasks: [Work] }));
+	registry.install(defineExtension({ name: "tasks", tasks: [Work, Parker] }));
 	const retention = options.retention ?? (() => 600_000);
 	const harness = await Harness.open(
 		storage,
@@ -243,6 +267,32 @@ describe("idle waiters by scope", () => {
 });
 
 describe("kept context ranges", () => {
+	it("count a conversation whose live work is all parked as inactive, and as busy once it runs again", async () => {
+		const { harness, conversation, work, end } = await open();
+		const x = await conversation();
+		const parker = await x.commit(
+			(tx) =>
+				tx.createTask(
+					Parker,
+					{ read: x.id as number },
+					{ ownership: { kind: "conversation" }, conversationId: x.id },
+				),
+			context,
+		);
+		await eventually(async () => (await harness.getTask(parker, context))?.state.status === "sleeping");
+		await quiet();
+		// Not idle, as a wait for idleness says, but inactive: its context ages like an idle one's.
+		expect(await settled(x.waitForIdle(context))).toBe(false);
+		expect(idleState(harness)).toMatchObject({ contexts: 1, idleContexts: 1, idleMismatches: 0 });
+		const running = await work("running", x);
+		await quiet();
+		expect(idleState(harness)).toMatchObject({ contexts: 1, idleContexts: 0, idleMismatches: 0 });
+		await end("running", running);
+		await harness.signal(parker, Wake, "go", {}, context);
+		await harness.waitForTask(parker, context);
+		await harness.close(context);
+	});
+
 	it("settles a run end whose sweep drops the chain without a check of every scope", async () => {
 		const { harness, root } = await open();
 		const tree = await root.commit(async (tx) => {

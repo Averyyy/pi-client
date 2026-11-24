@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { findPackageDirectories } from "./package-workspaces.mjs";
+import { getPublicWorkspacePackages } from "./release-packages.mjs";
 
 const bump = process.argv[2];
 if (!["major", "minor", "patch"].includes(bump)) throw new Error("Usage: bump-versions.mjs <major|minor|patch>");
-for (const directory of findPackageDirectories()) {
+for (const { directory, name } of getPublicWorkspacePackages()) {
+	if (name.startsWith("@averyyy/")) continue;
 	const path = join(directory, "package.json");
 	const pkg = JSON.parse(readFileSync(path, "utf8"));
-	if (pkg.private === true || pkg.name?.startsWith("@averyyy/")) continue;
 	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(pkg.version);
 	if (!match) continue;
 	let [major, minor, patch] = match.slice(1).map(Number);

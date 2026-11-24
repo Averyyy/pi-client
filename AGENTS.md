@@ -16,6 +16,7 @@
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
 - After completing implementation work, add any reusable lessons from the task to this `AGENTS.md` so future agents do not rediscover the same rule.
+- Before recommending a fix design, check how sibling implementations (other adapters, providers, commands) handle the same concern, and follow that pattern. If you deviate, say why.
 - No `any` unless absolutely necessary.
 - No runtime checks of values whose types TypeScript already guarantees (no `typeof`/`instanceof`/`Array.isArray`/shape guards on typed parameters, typed callback results or typed declarations). Validate only at decided trust boundaries (wire input, schema-checked arguments and params).
 - Inline single-line helpers that have only one call site.
@@ -46,6 +47,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 ## Agent Core Tool Scheduling
 
 - In parallel tool mode, do not downgrade an entire tool batch to sequential just because one tool has `executionMode: "sequential"`. Treat sequential tools as source-order barriers: run the parallel segment before them concurrently, run the sequential tool alone, then continue with the next parallel segment. Same-file edit/write ordering belongs in `withFileMutationQueue()`, and bash stays sequential so validation commands do not overlap sibling tool calls.
+- After a tool batch is cancelled, keep a result for each call in source order. Skip preparation and hooks for calls reached after cancellation and record an abort result for each.
 - Coalesce tool progress updates at the shared `executePreparedToolCall()` callback path, not inside individual tools or UI renderers. `tool_execution_update` may drop intermediate same-tick partials, but must flush the latest partial before `tool_execution_end`; the final tool result remains authoritative.
 - Keep hot-path message/context transforms single-pass in shared code such as `convertToLlm()` and `buildSessionContext()`. Benchmark before keeping perf changes, and revert candidates that only move cost or improve one path while measurably regressing the common path.
 - Keep cancellation state in `AgentSession`: show `Aborting...` and ignore repeated interrupts until the old operation finishes. New steering/follow-up messages submitted during cancellation must queue immediately and resume through the shared session run lifecycle only after cancellation ends; do not await cancellation inside queueing callbacks or make the old abort promise wait for the new run. Clearing/dequeueing those messages must prevent their automatic continuation. A pi-server disconnect is not cancellation: await explicit remote cancellation acknowledgement before continuing, and retain unconfirmed cancellations and queued intent for an explicit retry on failure.
@@ -73,6 +75,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 - Log actual provider failures once at the PiServer execution boundary with session ID, run ID, model, phase, and available structured error fields. Keep request bodies, headers, credentials, and free-form upstream error text out of failure logs. Preserve the original error response for the requesting client.
 - Provider lifecycle callbacks must execute in the client and return their result before the server continues the provider request. Route oversized callback replies through `ChunkRequest`; callback errors and cancellation must reject pending callbacks rather than recover a successful result. Reject unsupported executable transport options explicitly.
 - Omit SDK-internal provider callbacks from remote requests only by their exact function identity and absence of the corresponding extension handler. Preserve explicit caller callbacks and registered handlers; ordinary requests must not round-trip unused payloads or native stream events.
+- Assert unused callback elision at the proxy HTTP boundary. PiServer can observe provider response status locally for failure diagnostics without sending a callback to the client.
 - Manage cache warming in the shared SDK session-request path for local and remote transport. Replays retain the original prefix, route, session ID, and cache options; real and warm requests must share resolved auth base URL, environment, and model/auth/caller header precedence. Only usage entries are persisted, and session cancellation must also abort warming.
 - Remote warming must use the authenticated stream's server-resolved cache-retention enum, including run recovery/replay. Client process defaults cannot represent server defaults. Resolve authentication once, report only the non-sensitive enum, and use it for both the provider call and its warm replay.
 - Preserve JSON-safe `ClientIdentity` options through chat, compaction, image, classifier, and deferred pi-server requests. Keep process-local telemetry spans and executable callbacks out of serialized request options.
@@ -155,7 +158,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 - Do not mark pi-server sync as successful until the response is valid JSON. For proxy/network failures, report status, content-type, and a short body excerpt; stream responses must be `text/event-stream`.
 - If post-stream pi-server tree sync fails after a successful assistant response, do not auto-retry the LLM or call `agent.continue()` from that assistant leaf; detach the sync-error assistant from the active branch and let the next pi-server sync recover.
 - Keep Windows persistence recovery narrow: retry `rename` on Windows `EPERM`, but do not delete the target session file as a fallback.
-- Await the interactive shutdown resume hint's stdout write callback before calling `process.exit()` so asynchronous terminal output completes.
+- Await `flushStdout()` after interactive terminal cleanup and any resume hint. Keep the reload handoff exit code and omit the hint on that path.
 - To reproduce pi-server flows locally, use `packages/coding-agent/src/pi-client-cli.ts`, not `pi-test.sh`; `pi-test.sh` runs the plain CLI and does not set `PI_SERVER_MODE`.
 - When `PI_SERVER_MODE` is set, the pi-client CLI adapter automatically installs a process-local PATH shim that redirects `pi` subprocess invocations to `pi-client`, and rewrites displayed command strings to show `pi-client` instead of `pi` for consistency.
 ## pi-client Web UI
@@ -308,6 +311,10 @@ When closing issues via commit:
 
 Before writing or reviewing plugin code in `apps/p2` (server and worker facets, contracts, stores), read [apps/p2/docs/plugin-practices.md](apps/p2/docs/plugin-practices.md) in full and follow it.
 
+## Working on p3 (Pi Roam) packages
+
+Work on a p3 (Pi Roam) package in `apps/p3` starts by reading [apps/p3/docs/README.md](apps/p3/docs/README.md), then the guides it lists, in its order, in full. Follow them.
+
 ## Building p2's web UI
 
 For building or changing p2's web UI (`apps/p2`), load and follow [.pi/skills/p2-ui.md](.pi/skills/p2-ui.md).
@@ -381,6 +388,7 @@ For the Averyyy fork's combined release publication and local PiServerAtStartup 
 
 - This fork only consumes the upstream pi.dev model catalog. Keep generation, validation, and upstream release compatibility checks enabled, but gate the catalog publication job to `earendil-works/pi`; do not configure fork R2 credentials or change the runtime catalog default.
 - Keep `packages/pi-client/package.json` `piClient.basePiVersion` and `basePiCommit` aligned with the merged formal release tag, and run the client wrapper's update tests.
+- Compare released upstream changelog sections against the tag in the client manifest. Keep historical fork entries in the fork package changelogs.
 - Remote CLI model selection combines pi-server's cached public pi.dev catalogs and client model configuration with server-owned Devin and Google Antigravity account catalogs. Only configured providers request public catalogs. Send ordinary provider request auth through pi-server transport; server-account requests resolve auth on the server.
 - The retained experimental agent harness depends on `AssistantMessageFrame`, its encoder/reducer, and the pi-ai root export; keep that API and its tests with the harness.
 - The Pico conversation bridge owns its mutable replicated publication state. Chord context, JSON, and delta APIs use their public subpaths; the bridge preserves synchronous hydration and per-commit delivery without depending on Chord host state cells.
