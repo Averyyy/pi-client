@@ -29,6 +29,7 @@ import {
 	type ImageModel,
 	type ImagesContext,
 	type ImagesOptions,
+	type JsonObject,
 	type Message,
 	type Model,
 	type ModelsApiStreamOptions,
@@ -38,8 +39,10 @@ import {
 	registerSessionResourceCleanup,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { raceWithAbortSignal } from "../utils/abort.ts";
+import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
+import type { AntigravityClient } from "./antigravity-runtime.ts";
 import {
 	buildPiServerTreePrefixHashes,
 	hashPiServerSessionEntries,
@@ -71,6 +74,7 @@ const sessionTreeHashes = new Map<string, string>();
 const sessionTreeEntryCounts = new Map<string, number>();
 const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
+const antigravityPrefixes = new Map<string, { runId: string; messages: Message[] }>();
 interface ActivePiServerOperation {
 	ownerSessionId: string;
 	sessionId: string;
@@ -80,6 +84,7 @@ interface ActivePiServerOperation {
 	cancelPromise?: Promise<void>;
 	cancelFailed?: boolean;
 	cancelConfirmed?: boolean;
+	cancelResult?: PiServerAbortResponse;
 }
 
 const activePiServerOperations = new Map<string, Map<string, ActivePiServerOperation>>();
@@ -127,6 +132,7 @@ export function resetSessionTracking(sessionId: string): void {
 	sessionTreeEntryCounts.delete(sessionId);
 	sessionTreeLeafIds.delete(sessionId);
 	sessionHasTemporaryTree.delete(sessionId);
+	antigravityPrefixes.delete(sessionId);
 }
 
 registerSessionResourceCleanup((sessionId) => {
@@ -139,6 +145,7 @@ export function resetAllSessionTracking(): void {
 	sessionTreeEntryCounts.clear();
 	sessionTreeLeafIds.clear();
 	sessionHasTemporaryTree.clear();
+	antigravityPrefixes.clear();
 	activePiServerOperations.clear();
 }
 
@@ -214,6 +221,7 @@ async function cancelPiServerOperation(operation: ActivePiServerOperation, retry
 		if (result.status !== "aborted" && result.status !== "completed" && result.status !== "failed") {
 			throw new Error("Session run cancellation failed (response was not terminal)");
 		}
+		operation.cancelResult = result;
 		removePiServerOperation(operation);
 	})();
 
@@ -282,6 +290,7 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
+	antigravity?: AntigravityClient | true;
 }
 
 interface PiServerErrorResponse {
@@ -386,6 +395,7 @@ interface PiServerRunResponse {
 	runId: string;
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
+	executedToolResults?: ToolResultMessage[];
 	compactResult?: PiServerCompactionResponse;
 	operationResult?:
 		| AssistantImages
@@ -398,6 +408,8 @@ interface PiServerAbortResponse {
 	sessionId: string;
 	runId: string;
 	status: "aborted" | "completed" | "failed";
+	message?: AssistantMessage;
+	executedToolResults?: ToolResultMessage[];
 }
 
 interface PiServerSyncOptions {
@@ -1142,6 +1154,49 @@ export async function compactPiServer(
 	}
 }
 
+export async function readPiServerAntigravityModels(
+	signal: AbortSignal,
+): Promise<Model<"google-antigravity">[] | undefined> {
+	const response = await createPiServerRequest(signal).getJson("/api/antigravity/models");
+	const { models } = await readPiServerJson<{ models: Model<"google-antigravity">[] | null }>(
+		response,
+		"PiServer Antigravity model discovery failed",
+	);
+	return models ?? undefined;
+}
+
+export async function logoutPiServerAntigravity(signal: AbortSignal): Promise<void> {
+	const response = await createPiServerRequest(signal).postJson("/api/antigravity/logout", {});
+	await readPiServerJson(response, "PiServer Antigravity logout failed");
+}
+
+export async function releasePiServerAntigravity(sessionId: string): Promise<void> {
+	const prefix = antigravityPrefixes.get(sessionId);
+	if (!prefix) return;
+	antigravityPrefixes.delete(sessionId);
+	const response = await createPiServerRequest(AbortSignal.timeout(15_000)).postJson("/api/antigravity/release", {
+		sessionId,
+		runId: prefix.runId,
+	});
+	await readPiServerJson(response, "PiServer Antigravity session cleanup failed");
+}
+
+export function streamPiServerAntigravity(
+	model: Model<string>,
+	context: Context,
+	options?: SimpleStreamOptions,
+	client?: AntigravityClient,
+): Promise<PiServerEventStream> {
+	return streamPiServer({ ...model, headers: undefined }, context, {
+		antigravity: client ?? true,
+		sessionId: client ? options?.sessionId : undefined,
+		ownerSessionId: options?.sessionId,
+		signal: options?.signal,
+		timeoutMs: options?.timeoutMs,
+		reasoning: options?.reasoning,
+	});
+}
+
 export async function streamPiServer(
 	model: Model<any>,
 	context: Context,
@@ -1156,7 +1211,30 @@ export async function streamPiServer(
 	const runId = randomUUID();
 	const isEphemeralSession = options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
-	const stream = createAssistantMessageEventStream();
+	const agy = options?.antigravity;
+	const retainAgySession = agy !== undefined && agy !== true;
+	const agyPrefix = retainAgySession ? antigravityPrefixes.get(sessionId) : undefined;
+	const base = agyPrefix?.messages.every(
+		(message, index) =>
+			message === context.messages[index] || JSON.stringify(message) === JSON.stringify(context.messages[index]),
+	)
+		? agyPrefix
+		: undefined;
+	const executedToolResults: ToolResultMessage[] = [];
+	const stream = Object.assign(createAssistantMessageEventStream(), {
+		executedToolResults: agy ? executedToolResults : undefined,
+	});
+	const acceptAgyResult = (message: AssistantMessage, results?: readonly ToolResultMessage[]) => {
+		if (results) executedToolResults.splice(0, executedToolResults.length, ...results);
+		if (retainAgySession && (message.stopReason === "stop" || message.stopReason === "length")) {
+			antigravityPrefixes.set(sessionId, {
+				runId,
+				messages: [...context.messages, message, ...executedToolResults],
+			});
+		} else if (retainAgySession) {
+			antigravityPrefixes.delete(sessionId);
+		}
+	};
 
 	const partial: AssistantMessage = {
 		role: "assistant",
@@ -1179,6 +1257,7 @@ export async function streamPiServer(
 	(async () => {
 		let phase: PiServerFailurePhase = "session_init";
 		let streamOpened = false;
+		let terminalReceived = false;
 		let observerFailed = false;
 		let callbackFailed = false;
 		let cacheRetention: CacheRetention | undefined;
@@ -1246,7 +1325,7 @@ export async function streamPiServer(
 		};
 		try {
 			const request = createPiServerRequest(options?.signal);
-			await ensureSessionInit(sessionId, context, request);
+			if (!agy) await ensureSessionInit(sessionId, context, request);
 			if (observeTiming) sessionInitMs = Math.round(performance.now() - startedAt);
 
 			const makeBody = () => ({
@@ -1262,10 +1341,19 @@ export async function streamPiServer(
 				deferredHandle: options?.deferredHandle,
 				observeProviderStreamEvents: options?.onProviderStreamEvent !== undefined,
 				callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
-				contextOverlay: options?.contextOverlay ?? [
-					...(context.messages as Message[]),
-					...(options?.ephemeralMessages ?? []),
-				],
+				antigravity: agy
+					? {
+							retainSession: retainAgySession,
+							questions: agy !== true && !!agy.answerQuestion,
+							baseRunId: base?.runId,
+						}
+					: undefined,
+				contextOverlay: agy
+					? context.messages.slice(base?.messages.length ?? 0)
+					: (options?.contextOverlay ?? [
+							...(context.messages as Message[]),
+							...(options?.ephemeralMessages ?? []),
+						]),
 			});
 			phase = "provider_stream";
 			if (observeTiming) requestStartedAt = performance.now();
@@ -1274,7 +1362,7 @@ export async function streamPiServer(
 
 			if (!response.ok) {
 				let failure = await readPiServerFailure(response);
-				if (!options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
+				if (!agy && !options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);
 					if (observeTiming) requestStartedAt = performance.now();
@@ -1296,10 +1384,25 @@ export async function streamPiServer(
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
 			const parser = new ServerSentEventParser();
-			let terminalReceived = false;
 
 			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
+					if (serverEvent.event === "antigravity_tool_results") {
+						const results = parseServerSentEventData(
+							serverEvent,
+							"Antigravity tool results",
+						) as ToolResultMessage[];
+						executedToolResults.splice(0, executedToolResults.length, ...results);
+						continue;
+					}
+					if (serverEvent.event === "antigravity_update") {
+						const { sessionId, update } = parseServerSentEventData(serverEvent, "Antigravity update") as {
+							sessionId: string;
+							update: JsonObject;
+						};
+						if (agy !== true) agy?.recordUpdate?.(sessionId, update);
+						continue;
+					}
 					if (serverEvent.event === "timing") {
 						if (observeTiming)
 							serverTiming = parseServerSentEventData(serverEvent, "pi-server timing") as typeof serverTiming;
@@ -1371,7 +1474,10 @@ export async function streamPiServer(
 						recordTiming();
 					}
 					if (finalMessage) recordTiming(finalMessage);
-					if (event.type === "done" || event.type === "error") terminalReceived = true;
+					if (event.type === "done" || event.type === "error") {
+						terminalReceived = true;
+						if (agy && finalMessage) acceptAgyResult(finalMessage);
+					}
 					stream.push(event);
 				}
 			};
@@ -1398,6 +1504,7 @@ export async function streamPiServer(
 
 			stream.end();
 		} catch (error) {
+			if (retainAgySession && !terminalReceived) antigravityPrefixes.delete(sessionId);
 			let errorMessage = error instanceof Error ? error.message : String(error);
 			// Same-run recovery only applies to an interrupted event-stream. HTTP/proxy
 			// failures before the stream starts (502/504/fetch failed) never opened a run
@@ -1407,6 +1514,7 @@ export async function streamPiServer(
 				!options?.signal?.aborted &&
 				phase === "provider_stream" &&
 				streamOpened &&
+				!terminalReceived &&
 				!observerFailed &&
 				!callbackFailed
 			) {
@@ -1424,6 +1532,7 @@ export async function streamPiServer(
 						await applyCachePolicy(recoveredRun?.cacheRetention);
 					}
 					if (recoveredRun?.status === "completed" && recoveredRun.message) {
+						if (agy) acceptAgyResult(recoveredRun.message, recoveredRun.executedToolResults ?? []);
 						recordTiming(recoveredRun.message);
 						switch (recoveredRun.message.stopReason) {
 							case "stop":
@@ -1448,6 +1557,7 @@ export async function streamPiServer(
 					}
 					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
 						if (recoveredRun.message) {
+							if (agy) acceptAgyResult(recoveredRun.message, recoveredRun.executedToolResults ?? []);
 							recordTiming(recoveredRun.message);
 							stream.push({ type: "error", reason: "error", error: recoveredRun.message });
 							stream.end();
@@ -1456,6 +1566,13 @@ export async function streamPiServer(
 						errorMessage = recoveredRun.errorMessage;
 					}
 					if (recoveredRun?.status === "aborted") {
+						if (agy && recoveredRun.message) {
+							acceptAgyResult(
+								{ ...recoveredRun.message, stopReason: "aborted" },
+								recoveredRun.executedToolResults ?? [],
+							);
+							Object.assign(partial, recoveredRun.message);
+						}
 						errorMessage = recoveredRun.errorMessage ?? "pi-server run aborted";
 					}
 				} catch (recoveryError) {
@@ -1476,6 +1593,11 @@ export async function streamPiServer(
 					}`;
 				}
 			}
+			if (agy && operation?.cancelResult?.message) {
+				const { message, executedToolResults: results, status } = operation.cancelResult;
+				acceptAgyResult(status === "aborted" ? { ...message, stopReason: "aborted" } : message, results ?? []);
+				Object.assign(partial, message);
+			}
 			const reason = options?.signal?.aborted ? "aborted" : "error";
 			partial.stopReason = reason;
 			partial.errorMessage = errorMessage;
@@ -1488,7 +1610,7 @@ export async function streamPiServer(
 					details: {
 						phase,
 						source: "pi-server",
-						retryable: !callbackFailed && !observerFailed && isRetryablePiServerFailure(phase, error),
+						retryable: !agy && !callbackFailed && !observerFailed && isRetryablePiServerFailure(phase, error),
 					},
 				},
 			];
@@ -1700,7 +1822,7 @@ function assertNoCustomPiServerFetch(options?: Pick<ProviderRequestOptions<AnyMo
 async function handleProviderCallback<TModel extends AnyModel>(
 	callback: PiServerProviderCallbackRequest,
 	model: TModel,
-	options: ProviderRequestOptions<TModel> | undefined,
+	options: (ProviderRequestOptions<TModel> & Pick<PiServerStreamOptions, "antigravity">) | undefined,
 	sessionId: string,
 	runId: string,
 	request: ChunkRequest,
@@ -1734,6 +1856,24 @@ async function handleProviderCallback<TModel extends AnyModel>(
 				Promise.resolve().then(() => options.onResponse!(callback.response, remoteModel)),
 				options.signal,
 			);
+		} else if (callback.kind === "antigravity") {
+			const client = options?.antigravity;
+			if (!client || client === true) throw new Error("Unexpected pi-server Antigravity callback");
+			const signal = operationSignal(options?.signal);
+			const request = callback.request;
+			switch (request.kind) {
+				case "tool":
+					if (!client.executeTool) throw new Error("Pi session cannot execute Antigravity tools");
+					result = await client.executeTool(request.call, request.assistant, signal);
+					break;
+				case "permission":
+					result = await client.requestPermission?.(request.title, request.choices, signal);
+					break;
+				case "question":
+					if (!client.answerQuestion) throw new Error("Pi session cannot answer Antigravity questions");
+					result = await client.answerQuestion(request.request, signal);
+					break;
+			}
 		} else {
 			throw new Error("Unknown pi-server provider callback kind");
 		}

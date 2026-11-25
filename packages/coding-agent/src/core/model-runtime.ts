@@ -73,7 +73,7 @@ import {
 } from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import { ANTIGRAVITY_PROVIDER, loginAntigravity, logoutAntigravity, readAntigravityModels } from "./antigravity-acp.ts";
+import { ANTIGRAVITY_PROVIDER, logoutAntigravity, readAntigravityModels } from "./antigravity-acp.ts";
 import { AntigravityRuntime } from "./antigravity-runtime.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
@@ -93,8 +93,11 @@ import {
 	classifyPiServer,
 	fetchDeferredPiServer,
 	generateImagesPiServer,
+	logoutPiServerAntigravity,
 	type PiServerAccountOptions,
+	readPiServerAntigravityModels,
 	streamPiServer,
+	streamPiServerAntigravity,
 	streamRawPiServer,
 } from "./pi-server-client.ts";
 import {
@@ -231,6 +234,10 @@ export class ModelRuntime implements Models {
 	private availabilityError: string | undefined;
 	private readonly credentialOperations = new Map<string, Promise<unknown>>();
 
+	private get antigravityAuthSource(): string {
+		return this.piServerMode ? "PiServer Antigravity CLI" : "local Antigravity CLI";
+	}
+
 	private constructor(
 		credentials: RuntimeCredentials,
 		config: ModelConfig,
@@ -359,7 +366,10 @@ export class ModelRuntime implements Models {
 					return override ? applyModelOverride(model, override) : model;
 				});
 			const localSignIn = async (): Promise<never> => {
-				throw new ModelsError("auth", "Use Pi login for the local Antigravity CLI account");
+				throw new ModelsError(
+					"auth",
+					`Google Antigravity credentials are managed by the ${this.antigravityAuthSource}`,
+				);
 			};
 			return {
 				id: ANTIGRAVITY_PROVIDER,
@@ -368,7 +378,7 @@ export class ModelRuntime implements Models {
 					oauth: {
 						name: "Google Antigravity",
 						isSubscription: true,
-						loginLabel: "Sign in with Google Antigravity",
+						loginLabel: "Use an existing Antigravity CLI sign-in",
 						login: localSignIn,
 						refresh: localSignIn,
 						toAuth: localSignIn,
@@ -377,12 +387,11 @@ export class ModelRuntime implements Models {
 				getModels,
 				getAllModels: getModels,
 				stream: (model, context, options) =>
-					new AntigravityRuntime(process.cwd()).stream(model, context, {
+					this.streamAntigravity(model, context, {
 						signal: options?.signal,
 						timeoutMs: options?.timeoutMs,
 					}),
-				streamSimple: (model, context, options) =>
-					new AntigravityRuntime(process.cwd()).stream(model, context, options),
+				streamSimple: (model, context, options) => this.streamAntigravity(model, context, options),
 			};
 		}
 		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
@@ -650,7 +659,9 @@ export class ModelRuntime implements Models {
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
 		if (providerId === ANTIGRAVITY_PROVIDER) {
 			options?.signal?.throwIfAborted();
-			return this.antigravityModels === undefined ? undefined : { type: "oauth", source: "local Antigravity CLI" };
+			return this.antigravityModels === undefined
+				? undefined
+				: { type: "oauth", source: this.antigravityAuthSource };
 		}
 		if (this.isServerAccountProvider(providerId)) {
 			options?.signal?.throwIfAborted();
@@ -866,7 +877,7 @@ export class ModelRuntime implements Models {
 		if (providerId === ANTIGRAVITY_PROVIDER) {
 			return this.antigravityModels === undefined
 				? { configured: false }
-				: { configured: true, source: "local_account", label: "local Antigravity CLI" };
+				: { configured: true, source: "local_account", label: this.antigravityAuthSource };
 		}
 		if (this.isServerAccountProvider(providerId)) {
 			return this.serverAccounts.get(providerId)?.loggedIn
@@ -999,7 +1010,7 @@ export class ModelRuntime implements Models {
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
 		if (model.provider === ANTIGRAVITY_PROVIDER && !isVirtualModel(model)) {
-			return new AntigravityRuntime(process.cwd()).stream(model, transcript, {
+			return this.streamAntigravity(model, transcript, {
 				signal: options?.signal,
 				timeoutMs: options?.timeoutMs,
 			});
@@ -1061,7 +1072,7 @@ export class ModelRuntime implements Models {
 			);
 		}
 		if (model.provider === ANTIGRAVITY_PROVIDER) {
-			return new AntigravityRuntime(process.cwd()).stream(model, transcript, options);
+			return this.streamAntigravity(model, transcript, options);
 		}
 		return lazyStream(
 			model,
@@ -1081,6 +1092,12 @@ export class ModelRuntime implements Models {
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
 		return this.streamSimple(model, context, options).result();
+	}
+
+	private streamAntigravity(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
+		return this.piServerMode
+			? lazyStream(model, () => streamPiServerAntigravity(model, context, options), undefined, options?.signal)
+			: new AntigravityRuntime(process.cwd()).stream(model, context, options);
 	}
 
 	streamDeferred(
@@ -1186,12 +1203,15 @@ export class ModelRuntime implements Models {
 		return this.enqueueCredentialOperation(providerId, signal, async (): Promise<LoginResult> => {
 			if (providerId === ANTIGRAVITY_PROVIDER) {
 				if (type !== "oauth") throw new ModelsError("auth", "Google Antigravity requires an account login");
-				await loginAntigravity(process.cwd(), { ...interaction, signal });
 				const result = await this.refresh({ allowNetwork: false, providers: [providerId], signal });
 				if (result.errors.has(providerId)) throw result.errors.get(providerId);
 				signal.throwIfAborted();
-				if (this.antigravityModels === undefined)
-					throw new ModelsError("auth", "Antigravity CLI did not report an active sign-in");
+				if (this.antigravityModels === undefined) {
+					throw new ModelsError(
+						"auth",
+						`Sign in to agy on the machine running ${this.piServerMode ? "PiServer" : "Pi"}, then retry /login google-antigravity.`,
+					);
+				}
 				return { type: "local", providerId };
 			}
 			if (this.isServerAccountProvider(providerId)) {
@@ -1210,7 +1230,8 @@ export class ModelRuntime implements Models {
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			if (providerId === ANTIGRAVITY_PROVIDER) {
-				await logoutAntigravity(process.cwd(), signal);
+				if (this.piServerMode) await logoutPiServerAntigravity(signal);
+				else await logoutAntigravity(process.cwd(), signal);
 				++this.antigravityRefreshSeq;
 				this.antigravityModels = undefined;
 				this.antigravityError = undefined;
@@ -1263,7 +1284,9 @@ export class ModelRuntime implements Models {
 			try {
 				const timeout = AbortSignal.timeout(15_000);
 				const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-				const models = await readAntigravityModels(process.cwd(), signal);
+				const models = this.piServerMode
+					? await readPiServerAntigravityModels(signal)
+					: await readAntigravityModels(process.cwd(), signal);
 				if (antigravitySeq === this.antigravityRefreshSeq) {
 					this.antigravityModels = models;
 					this.antigravityError = undefined;

@@ -69,6 +69,7 @@ import {
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
+import { ANTIGRAVITY_PROVIDER } from "../../core/antigravity-acp.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -6551,7 +6552,7 @@ export class InteractiveMode {
 						if (this.session.modelRuntime.hasConfiguredAuth(providerOption.id)) {
 							const authStatus = this.session.modelRuntime.getProviderAuthStatus(providerOption.id);
 							const sources = {
-								local_account: "the local Antigravity CLI",
+								local_account: authStatus.label ?? "Antigravity CLI",
 								server_account: "a pi-server account",
 								stored: "stored credentials",
 								runtime: "a runtime API key",
@@ -6845,7 +6846,10 @@ export class InteractiveMode {
 		providerName: string,
 		method: "api_key" | "oauth",
 	): Promise<void> {
-		this.programStatus.setBlocked("login", { kind: "auth", message: `Log in to ${providerName}` });
+		this.programStatus.setBlocked("login", {
+			kind: "auth",
+			message: providerId === ANTIGRAVITY_PROVIDER ? "Load Antigravity models" : `Log in to ${providerName}`,
+		});
 		try {
 			await this.session.modelRuntime.login(
 				providerId,
@@ -6864,7 +6868,14 @@ export class InteractiveMode {
 
 	private async showLoginDialog(providerId: string, providerName: string, onBack?: () => void): Promise<void> {
 		const previousModel = this.session.model;
-		const dialog = new LoginDialogComponent(this.ui, providerId, (_success, _message) => {}, providerName);
+		const isAntigravity = providerId === ANTIGRAVITY_PROVIDER;
+		const dialog = new LoginDialogComponent(
+			this.ui,
+			providerId,
+			(_success, _message) => {},
+			providerName,
+			isAntigravity ? "Load Google Antigravity models" : undefined,
+		);
 		this.editorContainer.clear();
 		this.editorContainer.addChild(dialog);
 		this.ui.setFocus(dialog);
@@ -6880,6 +6891,13 @@ export class InteractiveMode {
 		try {
 			await this.loginProvider(dialog, providerId, providerName, "oauth");
 			restoreEditor();
+			if (isAntigravity) {
+				const { label } = this.session.modelRuntime.getProviderAuthStatus(providerId);
+				await this.updateAvailableProviderCount();
+				this.footer.invalidate();
+				this.showStatus(`Loaded ${providerName} models from ${label}. Use /model to select a model.`);
+				return;
+			}
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
 			if (providerId === RADIUS_PROVIDER_ID) this.offerRadiusMcpServer(providerId, providerName);
 		} catch (error: unknown) {

@@ -1,18 +1,10 @@
 const assert = require("node:assert/strict");
-const { appendFileSync, existsSync, unlinkSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, unlinkSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 
 const lines = createInterface({ input: process.stdin });
-if (process.argv.includes("--login")) {
-	console.log("https://accounts.google.com/mock-antigravity");
-	lines.once("line", (code) => {
-		assert.equal(code, "mock-code");
-		writeFileSync("signed-in", "");
-		lines.close();
-	});
-} else {
-	startAcp();
-}
+assert.ok(!process.argv.includes("--login"));
+startAcp();
 
 function startAcp() {
 	const sessionId = "mock-agy-session";

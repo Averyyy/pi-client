@@ -250,8 +250,8 @@ To use a service-account key file instead, set `GOOGLE_APPLICATION_CREDENTIALS` 
 
 ### Google Antigravity
 
-Install the [official Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) on the machine running Pi. The `agy` binary must be on `PATH`. Set `PI_ANTIGRAVITY_CLI` to its absolute path when needed.
+Install the [official Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) on the PiServer host in pi-server mode, or on the machine running standalone Pi. Put `agy` on `PATH` or set `PI_ANTIGRAVITY_CLI` to its absolute path in the process that launches it. Sign in to `agy` as that process's OS user.
 
-Run `/login google-antigravity`, follow the Google sign-in link, and paste the code Google displays. Pi reuses an existing `agy` sign-in and `/logout google-antigravity` signs out of `agy`. The CLI owns authentication and runs inference in a local [ACP session](https://antigravity.google/docs/cli/acp/), including in pi-server mode.
+`/login google-antigravity` checks the existing `agy` sign-in and loads the models it advertises through [ACP](https://antigravity.google/docs/cli/acp/). Use `/model` to choose a model. `/logout google-antigravity` signs out of that `agy` instance.
 
-Open `/model` to choose from the local CLI's account catalog. Orchestrator models appear when the CLI advertises them for your account. Pi exposes enabled tools to the Antigravity session through MCP and runs them through its tool hooks. Antigravity's own tools keep their native permissions. Pi shows approval requests in the interactive session and cancels them when no interactive UI is available.
+`agy` runs inference on the same host that loads its model catalog. Pi exposes enabled tools through MCP and runs them through its tool hooks in the client session. Antigravity's own tools keep their native permissions. Pi shows approval requests in the interactive session and cancels them when no interactive UI is available.

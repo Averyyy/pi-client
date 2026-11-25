@@ -30,7 +30,8 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "npm:@averyyy/pi-agent-core@1.5.2-piclient.4",
-		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@1.5.2-piclient.4"
+		"@earendil-works/pi-ai": "npm:@averyyy/pi-ai@1.5.2-piclient.4",
+		"@earendil-works/pi-coding-agent": "1.6.0"
 	},
 	"keywords": [
 		"pi-server",

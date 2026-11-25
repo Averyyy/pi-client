@@ -1,9 +1,12 @@
+import { once } from "node:events";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore, normalizeContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createPiServer } from "../../pi-server/src/server.ts";
 import { AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
@@ -16,6 +19,16 @@ import { createTestExtensionsResult, createTestResourceLoader } from "./utilitie
 
 const providerId = "google-antigravity";
 let cwd: string;
+const servers: Server[] = [];
+
+async function listen(server: Server): Promise<string> {
+	servers.push(server);
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+	return `http://127.0.0.1:${address.port}`;
+}
 
 function trace(): { method: string; params?: unknown; result?: unknown }[] {
 	return readFileSync(join(cwd, "trace.jsonl"), "utf8")
@@ -40,7 +53,11 @@ beforeEach(() => {
 	vi.stubEnv("PI_SERVER_MODE", "false");
 });
 
-afterEach(() => {
+afterEach(async () => {
+	for (const server of servers.splice(0).reverse()) {
+		server.closeAllConnections();
+		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+	}
 	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
 	vi.unstubAllGlobals();
@@ -48,7 +65,7 @@ afterEach(() => {
 });
 
 describe("Antigravity ACP", () => {
-	it("keeps login and model discovery in agy, and never uses the old Pi credential", async () => {
+	it("loads models from an existing agy sign-in without touching Pi credentials", async () => {
 		const old = { type: "oauth" as const, access: "old", refresh: "old", expires: 0 };
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify(providerId, async () => old);
@@ -57,17 +74,18 @@ describe("Antigravity ACP", () => {
 		});
 		vi.stubGlobal("fetch", network);
 		const runtime = await createRuntime(credentials);
-		expect(runtime.getProvider(providerId)?.auth.oauth?.loginLabel).toBe("Sign in with Google Antigravity");
 		expect(runtime.getModels(providerId)).toEqual([]);
 		expect(await runtime.listCredentials()).toEqual([]);
 
 		const notify = vi.fn();
-		const prompt = vi.fn(async () => "mock-code");
-		expect(await runtime.login(providerId, "oauth", { notify, prompt })).toEqual({ type: "local", providerId });
-		expect(notify).toHaveBeenCalledWith(
-			expect.objectContaining({ type: "auth_url", url: "https://accounts.google.com/mock-antigravity" }),
+		const prompt = vi.fn();
+		await expect(runtime.login(providerId, "oauth", { notify, prompt })).rejects.toThrow(
+			"Sign in to agy on the machine running Pi, then retry /login google-antigravity.",
 		);
-		expect(prompt).toHaveBeenCalledWith(expect.objectContaining({ type: "manual_code" }));
+		signedIn();
+		expect(await runtime.login(providerId, "oauth", { notify, prompt })).toEqual({ type: "local", providerId });
+		expect(notify).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
 		expect(runtime.getModels(providerId).map(({ id, name }) => ({ id, name }))).toEqual([
 			{ id: "gemini-test", name: "Gemini Test" },
 			{ id: "orchestrator-test", name: "Orchestrator (Argon)" },
@@ -138,17 +156,54 @@ describe("Antigravity ACP", () => {
 		]);
 	});
 
-	it("executes a custom Pi tool through MCP and sends subsequent turns to the same ACP session in PiServer mode", async () => {
-		signedIn();
+	it("discovers server agy models and sends incremental turns and tools through a 64 KiB proxy", async () => {
 		vi.stubEnv("PI_SERVER_MODE", "true");
-		vi.stubEnv("PI_SERVER_URL", "http://pi-server.invalid");
-		const network = vi.fn(async (input: string | URL | Request) => {
-			const path = new URL(String(input)).pathname;
-			if (path === "/api/accounts") return Response.json({ accounts: [] });
-			if (path === "/api/observer") return Response.json({ accepted: true });
-			throw new Error(`Unexpected PiServer request ${path}`);
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
+		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
+		const backendUrl = await listen(
+			createPiServer({
+				sessionStoreDir: join(cwd, "server"),
+				accountStoreDir: join(cwd, "accounts"),
+				authToken: "fixture",
+			}),
+		);
+		const requests: {
+			path: string;
+			body?: { target?: string; antigravity?: { baseRunId?: string }; contextOverlay?: unknown[] };
+			bytes: number;
+		}[] = [];
+		let released = false;
+		const proxy = createServer(async (request, response) => {
+			try {
+				const chunks: Buffer[] = [];
+				for await (const chunk of request) chunks.push(Buffer.from(chunk));
+				const body = Buffer.concat(chunks);
+				const path = request.url!;
+				requests.push({
+					path,
+					bytes: body.byteLength,
+					body: body.byteLength ? JSON.parse(body.toString("utf8")) : undefined,
+				});
+				if (body.byteLength > 65_536) {
+					response.writeHead(413).end();
+					return;
+				}
+				const upstream = await fetch(`${backendUrl}${path}`, {
+					method: request.method,
+					headers: { authorization: request.headers.authorization ?? "", "content-type": "application/json" },
+					...(body.byteLength ? { body } : {}),
+				});
+				response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "" });
+				response.flushHeaders();
+				if (upstream.body) for await (const chunk of upstream.body) response.write(chunk);
+				response.end();
+				if (path === "/api/antigravity/release") released = upstream.ok;
+			} catch (error) {
+				if (response.headersSent) response.destroy(error as Error);
+				else response.writeHead(500).end(String(error));
+			}
 		});
-		vi.stubGlobal("fetch", network);
+		vi.stubEnv("PI_SERVER_URL", await listen(proxy));
 		const modelsPath = join(cwd, "models.json");
 		writeFileSync(
 			modelsPath,
@@ -157,12 +212,23 @@ describe("Antigravity ACP", () => {
 			}),
 		);
 		const runtime = await createRuntime(undefined, modelsPath);
+		const interaction = { notify: vi.fn(), prompt: vi.fn() };
+		await expect(runtime.login(providerId, "oauth", interaction)).rejects.toThrow(
+			"Sign in to agy on the machine running PiServer, then retry /login google-antigravity.",
+		);
+		signedIn();
+		await runtime.login(providerId, "oauth", interaction);
+		expect(interaction.notify).not.toHaveBeenCalled();
+		expect(interaction.prompt).not.toHaveBeenCalled();
+		expect(requests.filter(({ path }) => path === "/api/antigravity/models")).toHaveLength(3);
+		const discoveryRequests = trace().length;
 		const model = runtime.getModel(providerId, "gemini-test")!;
 		expect(model.contextWindow).toBe(50_000);
+		const largeToolValue = "工具😀".repeat(7_000);
 		const execute = vi.fn(async (_id: string, params: { key: string }) => ({
 			content: [{ type: "text" as const, text: `Found ${params.key}` }],
 			details: { found: params.key },
-			structuredContent: { value: params.key },
+			structuredContent: { value: largeToolValue },
 		}));
 		const extensionsResult = await createTestExtensionsResult(
 			[
@@ -202,15 +268,18 @@ describe("Antigravity ACP", () => {
 		});
 		const toolEvents: string[] = [];
 		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const select = vi.fn(async () => "Allow once");
 		session.subscribe((event) => {
 			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolEvents.push(event.type);
 		});
 		try {
-			await session.bindExtensions({});
+			await session.bindExtensions({ uiContext: createTestUiContext({ select }) });
 			await session.prompt("custom");
 			expect(session.messages.findLast((message) => message.role === "assistant")).toMatchObject({
 				stopReason: "stop",
 			});
+			const largePrompt = "漢字😀".repeat(7_000);
+			await session.prompt(largePrompt);
 			await session.prompt("follow-up");
 			expect(execute).toHaveBeenCalledExactlyOnceWith(
 				expect.any(String),
@@ -223,15 +292,30 @@ describe("Antigravity ACP", () => {
 			const messages = session.messages.filter((message) => message.role === "assistant");
 			expect(messages.map((message) => message.content.at(-1))).toEqual([
 				{ type: "text", text: "Reviewed 答案" },
+				{ type: "text", text: `gemini-test: ${largePrompt}` },
 				{ type: "text", text: "gemini-test: follow-up" },
 			]);
-			const requests = trace();
-			expect(requests.filter((entry) => entry.method === "session/new")).toHaveLength(2);
-			expect(requests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
+			expect(
+				requests.some(({ path, body }) => path === "/api/request/chunk" && body?.target === "/api/stream"),
+			).toBe(true);
+			expect(
+				requests.some(
+					({ path, body }) => path === "/api/request/chunk" && body?.target === "/api/provider-callback",
+				),
+			).toBe(true);
+			expect(requests.every(({ bytes }) => bytes <= 65_536)).toBe(true);
+			expect(requests.filter(({ path }) => path === "/api/stream").at(-1)?.body).toMatchObject({
+				antigravity: { baseRunId: expect.any(String) },
+				contextOverlay: [expect.objectContaining({ role: "user", content: [{ type: "text", text: "follow-up" }] })],
+			});
+			const acpRequests = trace().slice(discoveryRequests);
+			expect(acpRequests.filter((entry) => entry.method === "session/new")).toHaveLength(1);
+			expect(acpRequests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
 				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "custom" }] },
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: largePrompt }] },
 				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "follow-up" }] },
 			]);
-			expect(requests.find((entry) => entry.method === "mock/tools/list")?.result).toMatchObject({
+			expect(acpRequests.find((entry) => entry.method === "mock/tools/list")?.result).toMatchObject({
 				tools: [
 					{
 						name: "lookup",
@@ -239,9 +323,9 @@ describe("Antigravity ACP", () => {
 					},
 				],
 			});
-			expect(requests.find((entry) => entry.method === "mock/tools/call")?.result).toEqual({
+			expect(acpRequests.find((entry) => entry.method === "mock/tools/call")?.result).toEqual({
 				content: [{ type: "text", text: "Reviewed 答案" }],
-				structuredContent: { value: "答案" },
+				structuredContent: { value: largeToolValue },
 				isError: false,
 			});
 			const reopen = () => SessionManager.open(sessionManager.getSessionFile()!, cwd).getBranch();
@@ -254,26 +338,42 @@ describe("Antigravity ACP", () => {
 					toolCallId: execute.mock.calls[0][0],
 					content: [{ type: "text", text: "Reviewed 答案" }],
 					details: { found: "答案" },
-					structuredContent: { value: "答案" },
+					structuredContent: { value: largeToolValue },
 					isError: false,
 				},
 			]);
 			expect(messages[0].content[0]).toMatchObject({ type: "toolCall", id: results[0].toolCallId });
+			await session.prompt("permission");
+			expect(select).toHaveBeenCalledWith("Run native tool", ["Allow once"], { signal: expect.any(AbortSignal) });
 			const compacted = await session.compact();
 			expect(compacted.summary).toContain("Reviewed 答案");
 			expect(reopen()).toContainEqual(expect.objectContaining({ type: "message", message: results[0] }));
 			expect(trace().at(-1)).toMatchObject({ method: "session/prompt" });
+			expect(requests.some(({ path }) => path.startsWith("/api/session/tree/"))).toBe(false);
+			const callsBeforeAbort = trace().filter(({ method }) => method === "mock/tools/call").length;
+			const prompt = session.prompt("custom-cancel");
+			try {
+				await vi.waitFor(
+					() =>
+						expect(trace().filter(({ method }) => method === "mock/tools/call")).toHaveLength(
+							callsBeforeAbort + 1,
+						),
+					{ timeout: 5_000 },
+				);
+			} finally {
+				await session.abort();
+				await prompt;
+			}
+			expect(trace().at(-1)).toMatchObject({ method: "session/cancel" });
 			expect(
-				network.mock.calls.every(([input]) =>
-					["/api/accounts", "/api/observer"].includes(new URL(String(input)).pathname),
-				),
-			).toBe(true);
+				reopen().findLast((entry) => entry.type === "message" && entry.message.role === "toolResult"),
+			).toMatchObject({ message: { toolCallId: execute.mock.calls.at(-1)?.[0] } });
+			await session.prompt("after cancellation");
 		} finally {
-			const closes = close.mock.calls.length;
 			session.dispose();
 			await Promise.all([closePiServerObserver(session), ...close.mock.results.map(({ value }) => value)]);
-			expect(close).toHaveBeenCalledTimes(closes + 1);
 		}
+		await vi.waitFor(() => expect(released).toBe(true));
 	});
 
 	it.each([

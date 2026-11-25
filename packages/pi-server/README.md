@@ -39,11 +39,17 @@ Received files default to `~/.pi/upload_files`.
 
 ## Account Providers
 
-PiServer owns Devin account login, credential persistence, token refresh, and model discovery. Connect with `pi-client`, run `/login devin`, and complete the browser authorization and redirect prompt. The client receives account status and model metadata. Google Antigravity uses the official CLI on the pi-client machine.
+PiServer owns Devin account login, credential persistence, token refresh, and model discovery. Connect with `pi-client`, run `/login devin`, and complete the browser authorization and redirect prompt. The client receives account status and model metadata.
 
 Account files default to `~/.pi/pi-server/accounts`. Set `PI_SERVER_ACCOUNT_STORE_DIR` to choose another directory. The server restores saved account catalogs on startup, refreshes them in the background, after successful login, and every four hours. Expiring OAuth tokens refresh when needed. Failed discovery keeps the saved catalog and reports the error. `/logout` cancels the selected account's pending work and deletes its credentials and catalog.
 
 The authenticated `/api/accounts` endpoint exposes the Devin account snapshot. Its inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials.
+
+## Google Antigravity
+
+Install `agy` on the PiServer host and sign in as the OS user running PiServer. PiServer uses the CLI on its `PATH` or the executable at `PI_ANTIGRAVITY_CLI`. The CLI provides both the account's model catalog and inference through ACP in the server's working directory.
+
+In Pi Client, `/login google-antigravity` checks the existing CLI sign-in and reloads the catalog. Use `/model` to select a model. The client sends conversation deltas through ChunkRequest and handles Pi tool calls and approval prompts in the client session.
 
 ## Public Model Catalogs
 

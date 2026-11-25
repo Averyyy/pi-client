@@ -76,7 +76,7 @@ export async function runAuthLogout(args: string[], options: AuthLogoutOptions):
 	const status = modelRuntime.getProviderAuthStatus(provider?.id ?? providerRef);
 	if (status.configured) {
 		const sources = {
-			local_account: "the local Antigravity CLI",
+			local_account: status.label ?? "Antigravity CLI",
 			server_account: "a pi-server account",
 			stored: "stored credentials",
 			runtime: "a runtime API key",

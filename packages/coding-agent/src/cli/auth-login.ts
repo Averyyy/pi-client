@@ -84,17 +84,17 @@ export async function runAuthLogin(args: string[], options: AuthLoginOptions): P
 		return 1;
 	}
 
+	if (result.type === "local") {
+		const { label } = modelRuntime.getProviderAuthStatus(provider.id);
+		terminal.write(`Loaded ${provider.name} models from ${label}.`);
+		return 0;
+	}
 	const location =
-		result.type === "local"
-			? "Credentials managed by the local Antigravity CLI"
-			: result.type === "remote"
-				? "Credentials saved on pi-server"
-				: `Credentials saved to ${getAuthPath()}`;
+		result.type === "remote" ? "Credentials saved on pi-server" : `Credentials saved to ${getAuthPath()}`;
 	terminal.write(
 		`${authType.type === "oauth" ? `Logged in to ${provider.name}` : `Saved API key for ${provider.name}`}. ${location}`,
 	);
-	if (result.type !== "remote" && result.type !== "local")
-		await refreshProviderCatalog(provider, modelRuntime, terminal, signal);
+	if (result.type !== "remote") await refreshProviderCatalog(provider, modelRuntime, terminal, signal);
 	if (provider.id === RADIUS_PROVIDER_ID) configureRadiusMcpServer(provider, options);
 	return 0;
 }

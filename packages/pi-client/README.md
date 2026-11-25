@@ -50,7 +50,7 @@ If your server uses an auth token, set it on the client:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
-Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin accounts store and resolve their credentials on the server. Google Antigravity uses the local `agy` CLI.
+Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin accounts store and resolve their credentials on the server. Google Antigravity uses `agy` on the PiServer host.
 
 Ordinary built-in model catalogs come from pi-server's shared pi.dev cache. Server metadata takes precedence over bundled metadata for the same model type and ID, independently of the package build date. The client requests catalogs only for providers with configured authentication and determines chat, image, and classifier availability from its own credentials and configuration. OpenRouter's credential-specific model filtering runs on the client. The Devin catalog comes from PiServer and the Antigravity catalog comes from `agy`. Extensions and codemode scripts use the normal model registry APIs. MCP connections, tools, and other provider logins remain in the client process.
 
@@ -95,7 +95,7 @@ Protocol references: [pi-devin](https://github.com/mizorewww/pi-devin), [pi-devi
 
 ## Google Antigravity
 
-Install [Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) where `pi-client` runs. Run `/login google-antigravity`, follow the Google sign-in link, and paste the code Google displays. An existing `agy` sign-in works with `/model` directly.
+Install [Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) on the PiServer host and sign in to `agy` as the OS user running PiServer. In Pi Client, use `/model` to select a model from the server CLI's catalog. `/login google-antigravity` checks the existing `agy` sign-in and reloads that catalog. PiServer also runs the ACP conversation with `agy`.
 
 The CLI owns the account catalog, inference, and native tool permissions. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Pi custom tools run in the Pi process and return results to `agy` over MCP. In pi-server mode the read-only viewer can still show Pi's session activity.
 

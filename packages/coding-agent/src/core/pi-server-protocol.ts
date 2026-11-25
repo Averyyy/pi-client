@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { AnyModel, Message, ProviderResponse, Tool } from "@earendil-works/pi-ai";
+import type { AntigravityCallback } from "../antigravity.ts";
 
 export type PiServerProviderCallbackRequest =
 	| { callbackId: string; kind: "payload"; model: AnyModel; payload: unknown }
-	| { callbackId: string; kind: "response"; model: AnyModel; response: ProviderResponse };
+	| { callbackId: string; kind: "response"; model: AnyModel; response: ProviderResponse }
+	| { callbackId: string; kind: "antigravity"; model: AnyModel; request: AntigravityCallback };
 
 export interface PiServerStaticContext {
 	systemPrompt?: string;

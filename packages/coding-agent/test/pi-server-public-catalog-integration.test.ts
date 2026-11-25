@@ -92,7 +92,8 @@ describe("ModelRuntime public catalog through pi-server HTTP", () => {
 		);
 		serverUrl = await listen(server);
 		server.prependListener("request", (req) => {
-			clientRequests.push({ url: new URL(req.url ?? "", serverUrl), headers: req.headers });
+			const url = new URL(req.url ?? "", serverUrl);
+			if (url.pathname.startsWith("/api/model-catalog/")) clientRequests.push({ url, headers: req.headers });
 		});
 		vi.stubEnv("PI_SERVER_URL", serverUrl);
 		const networkFetch = globalThis.fetch;

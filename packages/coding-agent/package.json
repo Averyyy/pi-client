@@ -25,6 +25,10 @@
 		"./pi-server-request": {
 			"types": "./dist/core/pi-server-request.d.ts",
 			"import": "./dist/core/pi-server-request.js"
+		},
+		"./antigravity": {
+			"types": "./dist/antigravity.d.ts",
+			"import": "./dist/antigravity.js"
 		}
 	},
 	"files": [

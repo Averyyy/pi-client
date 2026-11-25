@@ -3,7 +3,7 @@
 ### Changed
 
 - Based on upstream Pi 1.6.0, including GPT-6.2 models, Codex prompt-cache fixes, and tool results for every call in a cancelled batch.
-- Routed Google Antigravity sign-in, models, and inference through the official local `agy` CLI.
+- Load Google Antigravity models and run inference through PiServer's `agy` CLI. `/login google-antigravity` checks the existing CLI sign-in.
 
 ### Fixed
 

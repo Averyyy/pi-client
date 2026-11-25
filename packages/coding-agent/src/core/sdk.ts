@@ -7,7 +7,8 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
-import { AntigravityRuntime } from "./antigravity-runtime.ts";
+import { answerAntigravityQuestion } from "./antigravity-interactions.ts";
+import { type AntigravityClient, AntigravityRuntime } from "./antigravity-runtime.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
@@ -17,7 +18,13 @@ import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
-import { type PiServerHistorySnapshot, type PiServerStreamOptions, streamPiServer } from "./pi-server-client.ts";
+import {
+	type PiServerHistorySnapshot,
+	type PiServerStreamOptions,
+	releasePiServerAntigravity,
+	streamPiServer,
+	streamPiServerAntigravity,
+} from "./pi-server-client.ts";
 import { PiServerObserver } from "./pi-server-observer.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -350,7 +357,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-	const antigravity = new AntigravityRuntime(cwd);
+	const antigravity = process.env.PI_SERVER_MODE === "true" ? undefined : new AntigravityRuntime(cwd);
 	const cacheWarmer = new CacheWarmer(
 		modelRuntime,
 		sessionManager,
@@ -453,20 +460,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const requestOptions = buildRequestOptions(options);
 				const session = agentSession;
 				if (!session || options?.sessionId !== session.sessionId) {
-					return new AntigravityRuntime(cwd).stream(model, context, requestOptions);
+					return modelRuntime.streamSimple(model, context, requestOptions);
 				}
 				cacheWarmer.cancel();
 				const runner = extensionRunnerRef.current;
-				return antigravity.stream(model, context, requestOptions, {
+				const ui = runner?.hasUI() ? runner.getUIContext() : undefined;
+				const client: AntigravityClient = {
 					executeTool: (call, assistant, signal) => session.executeAntigravityTool(call, assistant, signal),
 					recordUpdate: (acpSessionId, update) => session.recordAntigravityUpdate(acpSessionId, update),
-					questionUI: runner?.hasUI()
-						? { ui: runner.getUIContext(), events: session.resourceLoader.getEventBus?.() }
+					answerQuestion: ui
+						? (request, signal) =>
+								answerAntigravityQuestion(
+									request,
+									{ ui, events: session.resourceLoader.getEventBus?.() },
+									signal,
+								)
 						: undefined,
 					requestPermission: (title, choices, signal) =>
 						extensionRunnerRef.current?.getUIContext().select(title, choices, { signal }) ??
 						Promise.resolve(undefined),
-				});
+				};
+				return antigravity
+					? antigravity.stream(model, context, requestOptions, client)
+					: streamPiServerAntigravity(model, context, requestOptions, client);
 			}
 			const remote = process.env.PI_SERVER_MODE === "true";
 			const serverAccount = modelRuntime.isServerAccountProvider(model.provider);
@@ -611,7 +627,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	});
 	agentSession = session;
 	session.subscribe((event) => {
-		if (event.type === "session_disposed" || event.type === "session_tree_changed") void antigravity.close();
+		if (event.type === "session_disposed" || event.type === "session_tree_changed") {
+			if (antigravity) void antigravity.close();
+			else {
+				void releasePiServerAntigravity(session.sessionId).catch((error: unknown) =>
+					console.error(error instanceof Error ? error.message : String(error)),
+				);
+			}
+		}
 		if (event.type === "abort_start") cacheWarmer.cancel();
 		if (process.env.PI_TIMING !== "1") return;
 		if (event.type === "run_state_changed" && event.running) {

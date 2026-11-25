@@ -1,11 +1,15 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { AuthInteraction, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { type JsonRpcRequest, McpError, parseJsonRpcMessage } from "@earendil-works/pi-mcp";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { killProcessTree } from "../utils/shell.ts";
 
 export const ANTIGRAVITY_PROVIDER = "google-antigravity";
+
+export function isAntigravityAuthRequired(error: unknown): boolean {
+	return error instanceof McpError && error.code === -32000 && error.message === "Authentication required";
+}
 
 export interface AcpConfigOption {
 	id: string;
@@ -203,54 +207,11 @@ export async function readAntigravityModels(
 		}
 		return models;
 	} catch (error) {
-		if (error instanceof McpError && error.code === -32000 && error.message === "Authentication required")
-			return undefined;
+		if (isAntigravityAuthRequired(error)) return undefined;
 		if ((error as NodeJS.ErrnoException).code === "ENOENT" && !process.env.PI_ANTIGRAVITY_CLI) return undefined;
 		throw error;
 	} finally {
 		await acp.close();
-	}
-}
-
-/** Run the CLI's terminal sign-in inside Pi's existing login dialog. */
-export async function loginAntigravity(cwd: string, interaction: AuthInteraction): Promise<void> {
-	const { signal } = interaction;
-	signal?.throwIfAborted();
-	const child = spawnAgy(["--login"], cwd);
-	child.stderr.resume();
-	const completion = new Promise<void>((resolve, reject) => {
-		child.on("error", reject);
-		child.stdin.on("error", reject);
-		child.once("close", (code) => {
-			if (code === 0) resolve();
-			else reject(new Error(`Antigravity CLI sign-in failed (${code})`));
-		});
-	});
-	const prompt = new AbortController();
-	const promptSignal = signal ? AbortSignal.any([signal, prompt.signal]) : prompt.signal;
-	const lines = createInterface({ input: child.stdout });
-	const code = (async () => {
-		for await (const output of lines) {
-			const url = output.trim();
-			if (!url.startsWith("https://accounts.google.com/")) continue;
-			interaction.notify({ type: "auth_url", url, instructions: "Sign in and copy the code from Google." });
-			const code = await interaction.prompt({
-				type: "manual_code",
-				message: "Paste the Antigravity sign-in code",
-				signal: promptSignal,
-			});
-			child.stdin.end(`${code.trim()}\n`);
-			break;
-		}
-		await completion;
-	})();
-	try {
-		await raceWithAbortSignal(Promise.race([completion, code]), signal);
-	} finally {
-		prompt.abort();
-		lines.close();
-		stopAgy(child);
-		await Promise.allSettled([completion, code]);
 	}
 }
 

@@ -49,7 +49,7 @@ const packageDefs = [
 		id: "pi-coding-agent",
 		source: "packages/coding-agent",
 		name: "@averyyy/pi-coding-agent",
-		requiredFiles: ["dist/cli.js", "dist/core/pi-server-request.js"],
+		requiredFiles: ["dist/cli.js", "dist/core/pi-server-request.js", "dist/antigravity.js"],
 		removeFiles: ["npm-shrinkwrap.json"],
 		mutate: (pkg, version) => {
 			setDependency(pkg, "@earendil-works/pi-agent-core", `npm:@averyyy/pi-agent-core@${version}`);
@@ -74,6 +74,7 @@ const packageDefs = [
 		mutate: (pkg, version) => {
 			setDependency(pkg, "@earendil-works/pi-agent-core", `npm:@averyyy/pi-agent-core@${version}`);
 			setDependency(pkg, "@earendil-works/pi-ai", `npm:@averyyy/pi-ai@${version}`);
+			setDependency(pkg, "@earendil-works/pi-coding-agent", `npm:@averyyy/pi-coding-agent@${version}`);
 		},
 	},
 ];

@@ -70,7 +70,7 @@ export async function getProviderCredential(
 	options: { refresh: boolean },
 ): Promise<string | undefined> {
 	if (providerId === ANTIGRAVITY_PROVIDER) {
-		throw new AuthCommandError("Google Antigravity credentials are managed by the local agy CLI");
+		throw new AuthCommandError("Google Antigravity credentials are managed by agy");
 	}
 	if (modelRuntime.isServerAccountProvider(providerId)) {
 		throw new AuthCommandError(

@@ -56,7 +56,7 @@ interface LoginRun {
 
 export function accountProvider(value: unknown): ServerAccountProvider {
 	if (value === "devin") return value;
-	throw new Error("PiServer account provider must be devin. Google Antigravity uses the local agy CLI.");
+	throw new Error("PiServer account provider must be devin.");
 }
 
 /** One server process owns these credential and catalog files. */

@@ -66,7 +66,7 @@ The dummy key makes the model available to Pi; Ollama ignores it. For an authent
 
 Opening `/model` reloads the file. A `models` entry adds or replaces a model with the same ID on that provider. Use `modelOverrides` to change metadata for an existing built-in or extension-provided model without replacing the provider's model list. Unknown override IDs are ignored.
 
-Pi applies client `modelOverrides` to the PiServer Devin catalog and to the local Antigravity CLI catalog. For example, `contextWindow` sets the context budget Pi uses to decide when to compact. Antigravity manages its own context budget when Pi has no configured limit.
+Pi applies client `modelOverrides` to the PiServer Devin catalog and to the Antigravity CLI catalog. For example, `contextWindow` sets the context budget Pi uses to decide when to compact. Antigravity manages its own context budget when Pi has no configured limit.
 
 To route a built-in provider through a proxy, set only its `baseUrl`. Its models and authentication stay unchanged:
 

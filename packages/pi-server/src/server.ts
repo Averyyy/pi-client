@@ -39,12 +39,14 @@ import {
 	type Model,
 	type Models,
 	type ModelsSimpleStreamOptions,
+	normalizeContext,
 	type ProviderClassifier,
 	type ProviderRequestOptions,
 	type ProviderResponse,
 	type ProviderStreamOptions,
 	type ProviderStreams,
 	type SimpleStreamOptions,
+	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { cloudflareWorkersAISystemOneApi } from "@earendil-works/pi-ai/api/cloudflare-workers-ai-system-one.lazy";
 import { llamaCppClassifyApi } from "@earendil-works/pi-ai/api/llama-cpp-classify.lazy";
@@ -59,8 +61,17 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
+import {
+	ANTIGRAVITY_PROVIDER,
+	type AntigravityCallback,
+	type AntigravityClient,
+	AntigravityRuntime,
+	logoutAntigravity,
+	readAntigravityModels,
+} from "@earendil-works/pi-coding-agent/antigravity";
 import { accountProvider, ServerAccounts } from "./accounts.ts";
 import { withAnthropicSubscription } from "./anthropic-subscription.ts";
+import { AntigravitySessions } from "./antigravity-sessions.ts";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
@@ -94,6 +105,7 @@ export { loadConfig, type ServerConfig } from "./config.ts";
 
 interface ServerRuntime extends ServerConfig {
 	accounts: ServerAccounts;
+	antigravity: AntigravitySessions;
 	viewer: ViewerHttp;
 	deletingSessions: Map<string, Promise<void>>;
 	requestVersion: RequestVersion;
@@ -117,6 +129,7 @@ interface StreamRequestBody {
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
+	antigravity?: { retainSession: boolean; questions: boolean; baseRunId?: string };
 }
 
 interface SessionSyncBody {
@@ -225,6 +238,7 @@ interface StreamRunRecord {
 	kind: "stream" | "compact" | "image" | "classifier" | "deferred-cancel";
 	status: "running" | "completed" | "failed" | "aborted";
 	message?: AssistantMessage;
+	executedToolResults?: readonly ToolResultMessage[];
 	cacheRetention?: CacheRetention;
 	compactResult?: SessionCompactSuccessBody;
 	operationResult?:
@@ -362,6 +376,7 @@ function startStreamRun(sessionId: string, runId: string, kind: StreamRunRecord[
 	if (existing) {
 		run.callbackConnectionClosed = false;
 		run.message = undefined;
+		run.executedToolResults = undefined;
 		run.cacheRetention = undefined;
 		run.errorMessage = undefined;
 		run.cancelRequested = false;
@@ -387,6 +402,7 @@ function streamRunResponseBody(run: StreamRunRecord) {
 		createdAt: run.createdAt,
 		updatedAt: run.updatedAt,
 		...(run.message ? { message: run.message } : {}),
+		...(run.executedToolResults ? { executedToolResults: run.executedToolResults } : {}),
 		...(run.cacheRetention !== undefined ? { cacheRetention: run.cacheRetention } : {}),
 		...(run.compactResult ? { compactResult: run.compactResult } : {}),
 		...(run.operationResult ? { operationResult: run.operationResult } : {}),
@@ -446,7 +462,7 @@ function completeStreamRun(run: StreamRunRecord | undefined, message: AssistantM
 	if (!run) return;
 	if (run.cancelRequested) {
 		run.status = "aborted";
-		run.message = undefined;
+		run.message = run.executedToolResults ? message : undefined;
 		run.errorMessage = "Stream run aborted";
 		run.updatedAt = Date.now();
 		return;
@@ -461,6 +477,7 @@ function failStreamRun(run: StreamRunRecord | undefined, errorMessage: string, m
 	if (!run) return;
 	if (run.cancelRequested) {
 		run.status = "aborted";
+		if (run.executedToolResults) run.message = message;
 		run.errorMessage = "Stream run aborted";
 		run.updatedAt = Date.now();
 		return;
@@ -481,12 +498,7 @@ function rejectProviderCallbacks(run: StreamRunRecord, error: Error): void {
 	for (const callback of pending) callback.reject(error);
 }
 
-function createProviderCallbacks<TModel extends AnyModel>(
-	run: StreamRunRecord,
-	res: ServerResponse,
-	callbacks: { onPayload?: boolean; onResponse?: boolean } | undefined,
-): Pick<ProviderRequestOptions<TModel>, "onPayload" | "onResponse"> {
-	if (!callbacks?.onPayload && !callbacks?.onResponse) return {};
+function createRunCallback(run: StreamRunRecord, res: ServerResponse) {
 	res.once("close", () => {
 		run.callbackConnectionClosed = true;
 		rejectProviderCallbacks(run, new Error("Provider callback connection closed"));
@@ -496,7 +508,7 @@ function createProviderCallbacks<TModel extends AnyModel>(
 		() => rejectProviderCallbacks(run, new DOMException("Provider run aborted", "AbortError")),
 		{ once: true },
 	);
-	const requestCallback = (request: PiServerProviderCallbackRequest): Promise<unknown> => {
+	return (request: PiServerProviderCallbackRequest): Promise<unknown> => {
 		if (run.controller.signal.aborted) return Promise.reject(new DOMException("Provider run aborted", "AbortError"));
 		if (run.callbackConnectionClosed || res.destroyed || res.writableEnded)
 			return Promise.reject(new Error("Provider callback connection closed"));
@@ -510,6 +522,15 @@ function createProviderCallbacks<TModel extends AnyModel>(
 			}
 		});
 	};
+}
+
+function createProviderCallbacks<TModel extends AnyModel>(
+	run: StreamRunRecord,
+	res: ServerResponse,
+	callbacks: { onPayload?: boolean; onResponse?: boolean } | undefined,
+): Pick<ProviderRequestOptions<TModel>, "onPayload" | "onResponse"> {
+	if (!callbacks?.onPayload && !callbacks?.onResponse) return {};
+	const requestCallback = createRunCallback(run, res);
 	return {
 		...(callbacks.onPayload
 			? {
@@ -633,6 +654,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 		recordDeletion(id);
 		const operation = Promise.resolve().then(async () => {
 			await deleteStreamRunsForSession(id);
+			await config.antigravity.release(id);
 			deletePersistedSession(config.sessionStoreDir, id);
 			await config.viewer.store.remove(id);
 			deleteSessionFromStore(id);
@@ -1349,13 +1371,13 @@ export function buildStreamContext(
 	};
 }
 
-function handleStream(
+async function handleStream(
 	config: ServerRuntime,
 	body: StreamRequestBody,
 	res: ServerResponse,
 	models: Models | undefined,
 	requestStartedAt: number,
-): void {
+): Promise<void> {
 	const timing = body.observeTiming
 		? {
 				bodyReadyMs: performance.now() - requestStartedAt,
@@ -1390,14 +1412,19 @@ function handleStream(
 
 	cleanupExpiredStreamRuns(Date.now());
 
-	const session = getOrCreateSession(body.sessionId);
+	const agy = body.antigravity;
+	if (agy && (!body.runId || !Array.isArray(body.contextOverlay))) {
+		sendError(res, 400, "Antigravity requires a runId and a context delta", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	const session = agy ? undefined : getOrCreateSession(body.sessionId);
 
-	if (body.staticContext) {
+	if (session && body.staticContext) {
 		setStaticContext(body.sessionId, body.staticContext);
 		persistSession(config, session);
 	}
 
-	if (!session.staticContext && !body.staticContext) {
+	if (session && !session.staticContext && !body.staticContext) {
 		sendError(
 			res,
 			400,
@@ -1416,7 +1443,6 @@ function handleStream(
 		return;
 	}
 
-	const context = buildStreamContext(session, body);
 	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 
 	const resolvedModel = body.model;
@@ -1432,6 +1458,9 @@ function handleStream(
 		if (existingRun.cacheRetention !== undefined) {
 			writeServerSentEvent(res, "cache_policy", { cacheRetention: existingRun.cacheRetention });
 		}
+		if (existingRun.executedToolResults) {
+			writeServerSentEvent(res, "antigravity_tool_results", existingRun.executedToolResults);
+		}
 		for (const event of replayStreamRun(existingRun)) {
 			writeStreamEvent(res, event);
 		}
@@ -1446,9 +1475,26 @@ function handleStream(
 		sendError(res, 409, "A stream with this runId is already in progress", PiServerErrorCode.RUN_IN_PROGRESS);
 		return;
 	}
+	if (agy && existingRun?.status === "failed") {
+		sendError(res, 409, existingRun.errorMessage ?? "The Antigravity turn failed", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+
+	let agySession: ReturnType<AntigravitySessions["begin"]> | undefined;
+	if (agy?.retainSession) {
+		try {
+			agySession = config.antigravity.begin(body.sessionId, agy.baseRunId, body.contextOverlay!);
+		} catch (error) {
+			sendError(res, 409, (error as Error).message, PiServerErrorCode.INVALID_REQUEST);
+			return;
+		}
+	}
+	const context: Context = session
+		? buildStreamContext(session, body)
+		: { messages: agySession?.messages ?? body.contextOverlay! };
 
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
-	const providerCallbacks = run ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {};
+	const providerCallbacks = run && !agy ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {};
 	let upstreamStatus: number | undefined;
 	let upstreamResponses = 0;
 	let terminalSeen = false;
@@ -1542,11 +1588,42 @@ function handleStream(
 	heartbeat.unref();
 
 	let stream: AsyncIterable<AssistantMessageEvent>;
+	let agyStream: ReturnType<AntigravityRuntime["stream"]> | undefined;
 	const activityVersion = config.requestVersion;
 	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
-		if (body.requestKind === "deferred") {
+		if (agy) {
+			const runtime = agySession?.runtime ?? new AntigravityRuntime(process.cwd(), "PiServer");
+			if (agySession?.reset) await runtime.close();
+			const requestCallback = createRunCallback(run!, res);
+			const ask = <T>(request: AntigravityCallback) =>
+				requestCallback({
+					callbackId: randomUUID(),
+					kind: "antigravity",
+					model: { ...resolvedModel, headers: undefined },
+					request,
+				}) as Promise<T>;
+			const client: AntigravityClient | undefined = agySession
+				? {
+						executeTool: (call, assistant) => ask({ kind: "tool", call, assistant }),
+						requestPermission: (title, choices) => ask({ kind: "permission", title, choices }),
+						...(agy.questions ? { answerQuestion: (request) => ask({ kind: "question", request }) } : {}),
+						recordUpdate: (sessionId, update) => {
+							if (!res.destroyed && !res.writableEnded) {
+								writeServerSentEvent(res, "antigravity_update", { sessionId, update });
+							}
+						},
+					}
+				: undefined;
+			agyStream = runtime.stream(
+				resolvedModel,
+				normalizeContext(context),
+				{ signal: run!.controller.signal, reasoning: body.options?.reasoning, timeoutMs: body.options?.timeoutMs },
+				client,
+			);
+			stream = agyStream;
+		} else if (body.requestKind === "deferred") {
 			stream = (models ?? builtinModels()).streamDeferred(resolvedModel, body.deferredHandle!, streamOptions);
 		} else {
 			const requestModels = models ?? createRequestModels(resolvedModel, streamOptions);
@@ -1556,6 +1633,7 @@ function handleStream(
 					: requestModels.streamSimple(resolvedModel, context, streamOptions);
 		}
 	} catch (err) {
+		if (agySession) await config.antigravity.release(body.sessionId);
 		clearInterval(heartbeat);
 		logFailure("dispatch", err);
 		const message = err instanceof Error ? err.message : String(err);
@@ -1588,7 +1666,16 @@ function handleStream(
 					timing.firstContentMs = performance.now() - requestStartedAt;
 					sendTiming();
 				}
-				if (event.type === "done" || event.type === "error") sendTiming();
+				if (event.type === "done" || event.type === "error") {
+					sendTiming();
+					if (agyStream && run) {
+						run.executedToolResults = agyStream.executedToolResults;
+						if (event.type === "done") {
+							agySession?.complete(run.runId, [event.message, ...agyStream.executedToolResults]);
+						}
+						writeServerSentEvent(res, "antigravity_tool_results", run.executedToolResults);
+					}
+				}
 				const proxyEvent = toProxyEvent(event);
 				if (proxyEvent) {
 					touchStreamRun(run);
@@ -1612,6 +1699,7 @@ function handleStream(
 			writeStreamError(res, message);
 		} finally {
 			clearInterval(heartbeat);
+			if (agySession && run?.status !== "completed") await config.antigravity.release(body.sessionId);
 			if (!terminalSeen) logFailure("stream", undefined, undefined, "stream_ended_without_terminal");
 			if (run?.status === "running") {
 				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
@@ -1647,15 +1735,40 @@ async function handlePostRequest(
 		await handleAccountRequest(config.accounts, pathname, body, res);
 		return true;
 	}
+	if (pathname === "/api/antigravity/logout") {
+		await logoutAntigravity(process.cwd(), AbortSignal.timeout(15_000));
+		sendJson(res, 200, { loggedIn: false });
+		return true;
+	}
+	if (pathname === "/api/antigravity/release") {
+		const { sessionId, runId } = (body as { sessionId?: unknown; runId?: unknown } | null) ?? {};
+		if (typeof sessionId !== "string" || !sessionId || typeof runId !== "string" || !runId) {
+			sendError(res, 400, "sessionId and runId are required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+			return true;
+		}
+		const released = await config.antigravity.releaseIdle(sessionId, runId);
+		sendJson(res, 200, { released });
+		return true;
+	}
 	const accountRequest = body as {
 		model: AnyModel;
 		options?: SimpleStreamOptions & { authSource?: "server-account" };
+		antigravity?: StreamRequestBody["antigravity"];
 	} | null;
-	if (
-		accountRequest?.model?.provider === "google-antigravity" ||
-		accountRequest?.model?.api === "google-antigravity"
-	) {
-		sendJson(res, 400, { error: "Google Antigravity uses the local agy CLI. Update pi-client to use it." });
+	const agyModel =
+		accountRequest?.model?.provider === ANTIGRAVITY_PROVIDER || accountRequest?.model?.api === ANTIGRAVITY_PROVIDER;
+	if (agyModel || accountRequest?.antigravity) {
+		if (
+			pathname !== "/api/stream" ||
+			!accountRequest?.antigravity ||
+			accountRequest.model?.provider !== ANTIGRAVITY_PROVIDER ||
+			accountRequest.model.api !== ANTIGRAVITY_PROVIDER ||
+			accountRequest.options?.authSource
+		) {
+			sendError(res, 400, "Antigravity requires an agy stream request", PiServerErrorCode.INVALID_REQUEST);
+			return true;
+		}
+		await handleStream(config, body as StreamRequestBody, res, undefined, requestStartedAt);
 		return true;
 	}
 	if (accountRequest?.options?.authSource === "server-account") {
@@ -1733,7 +1846,7 @@ async function handlePostRequest(
 	}
 
 	if (pathname === "/api/stream") {
-		handleStream(config, body as StreamRequestBody, res, streamModels, requestStartedAt);
+		await handleStream(config, body as StreamRequestBody, res, streamModels, requestStartedAt);
 		return true;
 	}
 
@@ -2023,6 +2136,7 @@ export function createPiServer(
 	const config: ServerRuntime = {
 		...serverConfig,
 		accounts: accountsOverride ?? new ServerAccounts(serverConfig.accountStoreDir),
+		antigravity: new AntigravitySessions(),
 		viewer,
 		deletingSessions: new Map(),
 		requestVersion: { version: 0 },
@@ -2096,6 +2210,18 @@ export function createPiServer(
 		}
 		if (req.method === "GET" && url.pathname === "/api/sessions") {
 			sendJson(res, 200, { sessions: listSessions() });
+			return;
+		}
+		if (req.method === "GET" && url.pathname === "/api/antigravity/models") {
+			const controller = new AbortController();
+			res.once("close", () => controller.abort());
+			try {
+				const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
+				const models = await readAntigravityModels(process.cwd(), signal);
+				if (!res.destroyed) sendJson(res, 200, { models: models ?? null });
+			} catch (error) {
+				if (!res.destroyed) sendError(res, 502, error instanceof Error ? error.message : String(error));
+			}
 			return;
 		}
 		if (req.method === "GET" && url.pathname === "/api/accounts") {
@@ -2262,7 +2388,7 @@ export function createPiServer(
 		const accountCleanup = config.accounts.close();
 		const catalogCleanup = catalog.close();
 		return close.call(this, (error) => {
-			void Promise.all([viewer.store.flush(), accountCleanup, catalogCleanup]).then(
+			void Promise.all([viewer.store.flush(), accountCleanup, catalogCleanup, config.antigravity.close()]).then(
 				() => callback?.(error),
 				(cleanupError: unknown) =>
 					callback?.(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))),

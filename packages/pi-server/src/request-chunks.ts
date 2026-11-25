@@ -24,6 +24,8 @@ const ALLOWED_TARGETS = new Set([
 	"/api/accounts/login/cancel",
 	"/api/accounts/logout",
 	"/api/accounts/refresh",
+	"/api/antigravity/logout",
+	"/api/antigravity/release",
 ]);
 
 export interface RequestChunkBody {

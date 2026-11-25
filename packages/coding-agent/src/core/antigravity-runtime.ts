@@ -17,11 +17,17 @@ import {
 } from "@earendil-works/pi-ai";
 import { McpError } from "@earendil-works/pi-mcp";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import { type AcpConfigOption, type AcpSession, AntigravityAcp, acpChoices } from "./antigravity-acp.ts";
+import {
+	type AcpConfigOption,
+	type AcpSession,
+	AntigravityAcp,
+	acpChoices,
+	isAntigravityAuthRequired,
+} from "./antigravity-acp.ts";
 import {
 	type AcpFormRequest,
 	type AcpPlanEntry,
-	answerAntigravityQuestion,
+	type answerAntigravityQuestion,
 	antigravityPlanResult,
 } from "./antigravity-interactions.ts";
 import { type AntigravityToolExecutor, openAntigravityTools } from "./antigravity-tools.ts";
@@ -47,14 +53,14 @@ interface AcpUpdate {
 	name?: string;
 }
 
-interface AntigravityClient {
+export interface AntigravityClient {
 	executeTool?: (
 		call: Parameters<AntigravityToolExecutor>[0],
 		assistant: AssistantMessage,
 		signal: AbortSignal,
 	) => ReturnType<AntigravityToolExecutor>;
 	requestPermission?: (title: string, options: string[], signal?: AbortSignal) => Promise<string | undefined>;
-	questionUI?: Parameters<typeof answerAntigravityQuestion>[1];
+	answerQuestion?: (request: AcpFormRequest, signal: AbortSignal) => ReturnType<typeof answerAntigravityQuestion>;
 	recordUpdate?: (sessionId: string, update: JsonObject) => void;
 }
 
@@ -74,6 +80,7 @@ interface Conversation {
 /** A Pi session's live Antigravity conversation. Pi owns the visible transcript, agy owns its turn loop. */
 export class AntigravityRuntime {
 	private readonly cwd: string;
+	private readonly host: "Pi" | "PiServer";
 	private acp: AntigravityAcp | undefined;
 	private conversation: Conversation | undefined;
 	private toolServer: Awaited<ReturnType<typeof openAntigravityTools>> | undefined;
@@ -89,8 +96,9 @@ export class AntigravityRuntime {
 		  }
 		| undefined;
 
-	constructor(cwd: string) {
+	constructor(cwd: string, host: "Pi" | "PiServer" = "Pi") {
 		this.cwd = cwd;
+		this.host = host;
 	}
 
 	stream(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions, client?: AntigravityClient) {
@@ -146,7 +154,11 @@ export class AntigravityRuntime {
 				emit.end();
 				output.content.unshift(...toolCalls);
 				output.stopReason = signal?.aborted ? "aborted" : "error";
-				output.errorMessage = error instanceof Error ? error.message : String(error);
+				output.errorMessage = isAntigravityAuthRequired(error)
+					? `Sign in to agy on the machine running ${this.host}.`
+					: error instanceof Error
+						? error.message
+						: String(error);
 				stream.push({ type: "error", reason: output.stopReason, error: output });
 			} finally {
 				stream.end();
@@ -215,7 +227,7 @@ export class AntigravityRuntime {
 							update.sessionUpdate === "plan_update" ||
 							update.sessionUpdate === "plan_removed"
 						) {
-							client?.recordUpdate?.(sessionId, update);
+							this.activeTurn?.client?.recordUpdate?.(sessionId, update);
 						}
 						if (
 							(update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
@@ -249,7 +261,7 @@ export class AntigravityRuntime {
 							toolCall?.name === "ask_question" ||
 							(toolCall?.toolCallId && this.conversation?.questionToolIds.has(toolCall.toolCallId));
 						let result: AcpPermissionResult;
-						if (isQuestion && title && request.sessionId && this.activeTurn?.client?.questionUI) {
+						if (isQuestion && title && request.sessionId && this.activeTurn?.client?.answerQuestion) {
 							const answer = await this.activeTurn.answerQuestion({
 								sessionId: request.sessionId,
 								mode: "form",
@@ -276,7 +288,7 @@ export class AntigravityRuntime {
 							result = await answerPermission(request, this.activeTurn?.client, this.activeTurn?.signal);
 						}
 						if (request.sessionId && toolCall?.toolCallId) {
-							client?.recordUpdate?.(request.sessionId, {
+							this.activeTurn?.client?.recordUpdate?.(request.sessionId, {
 								sessionUpdate: "permission_response",
 								toolCallId: toolCall.toolCallId,
 								...(title ? { title } : {}),
@@ -297,7 +309,7 @@ export class AntigravityRuntime {
 				},
 			);
 			this.acp = acp;
-			const { agentCapabilities } = await acp.initialize(setupSignal, Boolean(client?.questionUI));
+			const { agentCapabilities } = await acp.initialize(setupSignal, client?.answerQuestion !== undefined);
 			if (this.toolServer && !agentCapabilities?.mcpCapabilities?.http) {
 				throw new Error("Antigravity CLI does not support ACP HTTP MCP servers. Update agy.");
 			}
@@ -354,11 +366,12 @@ export class AntigravityRuntime {
 			signal,
 			update: onUpdate,
 			answerQuestion: async (request) => {
-				if (!client?.questionUI) throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
-				const questionUI = client.questionUI;
+				if (!client?.answerQuestion)
+					throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
+				const answerQuestion = client.answerQuestion;
 				return track(
 					(async () => {
-						const { result, outcome } = await answerAntigravityQuestion(request, questionUI, questionSignal);
+						const { result, outcome } = await answerQuestion(request, questionSignal);
 						addToolResult(outcome);
 						return result;
 					})(),
