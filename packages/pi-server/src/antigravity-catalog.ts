@@ -1,7 +1,7 @@
 // PiServer's Antigravity model catalog, discovered from the agy CLI on this machine.
 import type { Model } from "@earendil-works/pi-ai";
 import { readAntigravityModels } from "@earendil-works/pi-coding-agent/antigravity";
-import { ACCOUNT_REFRESH_INTERVAL_MS, ACCOUNT_REFRESH_TIMEOUT_MS } from "./accounts.ts";
+import { ACCOUNT_REFRESH_TIMEOUT_MS } from "./accounts.ts";
 
 /** `models: null` means agy is missing or signed out; a failed discovery keeps the last catalog and reports why. */
 export interface AntigravityCatalogSnapshot {
@@ -10,28 +10,22 @@ export interface AntigravityCatalogSnapshot {
 }
 
 /**
- * Discovers at startup, every four hours, and on explicit refresh, like the server account catalogs,
- * so client startups read the cached catalog instead of each starting an agy process.
+ * Starts agy only when a person needs the catalog: on the first read, then on explicit refresh
+ * (`/model`, `/login`). No timer starts agy in the background, and client startups share the cache.
  */
 export class AntigravityCatalog {
 	private readonly cwd: () => string;
-	private current: AntigravityCatalogSnapshot = { models: null };
+	private current: AntigravityCatalogSnapshot | undefined;
 	private pending: Promise<AntigravityCatalogSnapshot> | undefined;
-	private readonly ready: Promise<AntigravityCatalogSnapshot>;
-	private readonly timer: ReturnType<typeof setInterval>;
 
 	/** `cwd` gives the directory agy's discovery session runs in. */
 	constructor(cwd: () => string) {
 		this.cwd = cwd;
-		this.ready = this.refresh();
-		this.timer = setInterval(() => void this.refresh(), ACCOUNT_REFRESH_INTERVAL_MS);
-		this.timer.unref();
 	}
 
-	/** The catalog after startup discovery. */
+	/** The cached catalog, discovered on the first read. */
 	async snapshot(): Promise<AntigravityCatalogSnapshot> {
-		await this.ready;
-		return this.current;
+		return this.current ?? this.refresh();
 	}
 
 	/** Discover again; concurrent callers share one agy process. */
@@ -42,7 +36,7 @@ export class AntigravityCatalog {
 				this.current = { models: models ?? null };
 			} catch (error) {
 				this.current = {
-					models: this.current.models,
+					models: this.current?.models ?? null,
 					error: error instanceof Error ? error.message : String(error),
 				};
 			} finally {
@@ -54,7 +48,6 @@ export class AntigravityCatalog {
 	}
 
 	async close(): Promise<void> {
-		clearInterval(this.timer);
 		await this.pending;
 	}
 }

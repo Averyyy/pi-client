@@ -38,7 +38,7 @@ describe("AgentSession compaction model overrides", () => {
 	});
 
 	it.each(["manual", "auto"] as const)(
-		"keeps virtual %s compaction routed to Antigravity on the client",
+		"refuses virtual %s compaction routed to Antigravity before any request",
 		async (mode) => {
 			const harness = await createHarness({
 				settings: { compaction: { model: "router/summary", keepRecentTokens: 150 } },
@@ -62,23 +62,20 @@ describe("AgentSession compaction model overrides", () => {
 			});
 			harness.session.agent.streamFunction = streamLocal;
 
+			// agy answers only the person driving the session; Pi's summaries go to another model.
 			if (mode === "manual") {
-				await harness.session.compact();
+				await expect(harness.session.compact()).rejects.toThrow("compaction.model");
 			} else {
 				const session = harness.session as unknown as {
 					_runAutoCompaction(reason: "threshold", willRetry: boolean): Promise<boolean>;
 				};
-				await session._runAutoCompaction("threshold", false);
+				expect(await session._runAutoCompaction("threshold", false)).toBe(false);
+				expect(harness.eventsOfType("compaction_end")[0]?.errorMessage).toContain("compaction.model");
 			}
 
 			expect(route).toHaveBeenCalledOnce();
 			expect(compactRemote).not.toHaveBeenCalled();
-			expect(streamLocal).toHaveBeenCalledWith(
-				expect.objectContaining({ provider: ANTIGRAVITY_PROVIDER }),
-				expect.anything(),
-				expect.anything(),
-			);
-			expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe("summary");
+			expect(streamLocal).not.toHaveBeenCalled();
 		},
 	);
 

@@ -1,4 +1,4 @@
-// A Pi session's live agy ACP conversation: Pi owns the visible transcript, agy owns its turn loop.
+// A Pi session's live agy ACP conversation: agy is the agent, Pi shows and records its turns.
 import { createHash } from "node:crypto";
 import { type AgentToolCallOutcome, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import {
@@ -7,7 +7,6 @@ import {
 	type AssistantMessageEventStream,
 	createAssistantMessageEventStream,
 	getCurrentSystemMessage,
-	getSystemMessageText,
 	type ImageContent,
 	type JsonObject,
 	type Message,
@@ -17,6 +16,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 	type TranscriptContext,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { McpError } from "@earendil-works/pi-mcp";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
@@ -24,6 +24,7 @@ import {
 	type AcpConfigOption,
 	type AcpInitialize,
 	type AcpSession,
+	ANTIGRAVITY_PROVIDER,
 	AntigravityAcp,
 	acpChoices,
 	isAntigravityAuthRequired,
@@ -34,8 +35,10 @@ import {
 	type answerAntigravityQuestion,
 	antigravityPlanResult,
 } from "./antigravity-interactions.ts";
+import { type AcpToolCallUpdate, AntigravityNativeTools } from "./antigravity-native-tools.ts";
 import { type AntigravityToolExecutor, openAntigravityTools } from "./antigravity-tools.ts";
 import type { AntigravityWorkspaceRequest } from "./antigravity-workspace.ts";
+import { BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX } from "./messages.ts";
 
 interface AcpPermission {
 	sessionId?: string;
@@ -58,6 +61,12 @@ interface AcpUpdate {
 	name?: string;
 }
 
+/** agy's report of a compaction of its own context; wire input. */
+export type AcpCompactionUpdate =
+	| { sessionUpdate: "compaction_update"; compactionId: string; status: string; error?: string | null }
+	| { sessionUpdate: "compaction_summary_chunk"; compactionId: string };
+
+/** What the interactive Pi session offers agy. Without one, agy does not run. */
 export interface AntigravityClient {
 	executeTool?: (
 		call: Parameters<AntigravityToolExecutor>[0],
@@ -66,46 +75,53 @@ export interface AntigravityClient {
 	) => ReturnType<AntigravityToolExecutor>;
 	requestPermission?: (title: string, options: string[], signal?: AbortSignal) => Promise<string | undefined>;
 	answerQuestion?: (request: AcpFormRequest, signal: AbortSignal) => ReturnType<typeof answerAntigravityQuestion>;
-	recordUpdate?: (sessionId: string, update: JsonObject) => void;
+	/** Show one of agy's own tool calls while it runs. */
+	showToolCall?: (update: AcpToolCallUpdate) => void;
+	/** Show a compaction agy makes of its own context. */
+	showCompaction?: (update: AcpCompactionUpdate) => void;
 	/** Serve agy's `fs/*` and `terminal/*` requests in the Pi workspace. */
 	workspace?: (request: AntigravityWorkspaceRequest, signal: AbortSignal) => Promise<unknown>;
+	/** Pi tools agy may call over MCP: those from extensions and the SDK, never Pi's built-in tools. */
+	toolNames?: readonly string[];
 }
 
 /** What a host stores to resume a conversation in a new agy process. */
 export interface AntigravitySavedConversation {
 	sessionId: string;
-	/** Digest of the system prompt, the tools, and the first `length` transcript messages agy holds. */
-	digest: string;
-	length: number;
+	/** Digest of the agy reply that ends the session; a branch without that reply starts a new session. */
+	reply: string;
 }
-
-/** How Pi's system prompt reaches agy: ACP `systemPrompt`, the agy `_meta` extension, or the first prompt. */
-type SystemPromptRoute = "acp" | "antigravity" | "prompt";
 
 interface Conversation {
 	sessionId: string;
 	configOptions: AcpConfigOption[];
-	history: Message[];
-	digest: string;
-	systemPrompt: string;
 	toolDefinitions: string;
-	/** Instructions still owed to agy in the next prompt when it accepts no system prompt. */
-	pendingInstructions: string;
+	/** Digest of agy's latest reply in this session; undefined before its first completed turn. */
+	reply: string | undefined;
 	supportsImages: boolean;
 	plans: Map<string | null, AcpPlanEntry[]>;
 	planChanged: boolean;
 	questionToolIds: Set<string>;
+	nativeTools: AntigravityNativeTools;
 }
 
 interface ActiveTurn {
-	client?: AntigravityClient;
+	client: AntigravityClient;
 	executeTool?: AntigravityToolExecutor;
 	answerQuestion(request: AcpFormRequest): Promise<Awaited<ReturnType<typeof answerAntigravityQuestion>>["result"]>;
+	addToolResult(outcome: AgentToolCallOutcome): void;
 	signal: AbortSignal;
 	update(update: AcpUpdate): void;
 }
 
-/** A Pi session's live Antigravity conversation. Pi owns the visible transcript, agy owns its turn loop. */
+/** Why agy refuses requests that do not come from the person driving a Pi session. */
+export const ANTIGRAVITY_SESSION_ONLY =
+	"Antigravity runs only as the agent of an interactive Pi session. Choose another model for summaries and extension requests, for example with the compaction.model setting.";
+
+/**
+ * A Pi session's live Antigravity conversation. agy owns its instructions, context, and tools;
+ * Pi sends only what the user enters each turn and records agy's replies and tool calls.
+ */
 export class AntigravityRuntime {
 	private readonly cwd: string;
 	private readonly host: "Pi" | "PiServer";
@@ -156,23 +172,16 @@ export class AntigravityRuntime {
 		void (async () => {
 			try {
 				stream.push({ type: "start", partial: output });
-				const reason = await this.prompt(
-					model,
-					context,
-					options,
-					client,
-					output,
-					emit.update,
-					addToolResult,
-					executedToolResults,
-				);
-				if (!client || reason === "cancelled") await this.close();
+				// agy serves a person driving an interactive Pi session, never Pi's own background requests.
+				if (!client) throw new Error(ANTIGRAVITY_SESSION_ONLY);
+				const reason = await this.prompt(model, context, options, client, output, emit.update, addToolResult);
+				if (reason === "cancelled") await this.close();
 				emit.end();
 				if (signal?.aborted || reason === "cancelled") throw new Error("Antigravity turn cancelled");
 				if (reason === "max_turn_requests") throw new Error("Antigravity reached its turn request limit");
 				if (this.conversation) {
-					const { sessionId, digest, history } = this.conversation;
-					this.saved = { sessionId, digest, length: history.length };
+					this.conversation.reply = digestReply(output);
+					this.saved = { sessionId: this.conversation.sessionId, reply: this.conversation.reply };
 				}
 				output.stopReason = reason === "max_tokens" ? "length" : "stop";
 				output.rawStopReason = reason;
@@ -207,39 +216,44 @@ export class AntigravityRuntime {
 		model: Model<Api>,
 		context: TranscriptContext,
 		options: SimpleStreamOptions | undefined,
-		client: AntigravityClient | undefined,
+		client: AntigravityClient,
 		output: AssistantMessage,
 		onUpdate: (update: AcpUpdate) => void,
 		addToolResult: (outcome: AgentToolCallOutcome) => void,
-		toolResults: readonly ToolResultMessage[],
 	): Promise<string> {
 		const signal = operationSignal(options?.signal);
 		const setupSignal = AbortSignal.any([signal, AbortSignal.timeout(options?.timeoutMs ?? 30_000)]);
-		const systemMessage = getCurrentSystemMessage(context.messages);
-		const systemPrompt = systemMessage ? getSystemMessageText(systemMessage) : "";
-		const activeTools = systemMessage?.toolsAdded ?? [];
+		const activeTools = getCurrentSystemMessage(context.messages)?.toolsAdded ?? [];
 		const showTodo = activeTools.some((tool) => tool.name === "todo");
-		const tools = activeTools.filter((tool) => tool.name !== "todo" && tool.name !== "ask_user_question");
+		const exposed = new Set(client.toolNames);
+		// agy's native plan and questions stand in for Pi's todo and ask_user_question tools.
+		const tools = activeTools.filter(
+			(tool) => exposed.has(tool.name) && tool.name !== "todo" && tool.name !== "ask_user_question",
+		);
 		const toolDefinitions = JSON.stringify(tools);
 		const history = context.messages.filter((message) => message.role !== "system");
+		const prompt = promptBlocks(history);
+		if (prompt.length === 0) throw new Error("Antigravity needs a new user message to start a turn");
+		const lastReply = history.findLast(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" && message.provider === ANTIGRAVITY_PROVIDER,
+		);
+		const reply = lastReply && digestReply(lastReply);
 		const previous = this.conversation;
-		const reuse =
+		const conversation =
 			previous &&
-			previous.systemPrompt === systemPrompt &&
-			previous.toolDefinitions === toolDefinitions &&
-			previous.history.length < history.length &&
-			previous.history.every((message, index) => sameMessage(message, history[index]));
-		const conversation = reuse
-			? previous
-			: await this.open(systemPrompt, tools, toolDefinitions, history, client, setupSignal);
+			previous.reply !== undefined &&
+			previous.reply === reply &&
+			previous.toolDefinitions === toolDefinitions
+				? previous
+				: await this.open(tools, toolDefinitions, reply, client, setupSignal);
 		const acp = this.acp!;
 		await selectModel(acp, conversation, model.id, options?.reasoning, setupSignal);
-		const prompt = promptBlocks(history.slice(conversation.history.length), conversation.pendingInstructions);
 		if (prompt.some((part) => part.type === "image") && !conversation.supportsImages) {
 			throw new Error("Antigravity CLI does not support images over ACP");
 		}
 		setupSignal.throwIfAborted();
-		const execute = client?.executeTool;
+		const execute = client.executeTool;
 		const calls = new Set<Promise<unknown>>();
 		const questionController = new AbortController();
 		const questionSignal = AbortSignal.any([signal, questionController.signal]);
@@ -255,8 +269,9 @@ export class AntigravityRuntime {
 			client,
 			signal,
 			update: onUpdate,
+			addToolResult,
 			answerQuestion: async (request) => {
-				if (!client?.answerQuestion)
+				if (!client.answerQuestion)
 					throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
 				const answerQuestion = client.answerQuestion;
 				return track(
@@ -278,117 +293,91 @@ export class AntigravityRuntime {
 						)
 				: undefined,
 		};
-		const turnStart = conversation.history.length;
 		try {
 			const result = await promptAcp(acp, conversation.sessionId, prompt, signal);
-			conversation.pendingInstructions = "";
 			return result.stopReason;
 		} finally {
 			this.activeTurn = undefined;
 			questionController.abort();
 			await Promise.allSettled(calls);
+			for (const outcome of conversation.nativeTools.finish(
+				"Antigravity ended the turn before this tool finished",
+			)) {
+				addToolResult(outcome);
+			}
 			if (conversation.planChanged && showTodo) {
 				addToolResult(antigravityPlanResult([...conversation.plans.values()].flat()));
 				conversation.planChanged = false;
 			}
-			conversation.history = [...history, output, ...toolResults];
-			conversation.digest = digestMessages(conversation.digest, conversation.history.slice(turnStart));
 		}
 	}
 
-	/** Start an agy process and resume the saved conversation when it still matches, else create one. */
+	/** Start an agy process and resume the saved session when this branch ends with its reply, else create one. */
 	private async open(
-		systemPrompt: string,
 		tools: Parameters<typeof openAntigravityTools>[0],
 		toolDefinitions: string,
-		history: Message[],
-		client: AntigravityClient | undefined,
+		reply: string | undefined,
+		client: AntigravityClient,
 		signal: AbortSignal,
 	): Promise<Conversation> {
 		await this.close();
 		if (tools.length > 0) {
-			if (!client?.executeTool) throw new Error("Antigravity requires a Pi session to execute custom tools");
+			if (!client.executeTool) throw new Error("Antigravity requires a Pi session to execute custom tools");
 			this.toolServer = await openAntigravityTools(tools, () => this.activeTurn?.executeTool);
 		}
-		const acp = new AntigravityAcp(this.cwd, this.toolServer ? ["--process-per-session"] : [], (method, params) =>
-			this.answerAgent(method, params),
-		);
+		// Launched exactly as editors launch it: `agy acp`, nothing else.
+		const acp = new AntigravityAcp(this.cwd, [], (method, params) => this.answerAgent(method, params));
 		this.acp = acp;
 		const { agentCapabilities } = await acp.initialize(signal, {
-			workspace: client?.workspace !== undefined,
-			questions: client?.answerQuestion !== undefined,
+			workspace: client.workspace !== undefined,
+			questions: client.answerQuestion !== undefined,
+			compaction: client.showCompaction !== undefined,
 		});
 		if (this.toolServer && !agentCapabilities?.mcpCapabilities?.http) {
 			throw new Error("Antigravity CLI does not support ACP HTTP MCP servers. Update agy.");
 		}
-		const route: SystemPromptRoute = agentCapabilities?.sessionCapabilities?.systemPrompt
-			? "acp"
-			: agentCapabilities?._meta?.antigravity?.systemPrompt?.append === true
-				? "antigravity"
-				: "prompt";
-		// Resume and load take the same system prompt and MCP servers as the session that created them.
-		const sessionParams = {
-			cwd: this.cwd,
-			mcpServers: this.toolServer ? [this.toolServer.config] : [],
-			...(systemPrompt && route === "acp"
-				? { systemPrompt: { mode: "append", content: [{ type: "text", text: systemPrompt }] } }
-				: {}),
-			...(systemPrompt && route === "antigravity"
-				? { _meta: { antigravity: { systemPrompt: { append: systemPrompt } } } }
-				: {}),
-		};
-		const seed = digestText(JSON.stringify([systemPrompt, toolDefinitions]));
-		const resumed = await this.resume(acp, agentCapabilities, sessionParams, seed, history, signal);
+		// agy keeps its own instructions: Pi sends no system prompt and no transcript.
+		const sessionParams = { cwd: this.cwd, mcpServers: this.toolServer ? [this.toolServer.config] : [] };
+		const saved = reply !== undefined && this.saved?.reply === reply ? this.saved : undefined;
+		const resumed = saved && (await this.resume(acp, agentCapabilities, sessionParams, saved.sessionId, signal));
 		const session = resumed ?? (await acp.request<AcpSession>("session/new", sessionParams, signal));
 		this.conversation = {
 			sessionId: session.sessionId,
 			configOptions: session.configOptions ?? [],
-			history: resumed ? history.slice(0, resumed.length) : [],
-			digest: resumed ? resumed.digest : seed,
-			systemPrompt,
 			toolDefinitions,
-			pendingInstructions: route === "prompt" && !resumed ? systemPrompt : "",
+			reply: resumed ? reply : undefined,
 			supportsImages: agentCapabilities?.promptCapabilities?.image === true,
 			plans: new Map(),
 			planChanged: false,
 			questionToolIds: new Set(),
+			nativeTools: new AntigravityNativeTools(),
 		};
 		return this.conversation;
 	}
 
-	/** Reattach the saved agy session with `session/resume`, or `session/load`, which replays updates Pi ignores. */
+	/** Reattach a saved agy session with `session/resume`, or `session/load`, which replays updates Pi ignores. */
 	private async resume(
 		acp: AntigravityAcp,
 		capabilities: AcpInitialize["agentCapabilities"],
 		sessionParams: JsonObject,
-		seed: string,
-		history: Message[],
+		sessionId: string,
 		signal: AbortSignal,
-	): Promise<(AcpSession & AntigravitySavedConversation) | undefined> {
-		const saved = this.saved;
-		this.saved = undefined;
+	): Promise<AcpSession | undefined> {
 		const method = capabilities?.sessionCapabilities?.resume
 			? "session/resume"
 			: capabilities?.loadSession
 				? "session/load"
 				: undefined;
-		if (
-			!saved ||
-			!method ||
-			history.length <= saved.length ||
-			digestMessages(seed, history.slice(0, saved.length)) !== saved.digest
-		) {
-			return undefined;
-		}
+		if (!method) return undefined;
 		try {
 			const response = await acp.request<Omit<AcpSession, "sessionId">>(
 				method,
-				{ ...sessionParams, sessionId: saved.sessionId },
+				{ ...sessionParams, sessionId },
 				signal,
 			);
-			return { ...saved, configOptions: response.configOptions ?? undefined };
+			return { sessionId, configOptions: response.configOptions ?? undefined };
 		} catch (error) {
-			// agy no longer holds the session; a new one receives the transcript instead.
+			// agy no longer holds the session; the turn continues in a new one.
 			if (signal.aborted) throw error;
 			return undefined;
 		}
@@ -399,7 +388,7 @@ export class AntigravityRuntime {
 			const { sessionId, update } = params as { sessionId: string; update: AcpUpdate & JsonObject };
 			// Updates replayed by session/load arrive before the conversation exists and are skipped.
 			if (sessionId !== this.conversation?.sessionId) return;
-			this.trackUpdate(this.conversation, sessionId, update);
+			this.trackUpdate(this.conversation, update);
 			this.activeTurn?.update(update);
 			return;
 		}
@@ -413,33 +402,28 @@ export class AntigravityRuntime {
 		}
 		if (method.startsWith("fs/") || method.startsWith("terminal/")) {
 			const turn = this.activeTurn;
-			if (!turn?.client?.workspace) throw new McpError(-32601, `Pi serves ${method} only during a turn`);
+			if (!turn?.client.workspace) throw new McpError(-32601, `Pi serves ${method} only during a turn`);
 			return turn.client.workspace({ method, params: params as JsonObject, root: this.cwd }, turn.signal);
 		}
 		throw new McpError(-32601, `Unsupported ACP client method ${method}`);
 	}
 
-	private trackUpdate(conversation: Conversation, sessionId: string, update: AcpUpdate & JsonObject): void {
+	private trackUpdate(conversation: Conversation, update: AcpUpdate & JsonObject): void {
 		if (update.sessionUpdate === "config_option_update" && update.configOptions) {
 			conversation.configOptions = update.configOptions;
 		}
-		if (
-			update.sessionUpdate === "tool_call" ||
-			update.sessionUpdate === "tool_call_update" ||
-			update.sessionUpdate === "tool_call_content_chunk" ||
-			update.sessionUpdate === "terminal_output_chunk" ||
-			update.sessionUpdate === "plan" ||
-			update.sessionUpdate === "plan_update" ||
-			update.sessionUpdate === "plan_removed"
-		) {
-			this.activeTurn?.client?.recordUpdate?.(sessionId, update);
+		if (update.sessionUpdate === "compaction_update" || update.sessionUpdate === "compaction_summary_chunk") {
+			this.activeTurn?.client.showCompaction?.(update as unknown as AcpCompactionUpdate);
 		}
-		if (
-			(update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-			update.name === "ask_question" &&
-			update.toolCallId
-		) {
-			conversation.questionToolIds.add(update.toolCallId);
+		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+			// agy asks its questions through a tool; Pi records the answer as ask_user_question instead.
+			if (update.name === "ask_question" && update.toolCallId) conversation.questionToolIds.add(update.toolCallId);
+			if (update.toolCallId && !conversation.questionToolIds.has(update.toolCallId)) {
+				const toolUpdate = update as unknown as AcpToolCallUpdate;
+				const event = conversation.nativeTools.apply(toolUpdate);
+				this.activeTurn?.client.showToolCall?.(toolUpdate);
+				if (event.type === "end") this.activeTurn?.addToolResult(event.outcome);
+			}
 		}
 		if (update.sessionUpdate === "plan" && update.entries) {
 			conversation.plans.set(null, update.entries);
@@ -463,8 +447,7 @@ export class AntigravityRuntime {
 		const isQuestion =
 			toolCall?.name === "ask_question" ||
 			(toolCall?.toolCallId && this.conversation?.questionToolIds.has(toolCall.toolCallId));
-		let result: AcpPermissionResult;
-		if (isQuestion && title && request.sessionId && this.activeTurn?.client?.answerQuestion) {
+		if (isQuestion && title && request.sessionId && this.activeTurn?.client.answerQuestion) {
 			const answer = await this.activeTurn.answerQuestion({
 				sessionId: request.sessionId,
 				mode: "form",
@@ -481,25 +464,14 @@ export class AntigravityRuntime {
 					required: ["choice"],
 				},
 			});
-			result = {
+			return {
 				outcome:
 					answer.action === "accept"
 						? { outcome: "selected", optionId: String(answer.content.choice) }
 						: { outcome: "cancelled" },
 			};
-		} else {
-			result = await askPermission(request, title, this.activeTurn?.client, this.activeTurn?.signal);
 		}
-		if (request.sessionId && toolCall?.toolCallId) {
-			this.activeTurn?.client?.recordUpdate?.(request.sessionId, {
-				sessionUpdate: "permission_response",
-				toolCallId: toolCall.toolCallId,
-				...(title ? { title } : {}),
-				options: request.options,
-				...result,
-			});
-		}
-		return result;
+		return askPermission(request, title, this.activeTurn?.client, this.activeTurn?.signal);
 	}
 }
 
@@ -582,45 +554,34 @@ async function askPermission(
 	return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
 }
 
-function sameMessage(previous: Message, current: Message): boolean {
+/** Identify a reply by the fields every copy of it keeps, wherever Pi stored it. */
+function digestReply(message: AssistantMessage): string {
+	return createHash("sha256")
+		.update(JSON.stringify([message.timestamp, message.content]))
+		.digest("hex");
+}
+
+/**
+ * The user's input for this turn: the user messages after the last reply, whichever model gave it.
+ * Pi's compaction and branch summaries come from other models and stay out of agy's context.
+ */
+function promptBlocks(history: Message[]): (TextContent | ImageContent)[] {
+	const lastReply = history.findLastIndex((message) => message.role === "assistant");
+	return history
+		.slice(lastReply + 1)
+		.filter((message): message is UserMessage => message.role === "user" && !isPiSummary(message))
+		.flatMap((message) =>
+			typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content,
+		);
+}
+
+/** Pi's projection renders its summaries as user messages with these fixed prefixes (messages.ts). */
+function isPiSummary(message: UserMessage): boolean {
+	const [first] = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
 	return (
-		previous === current ||
-		(previous.role === current.role &&
-			previous.timestamp === current.timestamp &&
-			JSON.stringify(previous.content) === JSON.stringify(current.content))
+		first?.type === "text" &&
+		(first.text.startsWith(COMPACTION_SUMMARY_PREFIX) || first.text.startsWith(BRANCH_SUMMARY_PREFIX))
 	);
-}
-
-function digestText(text: string): string {
-	return createHash("sha256").update(text).digest("hex");
-}
-
-/** Extend a conversation digest with the message fields `sameMessage` compares. */
-function digestMessages(digest: string, messages: readonly Message[]): string {
-	let current = digest;
-	for (const message of messages) {
-		current = digestText(`${current}:${JSON.stringify([message.role, message.timestamp, message.content])}`);
-	}
-	return current;
-}
-
-function promptBlocks(messages: Message[], systemPrompt: string): (TextContent | ImageContent)[] {
-	const blocks: (TextContent | ImageContent)[] = [];
-	if (systemPrompt) blocks.push({ type: "text", text: `Pi session instructions:\n${systemPrompt}` });
-	for (const [index, message] of messages.entries()) {
-		const currentPrompt = index === messages.length - 1 && message.role === "user";
-		if (!currentPrompt) blocks.push({ type: "text", text: `Pi conversation history (${message.role}):` });
-		if (typeof message.content === "string") {
-			blocks.push({ type: "text", text: message.content });
-			continue;
-		}
-		for (const part of message.content ?? []) {
-			if (part.type === "text" || part.type === "image") blocks.push(part);
-			else if (part.type === "toolCall")
-				blocks.push({ type: "text", text: `${part.name} ${JSON.stringify(part.arguments)}` });
-		}
-	}
-	return blocks;
 }
 
 /** Stream agy's message and thought chunks, and place executed tool calls where they finished. */

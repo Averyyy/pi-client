@@ -31,7 +31,6 @@ import {
 	type ImageModel,
 	type ImagesContext,
 	type ImagesOptions,
-	type JsonObject,
 	type Message,
 	type Model,
 	type ModelsApiStreamOptions,
@@ -45,7 +44,8 @@ import {
 } from "@earendil-works/pi-ai";
 import type { AntigravityCallback } from "../antigravity.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import type { AntigravityClient } from "./antigravity-runtime.ts";
+import type { AcpToolCallUpdate } from "./antigravity-native-tools.ts";
+import type { AcpCompactionUpdate, AntigravityClient } from "./antigravity-runtime.ts";
 import {
 	appendPiServerContextHash,
 	buildPiServerTreePrefixHashes,
@@ -304,7 +304,8 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 	/** Send the context as a delta against PiServer's per-session message store. */
 	incrementalContext?: boolean;
-	antigravity?: AntigravityClient | true;
+	/** The Pi session's agy client; the stream then runs a turn of its agy conversation. */
+	antigravity?: AntigravityClient;
 	/** The Pi workspace agy's file and terminal requests run in. */
 	antigravityCwd?: string;
 }
@@ -1227,17 +1228,18 @@ function rememberPiServerContext(sessionId: string, hashes: readonly string[], p
 	for (const hash of hashes) known.messages.add(hash);
 }
 
+/** Run a turn of the Pi session's agy conversation on PiServer. */
 export function streamPiServerAntigravity(
 	model: Model<string>,
 	context: Context,
-	options?: SimpleStreamOptions & Pick<PiServerStreamOptions, "antigravityCwd">,
-	client?: AntigravityClient,
+	options: (SimpleStreamOptions & Pick<PiServerStreamOptions, "antigravityCwd">) | undefined,
+	client: AntigravityClient,
 ): Promise<PiServerEventStream> {
 	return streamPiServer({ ...model, headers: undefined }, context, {
-		antigravity: client ?? true,
+		antigravity: client,
 		antigravityCwd: options?.antigravityCwd,
-		incrementalContext: client !== undefined,
-		sessionId: client ? options?.sessionId : undefined,
+		incrementalContext: true,
+		sessionId: options?.sessionId,
 		ownerSessionId: options?.sessionId,
 		signal: options?.signal,
 		timeoutMs: options?.timeoutMs,
@@ -1260,8 +1262,7 @@ export async function streamPiServer(
 	const isEphemeralSession = options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const agy = options?.antigravity;
-	const agyClient = agy === true ? undefined : agy;
-	if (agyClient) antigravitySessions.add(sessionId);
+	if (agy) antigravitySessions.add(sessionId);
 	const contextMessages = [...(context.messages as Message[]), ...(options?.ephemeralMessages ?? [])];
 	const contextHashes = options?.incrementalContext
 		? contextMessages.map((message) => hashPiServerContextJson(JSON.stringify(message)))
@@ -1283,26 +1284,26 @@ export async function streamPiServer(
 		);
 		executedToolResults.splice(0, executedToolResults.length, ...resolved);
 	};
-	const answerAntigravity = agyClient
+	const answerAntigravity = agy
 		? async (request: AntigravityCallback, signal: AbortSignal): Promise<unknown> => {
 				switch (request.kind) {
 					case "tool": {
-						if (!agyClient.executeTool) throw new Error("Pi session cannot execute Antigravity tools");
-						const outcome = await agyClient.executeTool(request.call, partial, signal);
+						if (!agy.executeTool) throw new Error("Pi session cannot execute Antigravity tools");
+						const outcome = await agy.executeTool(request.call, partial, signal);
 						clientOutcomes.set(outcome.toolCall.id, outcome);
 						return outcome;
 					}
 					case "permission":
-						return agyClient.requestPermission?.(request.title, request.choices, signal);
+						return agy.requestPermission?.(request.title, request.choices, signal);
 					case "question": {
-						if (!agyClient.answerQuestion) throw new Error("Pi session cannot answer Antigravity questions");
-						const answer = await agyClient.answerQuestion(request.request, signal);
+						if (!agy.answerQuestion) throw new Error("Pi session cannot answer Antigravity questions");
+						const answer = await agy.answerQuestion(request.request, signal);
 						clientOutcomes.set(answer.outcome.toolCall.id, answer.outcome);
 						return answer;
 					}
 					case "workspace":
-						if (!agyClient.workspace) throw new Error("Pi session cannot serve Antigravity workspace requests");
-						return agyClient.workspace(request.request, signal);
+						if (!agy.workspace) throw new Error("Pi session cannot serve Antigravity workspace requests");
+						return agy.workspace(request.request, signal);
 				}
 			}
 		: undefined;
@@ -1416,9 +1417,9 @@ export async function streamPiServer(
 				callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 				antigravity: agy
 					? {
-							retainSession: agyClient !== undefined,
-							questions: !!agyClient?.answerQuestion,
+							questions: !!agy.answerQuestion,
 							cwd: options?.antigravityCwd,
+							tools: agy.toolNames,
 						}
 					: undefined,
 				...(contextHashes && contextPrefixes
@@ -1489,12 +1490,16 @@ export async function streamPiServer(
 						}
 						continue;
 					}
-					if (serverEvent.event === "antigravity_update") {
-						const { sessionId, update } = parseServerSentEventData(serverEvent, "Antigravity update") as {
-							sessionId: string;
-							update: JsonObject;
-						};
-						if (agy !== true) agy?.recordUpdate?.(sessionId, update);
+					if (serverEvent.event === "antigravity_compaction") {
+						agy?.showCompaction?.(
+							parseServerSentEventData(serverEvent, "Antigravity compaction") as AcpCompactionUpdate,
+						);
+						continue;
+					}
+					if (serverEvent.event === "antigravity_tool_call") {
+						agy?.showToolCall?.(
+							parseServerSentEventData(serverEvent, "Antigravity tool call") as AcpToolCallUpdate,
+						);
 						continue;
 					}
 					if (serverEvent.event === "timing") {

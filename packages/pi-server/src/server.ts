@@ -66,7 +66,7 @@ import {
 	ANTIGRAVITY_PROVIDER,
 	type AntigravityCallback,
 	type AntigravityClient,
-	AntigravityRuntime,
+	type AntigravityRuntime,
 	logoutAntigravity,
 } from "@earendil-works/pi-coding-agent/antigravity";
 import { accountProvider, ServerAccounts } from "./accounts.ts";
@@ -139,7 +139,8 @@ interface StreamRequestBody {
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	antigravity?: { retainSession: boolean; questions: boolean; cwd?: string };
+	/** A turn of the Pi session's agy conversation, with the client's UI, workspace, and Pi tools. */
+	antigravity?: { questions: boolean; cwd?: string; tools?: string[] };
 }
 
 interface SessionSyncBody {
@@ -1505,7 +1506,7 @@ async function handleStream(
 		return;
 	}
 	let agySession: ReturnType<AntigravitySessions["begin"]> | undefined;
-	if (agy?.retainSession) {
+	if (agy) {
 		try {
 			agySession = config.antigravity.begin(body.sessionId, config.antigravity.cwd(agy.cwd));
 		} catch (error) {
@@ -1621,7 +1622,7 @@ async function handleStream(
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
 		if (agy) {
-			const runtime = agySession?.runtime ?? new AntigravityRuntime(config.antigravity.cwd(undefined), "PiServer");
+			const { runtime } = agySession!;
 			const requestCallback = createRunCallback(run!, res);
 			const ask = <T>(request: AntigravityCallback) =>
 				requestCallback({
@@ -1630,36 +1631,36 @@ async function handleStream(
 					model: { ...resolvedModel, headers: undefined },
 					request,
 				}) as Promise<T>;
-			const client: AntigravityClient | undefined = agySession
-				? {
-						executeTool: async (call) => {
-							const outcome = await ask<AgentToolCallOutcome>({ kind: "tool", call });
-							clientResults.add(outcome.toolCall.id);
-							return outcome;
-						},
-						requestPermission: (title, choices) => ask({ kind: "permission", title, choices }),
-						workspace: (request) => ask({ kind: "workspace", request }),
-						...(agy.questions
-							? {
-									answerQuestion: async (request) => {
-										const answer = await ask<
-											Awaited<ReturnType<NonNullable<AntigravityClient["answerQuestion"]>>>
-										>({
-											kind: "question",
-											request,
-										});
-										clientResults.add(answer.outcome.toolCall.id);
-										return answer;
+			const client: AntigravityClient = {
+				executeTool: async (call) => {
+					const outcome = await ask<AgentToolCallOutcome>({ kind: "tool", call });
+					clientResults.add(outcome.toolCall.id);
+					return outcome;
+				},
+				requestPermission: (title, choices) => ask({ kind: "permission", title, choices }),
+				workspace: (request) => ask({ kind: "workspace", request }),
+				...(agy.questions
+					? {
+							answerQuestion: async (request) => {
+								const answer = await ask<Awaited<ReturnType<NonNullable<AntigravityClient["answerQuestion"]>>>>(
+									{
+										kind: "question",
+										request,
 									},
-								}
-							: {}),
-						recordUpdate: (sessionId, update) => {
-							if (!res.destroyed && !res.writableEnded) {
-								writeServerSentEvent(res, "antigravity_update", { sessionId, update });
-							}
-						},
-					}
-				: undefined;
+								);
+								clientResults.add(answer.outcome.toolCall.id);
+								return answer;
+							},
+						}
+					: {}),
+				showToolCall: (update) => {
+					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_tool_call", update);
+				},
+				showCompaction: (update) => {
+					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_compaction", update);
+				},
+				toolNames: agy.tools ?? [],
+			};
 			agyStream = runtime.stream(
 				resolvedModel,
 				normalizeContext(context),

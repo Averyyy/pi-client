@@ -50,6 +50,8 @@ export interface AcpClientFeatures {
 	workspace: boolean;
 	/** Answer form elicitations in an interactive UI. */
 	questions: boolean;
+	/** Show agy's context compactions. */
+	compaction: boolean;
 }
 
 type AcpHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
@@ -105,7 +107,7 @@ export class AntigravityAcp {
 
 	async initialize(
 		signal?: AbortSignal,
-		features: AcpClientFeatures = { workspace: false, questions: false },
+		features: AcpClientFeatures = { workspace: false, questions: false, compaction: false },
 	): Promise<AcpInitialize> {
 		const result = await this.request<AcpInitialize>(
 			"initialize",
@@ -116,6 +118,7 @@ export class AntigravityAcp {
 					fs: { readTextFile: features.workspace, writeTextFile: features.workspace },
 					terminal: features.workspace,
 					...(features.questions ? { elicitation: { form: {} } } : {}),
+					...(features.compaction ? { session: { compaction: {} } } : {}),
 				},
 			},
 			signal,

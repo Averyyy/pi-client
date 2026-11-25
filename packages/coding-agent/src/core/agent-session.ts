@@ -38,7 +38,6 @@ import {
 	contentText,
 	getCurrentSystemMessage,
 	getCurrentTools,
-	type JsonObject,
 	normalizeContext,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -75,6 +74,8 @@ import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
+import { type AcpToolCallUpdate, AntigravityNativeTools } from "./antigravity-native-tools.ts";
+import { type AcpCompactionUpdate, ANTIGRAVITY_SESSION_ONLY } from "./antigravity-runtime.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
@@ -677,6 +678,11 @@ export class AgentSession {
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
+	private readonly _antigravityTools = new AntigravityNativeTools();
+	private readonly _antigravityCompactions = new Set<string>();
+	/** agy compacted its context this turn; Pi compacts its own transcript once the turn ends. */
+	private _antigravityCompacted = false;
+	private _antigravityToolEvents: Promise<unknown> = Promise.resolve();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
 
@@ -804,6 +810,8 @@ export class AgentSession {
 					signal,
 				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
+		// Summaries are Pi's own requests; agy only answers the person driving the session.
+		if (model.provider === ANTIGRAVITY_PROVIDER) throw new Error(ANTIGRAVITY_SESSION_ONLY);
 		if (streamFn && runtimeStreamFunctions.get(streamFn) === this._modelRuntime) {
 			return { model, thinkingLevel };
 		}
@@ -1042,12 +1050,60 @@ export class AgentSession {
 		return { ...outcome, durationMs };
 	}
 
-	/** Keep native ACP tool output and plan updates on the active Pi session branch. */
-	recordAntigravityUpdate(acpSessionId: string, update: JsonObject): void {
-		const entry = this.sessionManager.getEntry(
-			this.sessionManager.appendCustomEntry("antigravity_acp_update", { acpSessionId, update }),
-		);
-		if (entry) this._emit({ type: "entry_appended", entry });
+	/**
+	 * Show a compaction agy makes of its own context as Pi compaction events. After the turn, Pi
+	 * compacts its own transcript with the compaction model, so another model can take over.
+	 */
+	showAntigravityCompaction(update: AcpCompactionUpdate): void {
+		const started = this._antigravityCompactions.has(update.compactionId);
+		if (!started) {
+			this._antigravityCompactions.add(update.compactionId);
+			this._emit({ type: "compaction_start", reason: "threshold" });
+		}
+		if (update.sessionUpdate !== "compaction_update" || update.status === "in_progress") return;
+		this._antigravityCompactions.delete(update.compactionId);
+		if (update.status === "completed") this._antigravityCompacted = true;
+		this._emit({
+			type: "compaction_end",
+			reason: "threshold",
+			result: undefined,
+			aborted: update.status === "cancelled",
+			willRetry: false,
+			errorMessage:
+				update.status === "failed" ? (update.error ?? "Antigravity could not compact its context") : undefined,
+		});
+	}
+
+	/** Show one of agy's own tool calls as a Pi tool row; the turn's transcript keeps its call and result. */
+	showAntigravityToolCall(update: AcpToolCallUpdate): void {
+		const event = this._antigravityTools.apply(update);
+		const toolCall = event.type === "end" ? event.outcome.toolCall : event.toolCall;
+		const ids = { toolCallId: toolCall.id, toolName: toolCall.name };
+		const events: (ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolExecutionEndEvent)[] = [];
+		if (event.type === "start" || (event.type === "end" && !event.started)) {
+			events.push({ type: "tool_execution_start", ...ids, args: toolCall.arguments });
+		}
+		if (event.type === "update") {
+			events.push({
+				type: "tool_execution_update",
+				...ids,
+				args: toolCall.arguments,
+				partialResult: { content: event.content, details: {} },
+			});
+		}
+		if (event.type === "end") {
+			events.push({
+				type: "tool_execution_end",
+				...ids,
+				result: event.outcome.result,
+				isError: event.outcome.isError,
+			});
+		}
+		for (const toolEvent of events) {
+			this._emit(toolEvent);
+			// Extensions see agy's tool calls in the order agy reported them.
+			this._antigravityToolEvents = this._antigravityToolEvents.then(() => this._extensionRunner.emit(toolEvent));
+		}
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -2248,11 +2304,7 @@ export class AgentSession {
 		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			buildSystemPromptSections(
-				this.model?.provider === ANTIGRAVITY_PROVIDER
-					? { ...options, hiddenTools: [...options.hiddenTools, "todo", "ask_user_question"] }
-					: options,
-			),
+			buildSystemPromptSections(options),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}
@@ -3948,6 +4000,13 @@ export class AgentSession {
 		if (externalSignal?.aborted) return false;
 		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
+		if (this._antigravityCompacted) {
+			this._antigravityCompacted = false;
+			// Pi's summary needs a model other than agy; "none" would mean the session model, agy itself.
+			if (this.settingsManager.getCompactionModel() !== "none" && assistantMessage.stopReason === "stop") {
+				return this._runAutoCompaction("threshold", false, undefined, undefined, externalSignal);
+			}
+		}
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
