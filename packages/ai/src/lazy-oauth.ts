@@ -14,9 +14,6 @@ export function registerLazyOAuthFlows(): void {
 	registerBundledOAuthFlowLoaders({
 		devin: async () => (await loadNodeAccountFlows()).devinOAuth,
 		devinRuntime: async () => (await loadNodeAccountFlows()).devinRuntime,
-		googleAntigravity: async () => (await loadNodeAccountFlows()).googleAntigravity.googleAntigravityOAuth,
-		googleAntigravityCatalog: async () => (await loadNodeAccountFlows()).googleAntigravity,
-		googleAntigravityRuntime: async () => (await loadNodeAccountFlows()).googleAntigravityRuntime,
 		anthropic: async () => (await import("./auth/oauth/anthropic.ts")).anthropicOAuth,
 		openaiCodex: async () => (await import("./auth/oauth/openai-codex.ts")).openaiCodexOAuth,
 		openaiChatGPT: async () => (await import("./auth/oauth/openai-chatgpt.ts")).openaiChatGPTOAuth,

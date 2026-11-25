@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { devinOAuth } from "../src/auth/oauth/devin.ts";
-import { googleAntigravityOAuth } from "../src/auth/oauth/google-antigravity.ts";
-import type { OAuthAuth } from "../src/auth/types.ts";
 
 vi.mock("node:http", () => ({
 	createServer: vi.fn(() => {
@@ -16,10 +14,8 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
-describe.each([
-	["devin", devinOAuth, "http://127.0.0.1:51122/callback"],
-	["google-antigravity", googleAntigravityOAuth, "http://localhost:51121/oauth-callback"],
-] satisfies [string, OAuthAuth, string][])("%s server account OAuth", (providerId, oauth, redirectUri) => {
+describe("Devin server account OAuth", () => {
+	const redirectUri = "http://127.0.0.1:51122/callback";
 	it("exchanges a manually relayed state-bound PKCE code without opening a callback listener", async () => {
 		let authorization: URL | undefined;
 		const requests: { url: string; init?: RequestInit }[] = [];
@@ -27,18 +23,9 @@ describe.each([
 			const url = String(input);
 			requests.push({ url, init });
 			if (url === "https://api.devin.ai/auth/cli/token") return Response.json({ token: "server-token" });
-			if (url === "https://oauth2.googleapis.com/token") {
-				return Response.json({ access_token: "server-token", refresh_token: "server-refresh", expires_in: 3600 });
-			}
-			if (url === "https://www.googleapis.com/oauth2/v2/userinfo?alt=json") {
-				return Response.json({ email: "account@example.invalid" });
-			}
-			if (url === "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist") {
-				return Response.json({ cloudaicompanionProject: "account-project" });
-			}
 			throw new Error(`Unexpected OAuth request: ${url}`);
 		});
-		const credential = await oauth.login(
+		const credential = await devinOAuth.login(
 			{
 				signal: new AbortController().signal,
 				notify: (event) => {
@@ -55,20 +42,11 @@ describe.each([
 		expect(credential.access).toBe("server-token");
 		expect(authorization?.searchParams.get("redirect_uri")).toBe(redirectUri);
 		expect(authorization?.searchParams.get("code_challenge_method")).toBe("S256");
-		const tokenRequest =
-			providerId === "devin"
-				? (JSON.parse(String(requests[0].init?.body)) as Record<string, string>)
-				: Object.fromEntries(new URLSearchParams(String(requests[0].init?.body)));
+		const tokenRequest = JSON.parse(String(requests[0].init?.body)) as Record<string, string>;
 		expect(tokenRequest.code).toBe("relayed-code");
 		expect(createHash("sha256").update(tokenRequest.code_verifier).digest("base64url")).toBe(
 			authorization?.searchParams.get("code_challenge"),
 		);
-		if (providerId === "google-antigravity") {
-			expect(tokenRequest.redirect_uri).toBe(redirectUri);
-			expect(credential).toMatchObject({ refresh: "server-refresh", projectId: "account-project" });
-			expect(new Headers(requests[1].init?.headers).get("Authorization")).toBe("Bearer server-token");
-			expect(new Headers(requests[2].init?.headers).get("Authorization")).toBe("Bearer server-token");
-		}
 	});
 
 	it.each(["state", "origin", "code"])(
@@ -78,7 +56,7 @@ describe.each([
 			vi.stubGlobal("fetch", fetcher);
 			let authorization: URL | undefined;
 			await expect(
-				oauth.login(
+				devinOAuth.login(
 					{
 						signal: new AbortController().signal,
 						notify: (event) => {
@@ -109,7 +87,7 @@ describe.each([
 		vi.stubGlobal("fetch", fetcher);
 		let promptSignal: AbortSignal | undefined;
 		await expect(
-			oauth.login(
+			devinOAuth.login(
 				{
 					signal: controller.signal,
 					notify: () => {},

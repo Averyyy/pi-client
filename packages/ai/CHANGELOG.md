@@ -2,20 +2,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Google Antigravity runs through the local CLI in pi-coding-agent.
+
 ### Added
 
-- Added native Google Antigravity subscription OAuth, token refresh, account model discovery, and streaming inference with tools, images, and thought signatures.
 - Added authenticated stream option transforms for raw, simple, and deferred provider dispatch without repeating auth resolution.
 - Added native Devin Pro OAuth, account model discovery, and Connect/protobuf inference with tool calls, images, and signed thinking replay. No Devin CLI or external Pi extension is required.
 - Added static startup fallbacks for the four known Devin model IDs used by configured scopes; successful account discovery remains authoritative.
 
 ### Fixed
 
-- Grouped Google Antigravity effort variants into one model per model id and sent the official CLI request envelope, including its identity prompt prose, whose absence the backend answered with a bare `429 RESOURCE_EXHAUSTED`.
-- Fixed Google Antigravity Claude tool declarations rejecting JSON Schema constants, exclusive numeric bounds, and pattern properties, including nested array items and unions.
-- Preserved Google Antigravity prompt and cache counts across sparse SSE frames and released the stream reader on a request timeout.
 - Stopped pending model refreshes from publishing catalogs after login replaces or logout removes their credentials.
-- Kept Google Antigravity inference runtime loading lazy when listing models or using other providers.
 - Fixed Devin losing system instructions and tool definitions after transcript normalization, which caused replies to stop without calling tools.
 - Fixed Devin context usage and threshold compaction to include cached input and cache creation tokens.
 - Fixed Devin's live `cached_input_tokens` usage parsing, including separate metric frames and protobuf zero values, so cached SWE-2 prompts retain their full context usage.

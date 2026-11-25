@@ -15,7 +15,6 @@ import { devinProvider } from "./devin.ts";
 import { fireworksProvider } from "./fireworks.ts";
 import { githubCopilotProvider } from "./github-copilot.ts";
 import { googleProvider } from "./google.ts";
-import { googleAntigravityProvider } from "./google-antigravity.ts";
 import { googleVertexProvider } from "./google-vertex.ts";
 import { groqProvider } from "./groq.ts";
 import { huggingfaceProvider } from "./huggingface.ts";
@@ -151,7 +150,6 @@ export function builtinProviders(): Provider[] {
 		fireworksProvider(),
 		githubCopilotProvider(),
 		googleProvider(),
-		googleAntigravityProvider(),
 		googleVertexProvider(),
 		groqProvider(),
 		huggingfaceProvider(),

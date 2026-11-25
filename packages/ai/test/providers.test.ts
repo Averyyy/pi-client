@@ -67,13 +67,7 @@ describe("builtin providers", () => {
 
 		for (const provider of providers) {
 			const list = models.getAllModels(provider.id);
-			if (provider.id === "google-antigravity") {
-				expect(list).toEqual([]);
-				expect(provider.refreshModels).toBeTypeOf("function");
-				expect(provider.auth.oauth).toBeDefined();
-			} else {
-				expect(list.length).toBeGreaterThan(0);
-			}
+			expect(list.length).toBeGreaterThan(0);
 			expect(list.every((m) => m.provider === provider.id)).toBe(true);
 		}
 		expect(getBuiltinModel("radius", "balanced")).toMatchObject({

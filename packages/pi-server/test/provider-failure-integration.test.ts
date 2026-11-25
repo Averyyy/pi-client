@@ -89,15 +89,9 @@ describe("provider failure logging", () => {
 				? {
 						diagnostics: [
 							{
-								type: "google_antigravity_response_failure",
+								type: "provider_response_failure",
 								timestamp: 1,
-								details: {
-									status: 429,
-									rpcStatus: "RESOURCE_EXHAUSTED",
-									reason: "RATE_LIMIT_EXCEEDED",
-									retryDelay: "30s",
-									privatePayload: "secret diagnostic",
-								},
+								error: { code: "RESOURCE_EXHAUSTED", message: "secret diagnostic" },
 							},
 						],
 					}
@@ -139,10 +133,7 @@ describe("provider failure logging", () => {
 		});
 		if (status === 429)
 			expect(JSON.parse(line)).toMatchObject({
-				providerStatus: 429,
 				providerCode: "RESOURCE_EXHAUSTED",
-				providerReason: "RATE_LIMIT_EXCEEDED",
-				retryDelay: "30s",
 			});
 		expect(line).not.toMatch(/secret|private upstream error/);
 		await (await fetch(`${base}/api/session/${sessionId}/runs/failed`, { headers })).text();

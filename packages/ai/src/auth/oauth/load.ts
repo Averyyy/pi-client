@@ -1,5 +1,5 @@
 import type { Model, ProviderStreams } from "../../types.ts";
-import type { OAuthAuth, OAuthCredential } from "../types.ts";
+import type { OAuthAuth } from "../types.ts";
 
 /**
  * Loads an OAuth flow module through a variable specifier so bundlers cannot
@@ -18,9 +18,6 @@ const importOAuthModule = (specifier: string): Promise<unknown> => {
 type OAuthFlowLoaders = {
 	devin: () => OAuthAuth | Promise<OAuthAuth>;
 	devinRuntime: () => DevinRuntime | Promise<DevinRuntime>;
-	googleAntigravity: () => OAuthAuth | Promise<OAuthAuth>;
-	googleAntigravityCatalog: () => GoogleAntigravityCatalog | Promise<GoogleAntigravityCatalog>;
-	googleAntigravityRuntime: () => ProviderStreams | Promise<ProviderStreams>;
 	anthropic: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiCodex: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiChatGPT: () => OAuthAuth | Promise<OAuthAuth>;
@@ -33,30 +30,6 @@ type OAuthFlowLoaders = {
 };
 
 let bundledLoaders: OAuthFlowLoaders | undefined;
-
-export interface GoogleAntigravityCatalog {
-	discoverGoogleAntigravityModels(
-		credential: OAuthCredential,
-		signal: AbortSignal,
-		baseUrl?: string,
-	): Promise<Model<"google-antigravity">[]>;
-}
-
-export const loadGoogleAntigravityOAuth = async (): Promise<OAuthAuth> => {
-	if (bundledLoaders) return bundledLoaders.googleAntigravity();
-	return ((await importOAuthModule("./google-antigravity.ts")) as { googleAntigravityOAuth: OAuthAuth })
-		.googleAntigravityOAuth;
-};
-
-export const loadGoogleAntigravityCatalog = async (): Promise<GoogleAntigravityCatalog> => {
-	if (bundledLoaders) return bundledLoaders.googleAntigravityCatalog();
-	return (await importOAuthModule("./google-antigravity.ts")) as GoogleAntigravityCatalog;
-};
-
-export const loadGoogleAntigravityRuntime = async (): Promise<ProviderStreams> => {
-	if (bundledLoaders) return bundledLoaders.googleAntigravityRuntime();
-	return (await importOAuthModule("./google-antigravity-runtime.ts")) as ProviderStreams;
-};
 
 export const loadDevinOAuth = async (): Promise<OAuthAuth> => {
 	if (bundledLoaders) return bundledLoaders.devin();

@@ -25,8 +25,6 @@ interface ProviderFailure {
 export function logProviderFailure(failure: ProviderFailure): void {
 	const { model, error, assistant, upstreamStatus } = failure;
 	const diagnostics = assistant?.diagnostics;
-	const google = diagnostics?.find((entry) => entry.type === "google_antigravity_response_failure")?.details;
-	const providerStatus = typeof google?.status === "number" ? google.status : undefined;
 	const diagnosticCode = diagnostics?.find((entry) => entry.error?.code !== undefined)?.error?.code;
 	const thrown = error instanceof Error ? error : undefined;
 	const cause = thrown?.cause instanceof Error ? thrown.cause : undefined;
@@ -50,13 +48,9 @@ export function logProviderFailure(failure: ProviderFailure): void {
 			messageCount: failure.messageCount,
 			toolCount: failure.toolCount,
 			code: failure.code,
-			upstreamStatus: upstreamStatus ?? providerStatus ?? (thrown && normalizeProviderError(thrown).status),
+			upstreamStatus: upstreamStatus ?? (thrown && normalizeProviderError(thrown).status),
 			upstreamResponses: failure.upstreamResponses,
-			providerStatus,
-			providerCode: errorCode(google?.rpcStatus ?? diagnosticCode),
-			providerReason: google?.reason,
-			retryDelay: google?.retryDelay,
-			quotaViolations: google?.quotaViolations,
+			providerCode: errorCode(diagnosticCode),
 			stopReason: errorCode(assistant?.rawStopReason),
 			diagnosticTypes: diagnostics?.map((entry) => entry.type),
 			errorName: errorCode(thrown?.name),

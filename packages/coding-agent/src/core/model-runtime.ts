@@ -331,6 +331,7 @@ export class ModelRuntime implements Models {
 	private providerIds(): Set<string> {
 		return new Set([
 			...this.builtins.keys(),
+			ANTIGRAVITY_PROVIDER,
 			...this.nativeExtensionProviders.keys(),
 			...this.config.getProviderIds(),
 			...this.extensionProviders.keys(),
@@ -350,8 +351,7 @@ export class ModelRuntime implements Models {
 
 	/** The provider without virtual models, or undefined when nothing defines it. */
 	private composeProvider(providerId: string): Provider | undefined {
-		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
-		if (providerId === ANTIGRAVITY_PROVIDER && base) {
+		if (providerId === ANTIGRAVITY_PROVIDER) {
 			const overrides = this.config.getProvider(providerId)?.modelOverrides;
 			const getModels = () =>
 				(this.antigravityModels ?? []).map((model) => {
@@ -362,8 +362,8 @@ export class ModelRuntime implements Models {
 				throw new ModelsError("auth", "Use Pi login for the local Antigravity CLI account");
 			};
 			return {
-				...base,
-				baseUrl: undefined,
+				id: ANTIGRAVITY_PROVIDER,
+				name: "Google Antigravity",
 				auth: {
 					oauth: {
 						name: "Google Antigravity",
@@ -376,7 +376,6 @@ export class ModelRuntime implements Models {
 				},
 				getModels,
 				getAllModels: getModels,
-				refreshModels: undefined,
 				stream: (model, context, options) =>
 					new AntigravityRuntime(process.cwd()).stream(model, context, {
 						signal: options?.signal,
@@ -386,6 +385,7 @@ export class ModelRuntime implements Models {
 					new AntigravityRuntime(process.cwd()).stream(model, context, options),
 			};
 		}
+		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
 		if (this.isServerAccountProvider(providerId) && base) {
 			const modelOverrides = this.config.getProvider(providerId)?.modelOverrides;
 			const getModels = () => {
