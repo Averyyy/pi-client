@@ -1,4 +1,4 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { type SettingsList, setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import {
@@ -7,6 +7,7 @@ import {
 	SettingsSelectorComponent,
 } from "../src/modes/interactive/components/settings-selector.ts";
 import { SelectSubmenu } from "../src/modes/interactive/components/settings-submenu.ts";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
@@ -21,6 +22,47 @@ describe("SettingsSelectorComponent", () => {
 	afterEach(() => {
 		harness?.cleanup();
 		harness = undefined;
+	});
+
+	it("opens the shared model picker and saves a compact model or none", async () => {
+		harness = await createHarness({
+			models: [{ id: "chat" }, { id: "family/summary" }],
+			settings: { enabledModels: ["faux/chat"] },
+		});
+		const { session, settingsManager } = harness;
+		await session.modelRuntime.getAvailable();
+		vi.spyOn(session.modelRuntime, "refresh").mockResolvedValue({ aborted: false, errors: new Map() });
+		const showSettings = Reflect.get(InteractiveMode.prototype, "showSettingsSelector") as (this: object) => void;
+		let list: SettingsList;
+		showSettings.call({
+			session,
+			settingsManager,
+			themeController: { getThemeSelection: () => "dark", getTerminalTheme: () => "dark" },
+			ui: { mode: "regular", requestRender: vi.fn() },
+			showSelector: (create: (done: () => void) => { focus: SettingsList }) => {
+				list = create(vi.fn()).focus;
+			},
+		});
+		list!.selectItem("compact-model");
+		list!.handleInput("\r");
+		expect(stripAnsi(list!.render(120).join("\n"))).toContain("→ ✓ none");
+		list!.handleInput("family/summary");
+		list!.handleInput("\r");
+		await settingsManager.reload();
+		expect(settingsManager.getCompactionModel()).toBe("faux/family/summary");
+		expect(settingsManager.getEnabledModels()).toEqual(["faux/chat"]);
+
+		list!.handleInput("\r");
+		expect(stripAnsi(list!.render(120).join("\n"))).toContain("→ ✓ family/summary");
+		list!.handleInput("none");
+		list!.handleInput("\x1b");
+		expect(settingsManager.getCompactionModel()).toBe("faux/family/summary");
+
+		list!.handleInput("\r");
+		list!.handleInput("none");
+		list!.handleInput("\r");
+		await settingsManager.reload();
+		expect(settingsManager.getCompactionModel()).toBe("none");
 	});
 
 	it("cycles through fullscreen settings", () => {

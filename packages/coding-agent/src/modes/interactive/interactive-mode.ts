@@ -200,7 +200,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
-import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
+import { refreshModelCatalogs, refreshModelsSelectorCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
@@ -5390,12 +5390,14 @@ export class InteractiveMode {
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
+			let disposeModelPicker: (() => void) | undefined;
 			const defaultProvider = this.settingsManager.getDefaultProvider();
 			const defaultModelId = this.settingsManager.getDefaultModel();
 			const defaultModel = defaultProvider && defaultModelId ? `${defaultProvider}/${defaultModelId}` : "not set";
 			selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					compactModel: this.settingsManager.getCompactionModel(),
 					defaultModel,
 					currentModel: this.session.model,
 					availableDefaultModels: this.session.modelRuntime.getAvailableSnapshot(),
@@ -5442,6 +5444,32 @@ export class InteractiveMode {
 					onAutoCompactChange: (enabled) => {
 						this.session.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					createCompactModelSelector: (selectedModelId, close) => {
+						const runtime = this.session.modelRuntime;
+						const finish = (value?: string) => {
+							disposeModelPicker?.();
+							disposeModelPicker = undefined;
+							close(value);
+						};
+						const picker = new ScopedModelsSelectorComponent(
+							{ allModels: runtime.getAvailableSnapshot(), refreshStatus: "Refreshing model catalogs…" },
+							{
+								selectedModelId,
+								onSelect: (modelId) => {
+									this.settingsManager.setCompactionModel(modelId);
+									finish(this.settingsManager.getCompactionModel());
+								},
+								onCancel: () => finish(),
+							},
+						);
+						disposeModelPicker = refreshModelsSelectorCatalogs(
+							runtime,
+							picker,
+							() => picker.updateModels(runtime.getAvailableSnapshot()),
+							() => this.ui.requestRender(),
+						);
+						return picker;
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);
@@ -5623,7 +5651,7 @@ export class InteractiveMode {
 					},
 				},
 			);
-			return { component: selector, focus: selector.getSettingsList() };
+			return { component: selector, focus: selector.getSettingsList(), dispose: () => disposeModelPicker?.() };
 		});
 	}
 
@@ -5913,13 +5941,6 @@ export class InteractiveMode {
 		};
 
 		this.showSelector((done) => {
-			let disposed = false;
-			let timedOut = false;
-			const controller = new AbortController();
-			const timeout = setTimeout(() => {
-				timedOut = true;
-				controller.abort();
-			}, 15_000);
 			const selector = new ScopedModelsSelectorComponent(
 				{
 					allModels: availableModels,
@@ -5946,9 +5967,10 @@ export class InteractiveMode {
 					},
 				},
 			);
-			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
-				.then((result) => {
-					if (disposed) return;
+			const dispose = refreshModelsSelectorCatalogs(
+				this.session.modelRuntime,
+				selector,
+				() => {
 					availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
 					availableModelIds = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
 					if (!selectionChanged && sessionScopedModels.length === 0) {
@@ -5958,38 +5980,10 @@ export class InteractiveMode {
 						selector.updateModels(availableModels);
 					}
 					if (currentEnabledIds !== null) updateSessionModels(currentEnabledIds);
-					if (result.aborted && timedOut) {
-						selector.setRefreshStatus("Model refresh timed out; showing cached models.", "warning");
-					} else if (result.errors.size > 0) {
-						selector.setRefreshStatus(
-							`Could not refresh ${[...result.errors.keys()].join(", ")}; showing cached models.`,
-							"warning",
-						);
-					} else {
-						selector.setRefreshStatus("Model catalogs refreshed.", "success");
-					}
-					this.ui.requestRender();
-				})
-				.catch((error: unknown) => {
-					if (disposed) return;
-					selector.setRefreshStatus(
-						timedOut
-							? "Model refresh timed out; showing cached models."
-							: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
-						"warning",
-					);
-					this.ui.requestRender();
-				})
-				.finally(() => clearTimeout(timeout));
-			return {
-				component: selector,
-				focus: selector,
-				dispose: () => {
-					disposed = true;
-					clearTimeout(timeout);
-					controller.abort();
 				},
-			};
+				() => this.ui.requestRender(),
+			);
+			return { component: selector, focus: selector, dispose };
 		});
 	}
 

@@ -40,6 +40,8 @@ A provider context-overflow error or an early final `stopReason: "length"` can s
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
+Choose **Compact model** in `/settings` to use a dedicated summarizer for both manual and automatic compaction. `none` uses the session model. The session model still determines the automatic trigger and per-model token settings.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards through the finalized session projection, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached

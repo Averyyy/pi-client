@@ -78,8 +78,8 @@ interface ModelItem {
 }
 
 export interface ModelsConfig {
-	allModels: Model<any>[];
-	enabledModelIds: string[] | null;
+	allModels: readonly Model<any>[];
+	enabledModelIds?: string[] | null;
 	refreshStatus?: string;
 }
 
@@ -91,9 +91,14 @@ export interface ModelsCallbacks {
 	onCancel: () => void;
 }
 
+interface ModelSelectionCallbacks {
+	selectedModelId: string;
+	onSelect: (modelId: string) => void;
+	onCancel: () => void;
+}
+
 /**
- * Component for enabling/disabling models for Ctrl+P cycling.
- * Changes are session-only until explicitly persisted with Ctrl+S.
+ * Searchable model list for editing the cycling scope or selecting one compact model.
  */
 export class ScopedModelsSelectorComponent extends Container implements Focusable {
 	readonly capturesViewportInput: boolean = true;
@@ -115,12 +120,12 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 	}
 	private listContainer: Container;
 	private footerText: Text;
-	private callbacks: ModelsCallbacks;
+	private callbacks: ModelsCallbacks | ModelSelectionCallbacks;
 	private maxVisible = 8;
 	private isDirty = false;
 	private refreshStatusText?: Text;
 
-	constructor(config: ModelsConfig, callbacks: ModelsCallbacks) {
+	constructor(config: ModelsConfig, callbacks: ModelsCallbacks | ModelSelectionCallbacks) {
 		super();
 		this.callbacks = callbacks;
 
@@ -130,15 +135,30 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			this.allIds.push(fullId);
 		}
 
-		this.enabledIds = config.enabledModelIds === null ? null : [...config.enabledModelIds];
+		this.enabledIds = config.enabledModelIds ? [...config.enabledModelIds] : null;
 		this.filteredItems = this.buildItems();
+		const singleSelection = "onSelect" in callbacks;
+		if (singleSelection) {
+			this.selectedIndex = this.filteredItems.findIndex((item) => item.fullId === callbacks.selectedModelId);
+		}
 
 		// Header
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("accent", theme.bold("Model Configuration")), 0, 0));
 		this.addChild(
-			new Text(theme.fg("muted", `Session-only. ${keyDisplayText("app.models.save")} to save to settings.`), 0, 0),
+			new Text(theme.fg("accent", theme.bold(singleSelection ? "Compact Model" : "Model Configuration")), 0, 0),
+		);
+		this.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					singleSelection
+						? "Select the model for manual and automatic compaction."
+						: `Session-only. ${keyDisplayText("app.models.save")} to save to settings.`,
+				),
+				0,
+				0,
+			),
 		);
 		this.addChild(new Spacer(1));
 
@@ -187,6 +207,16 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 	}
 
 	private buildItems(): ModelItem[] {
+		if ("onSelect" in this.callbacks) {
+			const { selectedModelId } = this.callbacks;
+			const ids = ["none", ...this.allIds];
+			if (!ids.includes(selectedModelId)) ids.splice(1, 0, selectedModelId);
+			return ids.map((fullId) => ({
+				fullId,
+				model: this.modelsById.get(fullId),
+				enabled: fullId === selectedModelId,
+			}));
+		}
 		return getSortedIds(this.enabledIds, this.allIds).map((id) => ({
 			fullId: id,
 			model: this.modelsById.get(id),
@@ -195,6 +225,9 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 	}
 
 	private getFooterText(): string {
+		if ("onSelect" in this.callbacks) {
+			return theme.fg("dim", `  ${keyDisplayText("tui.select.confirm")} select · Esc back`);
+		}
 		const enabledCount = this.enabledIds?.filter((id) => this.modelsById.has(id)).length ?? this.allIds.length;
 		const unavailableCount = this.enabledIds?.filter((id) => !this.modelsById.has(id)).length ?? 0;
 		const allEnabled = this.enabledIds === null;
@@ -230,10 +263,6 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 		this.footerText.setText(this.getFooterText());
 	}
 
-	private notifyChange(): void {
-		this.callbacks.onChange(this.enabledIds === null ? null : [...this.enabledIds]);
-	}
-
 	private updateList(): void {
 		this.listContainer.clear();
 
@@ -247,17 +276,21 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
 		);
 		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+		const singleSelection = "onSelect" in this.callbacks;
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = this.filteredItems[i]!;
 			const isSelected = i === this.selectedIndex;
 			const prefix = isSelected ? theme.fg("accent", "→ ") : "  ";
 			const id = item.model?.id ?? item.fullId;
-			const styledId = item.model ? id : theme.strikethrough(id);
+			const isNone = singleSelection && item.fullId === "none";
+			const styledId = item.model || isNone ? id : theme.strikethrough(id);
 			const modelText = isSelected ? theme.fg("accent", styledId) : styledId;
 			const name = item.model ? getDistinctModelName(item.model) : undefined;
 			const nameText = name ? theme.fg("muted", ` (${name})`) : "";
-			const providerBadge = theme.fg("muted", item.model ? ` [${item.model.provider}]` : " [unavailable]");
-			const status = item.model && item.enabled ? theme.fg("accent", "✓ ") : "  ";
+			const providerBadge = isNone
+				? ""
+				: theme.fg("muted", item.model ? ` [${item.model.provider}]` : " [unavailable]");
+			const status = item.enabled && (item.model || singleSelection) ? theme.fg("accent", "✓ ") : "  ";
 			this.listContainer.addChild(new Text(`${prefix}${status}${modelText}${nameText}${providerBadge}`, 0, 0));
 		}
 
@@ -268,17 +301,14 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			);
 		}
 
-		if (this.filteredItems.length > 0) {
-			const selected = this.filteredItems[this.selectedIndex];
-			this.listContainer.addChild(new Spacer(1));
-			this.listContainer.addChild(
-				new Text(
-					theme.fg("muted", `  ${selected.model ? `Model Name: ${selected.model.name}` : "Model unavailable"}`),
-					0,
-					0,
-				),
-			);
-		}
+		const selected = this.filteredItems[this.selectedIndex];
+		const detail = selected.model
+			? `Model Name: ${selected.model.name}`
+			: singleSelection && selected.fullId === "none"
+				? "Use the session model"
+				: "Model unavailable";
+		this.listContainer.addChild(new Spacer(1));
+		this.listContainer.addChild(new Text(theme.fg("muted", `  ${detail}`), 0, 0));
 	}
 
 	handleInput(data: string): void {
@@ -304,83 +334,13 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			this.updateList();
 			return;
 		}
-
-		// Reorder enabled models
-		const reorderUp = kb.matches(data, "app.models.reorderUp");
-		const reorderDown = kb.matches(data, "app.models.reorderDown");
-		if (reorderUp || reorderDown) {
-			if (this.enabledIds === null) return;
-			const item = this.filteredItems[this.selectedIndex];
-			if (item && isEnabled(this.enabledIds, item.fullId)) {
-				const delta = reorderUp ? -1 : 1;
-				const currentIndex = this.enabledIds.indexOf(item.fullId);
-				const newIndex = currentIndex + delta;
-				// Only move if within bounds
-				if (newIndex >= 0 && newIndex < this.enabledIds.length) {
-					this.enabledIds = move(this.enabledIds, item.fullId, delta);
-					this.isDirty = true;
-					this.selectedIndex += delta;
-					this.refresh();
-					this.notifyChange();
-				}
+		if ("onSelect" in this.callbacks) {
+			if (kb.matches(data, "tui.select.confirm")) {
+				const item = this.filteredItems[this.selectedIndex];
+				if (item && (item.model || item.fullId === "none")) this.callbacks.onSelect(item.fullId);
+				return;
 			}
-			return;
-		}
-
-		// Toggle on Enter
-		if (kb.matches(data, "tui.select.confirm")) {
-			const item = this.filteredItems[this.selectedIndex];
-			if (item) {
-				this.enabledIds = toggle(this.enabledIds, this.allIds, item.fullId);
-				this.isDirty = true;
-				this.refresh();
-				this.notifyChange();
-			}
-			return;
-		}
-
-		// Enable all (filtered if search active, otherwise all)
-		if (kb.matches(data, "app.models.enableAll")) {
-			const targetIds = this.searchInput.getValue() ? this.filteredItems.map((i) => i.fullId) : undefined;
-			this.enabledIds = enableAll(this.enabledIds, this.allIds, targetIds);
-			this.isDirty = true;
-			this.refresh();
-			this.notifyChange();
-			return;
-		}
-
-		// Clear all (filtered if search active, otherwise all)
-		if (kb.matches(data, "app.models.clearAll")) {
-			const targetIds = this.searchInput.getValue() ? this.filteredItems.map((i) => i.fullId) : undefined;
-			this.enabledIds = clearAll(this.enabledIds, this.allIds, targetIds);
-			this.isDirty = true;
-			this.refresh();
-			this.notifyChange();
-			return;
-		}
-
-		// Toggle provider of current item
-		if (kb.matches(data, "app.models.toggleProvider")) {
-			const item = this.filteredItems[this.selectedIndex];
-			if (item?.model) {
-				const provider = item.model.provider;
-				const providerIds = this.allIds.filter((id) => this.modelsById.get(id)!.provider === provider);
-				const allEnabled = providerIds.every((id) => isEnabled(this.enabledIds, id));
-				this.enabledIds = allEnabled
-					? clearAll(this.enabledIds, this.allIds, providerIds)
-					: enableAll(this.enabledIds, this.allIds, providerIds);
-				this.isDirty = true;
-				this.refresh();
-				this.notifyChange();
-			}
-			return;
-		}
-
-		// Save/persist to settings
-		if (kb.matches(data, "app.models.save")) {
-			this.callbacks.onPersist(this.enabledIds === null ? null : [...this.enabledIds]);
-			this.isDirty = false;
-			this.footerText.setText(this.getFooterText());
+		} else if (this.handleScopeInput(data, this.callbacks)) {
 			return;
 		}
 
@@ -401,15 +361,98 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			return;
 		}
 
-		// Pass everything else to search input. A new query moves the selection to the top row, so the best match is
-		// highlighted; toggles and reorders call refresh() too, so the reset lives here and not there. Cursor keys
-		// leave the query as it is and must not move the selection.
+		// A new query moves the selection to the top match. Cursor keys leave the selection alone.
 		const previousQuery = this.searchInput.getValue();
 		this.searchInput.handleInput(data);
 		const query = this.searchInput.getValue();
 		if (query === previousQuery) return;
 		if (query) this.selectedIndex = 0;
 		this.refresh();
+	}
+
+	private handleScopeInput(data: string, callbacks: ModelsCallbacks): boolean {
+		const kb = getKeybindings();
+		const notifyChange = () => callbacks.onChange(this.enabledIds === null ? null : [...this.enabledIds]);
+
+		// Reorder enabled models
+		const reorderUp = kb.matches(data, "app.models.reorderUp");
+		const reorderDown = kb.matches(data, "app.models.reorderDown");
+		if (reorderUp || reorderDown) {
+			if (this.enabledIds === null) return true;
+			const item = this.filteredItems[this.selectedIndex];
+			if (item && isEnabled(this.enabledIds, item.fullId)) {
+				const delta = reorderUp ? -1 : 1;
+				const currentIndex = this.enabledIds.indexOf(item.fullId);
+				const newIndex = currentIndex + delta;
+				// Only move if within bounds
+				if (newIndex >= 0 && newIndex < this.enabledIds.length) {
+					this.enabledIds = move(this.enabledIds, item.fullId, delta);
+					this.isDirty = true;
+					this.selectedIndex += delta;
+					this.refresh();
+					notifyChange();
+				}
+			}
+			return true;
+		}
+
+		// Toggle on Enter
+		if (kb.matches(data, "tui.select.confirm")) {
+			const item = this.filteredItems[this.selectedIndex];
+			if (item) {
+				this.enabledIds = toggle(this.enabledIds, this.allIds, item.fullId);
+				this.isDirty = true;
+				this.refresh();
+				notifyChange();
+			}
+			return true;
+		}
+
+		// Enable all (filtered if search active, otherwise all)
+		if (kb.matches(data, "app.models.enableAll")) {
+			const targetIds = this.searchInput.getValue() ? this.filteredItems.map((i) => i.fullId) : undefined;
+			this.enabledIds = enableAll(this.enabledIds, this.allIds, targetIds);
+			this.isDirty = true;
+			this.refresh();
+			notifyChange();
+			return true;
+		}
+
+		// Clear all (filtered if search active, otherwise all)
+		if (kb.matches(data, "app.models.clearAll")) {
+			const targetIds = this.searchInput.getValue() ? this.filteredItems.map((i) => i.fullId) : undefined;
+			this.enabledIds = clearAll(this.enabledIds, this.allIds, targetIds);
+			this.isDirty = true;
+			this.refresh();
+			notifyChange();
+			return true;
+		}
+
+		// Toggle provider of current item
+		if (kb.matches(data, "app.models.toggleProvider")) {
+			const item = this.filteredItems[this.selectedIndex];
+			if (item?.model) {
+				const provider = item.model.provider;
+				const providerIds = this.allIds.filter((id) => this.modelsById.get(id)!.provider === provider);
+				const allEnabled = providerIds.every((id) => isEnabled(this.enabledIds, id));
+				this.enabledIds = allEnabled
+					? clearAll(this.enabledIds, this.allIds, providerIds)
+					: enableAll(this.enabledIds, this.allIds, providerIds);
+				this.isDirty = true;
+				this.refresh();
+				notifyChange();
+			}
+			return true;
+		}
+
+		// Save/persist to settings
+		if (kb.matches(data, "app.models.save")) {
+			callbacks.onPersist(this.enabledIds === null ? null : [...this.enabledIds]);
+			this.isDirty = false;
+			this.footerText.setText(this.getFooterText());
+			return true;
+		}
+		return false;
 	}
 
 	getSearchInput(): Input {

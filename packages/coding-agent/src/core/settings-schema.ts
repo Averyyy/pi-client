@@ -17,6 +17,7 @@ const CompactionModelOverrideSchema = Type.Object({
 
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
+	model: Type.Optional(Type.String({ default: "none", description: 'Exact "provider/modelId" or "none".' })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
 	modelOverrides: Type.Optional(

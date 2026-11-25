@@ -843,6 +843,17 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getCompactionModel(): string {
+		return this.settings.compaction?.model ?? "none";
+	}
+
+	setCompactionModel(model: string): void {
+		this.globalSettings.compaction ??= {};
+		this.globalSettings.compaction.model = model;
+		this.markModified("compaction", "model");
+		this.save();
+	}
+
 	private getCompactionTokenSetting(
 		field: keyof CompactionModelOverride,
 		model?: Pick<Model<string>, "provider" | "id">,

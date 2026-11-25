@@ -193,6 +193,14 @@ import {
  */
 const runtimeStreamFunctions = new WeakMap<StreamFn, ModelRuntime>();
 
+interface SummarizationRequest {
+	model: Model<string>;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+	thinkingLevel: ThinkingLevel;
+}
+
 /** Mark `streamFn` as resolving auth through `modelRuntime` on its own. */
 export function markRuntimeStreamFunction(streamFn: StreamFn, modelRuntime: ModelRuntime): void {
 	runtimeStreamFunctions.set(streamFn, modelRuntime);
@@ -786,13 +794,7 @@ export class AgentSession {
 		selectedModel: Model<any>,
 		signal?: AbortSignal,
 		streamFn?: StreamFn,
-	): Promise<{
-		model: Model<any>;
-		apiKey?: string;
-		headers?: Record<string, string>;
-		env?: Record<string, string>;
-		thinkingLevel: ThinkingLevel;
-	}> {
+	): Promise<SummarizationRequest> {
 		// Route a virtual model first: summaries size their input and output from the model they get.
 		const { model, thinkingLevel } = isVirtualModel(selectedModel)
 			? await this._modelRuntime.resolveModel(selectedModel, convertToLlm(this.messages), {
@@ -3514,6 +3516,16 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _getCompactionModel(sessionModel: Model<string>): Model<string> {
+		const selection = this.settingsManager.getCompactionModel();
+		if (selection === "none") return sessionModel;
+		const model = this._modelRuntime
+			.getAvailableSnapshot()
+			.find((model) => `${model.provider}/${model.id}` === selection);
+		if (!model) throw new Error(`Compact model ${selection} is unavailable. Choose an available model in /settings.`);
+		return model;
+	}
+
 	private async _buildCompactionCacheInput(
 		model: Model<any>,
 		preparation?: CompactionPreparation,
@@ -3651,14 +3663,14 @@ export class AgentSession {
 			}
 
 			const settings = this.settingsManager.getCompactionSettings(model);
+			const summaryModel = this._getCompactionModel(model);
+			const serverRequest =
+				isPiServerMode() && (isVirtualModel(summaryModel) || summaryModel.provider !== ANTIGRAVITY_PROVIDER)
+					? await this._getSummarizationRequestAuth(summaryModel, this._compactionAbortController.signal)
+					: undefined;
 
-			if (isPiServerMode() && model.provider !== ANTIGRAVITY_PROVIDER) {
-				const {
-					model: requestModel,
-					apiKey,
-					headers,
-					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(model, this._compactionAbortController.signal);
+			if (serverRequest && serverRequest.model.provider !== ANTIGRAVITY_PROVIDER) {
+				const { model: requestModel, apiKey, headers, thinkingLevel } = serverRequest;
 				this._detachPiServerTerminalAssistantFailure();
 				const cacheInput = await this._buildCompactionCacheInput(requestModel);
 				const piServerResult = await compactPiServer(
@@ -3760,11 +3772,12 @@ export class AgentSession {
 					headers,
 					env,
 					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(
-					model,
+				} = serverRequest ??
+				(await this._getSummarizationRequestAuth(
+					summaryModel,
 					this._compactionAbortController.signal,
 					this.agent.streamFunction,
-				);
+				));
 				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const result = await compact(
 					preparation,
@@ -4043,7 +4056,7 @@ export class AgentSession {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
-		let started = false;
+		let serverRequest: SummarizationRequest | undefined;
 		let fromExtension = false;
 		let cancelledByExtension = false;
 		let warmCancellationPending = false;
@@ -4055,13 +4068,13 @@ export class AgentSession {
 			if (!model) {
 				return false;
 			}
+			const summaryModel = this._getCompactionModel(model);
 			this._cacheWarmer?.cancel();
 
-			if (isPiServerMode() && model.provider !== ANTIGRAVITY_PROVIDER) {
+			if (isPiServerMode() && (isVirtualModel(summaryModel) || summaryModel.provider !== ANTIGRAVITY_PROVIDER)) {
 				abortController = new AbortController();
 				this._autoCompactionAbortController = abortController;
 				this._emitWorkingStateChanged();
-				started = true;
 				this._emit({ type: "compaction_start", reason });
 				abortController.signal.throwIfAborted();
 				if (this._cacheWarmer) {
@@ -4073,13 +4086,12 @@ export class AgentSession {
 					abortController.signal.throwIfAborted();
 				}
 
-				const {
-					model: requestModel,
-					apiKey,
-					headers,
-					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(model, abortController.signal);
+				serverRequest = await this._getSummarizationRequestAuth(summaryModel, abortController.signal);
 				abortController.signal.throwIfAborted();
+			}
+
+			if (abortController && serverRequest && serverRequest.model.provider !== ANTIGRAVITY_PROVIDER) {
+				const { model: requestModel, apiKey, headers, thinkingLevel } = serverRequest;
 				const cacheInput = await this._buildCompactionCacheInput(requestModel);
 				const piServerResult = await compactPiServer(
 					requestModel,
@@ -4129,14 +4141,16 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const preparation = preparationOverride ?? prepareCompaction(pathEntries, settings);
 			if (!preparation) {
+				if (abortController) throw new Error("Nothing to compact");
 				return false;
 			}
 
-			abortController = new AbortController();
-			this._autoCompactionAbortController = abortController;
-			this._emitWorkingStateChanged();
-			started = true;
-			this._emit({ type: "compaction_start", reason });
+			if (!abortController) {
+				abortController = new AbortController();
+				this._autoCompactionAbortController = abortController;
+				this._emitWorkingStateChanged();
+				this._emit({ type: "compaction_start", reason });
+			}
 			abortController.signal.throwIfAborted();
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -4180,7 +4194,8 @@ export class AgentSession {
 					headers,
 					env,
 					thinkingLevel,
-				} = await this._getSummarizationRequestAuth(model, abortController.signal, this.agent.streamFunction);
+				} = serverRequest ??
+				(await this._getSummarizationRequestAuth(summaryModel, abortController.signal, this.agent.streamFunction));
 				abortController.signal.throwIfAborted();
 				const cacheInput = await this._buildCompactionCacheInput(requestModel, preparation);
 				const compactResult = await compact(
@@ -4261,28 +4276,13 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : "compaction failed";
 			const aborted =
 				externalSignal?.aborted === true || abortController?.signal.aborted === true || cancelledByExtension;
-			if (started) {
-				const errorMessage = aborted
-					? undefined
-					: reason === "overflow"
-						? `Context overflow recovery failed: ${message}`
-						: `Auto-compaction failed: ${message}`;
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted,
-					willRetry: false,
-					errorMessage,
-				});
-				await this._emitSessionCompactFailed({
-					reason,
-					errorMessage,
-					aborted,
-					willRetry: false,
-					fromExtension,
-				});
-			}
+			const errorMessage = aborted
+				? undefined
+				: reason === "overflow"
+					? `Context overflow recovery failed: ${message}`
+					: `Auto-compaction failed: ${message}`;
+			this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
+			await this._emitSessionCompactFailed({ reason, errorMessage, aborted, willRetry: false, fromExtension });
 			if (warmCancellationPending) {
 				// Agent core records thrown preparation failures as assistant errors.
 				// Keep unconfirmed cancellation terminal until an explicit abort retry.

@@ -60,6 +60,7 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	compactModel: string;
 	defaultModel: string;
 	currentModel?: Model<any>;
 	availableDefaultModels: readonly Model<any>[];
@@ -105,6 +106,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	createCompactModelSelector: NonNullable<SettingItem["submenu"]>;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -491,6 +493,13 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "compact-model",
+				label: "Compact model",
+				description: "Model for /compact and automatic compaction. 'none' uses the session model.",
+				currentValue: config.compactModel,
+				submenu: callbacks.createCompactModelSelector,
+			},
+			{
 				id: "steering-mode",
 				label: "Steering mode",
 				description:
@@ -769,15 +778,14 @@ export class SettingsSelectorComponent extends Container {
 
 		// Only show image toggle if terminal supports it
 		if (supportsImages) {
-			// Insert after autocompact
-			items.splice(1, 0, {
+			items.splice(2, 0, {
 				id: "show-images",
 				label: "Show images",
 				description: "Render images inline in terminal",
 				currentValue: config.showImages ? "true" : "false",
 				values: ["true", "false"],
 			});
-			items.splice(2, 0, {
+			items.splice(3, 0, {
 				id: "image-width-cells",
 				label: "Image width",
 				description: "Preferred inline image width in terminal cells",
@@ -787,7 +795,7 @@ export class SettingsSelectorComponent extends Container {
 		}
 
 		// Image auto-resize toggle (always available, affects both attached and read images)
-		items.splice(supportsImages ? 3 : 1, 0, {
+		items.splice(supportsImages ? 4 : 2, 0, {
 			id: "auto-resize-images",
 			label: "Auto-resize images",
 			description: "Resize large images to 2000x2000 max for better model compatibility",

@@ -12,15 +12,22 @@ describe("AgentSession server-account compaction", () => {
 	});
 
 	it.each([
-		["devin", "manual"],
-		["devin", "auto"],
-	] as const)("routes %s %s compaction with server account auth", async (provider, mode) => {
+		["manual", "none"],
+		["auto", "none"],
+		["manual", "devin/summary"],
+		["auto", "devin/summary"],
+	] as const)("routes %s compaction with server account auth and compaction.model=%s", async (mode, selection) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		vi.stubEnv("PI_SERVER_MODE", "true");
-		const model = { ...harness.getModel(), provider, headers: { Authorization: "client-header" } };
-		harness.session.agent.state.model = model;
-		vi.spyOn(harness.session.modelRuntime, "isServerAccountProvider").mockReturnValue(true);
+		const model = { ...harness.getModel(), provider: "devin", headers: { Authorization: "client-header" } };
+		const summaryModel = { ...model, id: "summary" };
+		if (selection === "none") harness.session.agent.state.model = model;
+		harness.settingsManager.setCompactionModel(selection);
+		vi.spyOn(harness.session.modelRuntime, "getAvailableSnapshot").mockReturnValue([summaryModel]);
+		vi.spyOn(harness.session.modelRuntime, "isServerAccountProvider").mockImplementation(
+			(provider) => provider === "devin",
+		);
 		const getAuth = vi
 			.spyOn(harness.session.modelRuntime, "getAuth")
 			.mockRejectedValue(new Error("client auth read"));
@@ -38,6 +45,7 @@ describe("AgentSession server-account compaction", () => {
 		expect(getAuth).not.toHaveBeenCalled();
 		expect(compact).toHaveBeenCalledOnce();
 		const [requestModel, , options] = compact.mock.calls[0];
+		expect(requestModel.id).toBe(selection === "none" ? model.id : summaryModel.id);
 		expect(requestModel.headers).toBeUndefined();
 		expect(options).toMatchObject({ authSource: "server-account" });
 		expect(options?.apiKey).toBeUndefined();

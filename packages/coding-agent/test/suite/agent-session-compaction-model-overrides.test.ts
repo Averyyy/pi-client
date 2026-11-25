@@ -1,6 +1,9 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ANTIGRAVITY_PROVIDER } from "../../src/core/antigravity-acp.ts";
 import type { SessionBeforeCompactEvent } from "../../src/core/extensions/index.ts";
+import * as piServerClient from "../../src/core/pi-server-client.ts";
+import { VIRTUAL_MODEL_API } from "../../src/core/virtual-models.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 function seedHistory(harness: Harness, totalTokens = 650): string {
@@ -30,7 +33,116 @@ describe("AgentSession compaction model overrides", () => {
 	const harnesses: Harness[] = [];
 	afterEach(() => {
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		while (harnesses.length) harnesses.pop()?.cleanup();
+	});
+
+	it.each(["manual", "auto"] as const)(
+		"keeps virtual %s compaction routed to Antigravity on the client",
+		async (mode) => {
+			const harness = await createHarness({
+				settings: { compaction: { model: "router/summary", keepRecentTokens: 150 } },
+			});
+			harnesses.push(harness);
+			seedHistory(harness);
+			vi.stubEnv("PI_SERVER_MODE", "true");
+			const model = harness.getModel();
+			const virtual = { ...model, id: "summary", provider: "router", api: VIRTUAL_MODEL_API };
+			const antigravity = { ...model, provider: ANTIGRAVITY_PROVIDER, maxTokens: 512 };
+			const runtime = harness.session.modelRuntime;
+			vi.spyOn(runtime, "getAvailableSnapshot").mockReturnValue([virtual]);
+			const route = vi
+				.spyOn(runtime, "resolveModel")
+				.mockResolvedValue({ model: antigravity, thinkingLevel: "off" });
+			const compactRemote = vi.spyOn(piServerClient, "compactPiServer");
+			const streamLocal = vi.fn(() => {
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("summary") });
+				return stream;
+			});
+			harness.session.agent.streamFunction = streamLocal;
+
+			if (mode === "manual") {
+				await harness.session.compact();
+			} else {
+				const session = harness.session as unknown as {
+					_runAutoCompaction(reason: "threshold", willRetry: boolean): Promise<boolean>;
+				};
+				await session._runAutoCompaction("threshold", false);
+			}
+
+			expect(route).toHaveBeenCalledOnce();
+			expect(compactRemote).not.toHaveBeenCalled();
+			expect(streamLocal).toHaveBeenCalledWith(
+				expect.objectContaining({ provider: ANTIGRAVITY_PROVIDER }),
+				expect.anything(),
+				expect.anything(),
+			);
+			expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe("summary");
+		},
+	);
+
+	it.each([
+		["manual", "faux/family/summary", "family/summary"],
+		["pre-prompt", "faux/family/summary", "family/summary"],
+		["manual", "none", "chat"],
+	] as const)("uses compaction.model for %s compaction with %s", async (path, selection, expectedModel) => {
+		const harness = await createHarness({
+			models: [
+				{ id: "chat", contextWindow: 4000, maxTokens: 512 },
+				{ id: "family/summary", contextWindow: 8000, maxTokens: 512 },
+			],
+			tools: [],
+			settings: {
+				compaction: {
+					model: selection,
+					keepRecentTokens: 150,
+					modelOverrides: { "faux/chat": { reserveTokens: 2000 } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.modelRuntime.getAvailable();
+		seedHistory(harness, 2500);
+		const requests: string[] = [];
+		harness.setResponses([
+			(_context, _options, _state, model) => {
+				requests.push(model.id);
+				return fauxAssistantMessage("summary");
+			},
+		]);
+		if (path === "manual") {
+			await harness.session.compact();
+		} else {
+			harness.appendResponses([
+				(_context, _options, _state, model) => {
+					requests.push(model.id);
+					return fauxAssistantMessage("chat reply");
+				},
+			]);
+			await harness.session.prompt("continue");
+		}
+		expect(requests).toEqual(path === "manual" ? [expectedModel] : [expectedModel, "chat"]);
+		expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe("summary");
+		expect(harness.session.model?.id).toBe("chat");
+	});
+
+	it("reports an unavailable compact model during manual and automatic compaction", async () => {
+		const harness = await createHarness({
+			models: [{ id: "chat", contextWindow: 4000 }],
+			tools: [],
+			settings: { compaction: { model: "faux/missing", reserveTokens: 2000, keepRecentTokens: 150 } },
+		});
+		harnesses.push(harness);
+		seedHistory(harness, 2500);
+		const error = "Compact model faux/missing is unavailable";
+		await expect(harness.session.compact()).rejects.toThrow(error);
+		harness.setResponses([fauxAssistantMessage("chat reply")]);
+		await harness.session.prompt("continue");
+		expect(harness.eventsOfType("compaction_end")).toMatchObject([
+			{ reason: "manual", errorMessage: expect.stringContaining(error) },
+			{ reason: "threshold", errorMessage: expect.stringContaining(error) },
+		]);
 	});
 
 	it.each(["manual", "pre-prompt", "post-run", "overflow"] as const)(

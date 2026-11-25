@@ -121,6 +121,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 
 ## pi-client / pi-server Compact and Resilience
 
+- Resolve `compaction.model` by exact `provider/modelId` from the client catalog for local and pi-server summary requests. Keep trigger and retention settings tied to the session model. `none` uses the session model, and an unavailable explicit selection fails with its model ID.
 - When provider usage includes cache counts, compute `totalTokens` from input, output, cacheRead, and cacheWrite so footer context usage and threshold compaction account for cached prompts.
 - Devin's live Token Usage metric reports cache hits as `cached_input_tokens`, separate from uncached `input_tokens`. Preserve per-metric reports across frames, treat an omitted numeric scalar in a present protobuf metric as zero, and verify repeated SWE-2 prompts against wire usage before claiming a usage fix.
 - Preserve providers' native `refreshModels` implementations instead of wrapping them with the static pi.dev catalog overlay. Devin's account catalog is not published by pi.dev. Keep Node bundle entries and Bun static registration in sync with new Node-only provider/OAuth loaders; source-only smoke tests do not prove packaged loaders resolve.
