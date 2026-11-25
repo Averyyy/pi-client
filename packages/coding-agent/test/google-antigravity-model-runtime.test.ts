@@ -14,6 +14,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ContextStore } from "../../pi-server/src/context-store.ts";
 import { createPiServer } from "../../pi-server/src/server.ts";
+import type { AntigravityToolDisplay } from "../src/core/antigravity-native-tools.ts";
 import { type AntigravityClient, AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
 import { AntigravityWorkspace } from "../src/core/antigravity-workspace.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -721,6 +722,53 @@ describe("Antigravity ACP", () => {
 		}
 	});
 
+	it("continues agy's session after another model with every user message since agy's last reply", async () => {
+		signedIn();
+		const runtime = await createRuntime();
+		const faux = fauxProvider({ models: [{ id: "other", contextWindow: 1_000_000 }] });
+		runtime.registerNativeProvider({
+			...faux.provider,
+			auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+		});
+		await runtime.refresh({ providers: [faux.provider.id], allowNetwork: false });
+		faux.setResponses([fauxAssistantMessage("another model's answer")]);
+		const agy = runtime.getModel(providerId, "gemini-test")!;
+		const discovery = trace().length;
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model: agy,
+			modelRuntime: runtime,
+			sessionManager: SessionManager.inMemory(cwd),
+			settingsManager: SettingsManager.inMemory(),
+			resourceLoader: createTestResourceLoader(),
+			noTools: "all",
+			autoSessionName: false,
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		try {
+			await session.bindExtensions({});
+			await session.prompt("first");
+			await session.setModel(runtime.getModel(faux.provider.id, "other")!);
+			await session.prompt("asked meanwhile");
+			await session.setModel(agy);
+			await session.prompt("back");
+			const acp = trace().slice(discovery);
+			expect(acp.filter((entry) => entry.method === "session/new")).toHaveLength(1);
+			// agy hears what the user asked meanwhile, never the other model's reply.
+			expect(acp.filter((entry) => entry.method === "session/prompt").at(-1)?.params).toEqual({
+				sessionId: "mock-agy-session",
+				prompt: [
+					{ type: "text", text: "asked meanwhile" },
+					{ type: "text", text: "back" },
+				],
+			});
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
+		}
+	});
+
 	it("stores native ACP results, maps the native plan and form to Pi extension records, and preserves cancelled Pi tool results", async () => {
 		signedIn();
 		const runtime = await createRuntime();
@@ -783,7 +831,7 @@ describe("Antigravity ACP", () => {
 				(event.type === "tool_execution_start" ||
 					event.type === "tool_execution_update" ||
 					event.type === "tool_execution_end") &&
-				event.toolName.startsWith("agy_")
+				(event.toolName === "read" || event.toolName.startsWith("agy_"))
 			) {
 				nativeRows.push([event.type, event.toolName]);
 			}
@@ -839,7 +887,7 @@ describe("Antigravity ACP", () => {
 			expect(results()).toMatchObject([
 				{ toolName: "lookup", details: { key: "答案" }, isError: false },
 				{
-					toolName: "agy_read_file",
+					toolName: "read",
 					content: [{ type: "text", text: "first chunk" }],
 					details: { rawOutput: { lines: 2 } },
 					isError: false,
@@ -860,12 +908,25 @@ describe("Antigravity ACP", () => {
 					details: { tasks: [{ id: 1, subject: "Review choices", status: "completed" }], nextId: 2 },
 				},
 			]);
-			// agy's own tool call showed as a live Pi tool row before its result reached the transcript.
+			// agy's own tool calls showed as live Pi tool rows before their results reached the transcript.
 			expect(nativeRows).toEqual([
-				["tool_execution_start", "agy_read_file"],
-				["tool_execution_update", "agy_read_file"],
-				["tool_execution_end", "agy_read_file"],
+				["tool_execution_start", "read"],
+				["tool_execution_update", "read"],
+				["tool_execution_end", "read"],
+				["tool_execution_start", "agy_search"],
+				["tool_execution_end", "agy_search"],
 			]);
+			// The transcript records agy's read as Pi's read, and its search, which no Pi tool describes, as a note.
+			const replyContent = SessionManager.open(manager.getSessionFile()!, cwd)
+				.getBranch()
+				.flatMap((entry) =>
+					entry.type === "message" && entry.message.role === "assistant" ? entry.message.content : [],
+				);
+			expect(replyContent).toContainEqual(
+				expect.objectContaining({ type: "toolCall", name: "read", arguments: { path: "notes.txt", offset: 1 } }),
+			);
+			expect(replyContent).toContainEqual({ type: "text", text: '[Antigravity ran: Search for TODO]\n{"hits":1}' });
+			expect(replyContent).not.toContainEqual(expect.objectContaining({ name: "agy_search" }));
 			select.mockImplementationOnce(async (_title, options) => options[1]).mockResolvedValueOnce("Submit answers");
 			await session.prompt("native-choice");
 			expect(trace()).toContainEqual(
@@ -902,7 +963,11 @@ describe("Antigravity ACP", () => {
 		signedIn();
 		writeFileSync(join(cwd, "notes.txt"), "one\ntwo\nthree");
 		const workspace = new AntigravityWorkspace(cwd);
-		const client: AntigravityClient = { workspace: (request, signal) => workspace.handle(request, signal) };
+		const displays: AntigravityToolDisplay[] = [];
+		const client: AntigravityClient = {
+			workspace: (request, signal) => workspace.handle(request, signal),
+			showToolCall: (display) => displays.push(display),
+		};
 		const context = normalizeContext({ messages: [{ role: "user", content: "workspace", timestamp: 1 }] });
 		let runtime: AntigravityRuntime | undefined;
 		try {
@@ -951,6 +1016,15 @@ describe("Antigravity ACP", () => {
 				output: { output: "minal ok", truncated: true, exitStatus: { exitCode: 0, signal: null } },
 			});
 			expect(readFileSync(join(cwd, "out", "result.txt"), "utf8")).toBe("written");
+			// The command agy ran in Pi's terminal is recorded and shown as Pi's bash, with the output agy read.
+			const bash = { name: "bash", arguments: { command: expect.stringContaining(" -e 'process.stdout.write(") } };
+			expect(reply.content).toContainEqual(expect.objectContaining(bash));
+			expect(displays.map((display) => [display.type, display.toolCall.name])).toEqual([
+				["start", "agy_execute"],
+				["update", "bash"],
+				["end", "bash"],
+			]);
+			expect(displays.at(-1)).toMatchObject({ result: { content: [{ type: "text", text: "minal ok" }] } });
 		} finally {
 			workspace.close();
 			await runtime?.close();

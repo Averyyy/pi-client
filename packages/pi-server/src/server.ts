@@ -1653,8 +1653,8 @@ async function handleStream(
 							},
 						}
 					: {}),
-				showToolCall: (update) => {
-					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_tool_call", update);
+				showToolCall: (display) => {
+					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_tool_call", display);
 				},
 				showCompaction: (update) => {
 					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_compaction", update);

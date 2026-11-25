@@ -462,7 +462,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const ui = runner?.hasUI() ? runner.getUIContext() : undefined;
 				const client: AntigravityClient = {
 					executeTool: (call, assistant, signal) => session.executeAntigravityTool(call, assistant, signal),
-					showToolCall: (update) => session.showAntigravityToolCall(update),
+					showToolCall: (display) => session.showAntigravityToolCall(display),
 					showCompaction: (update) => session.showAntigravityCompaction(update),
 					// Extensions and SDK callers add tools; agy keeps its own instead of Pi's built-in ones.
 					toolNames: session

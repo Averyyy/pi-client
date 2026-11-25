@@ -74,7 +74,7 @@ import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
-import { type AcpToolCallUpdate, AntigravityNativeTools } from "./antigravity-native-tools.ts";
+import type { AntigravityToolDisplay } from "./antigravity-native-tools.ts";
 import { type AcpCompactionUpdate, ANTIGRAVITY_SESSION_ONLY } from "./antigravity-runtime.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -678,7 +678,6 @@ export class AgentSession {
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
-	private readonly _antigravityTools = new AntigravityNativeTools();
 	private readonly _antigravityCompactions = new Set<string>();
 	/** agy compacted its context this turn; Pi compacts its own transcript once the turn ends. */
 	private _antigravityCompacted = false;
@@ -1075,29 +1074,23 @@ export class AgentSession {
 	}
 
 	/** Show one of agy's own tool calls as a Pi tool row; the turn's transcript keeps its call and result. */
-	showAntigravityToolCall(update: AcpToolCallUpdate): void {
-		const event = this._antigravityTools.apply(update);
-		const toolCall = event.type === "end" ? event.outcome.toolCall : event.toolCall;
+	showAntigravityToolCall(display: AntigravityToolDisplay): void {
+		const { toolCall } = display;
 		const ids = { toolCallId: toolCall.id, toolName: toolCall.name };
 		const events: (ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolExecutionEndEvent)[] = [];
-		if (event.type === "start" || (event.type === "end" && !event.started)) {
+		if (display.type === "start" || (display.type === "end" && !display.started)) {
 			events.push({ type: "tool_execution_start", ...ids, args: toolCall.arguments });
 		}
-		if (event.type === "update") {
+		if (display.type === "update") {
 			events.push({
 				type: "tool_execution_update",
 				...ids,
 				args: toolCall.arguments,
-				partialResult: { content: event.content, details: {} },
+				partialResult: { content: display.content, details: {} },
 			});
 		}
-		if (event.type === "end") {
-			events.push({
-				type: "tool_execution_end",
-				...ids,
-				result: event.outcome.result,
-				isError: event.outcome.isError,
-			});
+		if (display.type === "end") {
+			events.push({ type: "tool_execution_end", ...ids, result: display.result, isError: display.isError });
 		}
 		for (const toolEvent of events) {
 			this._emit(toolEvent);

@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { JsonObject } from "@earendil-works/pi-ai";
+import type { JsonObject, JsonValue } from "@earendil-works/pi-ai";
 import { McpError } from "@earendil-works/pi-mcp";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { getShellEnv } from "../utils/shell.ts";
@@ -102,9 +102,7 @@ export class AntigravityWorkspace {
 		if (typeof params.command !== "string" || !params.command) {
 			throw new McpError(-32602, "terminal/create requires a command");
 		}
-		const args = Array.isArray(params.args) ? params.args.map(String) : [];
-		// A command with arguments names a program; a bare command is a shell command line.
-		const command = args.length ? [params.command, ...args].map(quoteArgument).join(" ") : params.command;
+		const command = acpCommandLine(params.command, params.args);
 		const env = getShellEnv();
 		for (const variable of Array.isArray(params.env) ? params.env : []) {
 			const { name, value } = variable as { name?: unknown; value?: unknown };
@@ -149,10 +147,16 @@ export class AntigravityWorkspace {
 
 /** Map a path under the agy session root into the Pi workspace; other absolute paths stay as they are. */
 function toWorkspacePath(path: string, root: string, cwd: string): string {
+	const relative = rootRelativePath(path, root);
+	return relative === undefined ? path : join(cwd, ...relative.split("/").filter(Boolean));
+}
+
+/** `path` relative to `root` with `/` separators (empty for the root itself), or undefined outside `root`. */
+export function rootRelativePath(path: string, root: string): string | undefined {
 	const target = path.replace(/\\/g, "/");
 	const base = root.replace(/\\/g, "/").replace(/\/+$/, "");
-	if (target !== base && !target.startsWith(`${base}/`)) return path;
-	return join(cwd, ...target.slice(base.length).split("/").filter(Boolean));
+	if (target === base) return "";
+	return target.startsWith(`${base}/`) ? target.slice(base.length + 1) : undefined;
 }
 
 /** ACP lines are 1-based; `limit` counts lines from `line`. */
@@ -173,6 +177,13 @@ function truncateOutput(terminal: Terminal, limit: number): void {
 	terminal.truncated = true;
 }
 
-function quoteArgument(value: string): string {
+/** The shell command line of an ACP `terminal/create`: with arguments, `command` names a program; without, it is a command line. */
+export function acpCommandLine(command: string, args: JsonValue | undefined): string {
+	const values = Array.isArray(args) ? args.map(String) : [];
+	return values.length ? [command, ...values].map(quoteShellArgument).join(" ") : command;
+}
+
+/** Quote one word for a POSIX shell. */
+export function quoteShellArgument(value: string): string {
 	return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
