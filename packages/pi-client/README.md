@@ -97,7 +97,7 @@ Protocol references: [pi-devin](https://github.com/mizorewww/pi-devin), [pi-devi
 
 Install [Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) on the PiServer host and sign in to `agy` as the OS user running PiServer. In Pi Client, use `/model` to select a model from the server CLI's catalog. `/login google-antigravity` checks the existing `agy` sign-in and reloads that catalog. PiServer also runs the ACP conversation with `agy`.
 
-The CLI owns the account catalog, inference, and native tool permissions. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Pi custom tools run in the Pi process and return results to `agy` over MCP. In pi-server mode the read-only viewer can still show Pi's session activity.
+The CLI owns the account catalog, inference, and native tool permissions. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Pi custom tools run in the Pi process and return results to `agy` over MCP; file and terminal requests from `agy` also run in the Pi workspace. In pi-server mode the read-only viewer can still show Pi's session activity.
 
 ## Update
 

@@ -47,7 +47,9 @@ The authenticated `/api/accounts` endpoint exposes the Devin account snapshot. I
 
 ## Google Antigravity
 
-Install `agy` on the PiServer host and sign in as the OS user running PiServer. PiServer uses the CLI on its `PATH` or the executable at `PI_ANTIGRAVITY_CLI`. The CLI provides both the account's model catalog and inference through ACP in the server's working directory.
+Install `agy` on the PiServer host and sign in as the OS user running PiServer. PiServer uses the CLI on its `PATH` or the executable at `PI_ANTIGRAVITY_CLI`. The CLI provides both the account's model catalog and inference through ACP. PiServer discovers the catalog at startup, every four hours, and on account refresh, and returns it with `/api/accounts`.
+
+Each `agy` session works in the client's directory when that path exists on the PiServer host, and otherwise in an empty `antigravity-workspace` directory under the session store. File reads, writes, and terminal commands from `agy` run in the client's workspace. After each completed turn PiServer saves the `agy` session ID next to the session store and resumes that session after a restart or idle release.
 
 In Pi Client, `/login google-antigravity` checks the existing CLI sign-in and reloads the catalog. Use `/model` to select a model. The client sends conversation deltas through ChunkRequest and handles Pi tool calls and approval prompts in the client session.
 

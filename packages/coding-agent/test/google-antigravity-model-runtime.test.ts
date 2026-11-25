@@ -1,16 +1,23 @@
 import { once } from "node:events";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InMemoryCredentialStore, InMemoryModelsStore, normalizeContext } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	InMemoryCredentialStore,
+	InMemoryModelsStore,
+	normalizeContext,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ContextStore } from "../../pi-server/src/context-store.ts";
 import { createPiServer } from "../../pi-server/src/server.ts";
-import { AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
+import { type AntigravityClient, AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
+import { AntigravityWorkspace } from "../src/core/antigravity-workspace.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { streamPiServerAntigravity } from "../src/core/pi-server-client.ts";
 import { closePiServerObserver } from "../src/core/pi-server-observer.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -38,6 +45,14 @@ function trace(): { method: string; params?: unknown; result?: unknown }[] {
 		.map((line) => JSON.parse(line));
 }
 
+/** A PiServer session store whose agy workspace can start the fixture CLI, like the test directory. */
+function serverStore(name: string): string {
+	const store = join(cwd, name);
+	mkdirSync(join(store, "antigravity-workspace"), { recursive: true });
+	copyFileSync(join(cwd, "acp"), join(store, "antigravity-workspace", "acp"));
+	return store;
+}
+
 function signedIn(): void {
 	writeFileSync(join(cwd, "signed-in"), "");
 }
@@ -51,6 +66,7 @@ beforeEach(() => {
 	copyFileSync(new URL("./fixtures/antigravity-acp.cjs", import.meta.url), join(cwd, "acp"));
 	vi.spyOn(process, "cwd").mockReturnValue(cwd);
 	vi.stubEnv("PI_ANTIGRAVITY_CLI", process.execPath);
+	vi.stubEnv("PI_ACP_FIXTURE_DIR", cwd);
 	vi.stubEnv("PI_SERVER_MODE", "false");
 });
 
@@ -140,7 +156,7 @@ describe("Antigravity ACP", () => {
 			{
 				method: "initialize",
 				params: {
-					protocolVersion: 2,
+					protocolVersion: 1,
 					clientInfo: { name: "pi", title: "Pi" },
 					clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
 				},
@@ -163,14 +179,14 @@ describe("Antigravity ACP", () => {
 		vi.stubEnv("PI_CLIENT_MAX_REQUEST_KB", "64");
 		const backendUrl = await listen(
 			createPiServer({
-				sessionStoreDir: join(cwd, "server"),
+				sessionStoreDir: serverStore("server"),
 				accountStoreDir: join(cwd, "accounts"),
 				authToken: "fixture",
 			}),
 		);
 		const requests: {
 			path: string;
-			body?: { target?: string; antigravity?: { baseRunId?: string }; contextOverlay?: unknown[] };
+			body?: { target?: string; providerId?: string; contextOverlay?: unknown[] };
 			bytes: number;
 		}[] = [];
 		let released = false;
@@ -221,7 +237,16 @@ describe("Antigravity ACP", () => {
 		await runtime.login(providerId, "oauth", interaction);
 		expect(interaction.notify).not.toHaveBeenCalled();
 		expect(interaction.prompt).not.toHaveBeenCalled();
-		expect(requests.filter(({ path }) => path === "/api/antigravity/models")).toHaveLength(3);
+		// Startup reads PiServer's cached catalog with the accounts; each login asks it to rediscover.
+		expect(
+			requests
+				.filter(({ path }) => path.startsWith("/api/accounts"))
+				.map(({ path, body }) => [path, body?.providerId]),
+		).toEqual([
+			["/api/accounts", undefined],
+			["/api/accounts/refresh", "google-antigravity"],
+			["/api/accounts/refresh", "google-antigravity"],
+		]);
 		const discoveryRequests = trace().length;
 		const model = runtime.getModel(providerId, "gemini-test")!;
 		expect(model.contextWindow).toBe(50_000);
@@ -350,11 +375,14 @@ describe("Antigravity ACP", () => {
 					isError: false,
 				},
 			]);
-			expect(messages[0].content[0]).toMatchObject({ type: "toolCall", id: results[0].toolCallId });
+			// The tool call sits where agy ran it, between the thinking before it and the reply after it.
+			expect(messages[0].content).toMatchObject([
+				{ type: "thinking", thinking: "Planning" },
+				{ type: "toolCall", id: results[0].toolCallId },
+				{ type: "text", text: "Reviewed 答案" },
+			]);
 			await session.prompt("permission");
-			expect(select).toHaveBeenCalledWith("Run native tool (runs on the PiServer host)", ["Allow once"], {
-				signal: expect.any(AbortSignal),
-			});
+			expect(select).toHaveBeenCalledWith("Run native tool", ["Allow once"], { signal: expect.any(AbortSignal) });
 			const compacted = await session.compact();
 			expect(compacted.summary).toContain("Reviewed 答案");
 			expect(reopen()).toContainEqual(expect.objectContaining({ type: "message", message: results[0] }));
@@ -386,7 +414,7 @@ describe("Antigravity ACP", () => {
 		await vi.waitFor(() => expect(released).toBe(true));
 	});
 
-	it("keeps the agy context on PiServer across restarts and uploads it whole only when the store is gone", async () => {
+	it("resumes the agy session after a PiServer restart and uploads the context whole only when the store is gone", async () => {
 		signedIn();
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
@@ -401,7 +429,7 @@ describe("Antigravity ACP", () => {
 				await new Promise<void>((resolve, reject) => stopped.close((error) => (error ? reject(error) : resolve())));
 			}
 			backend = createPiServer({
-				sessionStoreDir: join(cwd, store),
+				sessionStoreDir: serverStore(store),
 				accountStoreDir: join(cwd, "accounts"),
 				authToken: "fixture",
 			});
@@ -488,14 +516,22 @@ describe("Antigravity ACP", () => {
 				},
 			]);
 			expect(statuses).toEqual([200, 200, 409, 200]);
-			const prompts = trace()
-				.slice(discovery)
-				.filter((entry) => entry.method === "session/prompt");
-			// Each restart starts a new agy process, which receives Pi's transcript once.
-			expect(prompts.at(1)?.params).toMatchObject({
+			const acp = trace().slice(discovery);
+			// The restarted process loads the saved agy session and receives only the new prompt.
+			expect(acp.filter((entry) => entry.method === "session/load").map((entry) => entry.params)).toEqual([
+				expect.objectContaining({ sessionId: "mock-agy-session", cwd }),
+			]);
+			const prompts = acp.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params);
+			expect(prompts.slice(0, 2)).toEqual([
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "first" }] },
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "second" }] },
+			]);
+			// The lost store also lost the saved session, so a new agy session receives the transcript.
+			expect(prompts[2]).toMatchObject({
 				prompt: expect.arrayContaining([
 					{ type: "text", text: "first" },
 					{ type: "text", text: "second" },
+					{ type: "text", text: "third" },
 				]),
 			});
 		} finally {
@@ -766,6 +802,108 @@ describe("Antigravity ACP", () => {
 		}
 	});
 
+	it.each(["Pi", "PiServer"])("serves agy file and terminal requests in the %s client workspace", async (host) => {
+		signedIn();
+		writeFileSync(join(cwd, "notes.txt"), "one\ntwo\nthree");
+		const workspace = new AntigravityWorkspace(cwd);
+		const client: AntigravityClient = { workspace: (request, signal) => workspace.handle(request, signal) };
+		const context = normalizeContext({ messages: [{ role: "user", content: "workspace", timestamp: 1 }] });
+		let runtime: AntigravityRuntime | undefined;
+		try {
+			let reply: AssistantMessage;
+			if (host === "Pi") {
+				const models = await createRuntime();
+				runtime = new AntigravityRuntime(cwd);
+				reply = await runtime.stream(models.getModel(providerId, "gemini-test")!, context, {}, client).result();
+			} else {
+				vi.stubEnv("PI_SERVER_MODE", "true");
+				vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
+				vi.stubEnv(
+					"PI_SERVER_URL",
+					await listen(
+						createPiServer({
+							sessionStoreDir: serverStore("server"),
+							accountStoreDir: join(cwd, "accounts"),
+							authToken: "fixture",
+						}),
+					),
+				);
+				const models = await createRuntime();
+				const stream = await streamPiServerAntigravity(
+					models.getModel(providerId, "gemini-test")!,
+					context,
+					{ sessionId: "workspace-session", antigravityCwd: cwd },
+					client,
+				);
+				reply = await stream.result();
+			}
+			expect(trace()).toContainEqual(
+				expect.objectContaining({
+					method: "initialize",
+					params: expect.objectContaining({
+						clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+					}),
+				}),
+			);
+			const text = reply.content.find((block) => block.type === "text");
+			expect(JSON.parse(text?.type === "text" ? text.text : "")).toEqual({
+				read: "two",
+				exit: { exitCode: 0, signal: null },
+				output: { output: "minal ok", truncated: true, exitStatus: { exitCode: 0, signal: null } },
+			});
+			expect(readFileSync(join(cwd, "out", "result.txt"), "utf8")).toBe("written");
+		} finally {
+			workspace.close();
+			await runtime?.close();
+		}
+	});
+
+	it("answers agy's parallel tool calls concurrently through PiServer", { timeout: 10_000 }, async () => {
+		signedIn();
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
+		vi.stubEnv(
+			"PI_SERVER_URL",
+			await listen(
+				createPiServer({
+					sessionStoreDir: serverStore("server"),
+					accountStoreDir: join(cwd, "accounts"),
+					authToken: "fixture",
+				}),
+			),
+		);
+		const models = await createRuntime();
+		let secondStarted!: () => void;
+		const second = new Promise<void>((resolve) => {
+			secondStarted = resolve;
+		});
+		const client: AntigravityClient = {
+			// The first call waits for the second, so answering callbacks one at a time would deadlock.
+			executeTool: async (call) => {
+				if (call.arguments.key === "first") await second;
+				else secondStarted();
+				return {
+					toolCall: call,
+					result: { content: [{ type: "text", text: String(call.arguments.key) }], details: {} },
+					isError: false,
+				};
+			},
+		};
+		const stream = await streamPiServerAntigravity(
+			models.getModel(providerId, "gemini-test")!,
+			normalizeContext({
+				tools: [{ name: "lookup", description: "Find an answer", parameters: Type.Object({ key: Type.String() }) }],
+				messages: [{ role: "user", content: "parallel", timestamp: 1 }],
+			}),
+			{ sessionId: "parallel-session", antigravityCwd: cwd },
+			client,
+		);
+		expect((await stream.result()).content.at(-1)).toEqual({ type: "text", text: "first+second" });
+		expect(stream.executedToolResults?.map((result) => result.content)).toEqual(
+			expect.arrayContaining([[{ type: "text", text: "first" }], [{ type: "text", text: "second" }]]),
+		);
+	});
+
 	it("forwards native permission outcomes and waits for ACP cancellation", async () => {
 		signedIn();
 		const runtime = await createRuntime();
@@ -788,6 +926,14 @@ describe("Antigravity ACP", () => {
 				expect.objectContaining({
 					method: "session/set_config_option",
 					params: { sessionId: "mock-agy-session", configId: "effort", value: "high" },
+				}),
+			);
+			// Pi sends no level for "off"; agy must still leave "high".
+			await adapter.stream(model, context("off"), {}, { requestPermission: permission }).result();
+			expect(trace()).toContainEqual(
+				expect.objectContaining({
+					method: "session/set_config_option",
+					params: { sessionId: "mock-agy-session", configId: "effort", value: "off" },
 				}),
 			);
 			const controller = new AbortController();

@@ -16,6 +16,8 @@ export interface PiServerAccount {
 
 export interface PiServerAccountsSnapshot {
 	accounts: PiServerAccount[];
+	/** PiServer's agy catalog; `models: null` means agy there is missing or signed out. */
+	antigravity?: { models: Model<Api>[] | null; error?: string };
 }
 
 export function isPiServerAccountProvider(providerId: string): providerId is PiServerAccountProviderId {
@@ -42,7 +44,7 @@ export async function readPiServerAccounts(signal?: AbortSignal): Promise<PiServ
 }
 
 export async function refreshPiServerAccounts(
-	providerId: PiServerAccountProviderId | undefined,
+	providerId: PiServerAccountProviderId | "google-antigravity" | undefined,
 	signal?: AbortSignal,
 ): Promise<PiServerAccountsSnapshot> {
 	const response = await request(signal).postJson("/api/accounts/refresh", { providerId });

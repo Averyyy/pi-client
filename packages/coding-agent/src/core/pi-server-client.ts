@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+	type AgentAssistantStream,
 	type AgentToolCallOutcome,
 	type CompactionPreparationOptions,
 	createToolResultMessage,
@@ -13,7 +14,6 @@ import {
 	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEvent,
-	type AssistantMessageEventStream,
 	type AuthOperationOptions,
 	type CacheRetention,
 	type ClassifierApi,
@@ -58,7 +58,8 @@ import {
 } from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
 
-type PiServerEventStream = AssistantMessageEventStream;
+/** Antigravity streams also carry the tool results agy executed during the turn. */
+type PiServerEventStream = AgentAssistantStream;
 
 function getServerUrl(): string {
 	return process.env.PI_SERVER_URL ?? "http://127.0.0.1:4217";
@@ -304,6 +305,8 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	/** Send the context as a delta against PiServer's per-session message store. */
 	incrementalContext?: boolean;
 	antigravity?: AntigravityClient | true;
+	/** The Pi workspace agy's file and terminal requests run in. */
+	antigravityCwd?: string;
 }
 
 interface PiServerErrorResponse {
@@ -1167,17 +1170,6 @@ export async function compactPiServer(
 	}
 }
 
-export async function readPiServerAntigravityModels(
-	signal: AbortSignal,
-): Promise<Model<"google-antigravity">[] | undefined> {
-	const response = await createPiServerRequest(signal).getJson("/api/antigravity/models");
-	const { models } = await readPiServerJson<{ models: Model<"google-antigravity">[] | null }>(
-		response,
-		"PiServer Antigravity model discovery failed",
-	);
-	return models ?? undefined;
-}
-
 export async function logoutPiServerAntigravity(signal: AbortSignal): Promise<void> {
 	const response = await createPiServerRequest(signal).postJson("/api/antigravity/logout", {});
 	await readPiServerJson(response, "PiServer Antigravity logout failed");
@@ -1238,11 +1230,12 @@ function rememberPiServerContext(sessionId: string, hashes: readonly string[], p
 export function streamPiServerAntigravity(
 	model: Model<string>,
 	context: Context,
-	options?: SimpleStreamOptions,
+	options?: SimpleStreamOptions & Pick<PiServerStreamOptions, "antigravityCwd">,
 	client?: AntigravityClient,
 ): Promise<PiServerEventStream> {
 	return streamPiServer({ ...model, headers: undefined }, context, {
 		antigravity: client ?? true,
+		antigravityCwd: options?.antigravityCwd,
 		incrementalContext: client !== undefined,
 		sessionId: client ? options?.sessionId : undefined,
 		ownerSessionId: options?.sessionId,
@@ -1307,6 +1300,9 @@ export async function streamPiServer(
 						clientOutcomes.set(answer.outcome.toolCall.id, answer.outcome);
 						return answer;
 					}
+					case "workspace":
+						if (!agyClient.workspace) throw new Error("Pi session cannot serve Antigravity workspace requests");
+						return agyClient.workspace(request.request, signal);
 				}
 			}
 		: undefined;
@@ -1335,6 +1331,8 @@ export async function streamPiServer(
 		let terminalReceived = false;
 		let observerFailed = false;
 		let callbackFailed = false;
+		let callbackError: unknown;
+		const agyCallbacks = new Set<Promise<void>>();
 		let cacheRetention: CacheRetention | undefined;
 		let sessionInitMs: number | undefined;
 		let requestStartedAt = startedAt;
@@ -1417,7 +1415,11 @@ export async function streamPiServer(
 				observeProviderStreamEvents: options?.onProviderStreamEvent !== undefined,
 				callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 				antigravity: agy
-					? { retainSession: agyClient !== undefined, questions: !!agyClient?.answerQuestion }
+					? {
+							retainSession: agyClient !== undefined,
+							questions: !!agyClient?.answerQuestion,
+							cwd: options?.antigravityCwd,
+						}
 					: undefined,
 				...(contextHashes && contextPrefixes
 					? {
@@ -1473,6 +1475,7 @@ export async function streamPiServer(
 
 			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
+					if (callbackError) throw callbackError;
 					if (serverEvent.event === "antigravity_tool_results") {
 						setAgyResults(
 							parseServerSentEventData(serverEvent, "Antigravity tool results") as Parameters<
@@ -1510,20 +1513,32 @@ export async function streamPiServer(
 						continue;
 					}
 					if (serverEvent.event === "provider_callback") {
-						try {
-							await handleProviderCallback(
-								parseServerSentEventData(serverEvent, "pi-server callback") as PiServerProviderCallbackRequest,
-								model,
-								options,
-								sessionId,
-								runId,
-								request,
-								answerAntigravity,
-							);
-						} catch (error) {
+						const callback = parseServerSentEventData(
+							serverEvent,
+							"pi-server callback",
+						) as PiServerProviderCallbackRequest;
+						const handled = handleProviderCallback(
+							callback,
+							model,
+							options,
+							sessionId,
+							runId,
+							request,
+							answerAntigravity,
+						).catch((error: unknown) => {
 							callbackFailed = true;
 							throw error;
+						});
+						if (callback.kind !== "antigravity") {
+							await handled;
+							continue;
 						}
+						// agy runs tools and terminals in parallel and waits on some of them, so answer each when it settles.
+						const running = handled.catch((error: unknown) => {
+							callbackError ??= error;
+						});
+						agyCallbacks.add(running);
+						void running.finally(() => agyCallbacks.delete(running));
 						continue;
 					}
 					const proxyEvent = parseServerSentEventData(
@@ -1588,6 +1603,9 @@ export async function streamPiServer(
 			}
 			await consumeEvents(parser.feed(decoder.decode()));
 			await consumeEvents(parser.finish());
+			// Only agy streams wait here; others keep cleanup in the turn that delivered their terminal event.
+			if (agyCallbacks.size > 0) await Promise.all(agyCallbacks);
+			if (callbackError) throw callbackError;
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request aborted by user");
@@ -1598,6 +1616,8 @@ export async function streamPiServer(
 
 			stream.end();
 		} catch (error) {
+			// Settle tools still running for agy before the turn reports its failure.
+			if (agyCallbacks.size > 0) await Promise.allSettled(agyCallbacks);
 			let errorMessage = error instanceof Error ? error.message : String(error);
 			// Same-run recovery only applies to an interrupted event-stream. HTTP/proxy
 			// failures before the stream starts (502/504/fetch failed) never opened a run

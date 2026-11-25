@@ -9,6 +9,7 @@ import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
 import { answerAntigravityQuestion } from "./antigravity-interactions.ts";
 import { type AntigravityClient, AntigravityRuntime } from "./antigravity-runtime.ts";
+import { AntigravityWorkspace } from "./antigravity-workspace.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
@@ -350,6 +351,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 	const antigravity = process.env.PI_SERVER_MODE === "true" ? undefined : new AntigravityRuntime(cwd);
+	// agy's file and terminal requests run here, in the session's workspace, wherever agy runs.
+	const antigravityWorkspace = new AntigravityWorkspace(cwd, settingsManager.getShellPath());
 	const cacheWarmer = new CacheWarmer(
 		modelRuntime,
 		sessionManager,
@@ -471,10 +474,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					requestPermission: (title, choices, signal) =>
 						extensionRunnerRef.current?.getUIContext().select(title, choices, { signal }) ??
 						Promise.resolve(undefined),
+					workspace: (request, signal) => antigravityWorkspace.handle(request, signal),
 				};
 				return antigravity
 					? antigravity.stream(model, context, requestOptions, client)
-					: streamPiServerAntigravity(model, context, requestOptions, client);
+					: streamPiServerAntigravity(model, context, { ...requestOptions, antigravityCwd: cwd }, client);
 			}
 			const remote = process.env.PI_SERVER_MODE === "true";
 			const serverAccount = modelRuntime.isServerAccountProvider(model.provider);
@@ -619,6 +623,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	agentSession = session;
 	session.subscribe((event) => {
 		if (event.type === "session_disposed") {
+			antigravityWorkspace.close();
 			if (antigravity) void antigravity.close();
 			else {
 				void releasePiServerAntigravity(session.sessionId).catch((error: unknown) =>

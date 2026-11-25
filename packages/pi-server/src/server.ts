@@ -68,10 +68,10 @@ import {
 	type AntigravityClient,
 	AntigravityRuntime,
 	logoutAntigravity,
-	readAntigravityModels,
 } from "@earendil-works/pi-coding-agent/antigravity";
 import { accountProvider, ServerAccounts } from "./accounts.ts";
 import { withAnthropicSubscription } from "./anthropic-subscription.ts";
+import { AntigravityCatalog } from "./antigravity-catalog.ts";
 import { AntigravitySessions } from "./antigravity-sessions.ts";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
@@ -112,6 +112,7 @@ export { loadConfig, type ServerConfig } from "./config.ts";
 interface ServerRuntime extends ServerConfig {
 	accounts: ServerAccounts;
 	antigravity: AntigravitySessions;
+	antigravityCatalog: AntigravityCatalog;
 	contexts: ContextStore;
 	viewer: ViewerHttp;
 	deletingSessions: Map<string, Promise<void>>;
@@ -138,7 +139,7 @@ interface StreamRequestBody {
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	antigravity?: { retainSession: boolean; questions: boolean };
+	antigravity?: { retainSession: boolean; questions: boolean; cwd?: string };
 }
 
 interface SessionSyncBody {
@@ -663,7 +664,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 		recordDeletion(id);
 		const operation = Promise.resolve().then(async () => {
 			await deleteStreamRunsForSession(id);
-			await config.antigravity.release(id);
+			await config.antigravity.forget(id);
 			config.contexts.delete(id);
 			deletePersistedSession(config.sessionStoreDir, id);
 			await config.viewer.store.remove(id);
@@ -1506,7 +1507,7 @@ async function handleStream(
 	let agySession: ReturnType<AntigravitySessions["begin"]> | undefined;
 	if (agy?.retainSession) {
 		try {
-			agySession = config.antigravity.begin(body.sessionId);
+			agySession = config.antigravity.begin(body.sessionId, config.antigravity.cwd(agy.cwd));
 		} catch (error) {
 			const { message, code } = error as PiServerError;
 			sendError(res, 409, message, code);
@@ -1620,7 +1621,7 @@ async function handleStream(
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
 		if (agy) {
-			const runtime = agySession?.runtime ?? new AntigravityRuntime(process.cwd(), "PiServer");
+			const runtime = agySession?.runtime ?? new AntigravityRuntime(config.antigravity.cwd(undefined), "PiServer");
 			const requestCallback = createRunCallback(run!, res);
 			const ask = <T>(request: AntigravityCallback) =>
 				requestCallback({
@@ -1636,9 +1637,8 @@ async function handleStream(
 							clientResults.add(outcome.toolCall.id);
 							return outcome;
 						},
-						// Native agy tools run on this machine, not in the client's workspace.
-						requestPermission: (title, choices) =>
-							ask({ kind: "permission", title: `${title} (runs on the PiServer host)`, choices }),
+						requestPermission: (title, choices) => ask({ kind: "permission", title, choices }),
+						workspace: (request) => ask({ kind: "workspace", request }),
 						...(agy.questions
 							? {
 									answerQuestion: async (request) => {
@@ -1677,7 +1677,7 @@ async function handleStream(
 					: requestModels.streamSimple(resolvedModel, context, streamOptions);
 		}
 	} catch (err) {
-		if (agySession) await config.antigravity.release(body.sessionId);
+		if (agySession) await config.antigravity.forget(body.sessionId);
 		clearInterval(heartbeat);
 		logFailure("dispatch", err);
 		const message = err instanceof Error ? err.message : String(err);
@@ -1759,7 +1759,7 @@ async function handleStream(
 			writeStreamError(res, message);
 		} finally {
 			clearInterval(heartbeat);
-			if (agySession && run?.status !== "completed") await config.antigravity.release(body.sessionId);
+			if (agySession && run?.status !== "completed") await config.antigravity.forget(body.sessionId);
 			if (!terminalSeen) logFailure("stream", undefined, undefined, "stream_ended_without_terminal");
 			if (run?.status === "running") {
 				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
@@ -1791,12 +1791,27 @@ async function handlePostRequest(
 		);
 		return true;
 	}
+	if (pathname === "/api/accounts/refresh") {
+		// The Antigravity catalog travels with the account snapshot but belongs to the local agy CLI.
+		const { providerId } = (body as { providerId?: unknown } | null) ?? {};
+		const [accounts, antigravity] = await Promise.all([
+			providerId === ANTIGRAVITY_PROVIDER
+				? config.accounts.snapshot()
+				: config.accounts.refresh(providerId === undefined ? undefined : accountProvider(providerId)),
+			providerId === undefined || providerId === ANTIGRAVITY_PROVIDER
+				? config.antigravityCatalog.refresh()
+				: config.antigravityCatalog.snapshot(),
+		]);
+		sendJson(res, 200, { ...accounts, antigravity });
+		return true;
+	}
 	if (pathname.startsWith("/api/accounts/")) {
 		await handleAccountRequest(config.accounts, pathname, body, res);
 		return true;
 	}
 	if (pathname === "/api/antigravity/logout") {
-		await logoutAntigravity(process.cwd(), AbortSignal.timeout(15_000));
+		await logoutAntigravity(config.antigravity.cwd(undefined), AbortSignal.timeout(15_000));
+		await config.antigravityCatalog.refresh();
 		sendJson(res, 200, { loggedIn: false });
 		return true;
 	}
@@ -1924,14 +1939,6 @@ async function handleAccountRequest(
 		return;
 	}
 	const request = body as { providerId?: unknown; loginId?: unknown; promptId?: unknown; value?: unknown };
-	if (pathname === "/api/accounts/refresh") {
-		sendJson(
-			res,
-			200,
-			await accounts.refresh(request.providerId === undefined ? undefined : accountProvider(request.providerId)),
-		);
-		return;
-	}
 	if (pathname === "/api/accounts/logout") {
 		sendJson(res, 200, await accounts.logout(accountProvider(request.providerId)));
 		return;
@@ -2193,10 +2200,12 @@ export function createPiServer(
 	const models = streamModels ?? builtinModels();
 	loadPersistedSessions(serverConfig.sessionStoreDir);
 	const viewer = new ViewerHttp(serverConfig, (ids) => deleteServerSessions(config, ids));
+	const antigravity = new AntigravitySessions(serverConfig.sessionStoreDir);
 	const config: ServerRuntime = {
 		...serverConfig,
 		accounts: accountsOverride ?? new ServerAccounts(serverConfig.accountStoreDir),
-		antigravity: new AntigravitySessions(),
+		antigravity,
+		antigravityCatalog: new AntigravityCatalog(() => antigravity.cwd(undefined)),
 		contexts: new ContextStore(serverConfig.sessionStoreDir),
 		viewer,
 		deletingSessions: new Map(),
@@ -2273,21 +2282,13 @@ export function createPiServer(
 			sendJson(res, 200, { sessions: listSessions() });
 			return;
 		}
-		if (req.method === "GET" && url.pathname === "/api/antigravity/models") {
-			const controller = new AbortController();
-			res.once("close", () => controller.abort());
-			try {
-				const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
-				const models = await readAntigravityModels(process.cwd(), signal);
-				if (!res.destroyed) sendJson(res, 200, { models: models ?? null });
-			} catch (error) {
-				if (!res.destroyed) sendError(res, 502, error instanceof Error ? error.message : String(error));
-			}
-			return;
-		}
 		if (req.method === "GET" && url.pathname === "/api/accounts") {
 			try {
-				sendJson(res, 200, await config.accounts.snapshot());
+				const [accounts, antigravity] = await Promise.all([
+					config.accounts.snapshot(),
+					config.antigravityCatalog.snapshot(),
+				]);
+				sendJson(res, 200, { ...accounts, antigravity });
 			} catch (error) {
 				sendError(
 					res,
@@ -2449,7 +2450,13 @@ export function createPiServer(
 		const accountCleanup = config.accounts.close();
 		const catalogCleanup = catalog.close();
 		return close.call(this, (error) => {
-			void Promise.all([viewer.store.flush(), accountCleanup, catalogCleanup, config.antigravity.close()]).then(
+			void Promise.all([
+				viewer.store.flush(),
+				accountCleanup,
+				catalogCleanup,
+				config.antigravity.close(),
+				config.antigravityCatalog.close(),
+			]).then(
 				() => callback?.(error),
 				(cleanupError: unknown) =>
 					callback?.(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))),
