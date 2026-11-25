@@ -1214,7 +1214,7 @@ export async function streamPiServer(
 	const agy = options?.antigravity;
 	const retainAgySession = agy !== undefined && agy !== true;
 	const agyPrefix = retainAgySession ? antigravityPrefixes.get(sessionId) : undefined;
-	const base = agyPrefix?.messages.every(
+	let base = agyPrefix?.messages.every(
 		(message, index) =>
 			message === context.messages[index] || JSON.stringify(message) === JSON.stringify(context.messages[index]),
 	)
@@ -1362,6 +1362,11 @@ export async function streamPiServer(
 
 			if (!response.ok) {
 				let failure = await readPiServerFailure(response);
+				if (base && failure.code === "ANTIGRAVITY_PREFIX_NOT_FOUND" && !options?.signal?.aborted) {
+					base = undefined;
+					response = await request.postJson("/api/stream", makeBody());
+					failure = response.ok ? { details: "", code: undefined } : await readPiServerFailure(response);
+				}
 				if (!agy && !options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 					resetSessionTracking(sessionId);
 					await ensureSessionInit(sessionId, context, request);

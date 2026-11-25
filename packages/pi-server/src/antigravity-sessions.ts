@@ -1,5 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { AntigravityRuntime } from "@earendil-works/pi-coding-agent/antigravity";
+import { PiServerError, PiServerErrorCode } from "./error-codes.ts";
 
 const IDLE_SESSION_MS = 60 * 60 * 1000;
 
@@ -16,9 +17,18 @@ export class AntigravitySessions {
 
 	begin(sessionId: string, baseRunId: string | undefined, delta: Message[]) {
 		const previous = this.sessions.get(sessionId);
-		if (previous && !previous.idleTimer) throw new Error("An Antigravity turn is already running for this session");
+		if (previous && !previous.idleTimer) {
+			throw new PiServerError(
+				"An Antigravity turn is already running for this session",
+				PiServerErrorCode.RUN_IN_PROGRESS,
+			);
+		}
 		if (baseRunId && previous?.prefix?.runId !== baseRunId) {
-			throw new Error("PiServer no longer has this Antigravity conversation prefix. Submit the turn again.");
+			// Restart, idle release, and failed turns drop the prefix; the client then resends the whole context.
+			throw new PiServerError(
+				"PiServer no longer has this Antigravity conversation prefix",
+				PiServerErrorCode.ANTIGRAVITY_PREFIX_NOT_FOUND,
+			);
 		}
 		const state = previous ?? { runtime: new AntigravityRuntime(process.cwd(), "PiServer") };
 		clearTimeout(state.idleTimer);

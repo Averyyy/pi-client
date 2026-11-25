@@ -1485,7 +1485,8 @@ async function handleStream(
 		try {
 			agySession = config.antigravity.begin(body.sessionId, agy.baseRunId, body.contextOverlay!);
 		} catch (error) {
-			sendError(res, 409, (error as Error).message, PiServerErrorCode.INVALID_REQUEST);
+			const { message, code } = error as PiServerError;
+			sendError(res, 409, message, code);
 			return;
 		}
 	}
