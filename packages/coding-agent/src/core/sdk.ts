@@ -6,6 +6,8 @@ import { clampThinkingLevel, type Message, type Model, streamSimple } from "@ear
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
+import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
+import { AntigravityRuntime } from "./antigravity-runtime.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
@@ -348,6 +350,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const antigravity = new AntigravityRuntime(cwd);
 	const cacheWarmer = new CacheWarmer(
 		modelRuntime,
 		sessionManager,
@@ -445,6 +448,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			if (model.provider === ANTIGRAVITY_PROVIDER) {
+				clientTiming = undefined;
+				const requestOptions = buildRequestOptions(options);
+				const session = agentSession;
+				if (!session || options?.sessionId !== session.sessionId) {
+					return new AntigravityRuntime(cwd).stream(model, context, requestOptions);
+				}
+				cacheWarmer.cancel();
+				return antigravity.stream(model, context, requestOptions, {
+					executeTool: (call, assistant, signal) => session.executeAntigravityTool(call, assistant, signal),
+					requestPermission: (title, choices, signal) =>
+						extensionRunnerRef.current?.getUIContext().select(title, choices, { signal }) ??
+						Promise.resolve(undefined),
+				});
+			}
 			const remote = process.env.PI_SERVER_MODE === "true";
 			const serverAccount = modelRuntime.isServerAccountProvider(model.provider);
 			const requestClientTiming = clientTiming;
@@ -587,8 +605,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		autoSessionName: options.autoSessionName,
 	});
 	agentSession = session;
-	if (process.env.PI_SERVER_MODE === "true") new PiServerObserver(session);
 	session.subscribe((event) => {
+		if (event.type === "session_disposed") void antigravity.close();
 		if (event.type === "abort_start") cacheWarmer.cancel();
 		if (process.env.PI_TIMING !== "1") return;
 		if (event.type === "run_state_changed" && event.running) {
@@ -599,6 +617,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			clientTiming = undefined;
 		}
 	});
+	if (process.env.PI_SERVER_MODE === "true") new PiServerObserver(session);
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

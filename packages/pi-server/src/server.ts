@@ -1651,6 +1651,13 @@ async function handlePostRequest(
 		model: AnyModel;
 		options?: SimpleStreamOptions & { authSource?: "server-account" };
 	} | null;
+	if (
+		accountRequest?.model?.provider === "google-antigravity" ||
+		accountRequest?.model?.api === "google-antigravity"
+	) {
+		sendJson(res, 400, { error: "Google Antigravity uses the local agy CLI. Update pi-client to use it." });
+		return true;
+	}
 	if (accountRequest?.options?.authSource === "server-account") {
 		await config.accounts.ready;
 		if (rejectDeletingSession(config, body, res, requestVersion)) return true;

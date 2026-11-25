@@ -1,6 +1,7 @@
 import type { CredentialInfo } from "@earendil-works/pi-ai";
 import { replaceControlCharacters } from "@earendil-works/pi-tui";
 import { APP_NAME } from "../config.ts";
+import { ANTIGRAVITY_PROVIDER } from "../core/antigravity-acp.ts";
 import { CredentialSynchronizationError, type ModelRuntime } from "../core/model-runtime.ts";
 import { findMatchingProviders } from "../core/provider-matching.ts";
 import type { AuthOutput } from "./auth-terminal.ts";
@@ -27,9 +28,11 @@ export async function runAuthLogout(args: string[], options: AuthLogoutOptions):
 	}
 
 	const provider = findMatchingProviders(modelRuntime.getProviders(), providerRef)[0];
-	const serverAccount = provider !== undefined && modelRuntime.isServerAccountProvider(provider.id);
+	const account =
+		provider !== undefined &&
+		(provider.id === ANTIGRAVITY_PROVIDER || modelRuntime.isServerAccountProvider(provider.id));
 	let stored: readonly CredentialInfo[] = [];
-	if (!serverAccount) {
+	if (!account) {
 		try {
 			stored = await modelRuntime.listCredentials({ signal });
 		} catch (error: unknown) {
@@ -46,7 +49,7 @@ export async function runAuthLogout(args: string[], options: AuthLogoutOptions):
 		return 1;
 	}
 	const providerName = provider?.name ?? providerRef;
-	if (!credential && !serverAccount) {
+	if (!credential && !account) {
 		terminal.write(
 			`No stored credentials for ${providerName}. Environment variables and models.json config are unchanged.`,
 		);
@@ -54,7 +57,7 @@ export async function runAuthLogout(args: string[], options: AuthLogoutOptions):
 	}
 
 	try {
-		await modelRuntime.logout(serverAccount ? provider.id : credential!.providerId, { signal });
+		await modelRuntime.logout(account ? provider.id : credential!.providerId, { signal });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (error instanceof CredentialSynchronizationError) {
@@ -67,12 +70,13 @@ export async function runAuthLogout(args: string[], options: AuthLogoutOptions):
 		return 1;
 	}
 	let message =
-		serverAccount || credential?.type === "oauth"
+		account || credential?.type === "oauth"
 			? `Logged out of ${providerName}.`
 			: `Removed stored API key for ${providerName}. Environment variables and models.json config are unchanged.`;
 	const status = modelRuntime.getProviderAuthStatus(provider?.id ?? providerRef);
 	if (status.configured) {
 		const sources = {
+			local_account: "the local Antigravity CLI",
 			server_account: "a pi-server account",
 			stored: "stored credentials",
 			runtime: "a runtime API key",

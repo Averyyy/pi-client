@@ -9,15 +9,14 @@
 ### Added
 
 - Published pi-client project metadata, committed conversation history, and run/tool activity to the server's independent viewer.
-- Added `/login google-antigravity` for Google Antigravity subscriptions, with account model selection and pi-server inference routing.
+- Added Google Antigravity sign-in, account model selection, and Pi custom tools through the local Antigravity CLI's ACP runtime.
 - Added native Devin Pro login and account model selection while retaining pi-server inference routing.
 
 - Added `pi-client` CLI adapter layer for automatic command rewriting when running in `PI_SERVER_MODE`. Extensions spawning `pi` subprocesses now automatically invoke `pi-client` instead, and terminal output displays `pi-client` in command strings and resume prompts.
 
 ### Fixed
 
-- Applied client `models.json` overrides to Devin and Google Antigravity models discovered by PiServer.
-- Grouped Google Antigravity effort variants into one model per model id with switchable pi reasoning levels, and matched the official CLI request envelope and system prompt prose, whose absence the backend answered with a bare `429 RESOURCE_EXHAUSTED`.
+- Applied client `models.json` overrides to Devin models discovered by PiServer and Antigravity models advertised by the local CLI.
 - Preserved queued image resizing across provisional message selection and delivery retries.
 - Preserved Anthropic message threads through pi-server cache warming and tool-result continuations, and released provider state when server sessions are deleted.
 - Shared execution lifecycle state between TUI working indicators and event-triggered pi-server observer reports, including preparation failures, asynchronous completion handlers, branch summaries, and cancellation acknowledgement.

@@ -73,6 +73,8 @@ import {
 } from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
+import { ANTIGRAVITY_PROVIDER, loginAntigravity, logoutAntigravity, readAntigravityModels } from "./antigravity-acp.ts";
+import { AntigravityRuntime } from "./antigravity-runtime.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
@@ -208,6 +210,9 @@ export class ModelRuntime implements Models {
 	private readonly modelNetworkEnabled: boolean;
 	private readonly piServerMode = process.env.PI_SERVER_MODE === "true";
 	private readonly serverAccounts = new Map<PiServerAccountProviderId, PiServerAccount>();
+	private antigravityModels: readonly Model<Api>[] | undefined;
+	private antigravityRefreshSeq = 0;
+	private antigravityError: string | undefined;
 	private serverAccountsSeq = 0;
 	private serverAccountsError: string | undefined;
 	private registrationRefresh: Promise<void> = Promise.resolve();
@@ -346,6 +351,41 @@ export class ModelRuntime implements Models {
 	/** The provider without virtual models, or undefined when nothing defines it. */
 	private composeProvider(providerId: string): Provider | undefined {
 		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
+		if (providerId === ANTIGRAVITY_PROVIDER && base) {
+			const overrides = this.config.getProvider(providerId)?.modelOverrides;
+			const getModels = () =>
+				(this.antigravityModels ?? []).map((model) => {
+					const override = overrides?.[model.id];
+					return override ? applyModelOverride(model, override) : model;
+				});
+			const localSignIn = async (): Promise<never> => {
+				throw new ModelsError("auth", "Use Pi login for the local Antigravity CLI account");
+			};
+			return {
+				...base,
+				baseUrl: undefined,
+				auth: {
+					oauth: {
+						name: "Google Antigravity",
+						isSubscription: true,
+						loginLabel: "Sign in with Google Antigravity",
+						login: localSignIn,
+						refresh: localSignIn,
+						toAuth: localSignIn,
+					},
+				},
+				getModels,
+				getAllModels: getModels,
+				refreshModels: undefined,
+				stream: (model, context, options) =>
+					new AntigravityRuntime(process.cwd()).stream(model, context, {
+						signal: options?.signal,
+						timeoutMs: options?.timeoutMs,
+					}),
+				streamSimple: (model, context, options) =>
+					new AntigravityRuntime(process.cwd()).stream(model, context, options),
+			};
+		}
 		if (this.isServerAccountProvider(providerId) && base) {
 			const modelOverrides = this.config.getProvider(providerId)?.modelOverrides;
 			const getModels = () => {
@@ -471,9 +511,11 @@ export class ModelRuntime implements Models {
 			const [allAvailable, auth, credential] = await Promise.all([
 				this.collectAllAvailable(providerId, { signal }),
 				this.checkAuth(providerId, { signal }),
-				this.isServerAccountProvider(providerId)
-					? Promise.resolve(this.serverAccounts.get(providerId)?.loggedIn)
-					: this.credentials.read(providerId, { signal }),
+				providerId === ANTIGRAVITY_PROVIDER
+					? Promise.resolve(this.antigravityModels !== undefined)
+					: this.isServerAccountProvider(providerId)
+						? Promise.resolve(this.serverAccounts.get(providerId)?.loggedIn)
+						: this.credentials.read(providerId, { signal }),
 			]);
 			signal.throwIfAborted();
 			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
@@ -594,6 +636,7 @@ export class ModelRuntime implements Models {
 		return (
 			await Promise.all(
 				providers.map(async (id) => {
+					if (id === ANTIGRAVITY_PROVIDER) return this.getAllModels(id);
 					if (this.isServerAccountProvider(id)) {
 						options?.signal?.throwIfAborted();
 						return this.serverAccounts.get(id)?.loggedIn ? this.getAllModels(id) : [];
@@ -605,6 +648,10 @@ export class ModelRuntime implements Models {
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+		if (providerId === ANTIGRAVITY_PROVIDER) {
+			options?.signal?.throwIfAborted();
+			return this.antigravityModels === undefined ? undefined : { type: "oauth", source: "local Antigravity CLI" };
+		}
 		if (this.isServerAccountProvider(providerId)) {
 			options?.signal?.throwIfAborted();
 			return this.serverAccounts.get(providerId)?.loggedIn
@@ -645,6 +692,7 @@ export class ModelRuntime implements Models {
 			errors.push(`Provider "${providerId}": ${error}`);
 		}
 		if (this.availabilityError) errors.push(`Availability refresh: ${this.availabilityError}`);
+		if (this.antigravityError) errors.push(`Google Antigravity: ${this.antigravityError}`);
 		if (this.serverAccountsError) errors.push(`pi-server accounts: ${this.serverAccountsError}`);
 		for (const account of this.serverAccounts.values()) {
 			if (account.error) errors.push(`Provider "${account.providerId}" account refresh: ${account.error}`);
@@ -668,7 +716,8 @@ export class ModelRuntime implements Models {
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
-		if (this.isServerAccountProvider(model.provider)) return { authHeader: false };
+		if (model.provider === ANTIGRAVITY_PROVIDER || this.isServerAccountProvider(model.provider))
+			return { authHeader: false };
 		return resolveCompatibilityRequestConfig(
 			model,
 			this.config.getProvider(model.provider),
@@ -699,7 +748,7 @@ export class ModelRuntime implements Models {
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
 		const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
-		if (this.isServerAccountProvider(providerId)) {
+		if (providerId === ANTIGRAVITY_PROVIDER || this.isServerAccountProvider(providerId)) {
 			overrides.signal?.throwIfAborted();
 			return undefined;
 		}
@@ -764,6 +813,9 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (providerId === ANTIGRAVITY_PROVIDER) {
+			return Promise.reject(new ModelsError("auth", "Google Antigravity signs in through the local agy CLI"));
+		}
 		if (this.isServerAccountProvider(providerId)) {
 			return Promise.reject(new ModelsError("auth", `${providerId} credentials are managed by pi-server`));
 		}
@@ -797,10 +849,13 @@ export class ModelRuntime implements Models {
 
 	async listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
 		const local = (await this.credentials.list(options)).filter(
-			(entry) => !this.isServerAccountProvider(entry.providerId),
+			(entry) => entry.providerId !== ANTIGRAVITY_PROVIDER && !this.isServerAccountProvider(entry.providerId),
 		);
 		return [
 			...local,
+			...(this.antigravityModels === undefined
+				? []
+				: [{ providerId: ANTIGRAVITY_PROVIDER, type: "oauth" as const }]),
 			...[...this.serverAccounts.values()]
 				.filter((account) => account.loggedIn)
 				.map((account): CredentialInfo => ({ providerId: account.providerId, type: "oauth" })),
@@ -808,6 +863,11 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
+		if (providerId === ANTIGRAVITY_PROVIDER) {
+			return this.antigravityModels === undefined
+				? { configured: false }
+				: { configured: true, source: "local_account", label: "local Antigravity CLI" };
+		}
 		if (this.isServerAccountProvider(providerId)) {
 			return this.serverAccounts.get(providerId)?.loggedIn
 				? { configured: true, source: "server_account", label: "pi-server account" }
@@ -938,6 +998,12 @@ export class ModelRuntime implements Models {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
+		if (model.provider === ANTIGRAVITY_PROVIDER && !isVirtualModel(model)) {
+			return new AntigravityRuntime(process.cwd()).stream(model, transcript, {
+				signal: options?.signal,
+				timeoutMs: options?.timeoutMs,
+			});
+		}
 		return lazyStream(
 			model,
 			async () => {
@@ -993,6 +1059,9 @@ export class ModelRuntime implements Models {
 				undefined,
 				options?.signal,
 			);
+		}
+		if (model.provider === ANTIGRAVITY_PROVIDER) {
+			return new AntigravityRuntime(process.cwd()).stream(model, transcript, options);
 		}
 		return lazyStream(
 			model,
@@ -1115,6 +1184,16 @@ export class ModelRuntime implements Models {
 	): Promise<LoginResult> {
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async (): Promise<LoginResult> => {
+			if (providerId === ANTIGRAVITY_PROVIDER) {
+				if (type !== "oauth") throw new ModelsError("auth", "Google Antigravity requires an account login");
+				await loginAntigravity(process.cwd(), { ...interaction, signal });
+				const result = await this.refresh({ allowNetwork: false, providers: [providerId], signal });
+				if (result.errors.has(providerId)) throw result.errors.get(providerId);
+				signal.throwIfAborted();
+				if (this.antigravityModels === undefined)
+					throw new ModelsError("auth", "Antigravity CLI did not report an active sign-in");
+				return { type: "local", providerId };
+			}
 			if (this.isServerAccountProvider(providerId)) {
 				if (type !== "oauth") throw new ModelsError("auth", `${providerId} requires an account login`);
 				this.applyServerAccounts(await loginPiServerAccount(providerId, { ...interaction, signal }));
@@ -1130,6 +1209,15 @@ export class ModelRuntime implements Models {
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			if (providerId === ANTIGRAVITY_PROVIDER) {
+				await logoutAntigravity(process.cwd(), signal);
+				++this.antigravityRefreshSeq;
+				this.antigravityModels = undefined;
+				this.antigravityError = undefined;
+				this.updateModelSnapshot();
+				await this.refreshProviderAvailability(providerId, signal);
+				return;
+			}
 			if (this.isServerAccountProvider(providerId)) {
 				this.applyServerAccounts(await logoutPiServerAccount(providerId, signal));
 				await this.queueAvailabilityRefresh(signal);
@@ -1149,6 +1237,8 @@ export class ModelRuntime implements Models {
 				this.isServerAccountProvider(providerId) && (!options.providers || options.providers.includes(providerId)),
 		);
 		const serverAccountsSeq = serverProviders.length > 0 ? ++this.serverAccountsSeq : this.serverAccountsSeq;
+		const refreshAntigravity = !options.providers || options.providers.includes(ANTIGRAVITY_PROVIDER);
+		const antigravitySeq = refreshAntigravity ? ++this.antigravityRefreshSeq : this.antigravityRefreshSeq;
 		try {
 			await raceWithAbortSignal(this.registrationRefresh, options.signal);
 		} catch (error) {
@@ -1169,6 +1259,23 @@ export class ModelRuntime implements Models {
 		};
 		const result = await this.models.refresh(refreshOptions);
 		const errors = new Map(result.errors);
+		if (refreshAntigravity) {
+			try {
+				const timeout = AbortSignal.timeout(15_000);
+				const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+				const models = await readAntigravityModels(process.cwd(), signal);
+				if (antigravitySeq === this.antigravityRefreshSeq) {
+					this.antigravityModels = models;
+					this.antigravityError = undefined;
+				}
+			} catch (error) {
+				if (!options.signal?.aborted && antigravitySeq === this.antigravityRefreshSeq) {
+					const failure = error instanceof Error ? error : new Error(String(error));
+					this.antigravityError = failure.message;
+					errors.set(ANTIGRAVITY_PROVIDER, failure);
+				}
+			}
+		}
 		if (serverProviders.length > 0) {
 			try {
 				const snapshot =
@@ -1224,7 +1331,9 @@ export class ModelRuntime implements Models {
 	private applyServerAccounts(snapshot: PiServerAccountsSnapshot): void {
 		++this.serverAccountsSeq;
 		this.serverAccounts.clear();
-		for (const account of snapshot.accounts) this.serverAccounts.set(account.providerId, account);
+		for (const account of snapshot.accounts) {
+			if (this.isServerAccountProvider(account.providerId)) this.serverAccounts.set(account.providerId, account);
+		}
 		this.serverAccountsError = undefined;
 		this.updateModelSnapshot();
 	}

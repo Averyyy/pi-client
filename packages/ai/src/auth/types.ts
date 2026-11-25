@@ -36,8 +36,8 @@ export interface OAuthCredential extends OAuthCredentials {
 /** One type-tagged credential per provider — the shape of today's auth.json. */
 export type Credential = ApiKeyCredential | OAuthCredential;
 
-/** A remote login acknowledges server-owned credentials without returning them. */
-export type LoginResult = Credential | { type: "remote"; providerId: string };
+/** A managed login acknowledges credentials owned by the server or local CLI. */
+export type LoginResult = Credential | { type: "remote" | "local"; providerId: string };
 
 /** Non-secret credential metadata for account/status enumeration. */
 export interface CredentialInfo {

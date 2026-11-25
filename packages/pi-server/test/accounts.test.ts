@@ -84,6 +84,12 @@ describe("server accounts", () => {
 		);
 	}
 
+	it("does not load retired Antigravity account files", async () => {
+		writeFileSync(join(directory, "google-antigravity.json"), "legacy credential file");
+		accounts = new ServerAccounts(directory);
+		expect(await accounts.refresh()).toEqual({ accounts: [{ providerId: "devin", loggedIn: false, models: [] }] });
+	});
+
 	it("restores the committed catalog without exposing tokens or static models and retains it on refresh errors", async () => {
 		seed();
 		const provider = fixture();

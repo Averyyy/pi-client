@@ -50,9 +50,9 @@ If your server uses an auth token, set it on the client:
 PI_SERVER_AUTH_TOKEN=your-token PI_SERVER_URL=http://127.0.0.1:4217 pi-client
 ```
 
-Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin and Google Antigravity accounts store and resolve their credentials on the server.
+Use matching client and server releases. Ordinary provider credentials, environment overrides, and request headers are configured on the client and forwarded for inference. Devin accounts store and resolve their credentials on the server. Google Antigravity uses the local `agy` CLI.
 
-Ordinary built-in model catalogs come from pi-server's shared pi.dev cache. Server metadata takes precedence over bundled metadata for the same model type and ID, independently of the package build date. The client requests catalogs only for providers with configured authentication and determines chat, image, and classifier availability from its own credentials and configuration. OpenRouter's credential-specific model filtering runs on the client. Devin and Google Antigravity account catalogs come from the server. Extensions and codemode scripts use the normal model registry APIs; inference runs on the server. MCP connections, tools, and other provider logins remain in the client process.
+Ordinary built-in model catalogs come from pi-server's shared pi.dev cache. Server metadata takes precedence over bundled metadata for the same model type and ID, independently of the package build date. The client requests catalogs only for providers with configured authentication and determines chat, image, and classifier availability from its own credentials and configuration. OpenRouter's credential-specific model filtering runs on the client. The Devin catalog comes from PiServer and the Antigravity catalog comes from `agy`. Extensions and codemode scripts use the normal model registry APIs. MCP connections, tools, and other provider logins remain in the client process.
 
 `PI_CLIENT_MAX_REQUEST_KB=64` limits each client HTTP request body to 65,536 UTF-8 bytes. Larger prompts, tool definitions, images, operation payloads, and session trees use the shared chunk transport.
 
@@ -95,9 +95,9 @@ Protocol references: [pi-devin](https://github.com/mizorewww/pi-devin), [pi-devi
 
 ## Google Antigravity
 
-Run `/login google-antigravity`, complete browser authorization, and paste the full redirect URL into the login prompt. PiServer stores the OAuth credentials and project, refreshes expiring tokens, and discovers the account's exact model IDs. `pi-client --list-models google-antigravity` reads the server's saved account catalog.
+Install [Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) where `pi-client` runs. Run `/login google-antigravity`, follow the Google sign-in link, and paste the code Google displays. An existing `agy` sign-in works with `/model` directly.
 
-Both account providers use the server directory configured by `PI_SERVER_ACCOUNT_STORE_DIR`, defaulting to `~/.pi/pi-server/accounts`. `/logout` removes the selected server account and its catalog. Provider tokens stay on the server. Local Pi sessions use their local credential store.
+The CLI owns the account catalog, inference, and native tool permissions. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Pi custom tools run in the Pi process and return results to `agy` over MCP. In pi-server mode the read-only viewer can still show Pi's session activity.
 
 ## Update
 

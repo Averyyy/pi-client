@@ -14,8 +14,6 @@ describe("AgentSession server-account compaction", () => {
 	it.each([
 		["devin", "manual"],
 		["devin", "auto"],
-		["google-antigravity", "manual"],
-		["google-antigravity", "auto"],
 	] as const)("routes %s %s compaction with server account auth", async (provider, mode) => {
 		const harness = await createHarness();
 		harnesses.push(harness);

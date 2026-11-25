@@ -24,6 +24,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
@@ -72,6 +73,7 @@ import { processImage } from "../utils/image-process.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
+import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
@@ -745,7 +747,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
-		if (this._modelRuntime.isServerAccountProvider(model.provider)) {
+		if (model.provider === ANTIGRAVITY_PROVIDER || this._modelRuntime.isServerAccountProvider(model.provider)) {
 			return { model: { ...model, headers: undefined } };
 		}
 		let result: AuthResult | undefined;
@@ -1001,6 +1003,39 @@ export class AgentSession {
 			},
 		});
 		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+	}
+
+	/** Execute a tool requested by the Antigravity MCP server through the Pi tool pipeline. */
+	async executeAntigravityTool(
+		toolCall: AgentToolCall,
+		assistantMessage: AssistantMessage,
+		signal: AbortSignal,
+	): Promise<AgentToolCallOutcome> {
+		const ids = { toolCallId: toolCall.id, toolName: toolCall.name };
+		const call = { ...ids, args: toolCall.arguments };
+		const emit = async (event: ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolExecutionEndEvent) => {
+			await this._extensionRunner.emit(event);
+			this._emit(event);
+		};
+		const started = performance.now();
+		await emit({ type: "tool_execution_start", ...call });
+		const outcome = await runToolCall(toolCall, {
+			tools: this.agent.state.tools,
+			assistantMessage,
+			context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
+			beforeToolCall: this.agent.beforeToolCall,
+			afterToolCall: this.agent.afterToolCall,
+			signal,
+			onUpdate: (partialResult) => emit({ type: "tool_execution_update", ...call, partialResult }),
+		});
+		await emit({
+			type: "tool_execution_end",
+			...ids,
+			result: outcome.result,
+			isError: outcome.isError,
+			durationMs: Math.round(performance.now() - started),
+		});
+		return outcome;
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -3489,6 +3524,7 @@ export class AgentSession {
 		cacheOptions?: CompactionCacheRequestOptions;
 		reason: string;
 	}> {
+		if (model.provider === ANTIGRAVITY_PROVIDER) return { reason: "cli_managed_context" };
 		if (this._cachePrefixUnavailableReason) return { reason: this._cachePrefixUnavailableReason };
 		if (this.agent.onPayload) return { reason: "request_payload_hook_active" };
 		if (this._runSystemPromptOptions?.forceSystemPrompt !== undefined) {
@@ -3616,7 +3652,7 @@ export class AgentSession {
 
 			const settings = this.settingsManager.getCompactionSettings(model);
 
-			if (isPiServerMode()) {
+			if (isPiServerMode() && model.provider !== ANTIGRAVITY_PROVIDER) {
 				const {
 					model: requestModel,
 					apiKey,
@@ -4021,7 +4057,7 @@ export class AgentSession {
 			}
 			this._cacheWarmer?.cancel();
 
-			if (isPiServerMode()) {
+			if (isPiServerMode() && model.provider !== ANTIGRAVITY_PROVIDER) {
 				abortController = new AbortController();
 				this._autoCompactionAbortController = abortController;
 				this._emitWorkingStateChanged();
@@ -4847,6 +4883,8 @@ export class AgentSession {
 	 * re-runs the whole stream path.
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// ACP runs tools inside a turn, so replaying a failed prompt could repeat their effects.
+		if (message.provider === ANTIGRAVITY_PROVIDER) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
 		if (this._isPostAssistantPiServerSyncFailure(message)) return false;

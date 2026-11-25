@@ -123,6 +123,7 @@ export type AuthStatus = {
 		| "fallback"
 		| "models_json_key"
 		| "models_json_command"
+		| "local_account"
 		| "server_account";
 	label?: string;
 };

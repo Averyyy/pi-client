@@ -3,7 +3,7 @@ import type { Api, AuthEvent, AuthInteraction, AuthPrompt, Model } from "@earend
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
 
-export type PiServerAccountProviderId = "devin" | "google-antigravity";
+export type PiServerAccountProviderId = "devin";
 
 export interface PiServerAccount {
 	providerId: PiServerAccountProviderId;
@@ -19,7 +19,7 @@ export interface PiServerAccountsSnapshot {
 }
 
 export function isPiServerAccountProvider(providerId: string): providerId is PiServerAccountProviderId {
-	return providerId === "devin" || providerId === "google-antigravity";
+	return providerId === "devin";
 }
 
 function request(signal?: AbortSignal): ChunkRequest {

@@ -72,6 +72,14 @@ describe("provider failure logging", () => {
 		rmSync(directory, { recursive: true, force: true });
 	});
 
+	it("rejects Antigravity inference before provider dispatch", async () => {
+		const stream = vi.spyOn(models, "streamSimple");
+		const response = await post("/api/stream", { sessionId, model: { ...model, provider: "google-antigravity" } });
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ error: expect.stringContaining("local agy CLI") });
+		expect(stream).not.toHaveBeenCalled();
+	});
+
 	it.each([429, 503])("logs terminal HTTP %s while preserving the SSE error", async (status) => {
 		const error = {
 			...fauxAssistantMessage(""),

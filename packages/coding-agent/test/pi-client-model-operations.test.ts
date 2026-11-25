@@ -961,7 +961,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(initialReads);
 		expect(runtime.getError()).toBeUndefined();
 		const refresh = await runtime.refresh({ allowNetwork: false });
-		expect([...refresh.errors.keys()].sort()).toEqual(["devin", "google-antigravity"]);
+		expect([...refresh.errors.keys()]).toEqual(["devin"]);
 		expect(runtime.getError()).toContain("pi-server accounts:");
 	});
 
@@ -1066,7 +1066,7 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(localCalls).toBe(0);
 		const refreshed = await runtime.refresh({ allowNetwork: false });
 		expect(refreshed.aborted).toBe(false);
-		expect([...refreshed.errors.keys()].sort()).toEqual(["devin", "google-antigravity"]);
+		expect([...refreshed.errors.keys()]).toEqual(["devin"]);
 		expect(runtime.getError()).toContain("pi-server accounts:");
 		const restarted = await createRuntime();
 		expect(restarted.getError()).toContain("pi-server accounts:");

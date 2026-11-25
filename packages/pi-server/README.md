@@ -39,11 +39,11 @@ Received files default to `~/.pi/upload_files`.
 
 ## Account Providers
 
-PiServer owns Devin and Google Antigravity account login, credential persistence, token refresh, and model discovery. Connect with `pi-client`, run `/login devin` or `/login google-antigravity`, and complete the browser authorization and redirect prompt. The client receives account status and model metadata; credentials remain on the server.
+PiServer owns Devin account login, credential persistence, token refresh, and model discovery. Connect with `pi-client`, run `/login devin`, and complete the browser authorization and redirect prompt. The client receives account status and model metadata. Google Antigravity uses the official CLI on the pi-client machine.
 
 Account files default to `~/.pi/pi-server/accounts`. Set `PI_SERVER_ACCOUNT_STORE_DIR` to choose another directory. The server restores saved account catalogs on startup, refreshes them in the background, after successful login, and every four hours. Expiring OAuth tokens refresh when needed. Failed discovery keeps the saved catalog and reports the error. `/logout` cancels the selected account's pending work and deletes its credentials and catalog.
 
-The authenticated `/api/accounts` endpoint exposes these two account snapshots. Their inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials. Other provider configuration and login remain client-owned.
+The authenticated `/api/accounts` endpoint exposes the Devin account snapshot. Its inference and compaction requests use `options.authSource: "server-account"`, which selects the exact saved account model and server credentials.
 
 ## Public Model Catalogs
 
@@ -87,7 +87,6 @@ Server fields are cumulative milliseconds from receipt of the HTTP request: `bod
 
 PiServer writes a JSON `provider_failure` event to stderr when a chat stream, compaction, image generation, classification, or deferred operation fails. Search the service log by `sessionId`, `runId`, or model ID. The event shows the operation, failure phase, elapsed time, and available upstream status and error codes. Chat failures also report request shape, including message and tool counts and the requested reasoning level when supplied.
 
-Google Antigravity errors can include the structured RPC status, reason, retry delay, and quota violation count returned by Google. Logging uses metadata fields and excludes the raw provider error text, request bodies, headers, and credentials.
 
 ## Thread Viewer
 

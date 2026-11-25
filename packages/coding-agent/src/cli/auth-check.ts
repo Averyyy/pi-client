@@ -1,4 +1,5 @@
 import type { CredentialStore } from "@earendil-works/pi-ai";
+import { ANTIGRAVITY_PROVIDER } from "../core/antigravity-acp.ts";
 import { resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { InMemoryCodingAgentModelsStore } from "../core/models-store.ts";
@@ -25,6 +26,10 @@ export async function checkProviderAuth(
 	options: { refresh: boolean } = { refresh: false },
 ): Promise<AuthCheckResult> {
 	const { provider: cliProvider, model: cliModel } = validateAuthCommandArgs(args, "check");
+	if (cliProvider === ANTIGRAVITY_PROVIDER || cliModel?.startsWith(`${ANTIGRAVITY_PROVIDER}/`)) {
+		const result = await modelRuntime.refresh({ providers: [ANTIGRAVITY_PROVIDER], allowNetwork: false });
+		if (result.errors.size) return { status: "invalid", provider: ANTIGRAVITY_PROVIDER, reason: "invalid_state" };
+	}
 	let provider = cliProvider;
 	if (cliModel) {
 		const resolved = resolveCliModel({ cliProvider, cliModel, modelRuntime });
@@ -49,7 +54,7 @@ export async function checkProviderAuth(
 			if (!(await modelRuntime.checkAuth(provider))) {
 				return { status: "not_ready", provider, reason: "credentials_not_configured" };
 			}
-		} else if (options.refresh && !(await modelRuntime.getAuth(provider))) {
+		} else if (options.refresh && provider !== ANTIGRAVITY_PROVIDER && !(await modelRuntime.getAuth(provider))) {
 			return { status: "not_ready", provider, reason: "credentials_not_configured" };
 		}
 		return { status: "ready", provider, authType: auth.type };
@@ -64,6 +69,9 @@ export async function getProviderCredential(
 	credentials: CredentialStore,
 	options: { refresh: boolean },
 ): Promise<string | undefined> {
+	if (providerId === ANTIGRAVITY_PROVIDER) {
+		throw new AuthCommandError("Google Antigravity credentials are managed by the local agy CLI");
+	}
 	if (modelRuntime.isServerAccountProvider(providerId)) {
 		throw new AuthCommandError(
 			`Provider "${providerId}" credentials are managed by pi-server and cannot be exported`,

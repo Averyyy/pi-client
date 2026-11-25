@@ -6349,9 +6349,7 @@ export class InteractiveMode {
 					authType: type,
 					status: {
 						type,
-						source: this.session.modelRuntime.isServerAccountProvider(providerId)
-							? "pi-server account"
-							: "stored credential",
+						source: this.session.modelRuntime.getProviderAuthStatus(providerId).label ?? "stored credential",
 					},
 					subscription: provider?.auth.oauth?.isSubscription === true,
 				};
@@ -6559,6 +6557,7 @@ export class InteractiveMode {
 						if (this.session.modelRuntime.hasConfiguredAuth(providerOption.id)) {
 							const authStatus = this.session.modelRuntime.getProviderAuthStatus(providerOption.id);
 							const sources = {
+								local_account: "the local Antigravity CLI",
 								server_account: "a pi-server account",
 								stored: "stored credentials",
 								runtime: "a runtime API key",

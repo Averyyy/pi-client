@@ -6,6 +6,7 @@
 
 - Collapsed viewer thinking and commands into one process section by default, showing the latest assistant text with a shimmer while running.
 - Based on upstream Pi 1.6.0, including GPT-6.2 models and Codex prompt-cache fixes.
+- Moved Google Antigravity accounts and inference to the client machine's official CLI.
 - Accepted event-triggered observer POSTs with publisher identity and sequence numbers, without client presence connections or heartbeats. Persisted explicit completion states and retained browser event streams.
 
 ### Added

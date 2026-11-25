@@ -17,12 +17,11 @@ import {
 	type Provider,
 } from "@earendil-works/pi-ai";
 import { devinProvider } from "@earendil-works/pi-ai/providers/devin";
-import { googleAntigravityProvider } from "@earendil-works/pi-ai/providers/google-antigravity";
 import { applyModelOverride, type ModelOverride } from "@earendil-works/pi-ai/utils/model-operations";
 
 export const ACCOUNT_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 export const ACCOUNT_REFRESH_TIMEOUT_MS = 60_000;
-export const SERVER_ACCOUNT_PROVIDERS = ["devin", "google-antigravity"] as const;
+export const SERVER_ACCOUNT_PROVIDERS = ["devin"] as const;
 export type ServerAccountProvider = (typeof SERVER_ACCOUNT_PROVIDERS)[number];
 
 export interface ServerAccount {
@@ -56,8 +55,8 @@ interface LoginRun {
 }
 
 export function accountProvider(value: unknown): ServerAccountProvider {
-	if (value === "devin" || value === "google-antigravity") return value;
-	throw new Error("Account provider must be devin or google-antigravity");
+	if (value === "devin") return value;
+	throw new Error("PiServer account provider must be devin. Google Antigravity uses the local agy CLI.");
 }
 
 /** One server process owns these credential and catalog files. */
@@ -74,7 +73,7 @@ export class ServerAccounts {
 	private readonly catalogs: ModelsStore;
 	private closed = false;
 
-	constructor(directory: string, providers: readonly Provider[] = [devinProvider(), googleAntigravityProvider()]) {
+	constructor(directory: string, providers: readonly Provider[] = [devinProvider()]) {
 		this.directory = directory;
 		for (const providerId of SERVER_ACCOUNT_PROVIDERS) {
 			const path = join(directory, `${providerId}.json`);
