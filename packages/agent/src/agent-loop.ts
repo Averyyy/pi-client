@@ -248,28 +248,42 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const { message, executedToolResults } = await streamAssistantResponse(
+				currentContext,
+				config,
+				signal,
+				emit,
+				streamFunction,
+			);
 			newMessages.push(message);
+
+			const toolResults: ToolResultMessage[] = [];
+			if (executedToolResults) {
+				for (const result of executedToolResults) {
+					await emitToolResultMessage(result, emit);
+					toolResults.push(result);
+					currentContext.messages.push(result);
+					newMessages.push(result);
+				}
+			}
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				lastCompletedTurn = {
 					message,
-					toolResults: [],
+					toolResults,
 					context: currentContext,
 					newMessages,
 				};
 				await config.finishTurn?.(lastCompletedTurn, signal);
-				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "turn_end", message, toolResults });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
 			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
-			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
+			const toolCalls = executedToolResults ? undefined : message.content.filter((c) => c.type === "toolCall");
+			if (toolCalls?.length) {
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
@@ -393,7 +407,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
-): Promise<AssistantMessage> {
+): Promise<{ message: AssistantMessage; executedToolResults?: readonly ToolResultMessage[] }> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -421,7 +435,7 @@ async function streamAssistantResponse(
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
-	for await (const event of response) {
+	events: for await (const event of response) {
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
@@ -449,21 +463,9 @@ async function streamAssistantResponse(
 					});
 				}
 				break;
-
 			case "done":
-			case "error": {
-				const finalMessage = await result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
-				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } });
-				}
-				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
-			}
+			case "error":
+				break events;
 		}
 	}
 
@@ -475,7 +477,7 @@ async function streamAssistantResponse(
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
 	await emit({ type: "message_end", message: finalMessage });
-	return finalMessage;
+	return { message: finalMessage, executedToolResults: response.executedToolResults };
 }
 
 /**
@@ -1006,7 +1008,8 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 	});
 }
 
-function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+/** Build the durable tool-result message from the finalized execution outcome. */
+export function createToolResultMessage(finalized: AgentToolCallOutcome): ToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
@@ -1015,6 +1018,9 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		// so the null never enters session history or provider payloads.
 		content: finalized.result.content ?? [],
 		details: finalized.result.details,
+		...(finalized.result.structuredContent === undefined
+			? {}
+			: { structuredContent: finalized.result.structuredContent }),
 		usage: finalized.result.usage,
 		isError: finalized.isError,
 		...(finalized.durationMs === undefined ? {} : { durationMs: finalized.durationMs }),

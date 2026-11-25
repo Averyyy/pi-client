@@ -16,6 +16,11 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
 
+export type AgentAssistantStream = AssistantMessageEventStream & {
+	/** Results of tool calls the runtime already executed in this response. Presence gives the runtime ownership of its tool loop. */
+	readonly executedToolResults?: readonly ToolResultMessage[];
+};
+
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
  * this shape.
@@ -34,7 +39,7 @@ export type StreamFn = (
 	model: Model<Api>,
 	context: TranscriptContext,
 	options?: SimpleStreamOptions,
-) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+) => AgentAssistantStream | Promise<AgentAssistantStream>;
 
 /**
  * Configuration for how tool calls from a single assistant message are executed.

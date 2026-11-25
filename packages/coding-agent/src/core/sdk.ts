@@ -456,8 +456,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return new AntigravityRuntime(cwd).stream(model, context, requestOptions);
 				}
 				cacheWarmer.cancel();
+				const runner = extensionRunnerRef.current;
 				return antigravity.stream(model, context, requestOptions, {
 					executeTool: (call, assistant, signal) => session.executeAntigravityTool(call, assistant, signal),
+					recordUpdate: (acpSessionId, update) => session.recordAntigravityUpdate(acpSessionId, update),
+					questionUI: runner?.hasUI()
+						? { ui: runner.getUIContext(), events: session.resourceLoader.getEventBus?.() }
+						: undefined,
 					requestPermission: (title, choices, signal) =>
 						extensionRunnerRef.current?.getUIContext().select(title, choices, { signal }) ??
 						Promise.resolve(undefined),
@@ -606,7 +611,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	});
 	agentSession = session;
 	session.subscribe((event) => {
-		if (event.type === "session_disposed") void antigravity.close();
+		if (event.type === "session_disposed" || event.type === "session_tree_changed") void antigravity.close();
 		if (event.type === "abort_start") cacheWarmer.cancel();
 		if (process.env.PI_TIMING !== "1") return;
 		if (event.type === "run_state_changed" && event.running) {

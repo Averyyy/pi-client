@@ -86,13 +86,15 @@ export class AntigravityAcp {
 		});
 	}
 
-	async initialize(signal?: AbortSignal): Promise<AcpInitialize> {
+	async initialize(signal?: AbortSignal, supportsQuestions?: boolean): Promise<AcpInitialize> {
+		const elicitation = supportsQuestions ? { elicitation: { form: {} } } : {};
 		const result = await this.request<AcpInitialize>(
 			"initialize",
 			{
 				protocolVersion: 2,
 				clientInfo: { name: "pi", title: "Pi" },
-				clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+				clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, ...elicitation },
+				...(supportsQuestions ? { capabilities: elicitation } : {}),
 			},
 			signal,
 		);

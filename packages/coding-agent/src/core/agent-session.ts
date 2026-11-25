@@ -38,6 +38,7 @@ import {
 	contentText,
 	getCurrentSystemMessage,
 	getCurrentTools,
+	type JsonObject,
 	normalizeContext,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -1030,14 +1031,23 @@ export class AgentSession {
 			signal,
 			onUpdate: (partialResult) => emit({ type: "tool_execution_update", ...call, partialResult }),
 		});
+		const durationMs = Math.round(performance.now() - started);
 		await emit({
 			type: "tool_execution_end",
 			...ids,
 			result: outcome.result,
 			isError: outcome.isError,
-			durationMs: Math.round(performance.now() - started),
+			durationMs,
 		});
-		return outcome;
+		return { ...outcome, durationMs };
+	}
+
+	/** Keep native ACP tool output and plan updates on the active Pi session branch. */
+	recordAntigravityUpdate(acpSessionId: string, update: JsonObject): void {
+		const entry = this.sessionManager.getEntry(
+			this.sessionManager.appendCustomEntry("antigravity_acp_update", { acpSessionId, update }),
+		);
+		if (entry) this._emit({ type: "entry_appended", entry });
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -1168,6 +1178,22 @@ export class AgentSession {
 	private _installAgentBoundaryHooks(): void {
 		const previousFinishTurn = this.agent.finishTurn;
 		this.agent.finishTurn = async (turn, signal) => {
+			if (
+				turn.message.provider === ANTIGRAVITY_PROVIDER &&
+				turn.toolResults.some(({ toolName }) => toolName === "todo")
+			) {
+				const todo = this._toolDefinitions.get("todo");
+				if (todo) {
+					await this._extensionRunner.emit(
+						{
+							type: "session_tree",
+							oldLeafId: this._findPersistedMessageEntryId(turn.message) ?? null,
+							newLeafId: this.sessionManager.getLeafId(),
+						},
+						todo.sourceInfo.path,
+					);
+				}
+			}
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
@@ -2222,7 +2248,11 @@ export class AgentSession {
 		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			buildSystemPromptSections(options),
+			buildSystemPromptSections(
+				this.model?.provider === ANTIGRAVITY_PROVIDER
+					? { ...options, hiddenTools: [...options.hiddenTools, "todo", "ask_user_question"] }
+					: options,
+			),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}

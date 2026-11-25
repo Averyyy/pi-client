@@ -25,10 +25,13 @@ function startAcp() {
 	let mcp;
 	let cancelId;
 	let permission;
+	let elicitation;
+	let supportsForm;
 	const send = (message) => console.log(JSON.stringify({ jsonrpc: "2.0", ...message }));
 	const trace = (message) => appendFileSync("trace.jsonl", `${JSON.stringify(message)}\n`);
 	const update = (sessionUpdate, text) =>
 		send({ method: "session/update", params: { sessionId, update: { sessionUpdate, content: { type: "text", text } } } });
+	const updateNative = (update) => send({ method: "session/update", params: { sessionId, update } });
 	const configs = () => [
 		{ id: "model", type: "select", currentValue: model, options: models },
 		...(model === "gemini-test" ? [{
@@ -57,6 +60,7 @@ function startAcp() {
 		switch (method) {
 			case "initialize":
 				assert.equal(params.protocolVersion, 2);
+				supportsForm = params.clientCapabilities.elicitation?.form && params.capabilities?.elicitation?.form;
 				reply({
 					protocolVersion: 2, agentInfo: { name: "antigravity-acp", version: "1.5.9" },
 					agentCapabilities: { auth: { logout: {} }, mcpCapabilities: { http: true },
@@ -87,12 +91,54 @@ function startAcp() {
 					break;
 				}
 				update("agent_thought_chunk", "Planning");
-				if (text === "custom") {
+				if (text === "custom" || text === "custom-error" || text === "custom-cancel" || text === "interactions") {
 					await callMcp("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "agy", version: "1.5.9" } });
 					const { tools } = await callMcp("tools/list");
 					assert.ok(tools.some((tool) => tool.name === "lookup"));
-					const tool = await callMcp("tools/call", { name: "lookup", arguments: { key: "答案" } });
-					update("agent_message_chunk", tool.content[0].text);
+					assert.ok(tools.every(({ name }) => name !== "todo" && name !== "ask_user_question"));
+					const tool = await callMcp("tools/call", { name: "lookup", arguments: { key: text === "custom-error" ? "fail" : "答案" } });
+					if (text === "custom-error") {
+						assert.equal(tool.isError, true);
+						send({ id, error: { code: -32603, message: "Antigravity prompt failed" } });
+						break;
+					}
+					if (text === "custom-cancel") {
+						cancelId = id;
+						break;
+					}
+					if (text === "interactions") {
+						assert.ok(supportsForm);
+						updateNative({ sessionUpdate: "plan", entries: [{ content: "Review choices", priority: "high", status: "in_progress" }] });
+						updateNative({ sessionUpdate: "tool_call", toolCallId: "native-1", name: "read_file", title: "Read a file", status: "in_progress" });
+						updateNative({ sessionUpdate: "tool_call_content_chunk", toolCallId: "native-1",
+							content: { type: "content", content: { type: "text", text: "first chunk" } } });
+						updateNative({ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed", rawOutput: { lines: 2 } });
+						const answer = new Promise((resolve) => { elicitation = resolve; });
+						send({ id: "elicitation", method: "elicitation/create", params: {
+							sessionId, mode: "form", message: "Pick a strategy", requestedSchema: {
+								type: "object", properties: {
+									choice: { type: "string", oneOf: [{ const: "balanced", title: "Balanced" }, { const: "fast", title: "Fast" }] },
+									features: { type: "array", items: { enum: ["Audit", "Metrics"] }, minItems: 1 },
+									note: { type: "string" },
+								}, required: ["choice", "features"],
+							},
+						} });
+						update("agent_message_chunk", JSON.stringify(await answer));
+						updateNative({ sessionUpdate: "plan", entries: [] });
+						updateNative({ sessionUpdate: "plan_update", plan: { type: "items", planId: "steps",
+							entries: [{ content: "Review choices", priority: "high", status: "completed" }] } });
+					} else {
+						update("agent_message_chunk", tool.content[0].text);
+					}
+				} else if (text === "native-choice") {
+					const toolCallId = "named-question";
+					updateNative({ sessionUpdate: "tool_call", toolCallId, name: "ask_question", title: "Pick the scope" });
+					const outcome = new Promise((resolve) => { permission = resolve; });
+					send({ id: "permission", method: "session/request_permission", params: {
+						sessionId, toolCall: { toolCallId, title: "Pick the scope" },
+						options: [{ optionId: "repo", name: "Repo" }, { optionId: "file", name: "File" }],
+					} });
+					update("agent_message_chunk", (await outcome).optionId);
 				} else if (text === "permission") {
 					const outcome = new Promise((resolve) => { permission = resolve; });
 					send({ id: "permission", method: "session/request_permission", params: {
@@ -115,8 +161,11 @@ function startAcp() {
 				reply({});
 				break;
 			case undefined:
-				assert.equal(id, "permission");
-				permission(message.result.outcome);
+				if (id === "elicitation") elicitation(message.result ?? message.error);
+				else {
+					assert.equal(id, "permission");
+					permission(message.result.outcome);
+				}
 				break;
 			default:
 				throw new Error(`Unexpected ACP method ${method}`);

@@ -1,3 +1,4 @@
+import { type AgentToolCallOutcome, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
@@ -6,26 +7,44 @@ import {
 	getCurrentSystemMessage,
 	getSystemMessageText,
 	type ImageContent,
+	type JsonObject,
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type TextContent,
+	type ToolResultMessage,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { McpError } from "@earendil-works/pi-mcp";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { type AcpConfigOption, type AcpSession, AntigravityAcp, acpChoices } from "./antigravity-acp.ts";
+import {
+	type AcpFormRequest,
+	type AcpPlanEntry,
+	answerAntigravityQuestion,
+	antigravityPlanResult,
+} from "./antigravity-interactions.ts";
 import { type AntigravityToolExecutor, openAntigravityTools } from "./antigravity-tools.ts";
 
 interface AcpPermission {
-	toolCall: { title?: string };
+	sessionId?: string;
+	title?: string;
+	toolCall?: { toolCallId?: string; name?: string; title?: string };
+	subject?: { type: "tool_call"; toolCall: { toolCallId: string; name?: string; title?: string } };
 	options: { optionId: string; name: string }[];
 }
+
+type AcpPermissionResult = { outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" } };
 
 interface AcpUpdate {
 	sessionUpdate: string;
 	content?: TextContent | ImageContent;
 	configOptions?: AcpConfigOption[];
+	entries?: AcpPlanEntry[];
+	plan?: { planId: string } & ({ type: "items"; entries: AcpPlanEntry[] } | { type: "markdown"; content: string });
+	planId?: string;
+	toolCallId?: string;
+	name?: string;
 }
 
 interface AntigravityClient {
@@ -35,6 +54,8 @@ interface AntigravityClient {
 		signal: AbortSignal,
 	) => ReturnType<AntigravityToolExecutor>;
 	requestPermission?: (title: string, options: string[], signal?: AbortSignal) => Promise<string | undefined>;
+	questionUI?: Parameters<typeof answerAntigravityQuestion>[1];
+	recordUpdate?: (sessionId: string, update: JsonObject) => void;
 }
 
 interface Conversation {
@@ -45,6 +66,9 @@ interface Conversation {
 	toolDefinitions: string;
 	appendSystemPrompt: boolean;
 	supportsImages: boolean;
+	plans: Map<string | null, AcpPlanEntry[]>;
+	planChanged: boolean;
+	questionToolIds: Set<string>;
 }
 
 /** A Pi session's live Antigravity conversation. Pi owns the visible transcript, agy owns its turn loop. */
@@ -57,6 +81,9 @@ export class AntigravityRuntime {
 		| {
 				client?: AntigravityClient;
 				executeTool?: AntigravityToolExecutor;
+				answerQuestion(
+					request: AcpFormRequest,
+				): Promise<Awaited<ReturnType<typeof answerAntigravityQuestion>>["result"]>;
 				signal: AbortSignal;
 				update(update: AcpUpdate): void;
 		  }
@@ -66,13 +93,14 @@ export class AntigravityRuntime {
 		this.cwd = cwd;
 	}
 
-	stream(
-		model: Model<Api>,
-		context: TranscriptContext,
-		options?: SimpleStreamOptions,
-		client?: AntigravityClient,
-	): AssistantMessageEventStream {
-		const stream = createAssistantMessageEventStream();
+	stream(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions, client?: AntigravityClient) {
+		const executedToolResults: ToolResultMessage[] = [];
+		const stream = Object.assign(createAssistantMessageEventStream(), { executedToolResults });
+		const toolCalls: AgentToolCallOutcome["toolCall"][] = [];
+		const addToolResult = (outcome: AgentToolCallOutcome) => {
+			toolCalls.push(outcome.toolCall);
+			executedToolResults.push(createToolResultMessage(outcome));
+		};
 		const output: AssistantMessage = {
 			role: "assistant",
 			api: model.api,
@@ -95,17 +123,28 @@ export class AntigravityRuntime {
 		void (async () => {
 			try {
 				stream.push({ type: "start", partial: output });
-				const reason = await this.prompt(model, context, options, client, output, emit.update);
+				const reason = await this.prompt(
+					model,
+					context,
+					options,
+					client,
+					output,
+					emit.update,
+					addToolResult,
+					executedToolResults,
+				);
 				if (!client || reason === "cancelled") await this.close();
 				emit.end();
 				if (signal?.aborted || reason === "cancelled") throw new Error("Antigravity turn cancelled");
 				if (reason === "max_turn_requests") throw new Error("Antigravity reached its turn request limit");
+				output.content.unshift(...toolCalls);
 				output.stopReason = reason === "max_tokens" ? "length" : "stop";
 				output.rawStopReason = reason;
 				stream.push({ type: "done", reason: output.stopReason, message: output });
 			} catch (error) {
 				await this.close();
 				emit.end();
+				output.content.unshift(...toolCalls);
 				output.stopReason = signal?.aborted ? "aborted" : "error";
 				output.errorMessage = error instanceof Error ? error.message : String(error);
 				stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -132,12 +171,16 @@ export class AntigravityRuntime {
 		client: AntigravityClient | undefined,
 		output: AssistantMessage,
 		onUpdate: (update: AcpUpdate) => void,
+		addToolResult: (outcome: AgentToolCallOutcome) => void,
+		toolResults: readonly ToolResultMessage[],
 	): Promise<string> {
 		const signal = operationSignal(options?.signal);
 		const setupSignal = AbortSignal.any([signal, AbortSignal.timeout(options?.timeoutMs ?? 30_000)]);
 		const systemMessage = getCurrentSystemMessage(context.messages);
 		const systemPrompt = systemMessage ? getSystemMessageText(systemMessage) : "";
-		const tools = systemMessage?.toolsAdded ?? [];
+		const activeTools = systemMessage?.toolsAdded ?? [];
+		const showTodo = activeTools.some((tool) => tool.name === "todo");
+		const tools = activeTools.filter((tool) => tool.name !== "todo" && tool.name !== "ask_user_question");
 		const toolDefinitions = JSON.stringify(tools);
 		const history = context.messages.filter((message) => message.role !== "system");
 		const previous = this.conversation;
@@ -158,22 +201,103 @@ export class AntigravityRuntime {
 				this.toolServer ? ["--process-per-session"] : [],
 				async (method, params) => {
 					if (method === "session/update") {
-						const { sessionId, update } = params as { sessionId: string; update: AcpUpdate };
+						const { sessionId, update } = params as { sessionId: string; update: AcpUpdate & JsonObject };
 						if (sessionId !== this.conversation?.sessionId) return;
 						if (update.sessionUpdate === "config_option_update" && update.configOptions) {
 							this.conversation.configOptions = update.configOptions;
+						}
+						if (
+							update.sessionUpdate === "tool_call" ||
+							update.sessionUpdate === "tool_call_update" ||
+							update.sessionUpdate === "tool_call_content_chunk" ||
+							update.sessionUpdate === "terminal_output_chunk" ||
+							update.sessionUpdate === "plan" ||
+							update.sessionUpdate === "plan_update" ||
+							update.sessionUpdate === "plan_removed"
+						) {
+							client?.recordUpdate?.(sessionId, update);
+						}
+						if (
+							(update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+							update.name === "ask_question" &&
+							update.toolCallId
+						) {
+							this.conversation.questionToolIds.add(update.toolCallId);
+						}
+						if (update.sessionUpdate === "plan" && update.entries) {
+							this.conversation.plans.set(null, update.entries);
+							this.conversation.planChanged = true;
+						} else if (update.sessionUpdate === "plan_update" && update.plan) {
+							const { plan } = update;
+							if (plan.type === "items") {
+								this.conversation.plans.set(plan.planId, plan.entries);
+								this.conversation.planChanged = true;
+							} else if (this.conversation.plans.delete(plan.planId)) {
+								this.conversation.planChanged = true;
+							}
+						} else if (update.sessionUpdate === "plan_removed" && update.planId !== undefined) {
+							if (this.conversation.plans.delete(update.planId)) this.conversation.planChanged = true;
 						}
 						this.activeTurn?.update(update);
 						return;
 					}
 					if (method === "session/request_permission") {
-						return answerPermission(params as AcpPermission, this.activeTurn?.client, this.activeTurn?.signal);
+						const request = params as AcpPermission;
+						const toolCall = request.toolCall ?? request.subject?.toolCall;
+						const title = request.title ?? toolCall?.title;
+						const isQuestion =
+							toolCall?.name === "ask_question" ||
+							(toolCall?.toolCallId && this.conversation?.questionToolIds.has(toolCall.toolCallId));
+						let result: AcpPermissionResult;
+						if (isQuestion && title && request.sessionId && this.activeTurn?.client?.questionUI) {
+							const answer = await this.activeTurn.answerQuestion({
+								sessionId: request.sessionId,
+								mode: "form",
+								message: title,
+								requestedSchema: {
+									type: "object",
+									properties: {
+										choice: {
+											type: "string",
+											title: "Answer",
+											oneOf: request.options.map(({ optionId, name }) => ({ const: optionId, title: name })),
+										},
+									},
+									required: ["choice"],
+								},
+							});
+							result = {
+								outcome:
+									answer.action === "accept"
+										? { outcome: "selected", optionId: String(answer.content.choice) }
+										: { outcome: "cancelled" },
+							};
+						} else {
+							result = await answerPermission(request, this.activeTurn?.client, this.activeTurn?.signal);
+						}
+						if (request.sessionId && toolCall?.toolCallId) {
+							client?.recordUpdate?.(request.sessionId, {
+								sessionUpdate: "permission_response",
+								toolCallId: toolCall.toolCallId,
+								...(title ? { title } : {}),
+								options: request.options,
+								...result,
+							});
+						}
+						return result;
+					}
+					if (method === "elicitation/create") {
+						const request = params as AcpFormRequest;
+						if (request.sessionId !== this.conversation?.sessionId || !this.activeTurn) {
+							throw new McpError(-32602, "Antigravity elicitation requires an active interactive Pi session");
+						}
+						return this.activeTurn.answerQuestion(request);
 					}
 					throw new McpError(-32601, `Unsupported ACP client method ${method}`);
 				},
 			);
 			this.acp = acp;
-			const { agentCapabilities } = await acp.initialize(setupSignal);
+			const { agentCapabilities } = await acp.initialize(setupSignal, Boolean(client?.questionUI));
 			if (this.toolServer && !agentCapabilities?.mcpCapabilities?.http) {
 				throw new Error("Antigravity CLI does not support ACP HTTP MCP servers. Update agy.");
 			}
@@ -197,6 +321,9 @@ export class AntigravityRuntime {
 				toolDefinitions,
 				appendSystemPrompt,
 				supportsImages: agentCapabilities?.promptCapabilities?.image === true,
+				plans: new Map(),
+				planChanged: false,
+				questionToolIds: new Set(),
 			};
 		}
 		const acp = this.acp!;
@@ -211,30 +338,55 @@ export class AntigravityRuntime {
 		}
 		setupSignal.throwIfAborted();
 		const execute = client?.executeTool;
-		const calls = new Set<ReturnType<AntigravityToolExecutor>>();
+		const calls = new Set<Promise<unknown>>();
+		const questionController = new AbortController();
+		const questionSignal = AbortSignal.any([signal, questionController.signal]);
+		const track = async <T>(running: Promise<T>): Promise<T> => {
+			calls.add(running);
+			try {
+				return await running;
+			} finally {
+				calls.delete(running);
+			}
+		};
 		this.activeTurn = {
 			client,
 			signal,
 			update: onUpdate,
+			answerQuestion: async (request) => {
+				if (!client?.questionUI) throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
+				const questionUI = client.questionUI;
+				return track(
+					(async () => {
+						const { result, outcome } = await answerAntigravityQuestion(request, questionUI, questionSignal);
+						addToolResult(outcome);
+						return result;
+					})(),
+				);
+			},
 			executeTool: execute
-				? async (call) => {
-						const running = execute(call, output, signal);
-						calls.add(running);
-						try {
-							return await running;
-						} finally {
-							calls.delete(running);
-						}
-					}
+				? (call) =>
+						track(
+							(async () => {
+								const outcome = await execute(call, output, signal);
+								addToolResult(outcome);
+								return outcome;
+							})(),
+						)
 				: undefined,
 		};
 		try {
 			const result = await promptAcp(acp, conversation.sessionId, prompt, signal);
-			conversation.history = [...history, output];
 			return result.stopReason;
 		} finally {
 			this.activeTurn = undefined;
+			questionController.abort();
 			await Promise.allSettled(calls);
+			if (conversation.planChanged && showTodo) {
+				addToolResult(antigravityPlanResult([...conversation.plans.values()].flat()));
+				conversation.planChanged = false;
+			}
+			conversation.history = [...history, output, ...toolResults];
 		}
 	}
 }
@@ -303,11 +455,15 @@ async function promptAcp(
 	}
 }
 
-async function answerPermission(request: AcpPermission, client?: AntigravityClient, signal?: AbortSignal) {
+async function answerPermission(
+	request: AcpPermission,
+	client?: AntigravityClient,
+	signal?: AbortSignal,
+): Promise<AcpPermissionResult> {
 	if (!client?.requestPermission || signal?.aborted) return { outcome: { outcome: "cancelled" } };
 	const selected = await raceWithAbortSignal(
 		client.requestPermission(
-			request.toolCall.title ?? "Antigravity tool permission",
+			request.title ?? request.toolCall?.title ?? request.subject?.toolCall.title ?? "Antigravity tool permission",
 			request.options.map((option) => option.name),
 			signal,
 		),

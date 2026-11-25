@@ -5,11 +5,13 @@ import { InMemoryCredentialStore, InMemoryModelsStore, normalizeContext } from "
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { closePiServerObserver } from "../src/core/pi-server-observer.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createTestUiContext } from "./suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 const providerId = "google-antigravity";
@@ -159,24 +161,31 @@ describe("Antigravity ACP", () => {
 		expect(model.contextWindow).toBe(50_000);
 		const execute = vi.fn(async (_id: string, params: { key: string }) => ({
 			content: [{ type: "text" as const, text: `Found ${params.key}` }],
-			details: {},
+			details: { found: params.key },
+			structuredContent: { value: params.key },
 		}));
 		const extensionsResult = await createTestExtensionsResult(
 			[
 				(pi) => {
 					pi.on("tool_result", (event) => {
-						if (event.toolName === "lookup") return { content: [{ type: "text", text: "Reviewed 答案" }] };
+						if (event.toolName === "lookup") {
+							return {
+								content: [{ type: "text", text: "Reviewed 答案" }],
+								structuredContent: event.structuredContent,
+							};
+						}
 					});
 				},
 			],
 			cwd,
 		);
+		const sessionManager = SessionManager.create(cwd, cwd);
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir: cwd,
 			model,
 			modelRuntime: runtime,
-			sessionManager: SessionManager.inMemory(cwd),
+			sessionManager,
 			settingsManager: SettingsManager.inMemory({ compaction: { keepRecentTokens: 1 } }),
 			resourceLoader: createTestResourceLoader({ extensionsResult }),
 			noTools: "builtin",
@@ -199,6 +208,9 @@ describe("Antigravity ACP", () => {
 		try {
 			await session.bindExtensions({});
 			await session.prompt("custom");
+			expect(session.messages.findLast((message) => message.role === "assistant")).toMatchObject({
+				stopReason: "stop",
+			});
 			await session.prompt("follow-up");
 			expect(execute).toHaveBeenCalledExactlyOnceWith(
 				expect.any(String),
@@ -229,10 +241,27 @@ describe("Antigravity ACP", () => {
 			});
 			expect(requests.find((entry) => entry.method === "mock/tools/call")?.result).toEqual({
 				content: [{ type: "text", text: "Reviewed 答案" }],
+				structuredContent: { value: "答案" },
 				isError: false,
 			});
+			const reopen = () => SessionManager.open(sessionManager.getSessionFile()!, cwd).getBranch();
+			const results = reopen().flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
+			);
+			expect(results).toMatchObject([
+				{
+					toolName: "lookup",
+					toolCallId: execute.mock.calls[0][0],
+					content: [{ type: "text", text: "Reviewed 答案" }],
+					details: { found: "答案" },
+					structuredContent: { value: "答案" },
+					isError: false,
+				},
+			]);
+			expect(messages[0].content[0]).toMatchObject({ type: "toolCall", id: results[0].toolCallId });
 			const compacted = await session.compact();
 			expect(compacted.summary).toContain("Reviewed 答案");
+			expect(reopen()).toContainEqual(expect.objectContaining({ type: "message", message: results[0] }));
 			expect(trace().at(-1)).toMatchObject({ method: "session/prompt" });
 			expect(
 				network.mock.calls.every(([input]) =>
@@ -244,6 +273,236 @@ describe("Antigravity ACP", () => {
 			session.dispose();
 			await Promise.all([closePiServerObserver(session), ...close.mock.results.map(({ value }) => value)]);
 			expect(close).toHaveBeenCalledTimes(closes + 1);
+		}
+	});
+
+	it.each([
+		{ label: "an unknown context window", contextWindow: 0, automatic: false },
+		{ label: "a configured context window", contextWindow: 50_000, automatic: true },
+	])("uses the correct compaction trigger with $label", async ({ contextWindow, automatic }) => {
+		signedIn();
+		let modelsPath: string | null = null;
+		if (contextWindow > 0) {
+			modelsPath = join(cwd, "models.json");
+			writeFileSync(
+				modelsPath,
+				JSON.stringify({ providers: { [providerId]: { modelOverrides: { "gemini-test": { contextWindow } } } } }),
+			);
+		}
+		const runtime = await createRuntime(undefined, modelsPath);
+		const model = runtime.getModel(providerId, "gemini-test")!;
+		expect(model.contextWindow).toBe(contextWindow);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model,
+			modelRuntime: runtime,
+			sessionManager,
+			settingsManager: SettingsManager.inMemory({
+				compaction: { enabled: true, reserveTokens: 49_000, keepRecentTokens: 1 },
+			}),
+			resourceLoader: createTestResourceLoader(),
+			noTools: "all",
+			autoSessionName: false,
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const reasons: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_start") reasons.push(event.reason);
+		});
+		try {
+			await session.bindExtensions({});
+			await session.prompt("Remember the initial requirement");
+			expect(reasons).toEqual([]);
+			await session.prompt("Retained fixture context. ".repeat(256));
+			expect(reasons).toEqual(automatic ? ["threshold"] : []);
+			if (!automatic) {
+				const requests = trace();
+				expect(requests.filter((entry) => entry.method === "session/prompt")).toHaveLength(2);
+				expect(requests.filter((entry) => entry.method === "session/new")).toHaveLength(2);
+				const result = await session.compact("Keep the initial requirement");
+				expect(result.summary).toContain("initial requirement");
+				expect(reasons).toEqual(["manual"]);
+			}
+			expect(sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
+		}
+	});
+
+	it("stores native ACP results, maps the native plan and form to Pi extension records, and preserves cancelled Pi tool results", async () => {
+		signedIn();
+		const runtime = await createRuntime();
+		const model = runtime.getModel(providerId, "gemini-test")!;
+		const manager = SessionManager.create(cwd, cwd);
+		const events = createEventBus();
+		const asked = vi.fn();
+		const blocked = vi.fn();
+		events.on("rpiv:ask-user:prompt", asked);
+		events.on("rpiv:ask-user:blocked", blocked);
+		const todoReplay = vi.fn();
+		const piTool = vi.fn(async () => ({ content: [], details: {} }));
+		const tool = (name: string) => ({
+			name,
+			label: name,
+			description: name,
+			promptSnippet: `Use Pi's ${name}`,
+			promptGuidelines: [`Prefer Pi's ${name}`],
+			parameters: Type.Object({}),
+			execute: piTool,
+		});
+		const lookup = vi.fn(async (_id: string, { key }: { key: string }) => {
+			if (key === "fail") throw new Error("Lookup failed");
+			return { content: [{ type: "text" as const, text: key }], details: { key } };
+		});
+		const extensionsResult = await createTestExtensionsResult(
+			[
+				(pi) => {
+					pi.registerTool(tool("todo"));
+					pi.registerTool(tool("ask_user_question"));
+					pi.on("session_tree", (_event, ctx) => {
+						todoReplay(ctx.sessionManager.getBranch().at(-1));
+					});
+				},
+			],
+			cwd,
+		);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model,
+			modelRuntime: runtime,
+			sessionManager: manager,
+			settingsManager: SettingsManager.inMemory(),
+			autoSessionName: false,
+			noTools: "builtin",
+			resourceLoader: { ...createTestResourceLoader({ extensionsResult }), getEventBus: () => events },
+			customTools: [
+				{
+					...tool("lookup"),
+					parameters: Type.Object({ key: Type.String() }),
+					execute: lookup,
+				},
+			],
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const select = vi
+			.fn<ReturnType<typeof createTestUiContext>["select"]>()
+			.mockImplementationOnce(async (_title, options) => options[0])
+			.mockImplementationOnce(async (_title, options) => options[0])
+			.mockImplementationOnce(async (_title, options) => options[1])
+			.mockResolvedValueOnce("Done selecting")
+			.mockResolvedValueOnce("Submit answers");
+		const results = () =>
+			SessionManager.open(manager.getSessionFile()!, cwd)
+				.getBranch()
+				.flatMap((entry) =>
+					entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
+				);
+		try {
+			await session.bindExtensions({ uiContext: createTestUiContext({ select, input: async () => "Keep both" }) });
+			await session.prompt("follow-up");
+			await session.prompt("interactions");
+			expect(trace()).toContainEqual(
+				expect.objectContaining({
+					method: "session/new",
+					params: expect.objectContaining({
+						mcpServers: [expect.objectContaining({ name: "pi" })],
+						_meta: {
+							antigravity: {
+								systemPrompt: { append: expect.not.stringMatching(/Pi's (todo|ask_user_question)/) },
+							},
+						},
+					}),
+				}),
+			);
+			expect(trace()).toContainEqual(
+				expect.objectContaining({
+					id: "elicitation",
+					result: {
+						action: "accept",
+						content: { choice: "balanced", features: ["Audit", "Metrics"], note: "Keep both" },
+					},
+				}),
+			);
+			expect(piTool).not.toHaveBeenCalled();
+			expect(asked).toHaveBeenCalledWith(
+				expect.objectContaining({
+					questions: expect.arrayContaining([expect.objectContaining({ header: "features", multiSelect: true })]),
+				}),
+			);
+			expect(blocked.mock.calls).toEqual([[{ active: true }], [{ active: false }]]);
+			expect(todoReplay).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({
+					message: expect.objectContaining({ role: "toolResult", toolName: "todo" }),
+				}),
+			);
+			expect(results()).toMatchObject([
+				{ toolName: "lookup", details: { key: "答案" }, isError: false },
+				{
+					toolName: "ask_user_question",
+					details: {
+						cancelled: false,
+						answers: [
+							{ kind: "option", answer: "Balanced" },
+							{ kind: "multi", selected: ["Audit", "Metrics"] },
+							{ kind: "custom", answer: "Keep both" },
+						],
+					},
+				},
+				{
+					toolName: "todo",
+					details: { tasks: [{ id: 1, subject: "Review choices", status: "completed" }], nextId: 2 },
+				},
+			]);
+			expect(SessionManager.open(manager.getSessionFile()!, cwd).getBranch()).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "custom",
+						customType: "antigravity_acp_update",
+						data: {
+							acpSessionId: "mock-agy-session",
+							update: {
+								sessionUpdate: "tool_call_update",
+								toolCallId: "native-1",
+								status: "completed",
+								rawOutput: { lines: 2 },
+							},
+						},
+					}),
+				]),
+			);
+			select.mockImplementationOnce(async (_title, options) => options[1]).mockResolvedValueOnce("Submit answers");
+			await session.prompt("native-choice");
+			expect(trace()).toContainEqual(
+				expect.objectContaining({
+					id: "permission",
+					result: { outcome: { outcome: "selected", optionId: "file" } },
+				}),
+			);
+			expect(results().at(-1)).toMatchObject({
+				toolName: "ask_user_question",
+				details: { cancelled: false, answers: [{ kind: "option", answer: "File" }] },
+			});
+			await session.prompt("custom-error");
+			expect(results().at(-1)).toMatchObject({
+				toolName: "lookup",
+				content: [{ type: "text", text: "Lookup failed" }],
+				isError: true,
+			});
+			const prompt = session.prompt("custom-cancel");
+			await vi.waitFor(() =>
+				expect(trace().at(-1)).toMatchObject({ method: "mock/tools/call", result: { isError: false } }),
+			);
+			await session.abort();
+			await prompt;
+			expect(results().at(-1)).toMatchObject({ toolName: "lookup", details: { key: "答案" }, isError: false });
+			expect(lookup).toHaveBeenCalledTimes(3);
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
 		}
 	});
 

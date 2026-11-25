@@ -1104,11 +1104,15 @@ export class ExtensionRunner {
 		);
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		extensionPath?: string,
+	): Promise<RunnerEmitResult<TEvent>> {
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
+			if (extensionPath && ext.path !== extensionPath) continue;
 			for (const handler of handlers) {
 				try {
 					const handlerResult = await handler(event, ctx);
