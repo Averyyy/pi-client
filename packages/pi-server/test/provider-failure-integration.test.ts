@@ -76,7 +76,7 @@ describe("provider failure logging", () => {
 		const stream = vi.spyOn(models, "streamSimple");
 		const response = await post("/api/stream", { sessionId, model: { ...model, provider: "google-antigravity" } });
 		expect(response.status).toBe(400);
-		expect(await response.json()).toMatchObject({ error: expect.stringContaining("local agy CLI") });
+		expect(await response.json()).toMatchObject({ error: "Antigravity requires an agy stream request" });
 		expect(stream).not.toHaveBeenCalled();
 	});
 

@@ -67,3 +67,24 @@ export function buildPiServerTreePrefixHashes(entries: SessionTreeEntry[]): stri
 export function hashPiServerSessionEntries(entries: SessionTreeEntry[]): string {
 	return buildPiServerTreePrefixHashes(entries)[entries.length];
 }
+
+/**
+ * A stream context the server rebuilds from its per-session message store: `base` names a
+ * prefix the server already holds, and each later item is a message or the hash of a stored one.
+ */
+export interface PiServerContextDelta {
+	base?: string;
+	messages: (Message | string)[];
+}
+
+export const PI_SERVER_EMPTY_CONTEXT_HASH = createHash("sha256").update("pi-context-v1").digest("hex");
+
+/** Hash one projected message from its exact JSON, so client and server name the same bytes. */
+export function hashPiServerContextJson(json: string): string {
+	return createHash("sha256").update(json).digest("hex");
+}
+
+/** Hash of the context prefix that ends with `messageHash`. */
+export function appendPiServerContextHash(prefixHash: string, messageHash: string): string {
+	return createHash("sha256").update(`${prefixHash}:${messageHash}`).digest("hex");
+}

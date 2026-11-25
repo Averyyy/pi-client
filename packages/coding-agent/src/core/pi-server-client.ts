@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
-import type {
-	CompactionPreparationOptions,
-	LegacyCompactResult,
-	ProxyAssistantMessageEvent,
-	SessionTreeEntry,
+import {
+	type AgentToolCallOutcome,
+	type CompactionPreparationOptions,
+	createToolResultMessage,
+	type LegacyCompactResult,
+	type ProxyAssistantMessageEvent,
+	type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
 import {
 	type AnyModel,
@@ -41,12 +43,17 @@ import {
 	type StreamOptions,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import type { AntigravityCallback } from "../antigravity.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import type { AntigravityClient } from "./antigravity-runtime.ts";
 import {
+	appendPiServerContextHash,
 	buildPiServerTreePrefixHashes,
+	hashPiServerContextJson,
 	hashPiServerSessionEntries,
 	hashPiServerStaticContext,
+	PI_SERVER_EMPTY_CONTEXT_HASH,
+	type PiServerContextDelta,
 	type PiServerProviderCallbackRequest,
 } from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
@@ -74,7 +81,10 @@ const sessionTreeHashes = new Map<string, string>();
 const sessionTreeEntryCounts = new Map<string, number>();
 const sessionTreeLeafIds = new Map<string, string | null>();
 const sessionHasTemporaryTree = new Set<string>();
-const antigravityPrefixes = new Map<string, { runId: string; messages: Message[] }>();
+/** Context prefixes and message hashes PiServer has acknowledged for each session in this process. */
+const contextKnowledge = new Map<string, { prefixes: Set<string>; messages: Set<string> }>();
+/** Sessions whose agy conversation PiServer may still hold. */
+const antigravitySessions = new Set<string>();
 interface ActivePiServerOperation {
 	ownerSessionId: string;
 	sessionId: string;
@@ -132,7 +142,7 @@ export function resetSessionTracking(sessionId: string): void {
 	sessionTreeEntryCounts.delete(sessionId);
 	sessionTreeLeafIds.delete(sessionId);
 	sessionHasTemporaryTree.delete(sessionId);
-	antigravityPrefixes.delete(sessionId);
+	contextKnowledge.delete(sessionId);
 }
 
 registerSessionResourceCleanup((sessionId) => {
@@ -145,7 +155,8 @@ export function resetAllSessionTracking(): void {
 	sessionTreeEntryCounts.clear();
 	sessionTreeLeafIds.clear();
 	sessionHasTemporaryTree.clear();
-	antigravityPrefixes.clear();
+	contextKnowledge.clear();
+	antigravitySessions.clear();
 	activePiServerOperations.clear();
 }
 
@@ -290,6 +301,8 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
+	/** Send the context as a delta against PiServer's per-session message store. */
+	incrementalContext?: boolean;
 	antigravity?: AntigravityClient | true;
 }
 
@@ -1171,14 +1184,55 @@ export async function logoutPiServerAntigravity(signal: AbortSignal): Promise<vo
 }
 
 export async function releasePiServerAntigravity(sessionId: string): Promise<void> {
-	const prefix = antigravityPrefixes.get(sessionId);
-	if (!prefix) return;
-	antigravityPrefixes.delete(sessionId);
+	if (!antigravitySessions.delete(sessionId)) return;
 	const response = await createPiServerRequest(AbortSignal.timeout(15_000)).postJson("/api/antigravity/release", {
 		sessionId,
-		runId: prefix.runId,
 	});
 	await readPiServerJson(response, "PiServer Antigravity session cleanup failed");
+}
+
+function buildPiServerContextPrefixes(hashes: readonly string[]): string[] {
+	const prefixes = [PI_SERVER_EMPTY_CONTEXT_HASH];
+	for (const hash of hashes) prefixes.push(appendPiServerContextHash(prefixes[prefixes.length - 1], hash));
+	return prefixes;
+}
+
+/** Encode a context as the longest prefix PiServer holds, then messages or the hashes of stored ones. */
+function encodePiServerContext(
+	messages: readonly Message[],
+	hashes: readonly string[],
+	prefixes: readonly string[],
+	known: { prefixes: Set<string>; messages: Set<string> } | undefined,
+): PiServerContextDelta {
+	let base = 0;
+	if (known) {
+		for (let index = hashes.length; index > 0 && base === 0; index--) {
+			if (known.prefixes.has(prefixes[index])) base = index;
+		}
+	} else {
+		// A resumed session: its previous request most likely ended before the last assistant reply.
+		// A wrong guess costs one whole-context upload.
+		base = Math.max(
+			0,
+			messages.findLastIndex((message) => message.role === "assistant"),
+		);
+	}
+	return {
+		...(base > 0 ? { base: prefixes[base] } : {}),
+		messages: messages
+			.slice(base)
+			.map((message, index) => (known?.messages.has(hashes[base + index]) ? hashes[base + index] : message)),
+	};
+}
+
+function rememberPiServerContext(sessionId: string, hashes: readonly string[], prefixes: readonly string[]): void {
+	let known = contextKnowledge.get(sessionId);
+	if (!known) {
+		known = { prefixes: new Set(), messages: new Set() };
+		contextKnowledge.set(sessionId, known);
+	}
+	for (const prefix of prefixes.slice(1)) known.prefixes.add(prefix);
+	for (const hash of hashes) known.messages.add(hash);
 }
 
 export function streamPiServerAntigravity(
@@ -1189,6 +1243,7 @@ export function streamPiServerAntigravity(
 ): Promise<PiServerEventStream> {
 	return streamPiServer({ ...model, headers: undefined }, context, {
 		antigravity: client ?? true,
+		incrementalContext: client !== undefined,
 		sessionId: client ? options?.sessionId : undefined,
 		ownerSessionId: options?.sessionId,
 		signal: options?.signal,
@@ -1212,29 +1267,49 @@ export async function streamPiServer(
 	const isEphemeralSession = options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const agy = options?.antigravity;
-	const retainAgySession = agy !== undefined && agy !== true;
-	const agyPrefix = retainAgySession ? antigravityPrefixes.get(sessionId) : undefined;
-	let base = agyPrefix?.messages.every(
-		(message, index) =>
-			message === context.messages[index] || JSON.stringify(message) === JSON.stringify(context.messages[index]),
-	)
-		? agyPrefix
+	const agyClient = agy === true ? undefined : agy;
+	if (agyClient) antigravitySessions.add(sessionId);
+	const contextMessages = [...(context.messages as Message[]), ...(options?.ephemeralMessages ?? [])];
+	const contextHashes = options?.incrementalContext
+		? contextMessages.map((message) => hashPiServerContextJson(JSON.stringify(message)))
 		: undefined;
+	const contextPrefixes = contextHashes && buildPiServerContextPrefixes(contextHashes);
+	let fullContext = false;
 	const executedToolResults: ToolResultMessage[] = [];
 	const stream = Object.assign(createAssistantMessageEventStream(), {
 		executedToolResults: agy ? executedToolResults : undefined,
 	});
-	const acceptAgyResult = (message: AssistantMessage, results?: readonly ToolResultMessage[]) => {
-		if (results) executedToolResults.splice(0, executedToolResults.length, ...results);
-		if (retainAgySession && (message.stopReason === "stop" || message.stopReason === "length")) {
-			antigravityPrefixes.set(sessionId, {
-				runId,
-				messages: [...context.messages, message, ...executedToolResults],
-			});
-		} else if (retainAgySession) {
-			antigravityPrefixes.delete(sessionId);
-		}
+	// Outcomes this client produced for agy. PiServer names their results by tool call ID and timestamp,
+	// so the rebuilt message matches the copy PiServer stored byte for byte.
+	const clientOutcomes = new Map<string, AgentToolCallOutcome>();
+	const setAgyResults = (results: readonly (ToolResultMessage | { toolCallId: string; timestamp: number })[]) => {
+		const resolved = results.map((result) =>
+			"role" in result
+				? result
+				: { ...createToolResultMessage(clientOutcomes.get(result.toolCallId)!), timestamp: result.timestamp },
+		);
+		executedToolResults.splice(0, executedToolResults.length, ...resolved);
 	};
+	const answerAntigravity = agyClient
+		? async (request: AntigravityCallback, signal: AbortSignal): Promise<unknown> => {
+				switch (request.kind) {
+					case "tool": {
+						if (!agyClient.executeTool) throw new Error("Pi session cannot execute Antigravity tools");
+						const outcome = await agyClient.executeTool(request.call, partial, signal);
+						clientOutcomes.set(outcome.toolCall.id, outcome);
+						return outcome;
+					}
+					case "permission":
+						return agyClient.requestPermission?.(request.title, request.choices, signal);
+					case "question": {
+						if (!agyClient.answerQuestion) throw new Error("Pi session cannot answer Antigravity questions");
+						const answer = await agyClient.answerQuestion(request.request, signal);
+						clientOutcomes.set(answer.outcome.toolCall.id, answer.outcome);
+						return answer;
+					}
+				}
+			}
+		: undefined;
 
 	const partial: AssistantMessage = {
 		role: "assistant",
@@ -1342,18 +1417,20 @@ export async function streamPiServer(
 				observeProviderStreamEvents: options?.onProviderStreamEvent !== undefined,
 				callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 				antigravity: agy
-					? {
-							retainSession: retainAgySession,
-							questions: agy !== true && !!agy.answerQuestion,
-							baseRunId: base?.runId,
-						}
+					? { retainSession: agyClient !== undefined, questions: !!agyClient?.answerQuestion }
 					: undefined,
-				contextOverlay: agy
-					? context.messages.slice(base?.messages.length ?? 0)
-					: (options?.contextOverlay ?? [
-							...(context.messages as Message[]),
-							...(options?.ephemeralMessages ?? []),
-						]),
+				...(contextHashes && contextPrefixes
+					? {
+							context: fullContext
+								? { messages: contextMessages }
+								: encodePiServerContext(
+										contextMessages,
+										contextHashes,
+										contextPrefixes,
+										contextKnowledge.get(sessionId),
+									),
+						}
+					: { contextOverlay: options?.contextOverlay ?? contextMessages }),
 			});
 			phase = "provider_stream";
 			if (observeTiming) requestStartedAt = performance.now();
@@ -1362,13 +1439,16 @@ export async function streamPiServer(
 
 			if (!response.ok) {
 				let failure = await readPiServerFailure(response);
-				if (base && failure.code === "ANTIGRAVITY_PREFIX_NOT_FOUND" && !options?.signal?.aborted) {
-					base = undefined;
+				if (failure.code === "CONTEXT_NOT_FOUND" && !options?.signal?.aborted) {
+					// PiServer lost the referenced messages; upload this context whole once.
+					contextKnowledge.delete(sessionId);
+					fullContext = true;
 					response = await request.postJson("/api/stream", makeBody());
 					failure = response.ok ? { details: "", code: undefined } : await readPiServerFailure(response);
 				}
 				if (!agy && !options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
 					resetSessionTracking(sessionId);
+					fullContext = true;
 					await ensureSessionInit(sessionId, context, request);
 					if (observeTiming) requestStartedAt = performance.now();
 					response = await request.postJson("/api/stream", makeBody());
@@ -1386,6 +1466,7 @@ export async function streamPiServer(
 
 			await ensurePiServerEventStream(response);
 			streamOpened = true;
+			if (contextHashes && contextPrefixes) rememberPiServerContext(sessionId, contextHashes, contextPrefixes);
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
 			const parser = new ServerSentEventParser();
@@ -1393,11 +1474,16 @@ export async function streamPiServer(
 			const consumeEvents = async (events: ServerSentEvent[]): Promise<void> => {
 				for (const serverEvent of events) {
 					if (serverEvent.event === "antigravity_tool_results") {
-						const results = parseServerSentEventData(
-							serverEvent,
-							"Antigravity tool results",
-						) as ToolResultMessage[];
-						executedToolResults.splice(0, executedToolResults.length, ...results);
+						setAgyResults(
+							parseServerSentEventData(serverEvent, "Antigravity tool results") as Parameters<
+								typeof setAgyResults
+							>[0],
+						);
+						// PiServer stored these results; the next context references them by hash.
+						const known = contextHashes && contextKnowledge.get(sessionId);
+						for (const result of known ? executedToolResults : []) {
+							known!.messages.add(hashPiServerContextJson(JSON.stringify(result)));
+						}
 						continue;
 					}
 					if (serverEvent.event === "antigravity_update") {
@@ -1432,6 +1518,7 @@ export async function streamPiServer(
 								sessionId,
 								runId,
 								request,
+								answerAntigravity,
 							);
 						} catch (error) {
 							callbackFailed = true;
@@ -1479,9 +1566,11 @@ export async function streamPiServer(
 						recordTiming();
 					}
 					if (finalMessage) recordTiming(finalMessage);
-					if (event.type === "done" || event.type === "error") {
-						terminalReceived = true;
-						if (agy && finalMessage) acceptAgyResult(finalMessage);
+					if (event.type === "done" || event.type === "error") terminalReceived = true;
+					if (event.type === "done" && contextHashes) {
+						// PiServer stored this reply with the level the agent loop records on it.
+						const reply = { ...event.message, thinkingLevel: options?.reasoning ?? "off" };
+						contextKnowledge.get(sessionId)?.messages.add(hashPiServerContextJson(JSON.stringify(reply)));
 					}
 					stream.push(event);
 				}
@@ -1509,7 +1598,6 @@ export async function streamPiServer(
 
 			stream.end();
 		} catch (error) {
-			if (retainAgySession && !terminalReceived) antigravityPrefixes.delete(sessionId);
 			let errorMessage = error instanceof Error ? error.message : String(error);
 			// Same-run recovery only applies to an interrupted event-stream. HTTP/proxy
 			// failures before the stream starts (502/504/fetch failed) never opened a run
@@ -1537,7 +1625,7 @@ export async function streamPiServer(
 						await applyCachePolicy(recoveredRun?.cacheRetention);
 					}
 					if (recoveredRun?.status === "completed" && recoveredRun.message) {
-						if (agy) acceptAgyResult(recoveredRun.message, recoveredRun.executedToolResults ?? []);
+						if (agy) setAgyResults(recoveredRun.executedToolResults ?? []);
 						recordTiming(recoveredRun.message);
 						switch (recoveredRun.message.stopReason) {
 							case "stop":
@@ -1562,7 +1650,7 @@ export async function streamPiServer(
 					}
 					if (recoveredRun?.status === "failed" && recoveredRun.errorMessage) {
 						if (recoveredRun.message) {
-							if (agy) acceptAgyResult(recoveredRun.message, recoveredRun.executedToolResults ?? []);
+							if (agy) setAgyResults(recoveredRun.executedToolResults ?? []);
 							recordTiming(recoveredRun.message);
 							stream.push({ type: "error", reason: "error", error: recoveredRun.message });
 							stream.end();
@@ -1572,10 +1660,7 @@ export async function streamPiServer(
 					}
 					if (recoveredRun?.status === "aborted") {
 						if (agy && recoveredRun.message) {
-							acceptAgyResult(
-								{ ...recoveredRun.message, stopReason: "aborted" },
-								recoveredRun.executedToolResults ?? [],
-							);
+							setAgyResults(recoveredRun.executedToolResults ?? []);
 							Object.assign(partial, recoveredRun.message);
 						}
 						errorMessage = recoveredRun.errorMessage ?? "pi-server run aborted";
@@ -1599,9 +1684,8 @@ export async function streamPiServer(
 				}
 			}
 			if (agy && operation?.cancelResult?.message) {
-				const { message, executedToolResults: results, status } = operation.cancelResult;
-				acceptAgyResult(status === "aborted" ? { ...message, stopReason: "aborted" } : message, results ?? []);
-				Object.assign(partial, message);
+				setAgyResults(operation.cancelResult.executedToolResults ?? []);
+				Object.assign(partial, operation.cancelResult.message);
 			}
 			const reason = options?.signal?.aborted ? "aborted" : "error";
 			partial.stopReason = reason;
@@ -1827,10 +1911,11 @@ function assertNoCustomPiServerFetch(options?: Pick<ProviderRequestOptions<AnyMo
 async function handleProviderCallback<TModel extends AnyModel>(
 	callback: PiServerProviderCallbackRequest,
 	model: TModel,
-	options: (ProviderRequestOptions<TModel> & Pick<PiServerStreamOptions, "antigravity">) | undefined,
+	options: ProviderRequestOptions<TModel> | undefined,
 	sessionId: string,
 	runId: string,
 	request: ChunkRequest,
+	answerAntigravity?: (request: AntigravityCallback, signal: AbortSignal) => Promise<unknown>,
 ): Promise<void> {
 	if (
 		!callback ||
@@ -1862,23 +1947,8 @@ async function handleProviderCallback<TModel extends AnyModel>(
 				options.signal,
 			);
 		} else if (callback.kind === "antigravity") {
-			const client = options?.antigravity;
-			if (!client || client === true) throw new Error("Unexpected pi-server Antigravity callback");
-			const signal = operationSignal(options?.signal);
-			const request = callback.request;
-			switch (request.kind) {
-				case "tool":
-					if (!client.executeTool) throw new Error("Pi session cannot execute Antigravity tools");
-					result = await client.executeTool(request.call, request.assistant, signal);
-					break;
-				case "permission":
-					result = await client.requestPermission?.(request.title, request.choices, signal);
-					break;
-				case "question":
-					if (!client.answerQuestion) throw new Error("Pi session cannot answer Antigravity questions");
-					result = await client.answerQuestion(request.request, signal);
-					break;
-			}
+			if (!answerAntigravity) throw new Error("Unexpected pi-server Antigravity callback");
+			result = await answerAntigravity(callback.request, operationSignal(options?.signal));
 		} else {
 			throw new Error("Unknown pi-server provider callback kind");
 		}

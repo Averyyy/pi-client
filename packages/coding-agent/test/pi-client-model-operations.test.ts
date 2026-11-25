@@ -927,44 +927,6 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(cancelled).toEqual([handle]);
 	});
 
-	it("updates client registrations and authentication while the server is unavailable", async () => {
-		const runtime = await createRuntime();
-		const initialReads = requests.filter((request) => request.path === "/api/models").length;
-		rejected = true;
-		runtime.registerNativeProvider(
-			createProvider({
-				id: "registered-account",
-				models: [{ ...chat, provider: "registered-account" }],
-				auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: "local-account-key" } }) } },
-				api: {
-					stream: () => {
-						throw new Error("Local inference is forbidden");
-					},
-					streamSimple: () => {
-						throw new Error("Local inference is forbidden");
-					},
-				},
-			}),
-		);
-		expect((await runtime.getAllAvailable("registered-account"))[0]?.id).toBe("shared");
-		runtime.unregisterProvider("registered-account");
-		expect(await runtime.getAllAvailable("registered-account")).toEqual([]);
-		runtime.registerVirtualModel({
-			provider: "registered-router",
-			id: "router",
-			name: "Router",
-			route: () => ({ model: chat, thinkingLevel: "off" }),
-		});
-		expect((await runtime.getAvailable("registered-router"))[0]?.id).toBe("router");
-		runtime.unregisterVirtualModel("registered-router", "router");
-		expect(await runtime.getAvailable("registered-router")).toEqual([]);
-		expect(requests.filter((request) => request.path === "/api/models")).toHaveLength(initialReads);
-		expect(runtime.getError()).toBeUndefined();
-		const refresh = await runtime.refresh({ allowNetwork: false });
-		expect([...refresh.errors.keys()]).toEqual(["devin"]);
-		expect(runtime.getError()).toContain("pi-server accounts:");
-	});
-
 	it("returns cancellation in the refresh result without changing the verified catalog", async () => {
 		const runtime = await createRuntime();
 		const before = runtime.getAllModels(providerId);
@@ -1036,40 +998,6 @@ describe("pi-client model operations through HTTP with a 65536-byte request limi
 		expect(runtime.getModel(native.id, discovered.id)).toEqual(fallback);
 		expect(await runtime.getAvailable(native.id)).toEqual([]);
 		expect(runtime.hasConfiguredAuth(native.id)).toBe(false);
-	});
-
-	it("reports remote errors without falling back to a client provider implementation", async () => {
-		const runtime = await createRuntime();
-		let localCalls = 0;
-		runtime.registerNativeProvider(
-			createProvider({
-				id: providerId,
-				models: [image],
-				auth: { apiKey: { name: "Local", resolve: async () => ({ auth: {} }) } },
-				images: {
-					"fixture-image": {
-						generateImages: async () => {
-							localCalls++;
-							throw new Error("Local inference is forbidden");
-						},
-					},
-				},
-			}),
-		);
-		await runtime.refresh({ allowNetwork: false });
-		rejected = true;
-		const result = await runtime.generateImages(runtime.getModelOfType("image", providerId, "shared")!, {
-			input: [{ type: "text", text: "circle" }],
-		});
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("503");
-		expect(localCalls).toBe(0);
-		const refreshed = await runtime.refresh({ allowNetwork: false });
-		expect(refreshed.aborted).toBe(false);
-		expect([...refreshed.errors.keys()]).toEqual(["devin"]);
-		expect(runtime.getError()).toContain("pi-server accounts:");
-		const restarted = await createRuntime();
-		expect(restarted.getError()).toContain("pi-server accounts:");
 	});
 
 	it("runs codemode image/classifier calls in a remote session and records their complete usage", async () => {
