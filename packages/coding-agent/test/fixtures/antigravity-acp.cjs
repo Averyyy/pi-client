@@ -130,10 +130,13 @@ function startAcp() {
 					if (text === "interactions") {
 						assert.ok(supportsForm);
 						updateNative({ sessionUpdate: "plan", entries: [{ content: "Review choices", priority: "high", status: "in_progress" }] });
-						updateNative({ sessionUpdate: "tool_call", toolCallId: "native-1", name: "read_file", title: "Read a file", status: "in_progress" });
+						updateNative({ sessionUpdate: "tool_call", toolCallId: "native-1", title: "Read a file", kind: "read",
+							status: "in_progress", locations: [{ path: `${sessionCwd}/notes.txt`, line: 1 }] });
 						updateNative({ sessionUpdate: "tool_call_update", toolCallId: "native-1",
 							content: [{ type: "content", content: { type: "text", text: "first chunk" } }] });
 						updateNative({ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed", rawOutput: { lines: 2 } });
+						updateNative({ sessionUpdate: "tool_call", toolCallId: "native-2", title: "Search for TODO", kind: "search",
+							status: "completed", rawOutput: { hits: 1 } });
 						const answer = new Promise((resolve) => { elicitation = resolve; });
 						send({ id: "elicitation", method: "elicitation/create", params: {
 							sessionId, mode: "form", message: "Pick a strategy", requestedSchema: {
@@ -177,11 +180,14 @@ function startAcp() {
 					assert.ok(clientCapabilities.fs.readTextFile && clientCapabilities.fs.writeTextFile && clientCapabilities.terminal);
 					const read = await clientRequest("fs/read_text_file", { path: `${sessionCwd}/notes.txt`, line: 2, limit: 1 });
 					await clientRequest("fs/write_text_file", { path: `${sessionCwd}/out/result.txt`, content: "written" });
+					updateNative({ sessionUpdate: "tool_call", toolCallId: "command", title: "Run node", kind: "execute", status: "in_progress" });
 					const { terminalId } = await clientRequest("terminal/create", {
 						command: process.execPath, args: ["-e", "process.stdout.write('terminal ok')"], outputByteLimit: 8,
 					});
+					updateNative({ sessionUpdate: "tool_call_update", toolCallId: "command", content: [{ type: "terminal", terminalId }] });
 					const exit = await clientRequest("terminal/wait_for_exit", { terminalId });
 					const output = await clientRequest("terminal/output", { terminalId });
+					updateNative({ sessionUpdate: "tool_call_update", toolCallId: "command", status: "completed" });
 					await clientRequest("terminal/release", { terminalId });
 					update("agent_message_chunk", JSON.stringify({ read: read.content, exit, output }));
 				} else if (text === "permission") {

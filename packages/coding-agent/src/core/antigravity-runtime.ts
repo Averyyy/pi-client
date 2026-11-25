@@ -35,7 +35,12 @@ import {
 	type answerAntigravityQuestion,
 	antigravityPlanResult,
 } from "./antigravity-interactions.ts";
-import { type AcpToolCallUpdate, AntigravityNativeTools } from "./antigravity-native-tools.ts";
+import {
+	type AcpToolCallUpdate,
+	AntigravityNativeTools,
+	type AntigravityToolDisplay,
+	type AntigravityToolRecord,
+} from "./antigravity-native-tools.ts";
 import { type AntigravityToolExecutor, openAntigravityTools } from "./antigravity-tools.ts";
 import type { AntigravityWorkspaceRequest } from "./antigravity-workspace.ts";
 import { BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX } from "./messages.ts";
@@ -75,8 +80,8 @@ export interface AntigravityClient {
 	) => ReturnType<AntigravityToolExecutor>;
 	requestPermission?: (title: string, options: string[], signal?: AbortSignal) => Promise<string | undefined>;
 	answerQuestion?: (request: AcpFormRequest, signal: AbortSignal) => ReturnType<typeof answerAntigravityQuestion>;
-	/** Show one of agy's own tool calls while it runs. */
-	showToolCall?: (update: AcpToolCallUpdate) => void;
+	/** Show one of agy's own tool calls while it runs, as the Pi tool call it maps to. */
+	showToolCall?: (display: AntigravityToolDisplay) => void;
 	/** Show a compaction agy makes of its own context. */
 	showCompaction?: (update: AcpCompactionUpdate) => void;
 	/** Serve agy's `fs/*` and `terminal/*` requests in the Pi workspace. */
@@ -109,7 +114,7 @@ interface ActiveTurn {
 	client: AntigravityClient;
 	executeTool?: AntigravityToolExecutor;
 	answerQuestion(request: AcpFormRequest): Promise<Awaited<ReturnType<typeof answerAntigravityQuestion>>["result"]>;
-	addToolResult(outcome: AgentToolCallOutcome): void;
+	record(record: AntigravityToolRecord): void;
 	signal: AbortSignal;
 	update(update: AcpUpdate): void;
 }
@@ -164,9 +169,10 @@ export class AntigravityRuntime {
 			timestamp: Date.now(),
 		};
 		const emit = streamAntigravityUpdates(stream, output);
-		const addToolResult = (outcome: AgentToolCallOutcome) => {
-			emit.toolCall(outcome.toolCall);
-			executedToolResults.push(createToolResultMessage(outcome));
+		const record = (record: AntigravityToolRecord) => {
+			if (record.type === "note") return emit.note(record.text);
+			emit.toolCall(record.outcome.toolCall);
+			executedToolResults.push(createToolResultMessage(record.outcome));
 		};
 		const signal = options?.signal;
 		void (async () => {
@@ -174,7 +180,7 @@ export class AntigravityRuntime {
 				stream.push({ type: "start", partial: output });
 				// agy serves a person driving an interactive Pi session, never Pi's own background requests.
 				if (!client) throw new Error(ANTIGRAVITY_SESSION_ONLY);
-				const reason = await this.prompt(model, context, options, client, output, emit.update, addToolResult);
+				const reason = await this.prompt(model, context, options, client, output, emit.update, record);
 				if (reason === "cancelled") await this.close();
 				emit.end();
 				if (signal?.aborted || reason === "cancelled") throw new Error("Antigravity turn cancelled");
@@ -219,7 +225,7 @@ export class AntigravityRuntime {
 		client: AntigravityClient,
 		output: AssistantMessage,
 		onUpdate: (update: AcpUpdate) => void,
-		addToolResult: (outcome: AgentToolCallOutcome) => void,
+		record: (record: AntigravityToolRecord) => void,
 	): Promise<string> {
 		const signal = operationSignal(options?.signal);
 		const setupSignal = AbortSignal.any([signal, AbortSignal.timeout(options?.timeoutMs ?? 30_000)]);
@@ -265,11 +271,12 @@ export class AntigravityRuntime {
 				calls.delete(running);
 			}
 		};
+		const addToolResult = (outcome: AgentToolCallOutcome) => record({ type: "tool", outcome });
 		this.activeTurn = {
 			client,
 			signal,
 			update: onUpdate,
-			addToolResult,
+			record,
 			answerQuestion: async (request) => {
 				if (!client.answerQuestion)
 					throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
@@ -300,10 +307,9 @@ export class AntigravityRuntime {
 			this.activeTurn = undefined;
 			questionController.abort();
 			await Promise.allSettled(calls);
-			for (const outcome of conversation.nativeTools.finish(
-				"Antigravity ended the turn before this tool finished",
-			)) {
-				addToolResult(outcome);
+			for (const change of conversation.nativeTools.finish("Antigravity ended the turn before this tool finished")) {
+				client.showToolCall?.(change.display);
+				record(change.record);
 			}
 			if (conversation.planChanged && showTodo) {
 				addToolResult(antigravityPlanResult([...conversation.plans.values()].flat()));
@@ -350,7 +356,7 @@ export class AntigravityRuntime {
 			plans: new Map(),
 			planChanged: false,
 			questionToolIds: new Set(),
-			nativeTools: new AntigravityNativeTools(),
+			nativeTools: new AntigravityNativeTools(this.cwd),
 		};
 		return this.conversation;
 	}
@@ -403,7 +409,10 @@ export class AntigravityRuntime {
 		if (method.startsWith("fs/") || method.startsWith("terminal/")) {
 			const turn = this.activeTurn;
 			if (!turn?.client.workspace) throw new McpError(-32601, `Pi serves ${method} only during a turn`);
-			return turn.client.workspace({ method, params: params as JsonObject, root: this.cwd }, turn.signal);
+			const request = params as JsonObject;
+			const result = await turn.client.workspace({ method, params: request, root: this.cwd }, turn.signal);
+			this.conversation?.nativeTools.observe(method, request, result);
+			return result;
 		}
 		throw new McpError(-32601, `Unsupported ACP client method ${method}`);
 	}
@@ -419,10 +428,9 @@ export class AntigravityRuntime {
 			// agy asks its questions through a tool; Pi records the answer as ask_user_question instead.
 			if (update.name === "ask_question" && update.toolCallId) conversation.questionToolIds.add(update.toolCallId);
 			if (update.toolCallId && !conversation.questionToolIds.has(update.toolCallId)) {
-				const toolUpdate = update as unknown as AcpToolCallUpdate;
-				const event = conversation.nativeTools.apply(toolUpdate);
-				this.activeTurn?.client.showToolCall?.(toolUpdate);
-				if (event.type === "end") this.activeTurn?.addToolResult(event.outcome);
+				const change = conversation.nativeTools.apply(update as unknown as AcpToolCallUpdate);
+				this.activeTurn?.client.showToolCall?.(change.display);
+				if (change.record) this.activeTurn?.record(change.record);
 			}
 		}
 		if (update.sessionUpdate === "plan" && update.entries) {
@@ -562,11 +570,15 @@ function digestReply(message: AssistantMessage): string {
 }
 
 /**
- * The user's input for this turn: the user messages after the last reply, whichever model gave it.
- * Pi's compaction and branch summaries come from other models and stay out of agy's context.
+ * The user's input for this turn: every user message since agy's last reply, so a turn after another
+ * model's replies still carries what the user asked meanwhile. Without an agy reply, the input after the
+ * last reply. Replies from other models and Pi's compaction and branch summaries stay out of agy's context.
  */
 function promptBlocks(history: Message[]): (TextContent | ImageContent)[] {
-	const lastReply = history.findLastIndex((message) => message.role === "assistant");
+	const agyReply = history.findLastIndex(
+		(message) => message.role === "assistant" && message.provider === ANTIGRAVITY_PROVIDER,
+	);
+	const lastReply = agyReply >= 0 ? agyReply : history.findLastIndex((message) => message.role === "assistant");
 	return history
 		.slice(lastReply + 1)
 		.filter((message): message is UserMessage => message.role === "user" && !isPiSummary(message))
@@ -604,6 +616,15 @@ function streamAntigravityUpdates(stream: AssistantMessageEventStream, output: A
 			const contentIndex = output.content.length - 1;
 			stream.push({ type: "toolcall_start", contentIndex, partial: output });
 			stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+		},
+		/** A note on one of agy's tool calls that no Pi tool describes, as its own text block. */
+		note: (text: string) => {
+			end();
+			output.content.push({ type: "text", text });
+			const contentIndex = output.content.length - 1;
+			stream.push({ type: "text_start", contentIndex, partial: output });
+			stream.push({ type: "text_delta", contentIndex, delta: text, partial: output });
+			stream.push({ type: "text_end", contentIndex, content: text, partial: output });
 		},
 		update: (update: AcpUpdate) => {
 			if (update.content?.type !== "text") return;

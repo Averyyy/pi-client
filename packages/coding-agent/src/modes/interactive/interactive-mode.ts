@@ -589,6 +589,8 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	// Calls whose row finished while their reply was still streaming: runtimes such as Antigravity run tools mid-reply.
+	private readonly toolsFinishedInStreamingMessage = new Set<string>();
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -3908,6 +3910,7 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					this.toolsFinishedInStreamingMessage.clear();
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -3929,7 +3932,7 @@ export class InteractiveMode {
 					this.streamingComponent.updateContent(this.streamingMessage, true);
 
 					for (const content of this.streamingMessage.content) {
-						if (content.type === "toolCall") {
+						if (content.type === "toolCall" && !this.toolsFinishedInStreamingMessage.has(content.id)) {
 							if (!this.pendingTools.has(content.id)) {
 								const component = new ToolExecutionComponent(
 									content.name,
@@ -4047,6 +4050,7 @@ export class InteractiveMode {
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
 					this.pendingTools.delete(event.toolCallId);
+					if (this.streamingComponent) this.toolsFinishedInStreamingMessage.add(event.toolCallId);
 					this.ui.requestRender();
 				}
 				break;

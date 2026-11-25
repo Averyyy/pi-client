@@ -97,7 +97,20 @@ Protocol references: [pi-devin](https://github.com/mizorewww/pi-devin), [pi-devi
 
 Install [Antigravity CLI](https://antigravity.google/docs/cli/tutorial/) on the PiServer host and sign in to `agy` as the OS user running PiServer. In Pi Client, use `/model` to select a model from the server CLI's catalog. `/login google-antigravity` checks the existing `agy` sign-in and reloads that catalog. PiServer also runs the ACP conversation with `agy`.
 
-`agy` is the agent: it owns the account catalog, its instructions, context, inference, and native tool permissions, and Pi sends only what you enter each turn. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Tools from Pi extensions run in the Pi process and return results to `agy` over MCP; file and terminal requests from `agy` also run in the Pi workspace. Pi's compaction and session summaries use the `compaction.model` setting, never `agy`. In pi-server mode the read-only viewer can still show Pi's session activity.
+`agy` is the agent: it owns the account catalog, its instructions, context, inference, and native tool permissions. Each turn, Pi sends `agy` only the messages you entered since its last reply; Pi's system prompt, other models' replies, and Pi's summaries never reach it. Models advertised by the CLI, including available Orchestrator variants, appear in `/model`. Tools from Pi extensions run in the Pi process and return results to `agy` over MCP; file and terminal requests from `agy` also run in the Pi workspace. Pi's compaction and session summaries use the `compaction.model` setting, never `agy`. In pi-server mode the read-only viewer can still show Pi's session activity.
+
+Pi records the tool calls `agy` makes with its own tools as Pi's `read`, `edit`, `write`, and `bash` calls when ACP's standard fields say exactly what ran: a read of one file, a change to one file, or a command in a terminal Pi ran for `agy`. Other calls, such as searches and web fetches, become notes in `agy`'s reply. Another model can then continue the session without being shown tools it cannot call. After you switch back, `agy` continues its own conversation: it knows its own turns, your messages, and the files in the workspace, not what other models replied.
+
+### Rules for a personal `agy` sign-in
+
+Your `agy` account is governed by Google's [Antigravity Terms](https://antigravity.google/terms) (section 6), [FAQ](https://antigravity.google/docs/faq), and [ACP documentation](https://antigravity.google/docs/ide/extensions/acp). A [reply on the Google AI Developers Forum](https://discuss.ai.google.dev/t/tos-clarification-is-opencode-antigravity-acp-official-agy-acp-in-opencode-permitted-under-the-antigravity-terms-of-service/202970) reads them strictly. Under that reading, a consumer sign-in (`oauth-personal`) allows `agy acp` only behind a thin client in which a person sends the prompts. A client that injects system instructions, tool definitions, replayed cross-model context, or automated loops risks automated suspension. Others in the same thread dispute that the reply is official, and Google suspends accounts without warning. Pi does not enforce the following rules; following them is your responsibility:
+
+- Type every `agy` prompt yourself in an interactive session. Do not use an Antigravity model in `pi-client -p`, RPC mode, scripts, scheduled jobs, or sessions that an extension, a subagent tool, or another model starts.
+- Do not have another model or agent hand work to `agy`, and do not paste another model's replies into an `agy` prompt as context.
+- One person per sign-in: do not share the PiServer that holds your `agy` sign-in, its tunnel, or the sign-in itself, and do not rotate accounts.
+- Keep `agy` unmodified. Pi launches plain `agy acp` and never reads its credentials; do not wrap it, proxy it, or copy its sign-in.
+- Pi offers your extension tools to `agy` over MCP, the ACP mechanism editors use for their tools. The forum reply counts a harness's tool definitions against `oauth-personal`; to stay within that reading, start Antigravity sessions with `--no-extensions`.
+- For automation or multi-model workflows, use a model from Pi's `google` provider with a Gemini API key instead of `agy`.
 
 ## Update
 

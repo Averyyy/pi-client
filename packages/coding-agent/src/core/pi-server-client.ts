@@ -44,7 +44,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { AntigravityCallback } from "../antigravity.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import type { AcpToolCallUpdate } from "./antigravity-native-tools.ts";
+import type { AntigravityToolDisplay } from "./antigravity-native-tools.ts";
 import type { AcpCompactionUpdate, AntigravityClient } from "./antigravity-runtime.ts";
 import {
 	appendPiServerContextHash,
@@ -1498,7 +1498,7 @@ export async function streamPiServer(
 					}
 					if (serverEvent.event === "antigravity_tool_call") {
 						agy?.showToolCall?.(
-							parseServerSentEventData(serverEvent, "Antigravity tool call") as AcpToolCallUpdate,
+							parseServerSentEventData(serverEvent, "Antigravity tool call") as AntigravityToolDisplay,
 						);
 						continue;
 					}
