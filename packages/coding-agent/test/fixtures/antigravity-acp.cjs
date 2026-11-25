@@ -1,9 +1,12 @@
 const assert = require("node:assert/strict");
-const { appendFileSync, existsSync, unlinkSync } = require("node:fs");
+const { appendFileSync, existsSync, unlinkSync, writeFileSync } = require("node:fs");
+const { join } = require("node:path");
 const { createInterface } = require("node:readline");
 
 const lines = createInterface({ input: process.stdin });
 assert.ok(!process.argv.includes("--login"));
+// Every agy process of a test shares one trace and sign-in state, whatever its working directory.
+const dir = process.env.PI_ACP_FIXTURE_DIR ?? process.cwd();
 startAcp();
 
 function startAcp() {
@@ -19,8 +22,18 @@ function startAcp() {
 	let permission;
 	let elicitation;
 	let supportsForm;
+	let clientCapabilities;
+	let sessionCwd;
+	let nextClientRequest = 0;
+	const clientRequests = new Map();
 	const send = (message) => console.log(JSON.stringify({ jsonrpc: "2.0", ...message }));
-	const trace = (message) => appendFileSync("trace.jsonl", `${JSON.stringify(message)}\n`);
+	const trace = (message) => appendFileSync(join(dir, "trace.jsonl"), `${JSON.stringify(message)}\n`);
+	const clientRequest = (method, params) =>
+		new Promise((resolve) => {
+			const id = `client-${++nextClientRequest}`;
+			clientRequests.set(id, resolve);
+			send({ id, method, params: { sessionId, ...params } });
+		});
 	const update = (sessionUpdate, text) =>
 		send({ method: "session/update", params: { sessionId, update: { sessionUpdate, content: { type: "text", text } } } });
 	const updateNative = (update) => send({ method: "session/update", params: { sessionId, update } });
@@ -28,7 +41,7 @@ function startAcp() {
 		{ id: "model", type: "select", currentValue: model, options: models },
 		...(model === "gemini-test" ? [{
 			id: "effort", category: "thought_level", type: "select", currentValue: effort,
-			options: ["medium", "high"].map((value) => ({ value, name: value })),
+			options: ["off", "medium", "high"].map((value) => ({ value, name: value })),
 		}] : []),
 	];
 	const callMcp = async (method, params) => {
@@ -51,22 +64,36 @@ function startAcp() {
 		const reply = (result) => send({ id, result });
 		switch (method) {
 			case "initialize":
-				assert.equal(params.protocolVersion, 2);
-				supportsForm = params.clientCapabilities.elicitation?.form && params.capabilities?.elicitation?.form;
+				assert.equal(params.protocolVersion, 1);
+				clientCapabilities = params.clientCapabilities;
+				supportsForm = clientCapabilities.elicitation?.form;
 				reply({
-					protocolVersion: 2, agentInfo: { name: "antigravity-acp", version: "1.5.9" },
-					agentCapabilities: { auth: { logout: {} }, mcpCapabilities: { http: true },
+					protocolVersion: 1, agentInfo: { name: "antigravity-acp", version: "1.5.17" },
+					agentCapabilities: { auth: { logout: {} }, loadSession: true, mcpCapabilities: { http: true },
 						promptCapabilities: { image: true }, _meta: { antigravity: { systemPrompt: { append: true } } } },
 				});
 				break;
 			case "session/new":
-				if (!existsSync("signed-in")) {
+				if (!existsSync(join(dir, "signed-in"))) {
 					send({ id, error: { code: -32000, message: "Authentication required" } });
 					break;
 				}
 				[mcp] = params.mcpServers;
 				if (mcp) assert.ok(process.argv.includes("--process-per-session"));
+				sessionCwd = params.cwd;
+				writeFileSync(join(dir, `session-${sessionId}`), "");
 				reply({ sessionId, configOptions: configs() });
+				break;
+			case "session/load":
+				if (params.sessionId !== sessionId || !existsSync(join(dir, `session-${sessionId}`))) {
+					send({ id, error: { code: -32002, message: "Session not found" } });
+					break;
+				}
+				[mcp] = params.mcpServers;
+				sessionCwd = params.cwd;
+				send({ method: "session/update", params: { sessionId, update: {
+					sessionUpdate: "user_message_chunk", content: { type: "text", text: "replayed" } } } });
+				reply({ configOptions: configs(), modes: null });
 				break;
 			case "session/set_config_option":
 				assert.equal(params.sessionId, sessionId);
@@ -131,6 +158,23 @@ function startAcp() {
 						options: [{ optionId: "repo", name: "Repo" }, { optionId: "file", name: "File" }],
 					} });
 					update("agent_message_chunk", (await outcome).optionId);
+				} else if (text === "parallel") {
+					await callMcp("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "agy", version: "1.5.17" } });
+					const [first, second] = await Promise.all(
+						["first", "second"].map((key) => callMcp("tools/call", { name: "lookup", arguments: { key } })),
+					);
+					update("agent_message_chunk", `${first.content[0].text}+${second.content[0].text}`);
+				} else if (text === "workspace") {
+					assert.ok(clientCapabilities.fs.readTextFile && clientCapabilities.fs.writeTextFile && clientCapabilities.terminal);
+					const read = await clientRequest("fs/read_text_file", { path: `${sessionCwd}/notes.txt`, line: 2, limit: 1 });
+					await clientRequest("fs/write_text_file", { path: `${sessionCwd}/out/result.txt`, content: "written" });
+					const { terminalId } = await clientRequest("terminal/create", {
+						command: process.execPath, args: ["-e", "process.stdout.write('terminal ok')"], outputByteLimit: 8,
+					});
+					const exit = await clientRequest("terminal/wait_for_exit", { terminalId });
+					const output = await clientRequest("terminal/output", { terminalId });
+					await clientRequest("terminal/release", { terminalId });
+					update("agent_message_chunk", JSON.stringify({ read: read.content, exit, output }));
 				} else if (text === "permission") {
 					const outcome = new Promise((resolve) => { permission = resolve; });
 					send({ id: "permission", method: "session/request_permission", params: {
@@ -149,11 +193,14 @@ function startAcp() {
 				send({ id: cancelId, result: { stopReason: "cancelled" } });
 				break;
 			case "logout":
-				if (existsSync("signed-in")) unlinkSync("signed-in");
+				if (existsSync(join(dir, "signed-in"))) unlinkSync(join(dir, "signed-in"));
 				reply({});
 				break;
 			case undefined:
-				if (id === "elicitation") elicitation(message.result ?? message.error);
+				if (clientRequests.has(id)) {
+					clientRequests.get(id)(message.result ?? { error: message.error });
+					clientRequests.delete(id);
+				} else if (id === "elicitation") elicitation(message.result ?? message.error);
 				else {
 					assert.equal(id, "permission");
 					permission(message.result.outcome);

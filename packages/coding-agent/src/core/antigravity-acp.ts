@@ -5,7 +5,7 @@ import { type JsonRpcRequest, McpError, parseJsonRpcMessage } from "@earendil-wo
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { killProcessTree } from "../utils/shell.ts";
 
-export const ANTIGRAVITY_PROVIDER = "google-antigravity";
+export const ANTIGRAVITY_PROVIDER = "google-antigravity" as const;
 
 export function isAntigravityAuthRequired(error: unknown): boolean {
 	return error instanceof McpError && error.code === -32000 && error.message === "Authentication required";
@@ -29,14 +29,27 @@ export interface AcpSession {
 	configOptions?: AcpConfigOption[];
 }
 
-interface AcpInitialize {
+/** The ACP major version Pi implements. */
+const ACP_PROTOCOL_VERSION = 1;
+
+export interface AcpInitialize {
 	protocolVersion: number;
 	agentCapabilities?: {
 		auth?: { logout?: object };
+		loadSession?: boolean;
 		mcpCapabilities?: { http?: boolean };
 		promptCapabilities?: { image?: boolean };
+		sessionCapabilities?: { resume?: object | null; systemPrompt?: object | null };
 		_meta?: { antigravity?: { systemPrompt?: { append?: boolean } } };
 	};
+}
+
+/** Client features Pi offers the agent in one ACP connection. */
+export interface AcpClientFeatures {
+	/** Serve `fs/*` and `terminal/*` requests in the Pi workspace. */
+	workspace: boolean;
+	/** Answer form elicitations in an interactive UI. */
+	questions: boolean;
 }
 
 type AcpHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
@@ -90,20 +103,25 @@ export class AntigravityAcp {
 		});
 	}
 
-	async initialize(signal?: AbortSignal, supportsQuestions?: boolean): Promise<AcpInitialize> {
-		const elicitation = supportsQuestions ? { elicitation: { form: {} } } : {};
+	async initialize(
+		signal?: AbortSignal,
+		features: AcpClientFeatures = { workspace: false, questions: false },
+	): Promise<AcpInitialize> {
 		const result = await this.request<AcpInitialize>(
 			"initialize",
 			{
-				protocolVersion: 2,
+				protocolVersion: ACP_PROTOCOL_VERSION,
 				clientInfo: { name: "pi", title: "Pi" },
-				clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, ...elicitation },
-				...(supportsQuestions ? { capabilities: elicitation } : {}),
+				clientCapabilities: {
+					fs: { readTextFile: features.workspace, writeTextFile: features.workspace },
+					terminal: features.workspace,
+					...(features.questions ? { elicitation: { form: {} } } : {}),
+				},
 			},
 			signal,
 		);
-		if (result.protocolVersion !== 1 && result.protocolVersion !== 2) {
-			throw new Error(`Unsupported Antigravity ACP version ${result.protocolVersion}`);
+		if (result.protocolVersion !== ACP_PROTOCOL_VERSION) {
+			throw new Error(`Antigravity CLI speaks ACP version ${result.protocolVersion}; Pi supports version 1`);
 		}
 		return result;
 	}

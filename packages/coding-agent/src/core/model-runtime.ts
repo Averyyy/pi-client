@@ -95,7 +95,6 @@ import {
 	generateImagesPiServer,
 	logoutPiServerAntigravity,
 	type PiServerAccountOptions,
-	readPiServerAntigravityModels,
 	streamPiServer,
 	streamPiServerAntigravity,
 	streamRawPiServer,
@@ -1203,7 +1202,13 @@ export class ModelRuntime implements Models {
 		return this.enqueueCredentialOperation(providerId, signal, async (): Promise<LoginResult> => {
 			if (providerId === ANTIGRAVITY_PROVIDER) {
 				if (type !== "oauth") throw new ModelsError("auth", "Google Antigravity requires an account login");
-				const result = await this.refresh({ allowNetwork: false, providers: [providerId], signal });
+				// Rediscover so an agy sign-in made since the last catalog shows up now.
+				const result = await this.refresh({
+					allowNetwork: true,
+					refreshServerAccounts: true,
+					providers: [providerId],
+					signal,
+				});
 				if (result.errors.has(providerId)) throw result.errors.get(providerId);
 				signal.throwIfAborted();
 				if (this.antigravityModels === undefined) {
@@ -1280,13 +1285,11 @@ export class ModelRuntime implements Models {
 		};
 		const result = await this.models.refresh(refreshOptions);
 		const errors = new Map(result.errors);
-		if (refreshAntigravity) {
+		if (refreshAntigravity && !this.piServerMode) {
 			try {
 				const timeout = AbortSignal.timeout(15_000);
 				const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-				const models = this.piServerMode
-					? await readPiServerAntigravityModels(signal)
-					: await readAntigravityModels(process.cwd(), signal);
+				const models = await readAntigravityModels(process.cwd(), signal);
 				if (antigravitySeq === this.antigravityRefreshSeq) {
 					this.antigravityModels = models;
 					this.antigravityError = undefined;
@@ -1299,16 +1302,19 @@ export class ModelRuntime implements Models {
 				}
 			}
 		}
-		if (serverProviders.length > 0) {
+		// PiServer's agy catalog travels with its account snapshot, so one request covers both.
+		const serverAntigravity = this.piServerMode && refreshAntigravity;
+		if (serverProviders.length > 0 || serverAntigravity) {
+			const requested: (PiServerAccountProviderId | typeof ANTIGRAVITY_PROVIDER)[] = [
+				...serverProviders,
+				...(serverAntigravity ? [ANTIGRAVITY_PROVIDER] : []),
+			];
 			try {
 				const snapshot =
 					(options.force || options.refreshServerAccounts) && refreshOptions.allowNetwork
-						? await refreshPiServerAccounts(
-								serverProviders.length === 1 ? serverProviders[0] : undefined,
-								options.signal,
-							)
+						? await refreshPiServerAccounts(requested.length === 1 ? requested[0] : undefined, options.signal)
 						: await readPiServerAccounts(options.signal);
-				if (serverAccountsSeq === this.serverAccountsSeq) {
+				if (serverProviders.length > 0 && serverAccountsSeq === this.serverAccountsSeq) {
 					this.applyServerAccounts(snapshot);
 					for (const account of snapshot.accounts) {
 						if (serverProviders.includes(account.providerId) && account.error) {
@@ -1316,11 +1322,22 @@ export class ModelRuntime implements Models {
 						}
 					}
 				}
+				if (serverAntigravity && antigravitySeq === this.antigravityRefreshSeq) {
+					this.antigravityModels = snapshot.antigravity?.models ?? undefined;
+					this.antigravityError = snapshot.antigravity?.error;
+					if (this.antigravityError) errors.set(ANTIGRAVITY_PROVIDER, new Error(this.antigravityError));
+				}
 			} catch (error) {
-				if (!options.signal?.aborted && serverAccountsSeq === this.serverAccountsSeq) {
-					this.serverAccountsError = error instanceof Error ? error.message : String(error);
-					for (const id of serverProviders)
-						errors.set(id, error instanceof Error ? error : new Error(String(error)));
+				if (!options.signal?.aborted) {
+					const failure = error instanceof Error ? error : new Error(String(error));
+					if (serverProviders.length > 0 && serverAccountsSeq === this.serverAccountsSeq) {
+						this.serverAccountsError = failure.message;
+						for (const id of serverProviders) errors.set(id, failure);
+					}
+					if (serverAntigravity && antigravitySeq === this.antigravityRefreshSeq) {
+						this.antigravityError = failure.message;
+						errors.set(ANTIGRAVITY_PROVIDER, failure);
+					}
 				}
 			}
 		}

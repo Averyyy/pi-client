@@ -254,4 +254,6 @@ Install the [official Antigravity CLI](https://antigravity.google/docs/cli/tutor
 
 `/login google-antigravity` checks the existing `agy` sign-in and loads the models it advertises through [ACP](https://antigravity.google/docs/cli/acp/). Use `/model` to choose a model. `/logout google-antigravity` signs out of that `agy` instance.
 
-`agy` runs inference on the same host that loads its model catalog. Pi exposes enabled tools through MCP and runs them through its tool hooks in the client session. Antigravity's own tools keep their native permissions. Pi shows approval requests in the interactive session and cancels them when no interactive UI is available.
+`agy` runs inference on the same host that loads its model catalog. Pi exposes enabled tools through MCP and runs them through its tool hooks in the client session. `agy` reads and writes files and runs terminal commands through Pi, so they happen in the Pi workspace even when `agy` runs on PiServer. Antigravity's own tools keep their native permissions. Pi shows approval requests in the interactive session and cancels them when no interactive UI is available.
+
+In pi-server mode, PiServer keeps the `agy` conversation across its own restarts: a new `agy` process resumes the saved session and receives only the new prompt.
