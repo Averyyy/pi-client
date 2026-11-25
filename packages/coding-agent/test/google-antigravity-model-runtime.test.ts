@@ -376,6 +376,120 @@ describe("Antigravity ACP", () => {
 		await vi.waitFor(() => expect(released).toBe(true));
 	});
 
+	it("resends the whole conversation when PiServer no longer has its agy prefix", async () => {
+		signedIn();
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
+		const startServer = (name: string) =>
+			listen(
+				createPiServer({
+					sessionStoreDir: join(cwd, name),
+					accountStoreDir: join(cwd, `${name}-accounts`),
+					authToken: "fixture",
+				}),
+			);
+		let backendUrl = await startServer("first");
+		const streams: { antigravity?: { baseRunId?: string }; contextOverlay?: unknown[] }[] = [];
+		let released = false;
+		const proxy = createServer(async (request, response) => {
+			try {
+				const chunks: Buffer[] = [];
+				for await (const chunk of request) chunks.push(Buffer.from(chunk));
+				const body = Buffer.concat(chunks);
+				if (request.url === "/api/stream") streams.push(JSON.parse(body.toString("utf8")));
+				const upstream = await fetch(`${backendUrl}${request.url}`, {
+					method: request.method,
+					headers: { authorization: request.headers.authorization ?? "", "content-type": "application/json" },
+					...(body.byteLength ? { body } : {}),
+				});
+				response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "" });
+				response.flushHeaders();
+				if (upstream.body) for await (const chunk of upstream.body) response.write(chunk);
+				response.end();
+				if (request.url === "/api/antigravity/release") released = upstream.ok;
+			} catch (error) {
+				if (response.headersSent) response.destroy(error as Error);
+				else response.writeHead(500).end(String(error));
+			}
+		});
+		vi.stubEnv("PI_SERVER_URL", await listen(proxy));
+		const runtime = await createRuntime();
+		const discovery = trace().length;
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model: runtime.getModel(providerId, "gemini-test")!,
+			modelRuntime: runtime,
+			sessionManager: SessionManager.inMemory(cwd),
+			settingsManager: SettingsManager.inMemory(),
+			resourceLoader: createTestResourceLoader(),
+			noTools: "all",
+			autoSessionName: false,
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		try {
+			await session.bindExtensions({});
+			await session.prompt("first");
+			backendUrl = await startServer("restarted");
+			await session.prompt("second");
+			expect(session.messages.findLast((message) => message.role === "assistant")).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "thinking" }, { type: "text", text: "gemini-test: second" }],
+			});
+			expect(
+				streams.map(({ antigravity, contextOverlay }) => [antigravity?.baseRunId, contextOverlay?.length]),
+			).toEqual([
+				[undefined, 2],
+				[expect.any(String), 1],
+				[undefined, 4],
+			]);
+			const prompts = trace()
+				.slice(discovery)
+				.filter((entry) => entry.method === "session/prompt");
+			expect(prompts.at(-1)?.params).toMatchObject({
+				prompt: expect.arrayContaining([
+					{ type: "text", text: "first" },
+					{ type: "text", text: "second" },
+				]),
+			});
+		} finally {
+			session.dispose();
+			await Promise.all([closePiServerObserver(session), ...close.mock.results.map(({ value }) => value)]);
+		}
+		await vi.waitFor(() => expect(released).toBe(true));
+	});
+
+	it("keeps automatic session naming out of the live agy conversation", async () => {
+		signedIn();
+		const runtime = await createRuntime();
+		const discovery = trace().length;
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model: runtime.getModel(providerId, "gemini-test")!,
+			modelRuntime: runtime,
+			sessionManager: SessionManager.inMemory(cwd),
+			settingsManager: SettingsManager.inMemory(),
+			resourceLoader: createTestResourceLoader(),
+			noTools: "all",
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		try {
+			await session.bindExtensions({});
+			await session.prompt("first");
+			await session.prompt("second");
+			const requests = trace().slice(discovery);
+			expect(requests.filter((entry) => entry.method === "session/new")).toHaveLength(1);
+			expect(requests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "first" }] },
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "second" }] },
+			]);
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
+		}
+	});
+
 	it.each([
 		{ label: "an unknown context window", contextWindow: 0, automatic: false },
 		{ label: "a configured context window", contextWindow: 50_000, automatic: true },

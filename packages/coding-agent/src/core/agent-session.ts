@@ -2465,6 +2465,8 @@ export class AgentSession {
 
 	private _shouldGenerateSessionName(): boolean {
 		if (!this._autoSessionNameEnabled || this._autoSessionNameAttempted || this._sessionHasInfoEntry()) return false;
+		// The title request would run as a turn in the session's live agy conversation and replace it.
+		if (this.model?.provider === ANTIGRAVITY_PROVIDER) return false;
 		const userMessages = this.agent.state.messages.filter((message) => message.role === "user");
 		if (userMessages.length !== 1) return false;
 		const lastAssistant = this._findLastAssistantMessage();
