@@ -1,10 +1,9 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildPiServerContextSync, createAgentSession } from "../src/core/sdk.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
 describe("createAgentSession session manager defaults", () => {
@@ -63,15 +62,6 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
-	});
-
-	it("sends only the projected pi-server provider context", () => {
-		const durableMessage: Message = { role: "user", content: "durable", timestamp: 1000 };
-		const ephemeralMessage: Message = { role: "user", content: "hint", timestamp: 2000 };
-
-		const sync = buildPiServerContextSync([durableMessage, ephemeralMessage]);
-
-		expect(sync.contextOverlay).toEqual([durableMessage, ephemeralMessage]);
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {

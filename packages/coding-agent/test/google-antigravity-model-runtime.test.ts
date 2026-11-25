@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore, normalizeContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ContextStore } from "../../pi-server/src/context-store.ts";
 import { createPiServer } from "../../pi-server/src/server.ts";
 import { AntigravityRuntime } from "../src/core/antigravity-runtime.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -268,6 +269,7 @@ describe("Antigravity ACP", () => {
 		});
 		const toolEvents: string[] = [];
 		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const resolve = vi.spyOn(ContextStore.prototype, "resolve");
 		const select = vi.fn(async () => "Allow once");
 		session.subscribe((event) => {
 			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolEvents.push(event.type);
@@ -304,10 +306,16 @@ describe("Antigravity ACP", () => {
 				),
 			).toBe(true);
 			expect(requests.every(({ bytes }) => bytes <= 65_536)).toBe(true);
-			expect(requests.filter(({ path }) => path === "/api/stream").at(-1)?.body).toMatchObject({
-				antigravity: { baseRunId: expect.any(String) },
-				contextOverlay: [expect.objectContaining({ role: "user", content: [{ type: "text", text: "follow-up" }] })],
-			});
+			// Each turn uploads only the new prompt; PiServer already holds the reply and the relayed tool result.
+			const deltas = resolve.mock.calls.slice(0, 3).map(([, delta]) => ({
+				base: delta.base !== undefined,
+				messages: delta.messages.map((message) => (typeof message === "string" ? "hash" : message.role)),
+			}));
+			expect(deltas).toEqual([
+				{ base: false, messages: ["system", "user"] },
+				{ base: true, messages: ["hash", "hash", "user"] },
+				{ base: true, messages: ["hash", "user"] },
+			]);
 			const acpRequests = trace().slice(discoveryRequests);
 			expect(acpRequests.filter((entry) => entry.method === "session/new")).toHaveLength(1);
 			expect(acpRequests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
@@ -344,7 +352,9 @@ describe("Antigravity ACP", () => {
 			]);
 			expect(messages[0].content[0]).toMatchObject({ type: "toolCall", id: results[0].toolCallId });
 			await session.prompt("permission");
-			expect(select).toHaveBeenCalledWith("Run native tool", ["Allow once"], { signal: expect.any(AbortSignal) });
+			expect(select).toHaveBeenCalledWith("Run native tool (runs on the PiServer host)", ["Allow once"], {
+				signal: expect.any(AbortSignal),
+			});
 			const compacted = await session.compact();
 			expect(compacted.summary).toContain("Reviewed 答案");
 			expect(reopen()).toContainEqual(expect.objectContaining({ type: "message", message: results[0] }));
@@ -376,32 +386,45 @@ describe("Antigravity ACP", () => {
 		await vi.waitFor(() => expect(released).toBe(true));
 	});
 
-	it("resends the whole conversation when PiServer no longer has its agy prefix", async () => {
+	it("keeps the agy context on PiServer across restarts and uploads it whole only when the store is gone", async () => {
 		signedIn();
 		vi.stubEnv("PI_SERVER_MODE", "true");
 		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
-		const startServer = (name: string) =>
-			listen(
-				createPiServer({
-					sessionStoreDir: join(cwd, name),
-					accountStoreDir: join(cwd, `${name}-accounts`),
-					authToken: "fixture",
-				}),
-			);
-		let backendUrl = await startServer("first");
-		const streams: { antigravity?: { baseRunId?: string }; contextOverlay?: unknown[] }[] = [];
+		let backend: Server | undefined;
+		let backendUrl = "";
+		// A restart stops the previous process before the next one opens the same store.
+		const restartServer = async (store: string) => {
+			if (backend) {
+				const stopped = backend;
+				servers.splice(servers.indexOf(stopped), 1);
+				stopped.closeAllConnections();
+				await new Promise<void>((resolve, reject) => stopped.close((error) => (error ? reject(error) : resolve())));
+			}
+			backend = createPiServer({
+				sessionStoreDir: join(cwd, store),
+				accountStoreDir: join(cwd, "accounts"),
+				authToken: "fixture",
+			});
+			backendUrl = await listen(backend);
+		};
+		await restartServer("store");
+		const streams: { context?: { base?: string; messages: unknown[] }; contextOverlay?: unknown[] }[] = [];
+		const statuses: number[] = [];
 		let released = false;
 		const proxy = createServer(async (request, response) => {
 			try {
 				const chunks: Buffer[] = [];
 				for await (const chunk of request) chunks.push(Buffer.from(chunk));
 				const body = Buffer.concat(chunks);
-				if (request.url === "/api/stream") streams.push(JSON.parse(body.toString("utf8")));
 				const upstream = await fetch(`${backendUrl}${request.url}`, {
 					method: request.method,
 					headers: { authorization: request.headers.authorization ?? "", "content-type": "application/json" },
 					...(body.byteLength ? { body } : {}),
 				});
+				if (request.url === "/api/stream") {
+					streams.push(JSON.parse(body.toString("utf8")));
+					statuses.push(upstream.status);
+				}
 				response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "" });
 				response.flushHeaders();
 				if (upstream.body) for await (const chunk of upstream.body) response.write(chunk);
@@ -430,23 +453,46 @@ describe("Antigravity ACP", () => {
 		try {
 			await session.bindExtensions({});
 			await session.prompt("first");
-			backendUrl = await startServer("restarted");
+			await restartServer("store");
 			await session.prompt("second");
+			await restartServer("lost");
+			await session.prompt("third");
 			expect(session.messages.findLast((message) => message.role === "assistant")).toMatchObject({
 				stopReason: "stop",
-				content: [{ type: "thinking" }, { type: "text", text: "gemini-test: second" }],
+				content: [{ type: "thinking" }, { type: "text", text: "gemini-test: third" }],
 			});
-			expect(
-				streams.map(({ antigravity, contextOverlay }) => [antigravity?.baseRunId, contextOverlay?.length]),
-			).toEqual([
-				[undefined, 2],
-				[expect.any(String), 1],
-				[undefined, 4],
+			const sent = streams.map(({ context, contextOverlay }) => ({
+				base: context?.base !== undefined,
+				roles: context?.messages.map((message) => (typeof message === "string" ? "hash" : message)),
+				contextOverlay,
+			}));
+			const user = (text: string) => expect.objectContaining({ role: "user", content: [{ type: "text", text }] });
+			const assistant = (text: string) =>
+				expect.objectContaining({ role: "assistant", content: [expect.anything(), { type: "text", text }] });
+			const system = expect.objectContaining({ role: "system" });
+			expect(sent).toEqual([
+				{ base: false, roles: [system, user("first")], contextOverlay: undefined },
+				{ base: true, roles: ["hash", user("second")], contextOverlay: undefined },
+				{ base: true, roles: ["hash", user("third")], contextOverlay: undefined },
+				{
+					base: false,
+					roles: [
+						system,
+						user("first"),
+						assistant("gemini-test: first"),
+						user("second"),
+						assistant("gemini-test: second"),
+						user("third"),
+					],
+					contextOverlay: undefined,
+				},
 			]);
+			expect(statuses).toEqual([200, 200, 409, 200]);
 			const prompts = trace()
 				.slice(discovery)
 				.filter((entry) => entry.method === "session/prompt");
-			expect(prompts.at(-1)?.params).toMatchObject({
+			// Each restart starts a new agy process, which receives Pi's transcript once.
+			expect(prompts.at(1)?.params).toMatchObject({
 				prompt: expect.arrayContaining([
 					{ type: "text", text: "first" },
 					{ type: "text", text: "second" },

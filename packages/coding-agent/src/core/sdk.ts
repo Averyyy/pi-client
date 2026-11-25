@@ -167,14 +167,6 @@ function getDefaultAgentDir(): string {
 	return getAgentDir();
 }
 
-export interface PiServerContextSync {
-	contextOverlay: Message[];
-}
-
-export function buildPiServerContextSync(contextMessages: Message[]): PiServerContextSync {
-	return { contextOverlay: contextMessages };
-}
-
 /**
  * Create an AgentSession with the specified options.
  *
@@ -522,9 +514,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...(serverAccount ? { authSource: "server-account" } : {}),
 			};
 			const activeAgentSession = agentSession;
-			const piServerContext = activeAgentSession
-				? buildPiServerContextSync(context.messages as Message[])
-				: undefined;
 			const headerRunner = extensionRunnerRef.current;
 			// Only session requests replace the selected model's cache entry. Keep its
 			// exact request prefix warm while tools run, then apply the configured idle policy.
@@ -557,7 +546,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 						: undefined,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
-					contextOverlay: piServerContext?.contextOverlay,
+					// The session's own requests share PiServer's message store; one-off requests stay inline.
+					incrementalContext:
+						activeAgentSession !== undefined && options?.sessionId === activeAgentSession.sessionId,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,
@@ -627,7 +618,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	});
 	agentSession = session;
 	session.subscribe((event) => {
-		if (event.type === "session_disposed" || event.type === "session_tree_changed") {
+		if (event.type === "session_disposed") {
 			if (antigravity) void antigravity.close();
 			else {
 				void releasePiServerAntigravity(session.sessionId).catch((error: unknown) =>

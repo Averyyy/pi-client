@@ -185,13 +185,15 @@ describe("AgentSession pi-server sync", () => {
 			expect(legacyAssistantId).toBeTruthy();
 			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
 			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
-			const contextOverlay = streamRequest?.body.contextOverlay as Array<{
-				role: string;
-				content: unknown;
-			}>;
-			expect(contextOverlay.map((message) => message.role)).toEqual(["user", "assistant", "system", "user"]);
+			const context = streamRequest?.body.context as {
+				base?: string;
+				messages: Array<{ role: string; content: unknown }>;
+			};
+			// A resumed session references the prefix its previous turn sent and uploads the rest of the projection.
+			expect(context.base).toEqual(expect.any(String));
+			expect(context.messages.map((message) => message.role)).toEqual(["assistant", "system", "user"]);
 			expect(
-				contextOverlay.some(
+				context.messages.some(
 					(message) =>
 						Array.isArray(message.content) &&
 						message.content.some((content) => content.type === "text" && content.text === "fresh question"),
@@ -663,13 +665,15 @@ describe("AgentSession pi-server sync", () => {
 			expect(oldErrorId).toBeTruthy();
 			expect(capturedRequests.some((request) => request.url.includes("/api/session/tree/"))).toBe(false);
 			const streamRequest = capturedRequests.find((request) => request.url.endsWith("/api/stream"));
-			const contextOverlay = streamRequest?.body.contextOverlay as Array<{
-				role: string;
-				stopReason?: string;
-				errorMessage?: string;
-			}>;
+			const context = streamRequest?.body.context as {
+				base?: string;
+				messages: Array<{ role: string; stopReason?: string; errorMessage?: string }>;
+			};
+			expect(context.base).toBeUndefined();
 			expect(
-				contextOverlay.some((message) => message.stopReason === "error" && message.errorMessage === "previous 524"),
+				context.messages.some(
+					(message) => message.stopReason === "error" && message.errorMessage === "previous 524",
+				),
 			).toBe(false);
 			const activeMessages = sessionManager.buildSessionContext().messages;
 			expect(activeMessages.map((message) => message.role)).toEqual(["user", "system", "user", "assistant"]);

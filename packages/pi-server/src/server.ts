@@ -3,6 +3,7 @@ import { createServer, type Server as HttpServer, type IncomingMessage, type Ser
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+	type AgentToolCallOutcome,
 	type CompactionCacheRequestOptions,
 	type CompactionPreparationOptions,
 	type CompactionSettings,
@@ -74,9 +75,14 @@ import { withAnthropicSubscription } from "./anthropic-subscription.ts";
 import { AntigravitySessions } from "./antigravity-sessions.ts";
 import type { ServerConfig } from "./config.ts";
 import { loadConfig } from "./config.ts";
+import { ContextStore } from "./context-store.ts";
 import { PiServerError, PiServerErrorCode, type PiServerErrorResponse } from "./error-codes.ts";
 import { encodeErrorEvent, encodeProxyEvent } from "./event-encoding.ts";
-import { hashPiServerProviderMessages, type PiServerProviderCallbackRequest } from "./pi-server-protocol.ts";
+import {
+	hashPiServerProviderMessages,
+	type PiServerContextDelta,
+	type PiServerProviderCallbackRequest,
+} from "./pi-server-protocol.ts";
 import { logProviderFailure } from "./provider-failure-log.ts";
 import { PublicCatalogRequestError, PublicModelCatalog } from "./public-model-catalog.ts";
 import { ReceiveUploadError, receiveUpload } from "./receive-upload.ts";
@@ -106,6 +112,7 @@ export { loadConfig, type ServerConfig } from "./config.ts";
 interface ServerRuntime extends ServerConfig {
 	accounts: ServerAccounts;
 	antigravity: AntigravitySessions;
+	contexts: ContextStore;
 	viewer: ViewerHttp;
 	deletingSessions: Map<string, Promise<void>>;
 	requestVersion: RequestVersion;
@@ -124,12 +131,14 @@ interface StreamRequestBody {
 	staticContext?: SessionStaticContext;
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
+	/** The session's context as a delta against the server's context store. */
+	context?: PiServerContextDelta;
 	observeProviderStreamEvents?: boolean;
 	observeTiming?: boolean;
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	antigravity?: { retainSession: boolean; questions: boolean; baseRunId?: string };
+	antigravity?: { retainSession: boolean; questions: boolean };
 }
 
 interface SessionSyncBody {
@@ -655,6 +664,7 @@ async function deleteServerSessions(config: ServerRuntime, ids: string[]): Promi
 		const operation = Promise.resolve().then(async () => {
 			await deleteStreamRunsForSession(id);
 			await config.antigravity.release(id);
+			config.contexts.delete(id);
 			deletePersistedSession(config.sessionStoreDir, id);
 			await config.viewer.store.remove(id);
 			deleteSessionFromStore(id);
@@ -1413,8 +1423,12 @@ async function handleStream(
 	cleanupExpiredStreamRuns(Date.now());
 
 	const agy = body.antigravity;
-	if (agy && (!body.runId || !Array.isArray(body.contextOverlay))) {
-		sendError(res, 400, "Antigravity requires a runId and a context delta", PiServerErrorCode.INVALID_REQUEST);
+	if (agy && !body.runId) {
+		sendError(res, 400, "Antigravity requires a runId", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	if (agy && !body.context && !body.contextOverlay) {
+		sendError(res, 400, "Antigravity requires a context", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
 	const session = agy ? undefined : getOrCreateSession(body.sessionId);
@@ -1440,6 +1454,10 @@ async function handleStream(
 	}
 	if (body.contextOverlay !== undefined && !Array.isArray(body.contextOverlay)) {
 		sendError(res, 400, "contextOverlay must be an array", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	if (body.context !== undefined && !Array.isArray(body.context?.messages)) {
+		sendError(res, 400, "context.messages must be an array", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
 
@@ -1480,10 +1498,15 @@ async function handleStream(
 		return;
 	}
 
+	const contextOverlay = body.context ? config.contexts.resolve(body.sessionId, body.context) : body.contextOverlay;
+	if (body.context && !contextOverlay) {
+		sendError(res, 409, "PiServer does not hold this context prefix", PiServerErrorCode.CONTEXT_NOT_FOUND);
+		return;
+	}
 	let agySession: ReturnType<AntigravitySessions["begin"]> | undefined;
 	if (agy?.retainSession) {
 		try {
-			agySession = config.antigravity.begin(body.sessionId, agy.baseRunId, body.contextOverlay!);
+			agySession = config.antigravity.begin(body.sessionId);
 		} catch (error) {
 			const { message, code } = error as PiServerError;
 			sendError(res, 409, message, code);
@@ -1491,8 +1514,8 @@ async function handleStream(
 		}
 	}
 	const context: Context = session
-		? buildStreamContext(session, body)
-		: { messages: agySession?.messages ?? body.contextOverlay! };
+		? buildStreamContext(session, { contextOverlay, ephemeralMessages: body.ephemeralMessages })
+		: { messages: contextOverlay! };
 
 	const run = body.runId ? startStreamRun(body.sessionId, body.runId) : undefined;
 	const providerCallbacks = run && !agy ? createProviderCallbacks<Model<string>>(run, res, body.callbacks) : {};
@@ -1590,13 +1613,14 @@ async function handleStream(
 
 	let stream: AsyncIterable<AssistantMessageEvent>;
 	let agyStream: ReturnType<AntigravityRuntime["stream"]> | undefined;
+	// Results the client produced through callbacks; the client already holds them.
+	const clientResults = new Set<string>();
 	const activityVersion = config.requestVersion;
 	recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
 		if (agy) {
 			const runtime = agySession?.runtime ?? new AntigravityRuntime(process.cwd(), "PiServer");
-			if (agySession?.reset) await runtime.close();
 			const requestCallback = createRunCallback(run!, res);
 			const ask = <T>(request: AntigravityCallback) =>
 				requestCallback({
@@ -1607,9 +1631,28 @@ async function handleStream(
 				}) as Promise<T>;
 			const client: AntigravityClient | undefined = agySession
 				? {
-						executeTool: (call, assistant) => ask({ kind: "tool", call, assistant }),
-						requestPermission: (title, choices) => ask({ kind: "permission", title, choices }),
-						...(agy.questions ? { answerQuestion: (request) => ask({ kind: "question", request }) } : {}),
+						executeTool: async (call) => {
+							const outcome = await ask<AgentToolCallOutcome>({ kind: "tool", call });
+							clientResults.add(outcome.toolCall.id);
+							return outcome;
+						},
+						// Native agy tools run on this machine, not in the client's workspace.
+						requestPermission: (title, choices) =>
+							ask({ kind: "permission", title: `${title} (runs on the PiServer host)`, choices }),
+						...(agy.questions
+							? {
+									answerQuestion: async (request) => {
+										const answer = await ask<
+											Awaited<ReturnType<NonNullable<AntigravityClient["answerQuestion"]>>>
+										>({
+											kind: "question",
+											request,
+										});
+										clientResults.add(answer.outcome.toolCall.id);
+										return answer;
+									},
+								}
+							: {}),
 						recordUpdate: (sessionId, update) => {
 							if (!res.destroyed && !res.writableEnded) {
 								writeServerSentEvent(res, "antigravity_update", { sessionId, update });
@@ -1670,11 +1713,20 @@ async function handleStream(
 				if (event.type === "done" || event.type === "error") {
 					sendTiming();
 					if (agyStream && run) {
-						run.executedToolResults = agyStream.executedToolResults;
-						if (event.type === "done") {
-							agySession?.complete(run.runId, [event.message, ...agyStream.executedToolResults]);
-						}
-						writeServerSentEvent(res, "antigravity_tool_results", run.executedToolResults);
+						const results = agyStream.executedToolResults;
+						run.executedToolResults = results;
+						// The next turn references these by hash instead of uploading them again.
+						if (body.context) config.contexts.add(body.sessionId, results);
+						if (event.type === "done") agySession?.complete();
+						writeServerSentEvent(
+							res,
+							"antigravity_tool_results",
+							results.map((result) =>
+								clientResults.has(result.toolCallId)
+									? { toolCallId: result.toolCallId, timestamp: result.timestamp }
+									: result,
+							),
+						);
 					}
 				}
 				const proxyEvent = toProxyEvent(event);
@@ -1684,6 +1736,13 @@ async function handleStream(
 				}
 				if (event.type === "done") {
 					terminalSeen = true;
+					// The agent loop records the requested level on its copy of the reply (agent-loop.ts).
+					// Store that copy so the next turn references it; a different projection is uploaded instead.
+					if (body.context) {
+						config.contexts.add(body.sessionId, [
+							{ ...event.message, thinkingLevel: body.options?.reasoning ?? "off" },
+						]);
+					}
 					completeStreamRun(run, event.message);
 				} else if (event.type === "error") {
 					logFailure("result", undefined, event.error);
@@ -1742,12 +1801,12 @@ async function handlePostRequest(
 		return true;
 	}
 	if (pathname === "/api/antigravity/release") {
-		const { sessionId, runId } = (body as { sessionId?: unknown; runId?: unknown } | null) ?? {};
-		if (typeof sessionId !== "string" || !sessionId || typeof runId !== "string" || !runId) {
-			sendError(res, 400, "sessionId and runId are required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
+		const { sessionId } = (body as { sessionId?: unknown } | null) ?? {};
+		if (typeof sessionId !== "string" || !sessionId) {
+			sendError(res, 400, "sessionId is required", PiServerErrorCode.REQUIRED_FIELD_MISSING);
 			return true;
 		}
-		const released = await config.antigravity.releaseIdle(sessionId, runId);
+		const released = await config.antigravity.releaseIdle(sessionId);
 		sendJson(res, 200, { released });
 		return true;
 	}
@@ -2138,6 +2197,7 @@ export function createPiServer(
 		...serverConfig,
 		accounts: accountsOverride ?? new ServerAccounts(serverConfig.accountStoreDir),
 		antigravity: new AntigravitySessions(),
+		contexts: new ContextStore(serverConfig.sessionStoreDir),
 		viewer,
 		deletingSessions: new Map(),
 		requestVersion: { version: 0 },
