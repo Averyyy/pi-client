@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import {
 	InMemoryModelsStore,
 	normalizeContext,
 } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ContextStore } from "../../pi-server/src/context-store.ts";
@@ -116,7 +117,7 @@ describe("Antigravity ACP", () => {
 		expect(network).not.toHaveBeenCalled();
 	});
 
-	it("selects the advertised Orchestrator using the ACP model config and preserves multimodal input", async () => {
+	it("sends agy only the user's turn and selects the advertised Orchestrator", async () => {
 		signedIn();
 		const runtime = await createRuntime();
 		const model = runtime.getModel(providerId, "orchestrator-test")!;
@@ -124,53 +125,84 @@ describe("Antigravity ACP", () => {
 			{ type: "text" as const, text: "你好" },
 			{ type: "image" as const, mimeType: "image/png", data: "cG5n" },
 		];
-		const stream = runtime.streamSimple(model, {
+		const context = normalizeContext({
 			systemPrompt: "Pi prompt",
-			messages: [{ role: "user", content: prompt, timestamp: 1 }],
-		});
-		const events = [];
-		for await (const event of stream) events.push(event.type);
-		expect(events).toEqual([
-			"start",
-			"thinking_start",
-			"thinking_delta",
-			"thinking_end",
-			"text_start",
-			"text_delta",
-			"text_delta",
-			"text_end",
-			"done",
-		]);
-		expect(await stream.result()).toMatchObject({
-			content: [
-				{ type: "thinking", thinking: "Planning" },
-				{ type: "text", text: "orchestrator-test: 你好" },
-			],
-			stopReason: "stop",
-		});
-		expect(
-			trace()
-				.slice(-4)
-				.map(({ method, params }) => ({ method, params })),
-		).toEqual([
-			{
-				method: "initialize",
-				params: {
-					protocolVersion: 1,
-					clientInfo: { name: "pi", title: "Pi" },
-					clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+			messages: [
+				{ role: "user", content: "earlier question", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "another model's answer" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
 				},
-			},
-			{
-				method: "session/new",
-				params: { cwd, mcpServers: [], _meta: { antigravity: { systemPrompt: { append: "Pi prompt" } } } },
-			},
-			{
-				method: "session/set_config_option",
-				params: { sessionId: "mock-agy-session", configId: "model", value: "orchestrator-test" },
-			},
-			{ method: "session/prompt", params: { sessionId: "mock-agy-session", prompt } },
-		]);
+				{ role: "user", content: prompt, timestamp: 3 },
+			],
+		});
+		// Pi's own requests never reach agy: no session, no process.
+		const traced = existsSync(join(cwd, "trace.jsonl")) ? trace().length : 0;
+		expect(await runtime.streamSimple(model, context).result()).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("only as the agent of an interactive Pi session"),
+		});
+		expect(trace()).toHaveLength(traced);
+		const adapter = new AntigravityRuntime(cwd);
+		try {
+			const stream = adapter.stream(model, context, {}, {});
+			const events = [];
+			for await (const event of stream) events.push(event.type);
+			expect(events).toEqual([
+				"start",
+				"thinking_start",
+				"thinking_delta",
+				"thinking_end",
+				"text_start",
+				"text_delta",
+				"text_delta",
+				"text_end",
+				"done",
+			]);
+			expect(await stream.result()).toMatchObject({
+				content: [
+					{ type: "thinking", thinking: "Planning" },
+					{ type: "text", text: "orchestrator-test: 你好" },
+				],
+				stopReason: "stop",
+			});
+			// agy keeps its own instructions and context: no Pi system prompt, no earlier turns.
+			expect(
+				trace()
+					.slice(-4)
+					.map(({ method, params }) => ({ method, params })),
+			).toEqual([
+				{
+					method: "initialize",
+					params: {
+						protocolVersion: 1,
+						clientInfo: { name: "pi", title: "Pi" },
+						clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+					},
+				},
+				{ method: "session/new", params: { cwd, mcpServers: [] } },
+				{
+					method: "session/set_config_option",
+					params: { sessionId: "mock-agy-session", configId: "model", value: "orchestrator-test" },
+				},
+				{ method: "session/prompt", params: { sessionId: "mock-agy-session", prompt } },
+			]);
+		} finally {
+			await adapter.close();
+		}
 	});
 
 	it("discovers server agy models and sends incremental turns and tools through a 64 KiB proxy", async () => {
@@ -383,10 +415,11 @@ describe("Antigravity ACP", () => {
 			]);
 			await session.prompt("permission");
 			expect(select).toHaveBeenCalledWith("Run native tool", ["Allow once"], { signal: expect.any(AbortSignal) });
-			const compacted = await session.compact();
-			expect(compacted.summary).toContain("Reviewed 答案");
+			// Pi's summaries never run on agy; compaction.model chooses another model for them.
+			const tracedBeforeCompaction = trace().length;
+			await expect(session.compact()).rejects.toThrow("compaction.model");
+			expect(trace()).toHaveLength(tracedBeforeCompaction);
 			expect(reopen()).toContainEqual(expect.objectContaining({ type: "message", message: results[0] }));
-			expect(trace().at(-1)).toMatchObject({ method: "session/prompt" });
 			expect(requests.some(({ path }) => path.startsWith("/api/session/tree/"))).toBe(false);
 			const callsBeforeAbort = trace().filter(({ method }) => method === "mock/tools/call").length;
 			const prompt = session.prompt("custom-cancel");
@@ -526,14 +559,8 @@ describe("Antigravity ACP", () => {
 				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "first" }] },
 				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "second" }] },
 			]);
-			// The lost store also lost the saved session, so a new agy session receives the transcript.
-			expect(prompts[2]).toMatchObject({
-				prompt: expect.arrayContaining([
-					{ type: "text", text: "first" },
-					{ type: "text", text: "second" },
-					{ type: "text", text: "third" },
-				]),
-			});
+			// The lost store also lost the saved session; agy starts a new one with this turn's input only.
+			expect(prompts[2]).toEqual({ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "third" }] });
 		} finally {
 			session.dispose();
 			await Promise.all([closePiServerObserver(session), ...close.mock.results.map(({ value }) => value)]);
@@ -575,7 +602,7 @@ describe("Antigravity ACP", () => {
 	it.each([
 		{ label: "an unknown context window", contextWindow: 0, automatic: false },
 		{ label: "a configured context window", contextWindow: 50_000, automatic: true },
-	])("uses the correct compaction trigger with $label", async ({ contextWindow, automatic }) => {
+	])("keeps Pi's compaction summaries off agy with $label", async ({ contextWindow, automatic }) => {
 		signedIn();
 		let modelsPath: string | null = null;
 		if (contextWindow > 0) {
@@ -607,21 +634,87 @@ describe("Antigravity ACP", () => {
 		session.subscribe((event) => {
 			if (event.type === "compaction_start") reasons.push(event.reason);
 		});
+		const large = "Retained fixture context. ".repeat(256);
 		try {
 			await session.bindExtensions({});
 			await session.prompt("Remember the initial requirement");
-			expect(reasons).toEqual([]);
-			await session.prompt("Retained fixture context. ".repeat(256));
+			await session.prompt(large);
 			expect(reasons).toEqual(automatic ? ["threshold"] : []);
-			if (!automatic) {
-				const requests = trace();
-				expect(requests.filter((entry) => entry.method === "session/prompt")).toHaveLength(2);
-				expect(requests.filter((entry) => entry.method === "session/new")).toHaveLength(2);
-				const result = await session.compact("Keep the initial requirement");
-				expect(result.summary).toContain("initial requirement");
-				expect(reasons).toEqual(["manual"]);
-			}
-			expect(sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			await expect(session.compact("Keep the initial requirement")).rejects.toThrow("compaction.model");
+			expect(sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+			// agy received the two user turns and nothing Pi generated.
+			expect(
+				trace()
+					.filter((entry) => entry.method === "session/prompt")
+					.map((entry) => (entry.params as { prompt: unknown }).prompt),
+			).toEqual([[{ type: "text", text: "Remember the initial requirement" }], [{ type: "text", text: large }]]);
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
+		}
+	});
+
+	it.each([
+		{ label: "no compaction model", piCompaction: false },
+		{ label: "a compaction model", piCompaction: true },
+	])("shows agy's own compaction and compacts Pi's transcript with $label", async ({ piCompaction }) => {
+		signedIn();
+		const runtime = await createRuntime();
+		const faux = fauxProvider({ models: [{ id: "summarizer", contextWindow: 1_000_000 }] });
+		runtime.registerNativeProvider({
+			...faux.provider,
+			auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+		});
+		await runtime.refresh({ providers: [faux.provider.id], allowNetwork: false });
+		// The cut splits the last turn, so Pi summarizes the history and that turn's prefix.
+		faux.setResponses([fauxAssistantMessage("Pi history summary"), fauxAssistantMessage("Pi turn prefix summary")]);
+		const discovery = trace().length;
+		const sessionManager = SessionManager.inMemory(cwd);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			model: runtime.getModel(providerId, "gemini-test")!,
+			modelRuntime: runtime,
+			sessionManager,
+			settingsManager: SettingsManager.inMemory({
+				compaction: {
+					enabled: true,
+					keepRecentTokens: 1,
+					...(piCompaction ? { model: `${faux.provider.id}/summarizer` } : {}),
+				},
+			}),
+			resourceLoader: createTestResourceLoader(),
+			noTools: "all",
+			autoSessionName: false,
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const events: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_start") events.push(`start:${event.reason}`);
+			if (event.type === "compaction_end")
+				events.push(`end:${event.result ? "summary" : (event.errorMessage ?? "agy")}`);
+		});
+		try {
+			await session.bindExtensions({});
+			await session.prompt("first");
+			await session.prompt("compact");
+			// agy's compaction shows as Pi events; Pi then summarizes its own copy with the compaction model.
+			expect(events).toEqual(
+				piCompaction
+					? ["start:threshold", "end:agy", "start:threshold", "end:summary"]
+					: ["start:threshold", "end:agy"],
+			);
+			expect(sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(
+				piCompaction ? 1 : 0,
+			);
+			// The agy session continues, and Pi's summary never reaches it.
+			await session.prompt("after");
+			const acp = trace().slice(discovery);
+			expect(acp.filter((entry) => entry.method === "session/new")).toHaveLength(1);
+			expect(acp.filter((entry) => entry.method === "session/prompt").at(-1)?.params).toEqual({
+				sessionId: "mock-agy-session",
+				prompt: [{ type: "text", text: "after" }],
+			});
 		} finally {
 			session.dispose();
 			await Promise.all(close.mock.results.map(({ value }) => value));
@@ -684,6 +777,17 @@ describe("Antigravity ACP", () => {
 			],
 		});
 		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		const nativeRows: [string, string][] = [];
+		session.subscribe((event) => {
+			if (
+				(event.type === "tool_execution_start" ||
+					event.type === "tool_execution_update" ||
+					event.type === "tool_execution_end") &&
+				event.toolName.startsWith("agy_")
+			) {
+				nativeRows.push([event.type, event.toolName]);
+			}
+		});
 		const select = vi
 			.fn<ReturnType<typeof createTestUiContext>["select"]>()
 			.mockImplementationOnce(async (_title, options) => options[0])
@@ -701,19 +805,16 @@ describe("Antigravity ACP", () => {
 			await session.bindExtensions({ uiContext: createTestUiContext({ select, input: async () => "Keep both" }) });
 			await session.prompt("follow-up");
 			await session.prompt("interactions");
+			// Only the SDK tool reaches agy, through MCP, and no Pi instructions come with it.
 			expect(trace()).toContainEqual(
 				expect.objectContaining({
 					method: "session/new",
-					params: expect.objectContaining({
-						mcpServers: [expect.objectContaining({ name: "pi" })],
-						_meta: {
-							antigravity: {
-								systemPrompt: { append: expect.not.stringMatching(/Pi's (todo|ask_user_question)/) },
-							},
-						},
-					}),
+					params: { cwd, mcpServers: [expect.objectContaining({ name: "pi" })] },
 				}),
 			);
+			expect(trace().find((entry) => entry.method === "mock/tools/list")?.result).toMatchObject({
+				tools: [{ name: "lookup" }],
+			});
 			expect(trace()).toContainEqual(
 				expect.objectContaining({
 					id: "elicitation",
@@ -738,6 +839,12 @@ describe("Antigravity ACP", () => {
 			expect(results()).toMatchObject([
 				{ toolName: "lookup", details: { key: "答案" }, isError: false },
 				{
+					toolName: "agy_read_file",
+					content: [{ type: "text", text: "first chunk" }],
+					details: { rawOutput: { lines: 2 } },
+					isError: false,
+				},
+				{
 					toolName: "ask_user_question",
 					details: {
 						cancelled: false,
@@ -753,23 +860,12 @@ describe("Antigravity ACP", () => {
 					details: { tasks: [{ id: 1, subject: "Review choices", status: "completed" }], nextId: 2 },
 				},
 			]);
-			expect(SessionManager.open(manager.getSessionFile()!, cwd).getBranch()).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({
-						type: "custom",
-						customType: "antigravity_acp_update",
-						data: {
-							acpSessionId: "mock-agy-session",
-							update: {
-								sessionUpdate: "tool_call_update",
-								toolCallId: "native-1",
-								status: "completed",
-								rawOutput: { lines: 2 },
-							},
-						},
-					}),
-				]),
-			);
+			// agy's own tool call showed as a live Pi tool row before its result reached the transcript.
+			expect(nativeRows).toEqual([
+				["tool_execution_start", "agy_read_file"],
+				["tool_execution_update", "agy_read_file"],
+				["tool_execution_end", "agy_read_file"],
+			]);
 			select.mockImplementationOnce(async (_title, options) => options[1]).mockResolvedValueOnce("Submit answers");
 			await session.prompt("native-choice");
 			expect(trace()).toContainEqual(
@@ -841,7 +937,10 @@ describe("Antigravity ACP", () => {
 				expect.objectContaining({
 					method: "initialize",
 					params: expect.objectContaining({
-						clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+						clientCapabilities: expect.objectContaining({
+							fs: { readTextFile: true, writeTextFile: true },
+							terminal: true,
+						}),
 					}),
 				}),
 			);
@@ -878,6 +977,7 @@ describe("Antigravity ACP", () => {
 			secondStarted = resolve;
 		});
 		const client: AntigravityClient = {
+			toolNames: ["lookup"],
 			// The first call waits for the second, so answering callbacks one at a time would deadlock.
 			executeTool: async (call) => {
 				if (call.arguments.key === "first") await second;
@@ -937,7 +1037,7 @@ describe("Antigravity ACP", () => {
 				}),
 			);
 			const controller = new AbortController();
-			const cancelled = adapter.stream(model, context("cancel"), { signal: controller.signal });
+			const cancelled = adapter.stream(model, context("cancel"), { signal: controller.signal }, {});
 			await vi.waitFor(() =>
 				expect(trace().at(-1)).toMatchObject({
 					method: "session/prompt",

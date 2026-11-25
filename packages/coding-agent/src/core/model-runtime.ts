@@ -96,7 +96,6 @@ import {
 	logoutPiServerAntigravity,
 	type PiServerAccountOptions,
 	streamPiServer,
-	streamPiServerAntigravity,
 	streamRawPiServer,
 } from "./pi-server-client.ts";
 import {
@@ -1093,10 +1092,9 @@ export class ModelRuntime implements Models {
 		return this.streamSimple(model, context, options).result();
 	}
 
+	/** agy runs only behind an interactive Pi session, so direct model calls end with that explanation. */
 	private streamAntigravity(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
-		return this.piServerMode
-			? lazyStream(model, () => streamPiServerAntigravity(model, context, options), undefined, options?.signal)
-			: new AntigravityRuntime(process.cwd()).stream(model, context, options);
+		return new AntigravityRuntime(process.cwd()).stream(model, context, options);
 	}
 
 	streamDeferred(

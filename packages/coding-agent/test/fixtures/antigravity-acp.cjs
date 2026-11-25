@@ -79,7 +79,9 @@ function startAcp() {
 					break;
 				}
 				[mcp] = params.mcpServers;
-				if (mcp) assert.ok(process.argv.includes("--process-per-session"));
+				// Pi launches agy the way editors do, `agy acp` and nothing else. The test runs `node acp`,
+				// where Node takes `acp` as this script, so any further argument would be an extra flag.
+				assert.deepEqual(process.argv.slice(2), []);
 				sessionCwd = params.cwd;
 				writeFileSync(join(dir, `session-${sessionId}`), "");
 				reply({ sessionId, configOptions: configs() });
@@ -129,8 +131,8 @@ function startAcp() {
 						assert.ok(supportsForm);
 						updateNative({ sessionUpdate: "plan", entries: [{ content: "Review choices", priority: "high", status: "in_progress" }] });
 						updateNative({ sessionUpdate: "tool_call", toolCallId: "native-1", name: "read_file", title: "Read a file", status: "in_progress" });
-						updateNative({ sessionUpdate: "tool_call_content_chunk", toolCallId: "native-1",
-							content: { type: "content", content: { type: "text", text: "first chunk" } } });
+						updateNative({ sessionUpdate: "tool_call_update", toolCallId: "native-1",
+							content: [{ type: "content", content: { type: "text", text: "first chunk" } }] });
 						updateNative({ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed", rawOutput: { lines: 2 } });
 						const answer = new Promise((resolve) => { elicitation = resolve; });
 						send({ id: "elicitation", method: "elicitation/create", params: {
@@ -158,6 +160,13 @@ function startAcp() {
 						options: [{ optionId: "repo", name: "Repo" }, { optionId: "file", name: "File" }],
 					} });
 					update("agent_message_chunk", (await outcome).optionId);
+				} else if (text === "compact") {
+					assert.ok(clientCapabilities.session?.compaction);
+					updateNative({ sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" });
+					updateNative({ sessionUpdate: "compaction_summary_chunk", compactionId: "compaction-1",
+						content: { type: "text", text: "agy summary" } });
+					updateNative({ sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "completed" });
+					update("agent_message_chunk", "compacted");
 				} else if (text === "parallel") {
 					await callMcp("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "agy", version: "1.5.17" } });
 					const [first, second] = await Promise.all(
