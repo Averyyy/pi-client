@@ -5,7 +5,7 @@ import { getOpenCodeSessionHeaders } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
+import { AgentSession, markRuntimeStreamFunction, oneOffRequest, type SessionStreamOptions } from "./agent-session.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
 import { answerAntigravityQuestion } from "./antigravity-interactions.ts";
 import { type AntigravityClient, AntigravityRuntime } from "./antigravity-runtime.ts";
@@ -449,12 +449,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			messages: existingSession.messages,
 		},
 		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
+		streamFn: async (model, context, options?: SessionStreamOptions) => {
+			// Pi's own one-off requests can reuse the session ID, but only the agent loop's requests
+			// are conversation turns: they run agy, keep the prompt cache warm, and extend PiServer's
+			// stored context.
+			const oneOff = options?.[oneOffRequest] === true;
 			if (model.provider === ANTIGRAVITY_PROVIDER) {
 				clientTiming = undefined;
 				const requestOptions = buildRequestOptions(options);
 				const session = agentSession;
-				if (!session || options?.sessionId !== session.sessionId) {
+				if (!session || options?.sessionId !== session.sessionId || oneOff) {
 					return modelRuntime.streamSimple(model, context, requestOptions);
 				}
 				cacheWarmer.cancel();
@@ -491,7 +495,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const requestClientTiming = clientTiming;
 			clientTiming = undefined;
 			const cacheIsCurrent =
-				options?.sessionId === sessionManager.getSessionId() ? cacheContextIsCurrent(model) : undefined;
+				options?.sessionId === sessionManager.getSessionId() && !oneOff ? cacheContextIsCurrent(model) : undefined;
 			if (remote && cacheIsCurrent) cacheWarmer.cancel();
 			const auth =
 				remote && !serverAccount
@@ -525,7 +529,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			const activeAgentSession = agentSession;
 			const headerRunner = extensionRunnerRef.current;
-			// Only session requests replace the selected model's cache entry. Keep its
+			// Only conversation turns replace the selected model's cache entry. Keep its
 			// exact request prefix warm while tools run, then apply the configured idle policy.
 			if (!remote && cacheIsCurrent) {
 				cacheWarmer.start({ model: requestModel, context, options: requestOptions }, cacheIsCurrent);
@@ -542,6 +546,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (!serverAccount && headerRunner?.hasHandlers("before_provider_headers")) {
 					headers = await headerRunner.emitBeforeProviderHeaders(headers ?? {});
 				}
+				// Requests under the session ID reference PiServer's message store; requests under other
+				// IDs stay inline. Only conversation turns record into it: later turns extend them.
+				const contextStore: PiServerStreamOptions["contextStore"] =
+					activeAgentSession !== undefined && options?.sessionId === activeAgentSession.sessionId
+						? oneOff
+							? "read"
+							: "record"
+						: undefined;
 				return streamPiServer(requestModel, context, {
 					...requestOptions,
 					clientTiming: requestClientTiming,
@@ -549,16 +561,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					onCacheRetentionResolved: cacheIsCurrent
 						? (cacheRetention) => {
 								if (options?.signal?.aborted || !cacheIsCurrent()) return;
-								cacheWarmer.start(
-									{ model: requestModel, context, options: { ...requestOptions, cacheRetention } },
-									cacheIsCurrent,
-								);
+								// ModelRuntime passes PiServer options through to the replay. It repeats this
+								// exact context, so it reads PiServer's stored copy instead of uploading it again.
+								const warmOptions: ModelsSimpleStreamOptions &
+									Pick<PiServerStreamOptions, "authSource" | "contextStore"> = {
+									...requestOptions,
+									cacheRetention,
+									contextStore: contextStore ? "read" : undefined,
+								};
+								cacheWarmer.start({ model: requestModel, context, options: warmOptions }, cacheIsCurrent);
 							}
 						: undefined,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
-					// The session's own requests share PiServer's message store; one-off requests stay inline.
-					incrementalContext:
-						activeAgentSession !== undefined && options?.sessionId === activeAgentSession.sessionId,
+					contextStore,
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,

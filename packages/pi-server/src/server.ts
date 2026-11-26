@@ -1462,6 +1462,10 @@ async function handleStream(
 		sendError(res, 400, "context.messages must be an array", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
+	if (body.context?.store !== undefined && body.context.store !== "record" && body.context.store !== "read") {
+		sendError(res, 400, 'context.store must be "record" or "read"', PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
 
 	const existingRun = body.runId ? getStreamRun(body.sessionId, body.runId) : undefined;
 
@@ -1500,7 +1504,13 @@ async function handleStream(
 		return;
 	}
 
-	const contextOverlay = body.context ? config.contexts.resolve(body.sessionId, body.context) : body.contextOverlay;
+	// Warm replays and one-off requests only reference stored messages; later turns never extend them.
+	const recordContext = body.context !== undefined && body.context.store !== "read";
+	const contextOverlay = !body.context
+		? body.contextOverlay
+		: recordContext
+			? config.contexts.resolve(body.sessionId, body.context)
+			: config.contexts.read(body.sessionId, body.context);
 	if (body.context && !contextOverlay) {
 		sendError(res, 409, "PiServer does not hold this context prefix", PiServerErrorCode.CONTEXT_NOT_FOUND);
 		return;
@@ -1717,7 +1727,7 @@ async function handleStream(
 						const results = agyStream.executedToolResults;
 						run.executedToolResults = results;
 						// The next turn references these by hash instead of uploading them again.
-						if (body.context) config.contexts.add(body.sessionId, results);
+						if (recordContext) config.contexts.add(body.sessionId, results);
 						if (event.type === "done") agySession?.complete();
 						writeServerSentEvent(
 							res,
@@ -1739,7 +1749,7 @@ async function handleStream(
 					terminalSeen = true;
 					// The agent loop records the requested level on its copy of the reply (agent-loop.ts).
 					// Store that copy so the next turn references it; a different projection is uploaded instead.
-					if (body.context) {
+					if (recordContext) {
 						config.contexts.add(body.sessionId, [
 							{ ...event.message, thinkingLevel: body.options?.reasoning ?? "off" },
 						]);

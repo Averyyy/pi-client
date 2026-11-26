@@ -70,6 +70,19 @@ export class ContextStore {
 		return messages;
 	}
 
+	/** Rebuild the full context without recording anything; undefined when the base or a hash is unknown. */
+	read(sessionId: string, delta: PiServerContextDelta): Message[] | undefined {
+		const store = this.load(sessionId);
+		const messages = delta.base === undefined ? [] : walkPrefix(store, delta.base);
+		if (!messages) return undefined;
+		for (const item of delta.messages) {
+			const message = typeof item === "string" ? store.messages.get(item) : item;
+			if (!message) return undefined;
+			messages.push(message);
+		}
+		return messages;
+	}
+
 	/** Store messages the server produced for the client, such as tool results it relayed. */
 	add(sessionId: string, messages: readonly Message[]): void {
 		const store = this.load(sessionId);

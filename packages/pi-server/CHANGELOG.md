@@ -42,6 +42,7 @@
 
 ### Fixed
 
+- Added a read-only `/api/stream` context mode (`context.store: "read"`) that rebuilds a session context from stored messages without recording the request's messages or reply, for cache warm replays and one-off requests.
 - Applied request-specific model metadata overrides to the current account catalog model for inference and compaction.
 - Excluded linked subagent sessions from project conversation lists, counts, pagination, and running threads while preserving their parent links, history, and project deletion.
 - Reclaimed idle request-chunk caches, bounded completed request bodies, and retained chunk checksums without duplicate Base64 payloads.

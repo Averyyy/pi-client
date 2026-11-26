@@ -42,6 +42,24 @@ describe("ContextStore", () => {
 		expect(store.resolve("session", { base: prefix(first), messages: [hash(third)] })).toEqual([first, third]);
 	});
 
+	it("reads a context from stored messages without recording its new messages", () => {
+		const store = new ContextStore(directory);
+		const [first, second, oneOff] = [user("first", 1), user("second", 2), user("one-off", 3)];
+		store.resolve("session", { messages: [first, second] });
+		const [file] = readdirSync(directory);
+		const recorded = readFileSync(join(directory, file), "utf-8");
+		// A warm replay names the whole stored prefix; a one-off request appends its own message.
+		expect(store.read("session", { base: prefix(first, second), messages: [] })).toEqual([first, second]);
+		expect(store.read("session", { base: prefix(first), messages: [hash(second), oneOff] })).toEqual([
+			first,
+			second,
+			oneOff,
+		]);
+		expect(readFileSync(join(directory, file), "utf-8")).toBe(recorded);
+		expect(store.read("session", { base: prefix(first, oneOff), messages: [] })).toBeUndefined();
+		expect(store.read("session", { messages: [hash(oneOff)] })).toBeUndefined();
+	});
+
 	it("reports an unknown base or message hash without recording the request", () => {
 		const store = new ContextStore(directory);
 		const first = user("first", 1);

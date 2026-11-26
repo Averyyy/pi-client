@@ -1704,6 +1704,26 @@ describe("pi-server HTTP", () => {
 		expect(body.error).toContain("static context");
 	});
 
+	it("rejects a context store mode other than record or read", async () => {
+		const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+		await fetch(`${baseUrl}/api/session/init`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ sessionId: "context-store-mode", staticContext: { systemPrompt: "Mode test" } }),
+		});
+		const res = await fetch(`${baseUrl}/api/stream`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				sessionId: "context-store-mode",
+				model: { id: "test", api: "openai-completions", provider: "opencode-go", baseUrl: "http://127.0.0.1:1" },
+				context: { messages: [], store: "replace" },
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(((await res.json()) as ServerResponse).error).toBe('context.store must be "record" or "read"');
+	});
+
 	it("sends a stream heartbeat before upstream provider events", async () => {
 		await fetch(`${baseUrl}/api/session/init`, {
 			method: "POST",

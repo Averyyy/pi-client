@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,6 +95,7 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 			retention?: CacheRetention;
 			autoCompact?: boolean;
 			failAbort?: boolean;
+			autoSessionName?: boolean;
 		} = {},
 	) {
 		directory = mkdtempSync(join(tmpdir(), "pi-client-cache-warming-"));
@@ -202,7 +203,7 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		);
 		servers.push(backend);
 		const backendUrl = await listen(backend);
-		const requests: { path: string; bytes: number }[] = [];
+		const requests: { path: string; bytes: number; context?: unknown }[] = [];
 		let rejected = 0;
 		const proxy = createServer(async (request, response) => {
 			const chunks: Buffer[] = [];
@@ -212,7 +213,13 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 				request.url === "/api/request/chunk"
 					? (JSON.parse(body.toString("utf8")) as { target: string }).target
 					: request.url;
-			requests.push({ path: request.url ?? "/", bytes: body.length });
+			requests.push({
+				path: request.url ?? "/",
+				bytes: body.length,
+				...(request.url === "/api/stream"
+					? { context: (JSON.parse(body.toString("utf8")) as { context?: unknown }).context }
+					: {}),
+			});
 			if (body.length > 65536) {
 				rejected++;
 				response.writeHead(413).end("Body exceeds 65536 UTF-8 bytes");
@@ -335,7 +342,7 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 				retry: { enabled: false },
 			}),
 			sessionManager: SessionManager.inMemory(directory),
-			autoSessionName: false,
+			autoSessionName: options.autoSessionName ?? false,
 			resourceLoader: {
 				...createTestResourceLoader({ extensionsResult }),
 				getSystemPrompt: () => "Exact cache system prompt",
@@ -393,6 +400,11 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 				holdWarm = true;
 			},
 			rejected: () => rejected,
+			// PiServer keeps one append-only context file per session.
+			storedContext: () => {
+				const [file] = readdirSync(join(directory, "server")).filter((name) => name.endsWith(".context.jsonl"));
+				return readFileSync(join(directory, "server", file), "utf8");
+			},
 		};
 	}
 
@@ -718,6 +730,49 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		expect(session.sessionManager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(2);
 		expect(session.sessionManager.buildSessionContext().messages).toEqual(before);
 		expect(getOrCreateSession(session.sessionId).entries).toEqual([]);
+		expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
+	});
+
+	it("replays warms against PiServer's stored context without uploading or recording it", async () => {
+		const { session, calls, requests, storedContext } = await fixture({ mode: "idle" });
+		await session.prompt(largeText);
+		// The real request uploads the large prompt in chunks and records it.
+		expect(requests.some((request) => request.path === "/api/request/chunk")).toBe(true);
+		const recorded = storedContext();
+		const sent = requests.length;
+		await warmNow(session);
+		await warmNow(session);
+		expect(calls.filter((call) => call.warm)).toHaveLength(2);
+		expect(calls[1].context).toEqual(calls[0].context);
+		expect(calls[2].context).toEqual(calls[0].context);
+		const warms = requests.slice(sent);
+		expect(warms.map((request) => request.path)).toEqual(["/api/stream", "/api/stream"]);
+		for (const warm of warms) {
+			expect(warm.context).toEqual({ base: expect.any(String), messages: [], store: "read" });
+			expect(warm.bytes).toBeLessThan(8192);
+		}
+		// Later turns never extend a warm reply, so PiServer does not store it.
+		expect(storedContext()).toBe(recorded);
+	});
+
+	it("keeps session naming and bug-report requests out of warming and the stored context", async () => {
+		const { session, calls, requests, storedContext } = await fixture({ mode: "idle", autoSessionName: true });
+		await session.prompt(largeText);
+		// The first turn then asks for a session name under the session ID.
+		expect(calls).toHaveLength(2);
+		expect(requests.filter((request) => request.path === "/api/stream").at(-1)?.context).toMatchObject({
+			store: "read",
+		});
+		await session.summarizeForBugReport({ signal: new AbortController().signal });
+		expect(calls).toHaveLength(3);
+		expect(session.cacheWarmingStatus).toMatchObject({ state: "scheduled", decision: { phase: "idle" } });
+		await warmNow(session);
+		expect(calls[3]).toMatchObject({ warm: true });
+		expect(calls[3].context).toEqual(calls[0].context);
+		const stored = storedContext();
+		expect(stored).toContain("real answer");
+		expect(stored).not.toContain("Name this coding session");
+		expect(stored).not.toContain("Write the bug report in Markdown");
 		expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
 	});
 
