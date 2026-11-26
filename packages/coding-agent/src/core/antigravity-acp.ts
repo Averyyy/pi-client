@@ -119,7 +119,7 @@ export class AntigravityAcp {
 			"initialize",
 			{
 				protocolVersion: ACP_PROTOCOL_VERSION,
-				clientInfo: { name: ANTIGRAVITY_CLIENT_NAME, title: "Avery UI" },
+				clientInfo: { name: ANTIGRAVITY_CLIENT_NAME, title: ANTIGRAVITY_CLIENT_NAME },
 				clientCapabilities: {
 					fs: { readTextFile: features.workspace, writeTextFile: features.workspace },
 					terminal: features.workspace,
@@ -130,7 +130,9 @@ export class AntigravityAcp {
 			signal,
 		);
 		if (result.protocolVersion !== ACP_PROTOCOL_VERSION) {
-			throw new Error(`Antigravity CLI speaks ACP version ${result.protocolVersion}; Pi supports version 1`);
+			throw new Error(
+				`Antigravity CLI uses ACP version ${result.protocolVersion}. ${ANTIGRAVITY_CLIENT_NAME} supports version ${ACP_PROTOCOL_VERSION}.`,
+			);
 		}
 		return result;
 	}

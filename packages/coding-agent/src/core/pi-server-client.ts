@@ -44,6 +44,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { AntigravityCallback } from "../antigravity.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
+import { aliasAntigravitySkills } from "./antigravity-instructions.ts";
 import type { AntigravityToolDisplay } from "./antigravity-native-tools.ts";
 import type { AcpCompactionUpdate, AntigravityClient } from "./antigravity-runtime.ts";
 import {
@@ -1235,14 +1236,16 @@ function rememberPiServerContext(sessionId: string, hashes: readonly string[], p
 }
 
 /** Run a turn of the Pi session's agy conversation on PiServer. */
-export function streamPiServerAntigravity(
+export async function streamPiServerAntigravity(
 	model: Model<string>,
 	context: Context,
 	options: (SimpleStreamOptions & Pick<PiServerStreamOptions, "antigravityCwd">) | undefined,
 	client: AntigravityClient,
 ): Promise<PiServerEventStream> {
 	return streamPiServer({ ...model, headers: undefined }, context, {
-		antigravity: client,
+		antigravity: client.instructions
+			? { ...client, instructions: await aliasAntigravitySkills(client.instructions) }
+			: client,
 		antigravityCwd: options?.antigravityCwd,
 		contextStore: "record",
 		sessionId: options?.sessionId,

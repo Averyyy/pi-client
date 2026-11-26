@@ -3,7 +3,7 @@
 ### Changed
 
 - Based on upstream Pi 1.6.0, including GPT-6.2 models, Codex prompt-cache fixes, and tool results for every call in a cancelled batch.
-- Load Google Antigravity models and run inference through PiServer's `agy` CLI. `/login google-antigravity` checks the existing CLI sign-in.
+- Load Google Antigravity models and run inference through PiServer's `agy` CLI. `/login google-antigravity` checks the existing CLI sign-in. The `avery-ui` adapter exposes global skills through `~/.avery-ui/skills` and stores its skill ledger under `~/.avery-ui` on the `agy` host.
 
 ### Fixed
 

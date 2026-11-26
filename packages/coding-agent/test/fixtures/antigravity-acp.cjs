@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
-const { appendFileSync, existsSync, unlinkSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } = require("node:fs");
+const { homedir } = require("node:os");
 const { join } = require("node:path");
 const { createInterface } = require("node:readline");
 
@@ -176,6 +177,20 @@ function startAcp() {
 						["first", "second"].map((key) => callMcp("tools/call", { name: "lookup", arguments: { key } })),
 					);
 					update("agent_message_chunk", `${first.content[0].text}+${second.content[0].text}`);
+				} else if (text?.startsWith("read-skill ")) {
+					const name = text.slice("read-skill ".length);
+					const declaration = readFileSync(join(homedir(), ".gemini", "antigravity-cli", "skills", name, "SKILL.md"), "utf8");
+					const [, path] = declaration.match(/read its instructions in `([^`]+)`/);
+					const [, baseDir] = declaration.match(/Resolve relative paths in it against `([^`]+)`/);
+					const read = await clientRequest("fs/read_text_file", { path });
+					await clientRequest("fs/write_text_file", { path: join(baseDir, "result.txt"), content: "written" });
+					const { terminalId } = await clientRequest("terminal/create", {
+						command: process.execPath, args: ["-e", "process.stdout.write(require('fs').readFileSync('result.txt'))"], cwd: baseDir,
+					});
+					await clientRequest("terminal/wait_for_exit", { terminalId });
+					const terminal = await clientRequest("terminal/output", { terminalId });
+					await clientRequest("terminal/release", { terminalId });
+					update("agent_message_chunk", JSON.stringify([read.content, terminal.output]));
 				} else if (text === "workspace") {
 					assert.ok(clientCapabilities.fs.readTextFile && clientCapabilities.fs.writeTextFile && clientCapabilities.terminal);
 					const read = await clientRequest("fs/read_text_file", { path: `${sessionCwd}/notes.txt`, line: 2, limit: 1 });

@@ -74,6 +74,7 @@ import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
+import { aliasAntigravitySkills } from "./antigravity-instructions.ts";
 import type { AntigravityToolDisplay } from "./antigravity-native-tools.ts";
 import { type AcpCompactionUpdate, ANTIGRAVITY_SESSION_ONLY } from "./antigravity-runtime.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
@@ -2863,7 +2864,7 @@ export class AgentSession {
 		// Expand skill commands (/skill:name args) and prompt templates (/template args)
 		let expandedText = currentText;
 		if (expandPromptTemplates) {
-			expandedText = this._expandSkillCommand(expandedText);
+			if (expandedText.startsWith("/skill:")) expandedText = await this._expandSkillCommand(expandedText);
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 
@@ -2937,12 +2938,10 @@ export class AgentSession {
 
 	/**
 	 * Expand skill commands (/skill:name args) to their full content.
-	 * Returns the expanded text, or the original text if not a skill command or skill not found.
+	 * Unknown skill names pass through as typed.
 	 * Emits errors via extension runner if file read fails.
 	 */
-	private _expandSkillCommand(text: string): string {
-		if (!text.startsWith("/skill:")) return text;
-
+	private async _expandSkillCommand(text: string): Promise<string> {
 		const spaceIndex = text.indexOf(" ");
 		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
@@ -2950,10 +2949,14 @@ export class AgentSession {
 		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
 		if (!skill) return text; // Unknown skill, pass through
 
+		const location =
+			this.model?.provider === ANTIGRAVITY_PROVIDER
+				? (await aliasAntigravitySkills({ skills: [skill] })).skills[0]
+				: skill;
 		try {
 			const content = readFileSync(skill.filePath, "utf-8");
 			const body = stripFrontmatter(content).trim();
-			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+			const skillBlock = `<skill name="${skill.name}" location="${location.filePath}">\nReferences are relative to ${location.baseDir}.\n\n${body}\n</skill>`;
 			return args ? `${skillBlock}\n\n${args}` : skillBlock;
 		} catch (err) {
 			// Emit error like extension commands do
@@ -2984,7 +2987,8 @@ export class AgentSession {
 		);
 		if (!processedInput) return "handled";
 
-		let expandedText = this._expandSkillCommand(processedInput.text);
+		let expandedText = processedInput.text;
+		if (expandedText.startsWith("/skill:")) expandedText = await this._expandSkillCommand(expandedText);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {

@@ -81,7 +81,7 @@ export async function answerAntigravityQuestion(
 	outcome: AgentToolCallOutcome;
 }> {
 	if (request.mode !== "form" || request.requestedSchema?.type !== "object") {
-		throw new McpError(-32602, "Pi supports Antigravity form elicitation");
+		throw new McpError(-32602, "Antigravity elicitation requires a form with an object schema");
 	}
 	const { properties, required = [] } = request.requestedSchema;
 	for (const key of required) {

@@ -1,8 +1,13 @@
 // The live agy conversations PiServer runs for Pi sessions, and the records that resume them.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { AntigravityRuntime, type AntigravitySavedConversation } from "@earendil-works/pi-coding-agent/antigravity";
+import {
+	ANTIGRAVITY_CLIENT_NAME,
+	AntigravityRuntime,
+	type AntigravitySavedConversation,
+} from "@earendil-works/pi-coding-agent/antigravity";
 import { PiServerError, PiServerErrorCode } from "./error-codes.ts";
 
 const IDLE_SESSION_MS = 60 * 60 * 1000;
@@ -30,7 +35,7 @@ export class AntigravitySessions {
 	 */
 	cwd(clientCwd: string | undefined): string {
 		if (clientCwd && isAbsolute(clientCwd) && existsSync(clientCwd)) return clientCwd;
-		const workspace = join(this.directory, "antigravity-workspace");
+		const workspace = join(homedir(), `.${ANTIGRAVITY_CLIENT_NAME}`, "antigravity-workspace");
 		mkdirSync(workspace, { recursive: true });
 		return workspace;
 	}

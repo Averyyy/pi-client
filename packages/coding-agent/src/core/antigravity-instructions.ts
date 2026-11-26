@@ -1,8 +1,10 @@
 // Pi's global AGENTS.md and skill declarations, written as agy's own global rule and skill files.
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { pathsEqual } from "../utils/paths.ts";
+import { mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, parse, relative, sep } from "node:path";
+import { CONFIG_DIR_NAME } from "../config.ts";
+import { canonicalizePath, isPathWithin, pathsEqual } from "../utils/paths.ts";
 import { ANTIGRAVITY_CLIENT_NAME } from "./antigravity-acp.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 
@@ -27,23 +29,75 @@ export function readAntigravityInstructions(resources: ResourceLoader, agentDir:
 	return agentsFile ? { agentsFile: { path: agentsFile.path, content: agentsFile.content }, skills } : { skills };
 }
 
+/** Give Pi-managed skill directories client-local aliases usable by ACP file reads and shell commands alike. */
+export async function aliasAntigravitySkills(instructions: AntigravityInstructions): Promise<AntigravityInstructions> {
+	const home = homedir();
+	const agent = join(home, CONFIG_DIR_NAME, "agent");
+	const state = join(home, `.${ANTIGRAVITY_CLIENT_NAME}`);
+	const directories = new Map<string, string>();
+	const skills = instructions.skills.map((skill) => {
+		let source: string;
+		let alias: string;
+		if (isPathWithin(agent, skill.baseDir) && !pathsEqual(agent, skill.baseDir)) {
+			const [resource] = relative(agent, skill.baseDir).split(sep);
+			source = join(agent, resource);
+			alias = pathsEqual(source, join(agent, "skills")) ? join(state, "skills") : join(state, "resources", resource);
+		} else {
+			const { root } = parse(skill.baseDir);
+			const parts = relative(root, skill.baseDir).split(sep);
+			const config = parts.findIndex((part) =>
+				process.platform === "win32"
+					? part.toLowerCase() === CONFIG_DIR_NAME.toLowerCase()
+					: part === CONFIG_DIR_NAME,
+			);
+			if (config === -1) return skill;
+			const project = parts.slice(0, config);
+			const resource = parts[config + 1] ?? "";
+			source = join(root, ...project, parts[config], resource);
+			// Reserve @resources beneath each project, including projects nested inside another one.
+			const owner = project.map((part) => (part.startsWith("@") ? `@${part}` : part));
+			alias = join(state, "projects", encodeURIComponent(root), ...owner, "@resources", resource);
+		}
+		directories.set(alias, source);
+		return {
+			...skill,
+			baseDir: join(alias, relative(source, skill.baseDir)),
+			filePath: join(alias, relative(source, skill.filePath)),
+		};
+	});
+	await Promise.all(Array.from(directories, ([alias, source]) => linkSkillDirectory(source, alias)));
+	return { ...instructions, skills };
+}
+
+async function linkSkillDirectory(source: string, alias: string): Promise<void> {
+	await mkdir(dirname(alias), { recursive: true });
+	try {
+		await symlink(source, alias, process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		if (!pathsEqual(await realpath(alias), await realpath(source)))
+			throw new Error(`Skill directory alias is in use: ${alias}`);
+	}
+}
+
 /**
  * Write the instructions as agy's global rule and skills under `home`, the home directory of the
  * user agy runs as, and remove the skills Pi wrote before that the session no longer has. The files
- * hold only what agy should read; `ledger`, outside agy's directories, records which skills Pi wrote.
+ * hold only what agy should read; the host ledger records which declarations this client wrote.
  * agy reads these directories when it starts, so the latest Pi session to start agy on a machine sets them.
  */
 export async function installAntigravityInstructions(
 	instructions: AntigravityInstructions,
 	home: string,
-	ledger: string,
+	previousLedger: string,
 ): Promise<void> {
+	const ledger = join(home, `.${ANTIGRAVITY_CLIENT_NAME}`, "antigravity-skills.json");
 	await Promise.all([
 		writeRule(
 			instructions.agentsFile,
 			join(home, ".gemini", "config", "rules", `${ANTIGRAVITY_CLIENT_NAME}-agents.md`),
 		),
-		writeSkills(instructions.skills, join(home, ".gemini", "antigravity-cli", "skills"), ledger),
+		writeSkills(instructions.skills, join(home, ".gemini", "antigravity-cli", "skills"), ledger, previousLedger),
 	]);
 }
 
@@ -55,12 +109,18 @@ async function writeRule(file: AntigravityInstructions["agentsFile"], path: stri
 /** The Agent Skills name rule, which agy requires of a skill folder name. */
 const SKILL_NAME = /^(?=.{1,64}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
-async function writeSkills(skills: AntigravityInstructions["skills"], dir: string, ledger: string): Promise<void> {
+async function writeSkills(
+	skills: AntigravityInstructions["skills"],
+	dir: string,
+	ledger: string,
+	previousLedger: string,
+): Promise<void> {
 	// Names become folder names and reach PiServer as wire input; a name outside the rule is skipped.
 	const wanted = new Map(
 		skills.filter((skill) => SKILL_NAME.test(skill.name)).map((skill) => [skill.name, declareSkill(skill)]),
 	);
-	const written = await readLedger(ledger);
+	const previous = pathsEqual(ledger, previousLedger) ? undefined : await readLedger(previousLedger);
+	const written = { ...previous, ...(await readLedger(ledger)) };
 	for (const entry of await readEntries(dir)) {
 		const content = entry.isDirectory()
 			? await readFile(join(dir, entry.name, "SKILL.md"), "utf8").catch(() => undefined)
@@ -77,6 +137,8 @@ async function writeSkills(skills: AntigravityInstructions["skills"], dir: strin
 		ledger,
 		JSON.stringify(Object.fromEntries([...wanted].map(([name, content]) => [name, digest(content)]))),
 	);
+	if (previous && !pathsEqual(canonicalizePath(previousLedger), canonicalizePath(ledger)))
+		await rm(previousLedger, { force: true });
 }
 
 async function readEntries(dir: string) {
@@ -89,11 +151,12 @@ async function readEntries(dir: string) {
 }
 
 /** Skill name to the digest of the SKILL.md Pi wrote. A missing or torn ledger records nothing. */
-async function readLedger(path: string): Promise<Record<string, string>> {
+async function readLedger(path: string): Promise<Record<string, string> | undefined> {
 	try {
 		return JSON.parse(await readFile(path, "utf8")) as Record<string, string>;
-	} catch {
-		return {};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
+		throw error;
 	}
 }
 

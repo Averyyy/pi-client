@@ -58,12 +58,12 @@ function trace(): { method: string; params?: unknown; result?: unknown }[] {
 		.map((line) => JSON.parse(line));
 }
 
-/** A PiServer session store whose agy workspace can start the fixture CLI, like the test directory. */
+/** Give the server's agy workspace the fixture CLI and return the requested session store. */
 function serverStore(name: string): string {
-	const store = join(cwd, name);
-	mkdirSync(join(store, "antigravity-workspace"), { recursive: true });
-	copyFileSync(join(cwd, "acp"), join(store, "antigravity-workspace", "acp"));
-	return store;
+	const workspace = join(cwd, "home", ".avery-ui", "antigravity-workspace");
+	mkdirSync(workspace, { recursive: true });
+	copyFileSync(join(cwd, "acp"), join(workspace, "acp"));
+	return join(cwd, name);
 }
 
 function signedIn(): void {
@@ -168,7 +168,7 @@ describe("Antigravity ACP", () => {
 		const traced = existsSync(join(cwd, "trace.jsonl")) ? trace().length : 0;
 		expect(await runtime.streamSimple(model, context).result()).toMatchObject({
 			stopReason: "error",
-			errorMessage: expect.stringContaining("only as the agent of an interactive Pi session"),
+			errorMessage: expect.stringContaining("requires an interactive user turn in avery-ui"),
 		});
 		expect(trace()).toHaveLength(traced);
 		const adapter = new AntigravityRuntime(cwd);
@@ -204,7 +204,7 @@ describe("Antigravity ACP", () => {
 					method: "initialize",
 					params: {
 						protocolVersion: 1,
-						clientInfo: { name: "avery-ui", title: "Avery UI" },
+						clientInfo: { name: "avery-ui", title: "avery-ui" },
 						clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
 					},
 				},
@@ -587,8 +587,12 @@ describe("Antigravity ACP", () => {
 		signedIn();
 		const runtime = await createRuntime();
 		const discovery = trace().length;
-		const agentDir = join(cwd, "agent");
+		const agentDir = join(cwd, "home", ".pi", "agent");
 		const skillPath = (name: string) => join(agentDir, "skills", name, "SKILL.md");
+		for (const name of ["review", "manual"]) {
+			mkdirSync(dirname(skillPath(name)), { recursive: true });
+			writeFileSync(skillPath(name), `Read ${name}: keep .pi in user content.`);
+		}
 		const skill = (name: string, disableModelInvocation: boolean): Skill => ({
 			name,
 			description: `Use ${name}`,
@@ -620,17 +624,33 @@ describe("Antigravity ACP", () => {
 		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
 		try {
 			await session.bindExtensions({});
-			await session.prompt("first");
+			await session.prompt("read-skill review");
+			expect(session.messages.at(-1)).toMatchObject({
+				content: expect.arrayContaining([
+					{ type: "text", text: JSON.stringify(["Read review: keep .pi in user content.", "written"]) },
+				]),
+			});
+			expect(readFileSync(join(dirname(skillPath("review")), "result.txt"), "utf8")).toBe("written");
+			await session.prompt("/skill:manual use .pi verbatim");
 			const gemini = join(cwd, "home", ".gemini");
 			// agy reads the project's AGENTS.md itself; Pi adds only the global one.
 			expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toBe("Global rules");
 			expect(readdirSync(join(gemini, "antigravity-cli", "skills"))).toEqual(["review"]);
 			expect(readFileSync(join(gemini, "antigravity-cli", "skills", "review", "SKILL.md"), "utf8")).toContain(
-				`read its instructions in \`${skillPath("review")}\``,
+				`read its instructions in \`${join(cwd, "home", ".avery-ui", "skills", "review", "SKILL.md")}\``,
 			);
 			const requests = trace().slice(discovery);
 			expect(requests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
-				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "first" }] },
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "read-skill review" }] },
+				{
+					sessionId: "mock-agy-session",
+					prompt: [
+						{
+							type: "text",
+							text: `<skill name="manual" location="${join(cwd, "home", ".avery-ui", "skills", "manual", "SKILL.md")}">\nReferences are relative to ${join(cwd, "home", ".avery-ui", "skills", "manual")}.\n\nRead manual: keep .pi in user content.\n</skill>\n\nuse .pi verbatim`,
+						},
+					],
+				},
 			]);
 		} finally {
 			session.dispose();
@@ -653,30 +673,40 @@ describe("Antigravity ACP", () => {
 			),
 		);
 		const models = await createRuntime();
+		const baseDir = join(cwd, "home", ".pi", "agent", "skills", "deploy");
+		mkdirSync(baseDir, { recursive: true });
+		writeFileSync(join(baseDir, "SKILL.md"), "Client deploy");
+		const workspace = new AntigravityWorkspace(cwd);
 		const stream = await streamPiServerAntigravity(
 			models.getModel(providerId, "gemini-test")!,
-			normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }),
-			{ sessionId: "instructions-session", antigravityCwd: cwd },
+			normalizeContext({ messages: [{ role: "user", content: "read-skill deploy", timestamp: 1 }] }),
+			{ sessionId: "instructions-session" },
 			{
+				workspace: (request, signal) => workspace.handle(request, signal),
 				instructions: {
 					agentsFile: { path: "/client/.pi/agent/AGENTS.md", content: "Client rules" },
 					skills: [
 						{
 							name: "deploy",
 							description: "Deploy the app",
-							filePath: "/client/.pi/agent/skills/deploy/SKILL.md",
-							baseDir: "/client/.pi/agent/skills/deploy",
+							filePath: join(baseDir, "SKILL.md"),
+							baseDir,
 						},
 					],
 				},
 			},
 		);
-		expect((await stream.result()).stopReason).toBe("stop");
+		expect(await stream.result()).toMatchObject({
+			stopReason: "stop",
+			content: expect.arrayContaining([{ type: "text", text: JSON.stringify(["Client deploy", "written"]) }]),
+		});
+		workspace.close();
+		expect(readFileSync(join(baseDir, "result.txt"), "utf8")).toBe("written");
 		const gemini = join(cwd, "home", ".gemini");
 		expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toContain("Client rules");
 		// The declaration points at the client's file, which agy reads through the client's workspace.
 		expect(readFileSync(join(gemini, "antigravity-cli", "skills", "deploy", "SKILL.md"), "utf8")).toContain(
-			"`/client/.pi/agent/skills/deploy/SKILL.md`",
+			`\`${join(cwd, "home", ".avery-ui", "skills", "deploy", "SKILL.md")}\``,
 		);
 	});
 

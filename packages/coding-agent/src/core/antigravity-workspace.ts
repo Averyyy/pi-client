@@ -82,7 +82,7 @@ export class AntigravityWorkspace {
 				return {};
 			}
 			default:
-				throw new McpError(-32601, `Pi does not serve ACP method ${method}`);
+				throw new McpError(-32601, `Unsupported ACP workspace method ${method}`);
 		}
 	}
 

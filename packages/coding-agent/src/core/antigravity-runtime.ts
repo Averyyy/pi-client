@@ -27,12 +27,17 @@ import {
 	type AcpConfigOption,
 	type AcpInitialize,
 	type AcpSession,
+	ANTIGRAVITY_CLIENT_NAME,
 	ANTIGRAVITY_PROVIDER,
 	AntigravityAcp,
 	acpChoices,
 	isAntigravityAuthRequired,
 } from "./antigravity-acp.ts";
-import { type AntigravityInstructions, installAntigravityInstructions } from "./antigravity-instructions.ts";
+import {
+	type AntigravityInstructions,
+	aliasAntigravitySkills,
+	installAntigravityInstructions,
+} from "./antigravity-instructions.ts";
 import {
 	type AcpFormRequest,
 	type AcpPlanEntry,
@@ -126,8 +131,7 @@ interface ActiveTurn {
 }
 
 /** Why agy refuses requests that do not come from the person driving a Pi session. */
-export const ANTIGRAVITY_SESSION_ONLY =
-	"Antigravity runs only as the agent of an interactive Pi session. Choose another model for summaries and extension requests, for example with the compaction.model setting.";
+export const ANTIGRAVITY_SESSION_ONLY = `Antigravity requires an interactive user turn in ${ANTIGRAVITY_CLIENT_NAME}. Choose another model for summaries and extension requests, for example with the compaction.model setting.`;
 
 /**
  * A Pi session's live Antigravity conversation. agy owns its instructions, context, and tools;
@@ -286,7 +290,10 @@ export class AntigravityRuntime {
 			record,
 			answerQuestion: async (request) => {
 				if (!client.answerQuestion)
-					throw new McpError(-32601, "Pi has no interactive UI for Antigravity elicitation");
+					throw new McpError(
+						-32601,
+						`${ANTIGRAVITY_CLIENT_NAME} has no interactive UI for Antigravity elicitation`,
+					);
 				const answerQuestion = client.answerQuestion;
 				return track(
 					(async () => {
@@ -337,13 +344,13 @@ export class AntigravityRuntime {
 		// agy reads its global rules and skills when it starts, so Pi writes its own there first.
 		if (client.instructions) {
 			await installAntigravityInstructions(
-				client.instructions,
+				this.host === "Pi" ? await aliasAntigravitySkills(client.instructions) : client.instructions,
 				homedir(),
 				join(getAgentDir(), "antigravity-skills.json"),
 			);
 		}
 		if (tools.length > 0) {
-			if (!client.executeTool) throw new Error("Antigravity requires a Pi session to execute custom tools");
+			if (!client.executeTool) throw new Error("Antigravity custom tools require a client tool executor");
 			this.toolServer = await openAntigravityTools(tools, () => this.activeTurn?.executeTool);
 		}
 		// Launched exactly as editors launch it: `agy acp`, nothing else.
@@ -417,13 +424,13 @@ export class AntigravityRuntime {
 		if (method === "elicitation/create") {
 			const request = params as AcpFormRequest;
 			if (request.sessionId !== this.conversation?.sessionId || !this.activeTurn) {
-				throw new McpError(-32602, "Antigravity elicitation requires an active interactive Pi session");
+				throw new McpError(-32602, "Antigravity elicitation requires an active interactive session");
 			}
 			return this.activeTurn.answerQuestion(request);
 		}
 		if (method.startsWith("fs/") || method.startsWith("terminal/")) {
 			const turn = this.activeTurn;
-			if (!turn?.client.workspace) throw new McpError(-32601, `Pi serves ${method} only during a turn`);
+			if (!turn?.client.workspace) throw new McpError(-32601, `${method} requires an active workspace turn`);
 			const request = params as JsonObject;
 			const result = await turn.client.workspace({ method, params: request, root: this.cwd }, turn.signal);
 			this.conversation?.nativeTools.observe(method, request, result);

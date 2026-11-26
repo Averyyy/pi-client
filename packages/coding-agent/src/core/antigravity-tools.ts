@@ -95,8 +95,9 @@ async function dispatch(
 			return { tools };
 		case "tools/call": {
 			const { name, arguments: args = {} } = params as { name: string; arguments?: JsonObject };
-			if (!tools.some((tool) => tool.name === name)) throw new McpError(-32602, `Unknown Pi tool ${name}`);
-			if (!execute) throw new McpError(-32000, "Pi has no active Antigravity turn");
+			if (!tools.some((tool) => tool.name === name))
+				throw new McpError(-32602, `Unknown ${ANTIGRAVITY_CLIENT_NAME} tool ${name}`);
+			if (!execute) throw new McpError(-32000, "No active Antigravity turn");
 			const { result, isError } = await execute({ type: "toolCall", id: randomUUID(), name, arguments: args });
 			return {
 				content: result.content,
@@ -105,6 +106,6 @@ async function dispatch(
 			};
 		}
 		default:
-			throw new McpError(-32601, `Unsupported Pi MCP method ${method}`);
+			throw new McpError(-32601, `Unsupported MCP method ${method}`);
 	}
 }

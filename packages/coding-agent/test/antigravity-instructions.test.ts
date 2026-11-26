@@ -4,15 +4,17 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type AntigravityInstructions,
+	aliasAntigravitySkills,
 	installAntigravityInstructions,
 	readAntigravityInstructions,
 } from "../src/core/antigravity-instructions.ts";
@@ -24,8 +26,10 @@ let home: string;
 const rule = () => join(home, ".gemini", "config", "rules", "avery-ui-agents.md");
 const skills = () => join(home, ".gemini", "antigravity-cli", "skills");
 const skillFile = (name: string) => join(skills(), name, "SKILL.md");
-const ledger = () => join(home, ".pi", "agent", "antigravity-skills.json");
-const install = (instructions: AntigravityInstructions) => installAntigravityInstructions(instructions, home, ledger());
+const ledger = () => join(home, ".avery-ui", "antigravity-skills.json");
+const previousLedger = () => join(home, ".pi", "agent", "antigravity-skills.json");
+const install = (instructions: AntigravityInstructions) =>
+	installAntigravityInstructions(instructions, home, previousLedger());
 
 function piSkill(name: string, description = `Use ${name}`): AntigravityInstructions["skills"][number] {
 	return { name, description, filePath: `/pi/skills/${name}/SKILL.md`, baseDir: `/pi/skills/${name}` };
@@ -36,6 +40,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.unstubAllEnvs();
 	rmSync(home, { recursive: true, force: true });
 });
 
@@ -94,10 +99,63 @@ describe("installAntigravityInstructions", () => {
 		expect(readdirSync(skills())).toEqual([]);
 	});
 
+	it("uses the old ledger to update owned declarations and keep edited ones during migration", async () => {
+		await install({ skills: [piSkill("review"), piSkill("stale"), piSkill("edited")] });
+		mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+		renameSync(ledger(), previousLedger());
+		writeFileSync(skillFile("edited"), "my changes");
+		const baseDir = join(home, ".avery-ui", "skills", "review");
+		await install({ skills: [{ ...piSkill("review"), baseDir, filePath: join(baseDir, "SKILL.md") }] });
+		expect(readFileSync(skillFile("review"), "utf8")).toContain(baseDir);
+		expect(readFileSync(skillFile("edited"), "utf8")).toBe("my changes");
+		expect(existsSync(skillFile("stale"))).toBe(false);
+		expect(Object.keys(JSON.parse(readFileSync(ledger(), "utf8")))).toEqual(["review"]);
+		expect(existsSync(previousLedger())).toBe(false);
+	});
+
 	it("skips names agy cannot use as a skill folder, which also keeps writes inside the skills directory", async () => {
 		await install({ skills: [piSkill("../escape"), piSkill("Upper"), piSkill("a".repeat(65)), piSkill("ok-name")] });
 		expect(readdirSync(skills())).toEqual(["ok-name"]);
 		expect(existsSync(join(home, ".gemini", "antigravity-cli", "escape"))).toBe(false);
+	});
+});
+
+describe("aliasAntigravitySkills", () => {
+	it("resolves same-named global and project skills independently and preserves other directories", async () => {
+		vi.stubEnv("HOME", home);
+		vi.stubEnv("USERPROFILE", home);
+		const roots = [
+			join(home, ".pi", "agent", "skills"),
+			join(home, "project", ".pi", "skills"),
+			join(home, "project", ".pi-backup", "skills"),
+		];
+		const skills = roots.map((root, index) => {
+			const baseDir = join(root, "review");
+			const filePath = join(baseDir, "SKILL.md");
+			mkdirSync(baseDir, { recursive: true });
+			writeFileSync(filePath, String(index));
+			return { ...piSkill("review"), baseDir, filePath };
+		});
+		const projected = await aliasAntigravitySkills({ skills });
+		expect(projected.skills[0].baseDir).toBe(join(home, ".avery-ui", "skills", "review"));
+		expect(projected.skills[1].baseDir).toContain(join(home, ".avery-ui", "projects"));
+		expect(projected.skills[2]).toEqual(skills[2]);
+		expect(projected.skills.map((skill) => readFileSync(skill.filePath, "utf8"))).toEqual(["0", "1", "2"]);
+		expect(await aliasAntigravitySkills({ skills })).toEqual(projected);
+	});
+
+	it("preserves an existing directory at the alias path", async () => {
+		vi.stubEnv("HOME", home);
+		vi.stubEnv("USERPROFILE", home);
+		const baseDir = join(home, ".pi", "agent", "skills", "review");
+		const alias = join(home, ".avery-ui", "skills");
+		mkdirSync(baseDir, { recursive: true });
+		mkdirSync(alias, { recursive: true });
+		writeFileSync(join(alias, "mine"), "owned by user");
+		await expect(
+			aliasAntigravitySkills({ skills: [{ ...piSkill("review"), baseDir, filePath: join(baseDir, "SKILL.md") }] }),
+		).rejects.toThrow();
+		expect(readFileSync(join(alias, "mine"), "utf8")).toBe("owned by user");
 	});
 });
 
