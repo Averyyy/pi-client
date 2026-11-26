@@ -4089,7 +4089,7 @@ export class InteractiveMode {
 								text,
 							)
 					: undefined;
-				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, colorFn));
+				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, event.model, colorFn));
 				this.ui.requestRender();
 				break;
 			}
@@ -4203,7 +4203,7 @@ export class InteractiveMode {
 									text,
 								)
 						: undefined;
-					this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, colorFn));
+					this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, event.model, colorFn));
 				}
 				this.ui.requestRender();
 				break;
