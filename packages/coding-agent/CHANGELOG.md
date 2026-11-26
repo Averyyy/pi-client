@@ -9,6 +9,7 @@
 ### Changed
 
 - The default model for `cloudflare-workers-ai` and `cloudflare-ai-gateway` is now `@cf/zai-org/glm-5.3`, because Cloudflare deprecated Workers AI Kimi K2.6 and K2.7 Code
+- New Antigravity conversations start in `auto` permission mode.
 
 ### Added
 

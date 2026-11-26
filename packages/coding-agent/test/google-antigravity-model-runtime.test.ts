@@ -197,7 +197,7 @@ describe("Antigravity ACP", () => {
 			// agy keeps its own instructions and context: no Pi system prompt, no earlier turns.
 			expect(
 				trace()
-					.slice(-4)
+					.slice(traced)
 					.map(({ method, params }) => ({ method, params })),
 			).toEqual([
 				{
@@ -209,6 +209,10 @@ describe("Antigravity ACP", () => {
 					},
 				},
 				{ method: "session/new", params: { cwd, mcpServers: [] } },
+				{
+					method: "session/set_config_option",
+					params: { sessionId: "mock-agy-session", configId: "mode", value: "auto" },
+				},
 				{
 					method: "session/set_config_option",
 					params: { sessionId: "mock-agy-session", configId: "model", value: "orchestrator-test" },
@@ -530,7 +534,14 @@ describe("Antigravity ACP", () => {
 			await session.bindExtensions({});
 			await session.prompt("first");
 			await restartServer("store");
+			const beforeResume = trace().length;
 			await session.prompt("second");
+			expect(trace().slice(beforeResume)).not.toContainEqual(
+				expect.objectContaining({
+					method: "session/set_config_option",
+					params: expect.objectContaining({ configId: "mode" }),
+				}),
+			);
 			await restartServer("lost");
 			await session.prompt("third");
 			expect(session.messages.findLast((message) => message.role === "assistant")).toMatchObject({

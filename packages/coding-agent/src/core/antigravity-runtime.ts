@@ -369,6 +369,9 @@ export class AntigravityRuntime {
 		const saved = reply !== undefined && this.saved?.reply === reply ? this.saved : undefined;
 		const resumed = saved && (await this.resume(acp, agentCapabilities, sessionParams, saved.sessionId, signal));
 		const session = resumed ?? (await acp.request<AcpSession>("session/new", sessionParams, signal));
+		if (!resumed) {
+			session.configOptions = await setConfigOption(acp, session.sessionId, "mode", "auto", signal);
+		}
 		this.conversation = {
 			sessionId: session.sessionId,
 			configOptions: session.configOptions ?? [],

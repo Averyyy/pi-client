@@ -18,6 +18,7 @@ function startAcp() {
 	];
 	let model = models[0].value;
 	let effort = "medium";
+	let mode = "default";
 	let mcp;
 	let cancelId;
 	let permission;
@@ -40,6 +41,8 @@ function startAcp() {
 	const updateNative = (update) => send({ method: "session/update", params: { sessionId, update } });
 	const configs = () => [
 		{ id: "model", type: "select", currentValue: model, options: models },
+		{ id: "mode", category: "mode", type: "select", currentValue: mode,
+			options: ["default", "auto"].map((value) => ({ value, name: value })) },
 		...(model === "gemini-test" ? [{
 			id: "effort", category: "thought_level", type: "select", currentValue: effort,
 			options: ["off", "medium", "high"].map((value) => ({ value, name: value })),
@@ -102,6 +105,7 @@ function startAcp() {
 				assert.equal(params.sessionId, sessionId);
 				if (params.configId === "model") model = params.value;
 				else if (params.configId === "effort") effort = params.value;
+				else if (params.configId === "mode") mode = params.value;
 				else throw new Error(`Unexpected ACP configuration ${params.configId}`);
 				reply({ configOptions: configs() });
 				break;
