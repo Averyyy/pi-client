@@ -1431,6 +1431,7 @@ export async function streamPiServer(
 							questions: !!agy.answerQuestion,
 							cwd: options?.antigravityCwd,
 							tools: agy.toolNames,
+							instructions: agy.instructions,
 						}
 					: undefined,
 				...(contextHashes && contextPrefixes

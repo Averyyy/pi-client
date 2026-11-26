@@ -7,6 +7,12 @@ import { killProcessTree } from "../utils/shell.ts";
 
 export const ANTIGRAVITY_PROVIDER = "google-antigravity" as const;
 
+/**
+ * How this client names itself to agy: in ACP `clientInfo`, as its MCP server, and in agy's rule
+ * file. It is the Averyyy fork, not upstream Pi, so it does not report Pi's name.
+ */
+export const ANTIGRAVITY_CLIENT_NAME = "avery-ui";
+
 export function isAntigravityAuthRequired(error: unknown): boolean {
 	return error instanceof McpError && error.code === -32000 && error.message === "Authentication required";
 }
@@ -113,7 +119,7 @@ export class AntigravityAcp {
 			"initialize",
 			{
 				protocolVersion: ACP_PROTOCOL_VERSION,
-				clientInfo: { name: "pi", title: "Pi" },
+				clientInfo: { name: ANTIGRAVITY_CLIENT_NAME, title: "Avery UI" },
 				clientCapabilities: {
 					fs: { readTextFile: features.workspace, writeTextFile: features.workspace },
 					terminal: features.workspace,

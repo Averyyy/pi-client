@@ -8,6 +8,7 @@ import {
 	parseJsonRpcMessage,
 	SUPPORTED_PROTOCOL_VERSIONS,
 } from "@earendil-works/pi-mcp";
+import { ANTIGRAVITY_CLIENT_NAME } from "./antigravity-acp.ts";
 
 export type AntigravityToolExecutor = (toolCall: ToolCall) => Promise<AgentToolCallOutcome>;
 
@@ -63,7 +64,7 @@ export async function openAntigravityTools(
 	});
 	const { port } = server.address() as { port: number };
 	return {
-		config: { type: "http", name: "pi", url: `http://127.0.0.1:${port}${path}`, headers: [] },
+		config: { type: "http", name: ANTIGRAVITY_CLIENT_NAME, url: `http://127.0.0.1:${port}${path}`, headers: [] },
 		close: () => {
 			server.close();
 			server.closeAllConnections();
@@ -85,7 +86,7 @@ async function dispatch(
 					? protocolVersion
 					: LATEST_PROTOCOL_VERSION,
 				capabilities: { tools: {} },
-				serverInfo: { name: "pi", version: "1.0.0" },
+				serverInfo: { name: ANTIGRAVITY_CLIENT_NAME, version: "1.0.0" },
 			};
 		}
 		case "ping":

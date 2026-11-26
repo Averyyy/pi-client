@@ -1,8 +1,17 @@
 import { once } from "node:events";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	type AssistantMessage,
 	InMemoryCredentialStore,
@@ -24,6 +33,8 @@ import { closePiServerObserver } from "../src/core/pi-server-observer.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import type { Skill } from "../src/core/skills.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { createTestUiContext } from "./suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
@@ -70,6 +81,9 @@ beforeEach(() => {
 	vi.stubEnv("PI_ANTIGRAVITY_CLI", process.execPath);
 	vi.stubEnv("PI_ACP_FIXTURE_DIR", cwd);
 	vi.stubEnv("PI_SERVER_MODE", "false");
+	// agy's native rule and skill files go to its user's home; keep them out of the real one.
+	vi.stubEnv("HOME", join(cwd, "home"));
+	vi.stubEnv("USERPROFILE", join(cwd, "home"));
 });
 
 afterEach(async () => {
@@ -190,7 +204,7 @@ describe("Antigravity ACP", () => {
 					method: "initialize",
 					params: {
 						protocolVersion: 1,
-						clientInfo: { name: "pi", title: "Pi" },
+						clientInfo: { name: "avery-ui", title: "Avery UI" },
 						clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
 					},
 				},
@@ -569,6 +583,103 @@ describe("Antigravity ACP", () => {
 		await vi.waitFor(() => expect(released).toBe(true));
 	});
 
+	it("writes the global AGENTS.md and Pi skills as agy's native files, and still prompts only the user's input", async () => {
+		signedIn();
+		const runtime = await createRuntime();
+		const discovery = trace().length;
+		const agentDir = join(cwd, "agent");
+		const skillPath = (name: string) => join(agentDir, "skills", name, "SKILL.md");
+		const skill = (name: string, disableModelInvocation: boolean): Skill => ({
+			name,
+			description: `Use ${name}`,
+			filePath: skillPath(name),
+			baseDir: dirname(skillPath(name)),
+			sourceInfo: createSyntheticSourceInfo(skillPath(name), { source: "user" }),
+			disableModelInvocation,
+		});
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model: runtime.getModel(providerId, "gemini-test")!,
+			modelRuntime: runtime,
+			sessionManager: SessionManager.inMemory(cwd),
+			settingsManager: SettingsManager.inMemory(),
+			resourceLoader: {
+				...createTestResourceLoader(),
+				getAgentsFiles: () => ({
+					agentsFiles: [
+						{ path: join(agentDir, "AGENTS.md"), content: "Global rules" },
+						{ path: join(cwd, "AGENTS.md"), content: "Project rules" },
+					],
+				}),
+				getSkills: () => ({ skills: [skill("review", false), skill("manual", true)], diagnostics: [] }),
+			},
+			noTools: "all",
+			autoSessionName: false,
+		});
+		const close = vi.spyOn(AntigravityRuntime.prototype, "close");
+		try {
+			await session.bindExtensions({});
+			await session.prompt("first");
+			const gemini = join(cwd, "home", ".gemini");
+			// agy reads the project's AGENTS.md itself; Pi adds only the global one.
+			expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toBe("Global rules");
+			expect(readdirSync(join(gemini, "antigravity-cli", "skills"))).toEqual(["review"]);
+			expect(readFileSync(join(gemini, "antigravity-cli", "skills", "review", "SKILL.md"), "utf8")).toContain(
+				`read its instructions in \`${skillPath("review")}\``,
+			);
+			const requests = trace().slice(discovery);
+			expect(requests.filter((entry) => entry.method === "session/prompt").map((entry) => entry.params)).toEqual([
+				{ sessionId: "mock-agy-session", prompt: [{ type: "text", text: "first" }] },
+			]);
+		} finally {
+			session.dispose();
+			await Promise.all(close.mock.results.map(({ value }) => value));
+		}
+	});
+
+	it("writes the client's instructions as agy's native files on the PiServer host", async () => {
+		signedIn();
+		vi.stubEnv("PI_SERVER_MODE", "true");
+		vi.stubEnv("PI_SERVER_AUTH_TOKEN", "fixture");
+		vi.stubEnv(
+			"PI_SERVER_URL",
+			await listen(
+				createPiServer({
+					sessionStoreDir: serverStore("server"),
+					accountStoreDir: join(cwd, "accounts"),
+					authToken: "fixture",
+				}),
+			),
+		);
+		const models = await createRuntime();
+		const stream = await streamPiServerAntigravity(
+			models.getModel(providerId, "gemini-test")!,
+			normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }),
+			{ sessionId: "instructions-session", antigravityCwd: cwd },
+			{
+				instructions: {
+					agentsFile: { path: "/client/.pi/agent/AGENTS.md", content: "Client rules" },
+					skills: [
+						{
+							name: "deploy",
+							description: "Deploy the app",
+							filePath: "/client/.pi/agent/skills/deploy/SKILL.md",
+							baseDir: "/client/.pi/agent/skills/deploy",
+						},
+					],
+				},
+			},
+		);
+		expect((await stream.result()).stopReason).toBe("stop");
+		const gemini = join(cwd, "home", ".gemini");
+		expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toContain("Client rules");
+		// The declaration points at the client's file, which agy reads through the client's workspace.
+		expect(readFileSync(join(gemini, "antigravity-cli", "skills", "deploy", "SKILL.md"), "utf8")).toContain(
+			"`/client/.pi/agent/skills/deploy/SKILL.md`",
+		);
+	});
+
 	it("keeps automatic session naming out of the live agy conversation", async () => {
 		signedIn();
 		const runtime = await createRuntime();
@@ -857,7 +968,7 @@ describe("Antigravity ACP", () => {
 			expect(trace()).toContainEqual(
 				expect.objectContaining({
 					method: "session/new",
-					params: { cwd, mcpServers: [expect.objectContaining({ name: "pi" })] },
+					params: { cwd, mcpServers: [expect.objectContaining({ name: "avery-ui" })] },
 				}),
 			);
 			expect(trace().find((entry) => entry.method === "mock/tools/list")?.result).toMatchObject({
