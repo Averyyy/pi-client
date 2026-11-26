@@ -613,9 +613,9 @@ describe("Generate E2E Tests", () => {
 	});
 
 	describe.skipIf(!hasCloudflareWorkersAICredentials())(
-		"Cloudflare Workers AI Provider (Kimi K2.6 via OpenAI Completions)",
+		"Cloudflare Workers AI Provider (GLM-5.3 via OpenAI Completions)",
 		() => {
-			const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+			const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 			it("should complete basic text generation", { retry: 3 }, async () => {
 				await basicTextGeneration(llm);

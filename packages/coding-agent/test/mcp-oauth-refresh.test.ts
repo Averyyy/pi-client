@@ -82,12 +82,19 @@ describe("MCP OAuth refresh", () => {
 	it("cancels a sign-in that waits for another process's refresh", async () => {
 		const { server, lockDir, process } = await signedIn();
 		let release = () => {};
+		let locked = () => {};
+		const lockTaken = new Promise<void>((resolve) => {
+			locked = resolve;
+		});
 		const held = process().store.withRefreshLock(
 			() =>
 				new Promise<void>((resolve) => {
 					release = resolve;
+					locked();
 				}),
 		);
+		// Taking the lock is asynchronous: under load the sign-in could otherwise take it first and refresh.
+		await lockTaken;
 		// The sign-in's store, recording its wait for the lock.
 		const store = process().store;
 		let waiting: Promise<unknown> | undefined;

@@ -5,6 +5,8 @@
 ### Changed
 
 - Google Antigravity runs through the local CLI in pi-coding-agent.
+- Qwen Token Plan Individual now lists `qwen4-max` instead of the retired `qwen4-max-preview`
+- Together drops its reasoning-effort overrides for `openai/gpt-oss-20b`, `openai/gpt-oss-120b` and `deepseek-ai/DeepSeek-V4-Pro-0813`, which the upstream catalog deprecated (they were skipped already); every listed Together reasoning model takes the Together thinking toggle
 
 ### Added
 
