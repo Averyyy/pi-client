@@ -7,6 +7,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction, oneOffRequest, type SessionStreamOptions } from "./agent-session.ts";
 import { ANTIGRAVITY_PROVIDER } from "./antigravity-acp.ts";
+import { readAntigravityInstructions } from "./antigravity-instructions.ts";
 import { answerAntigravityQuestion } from "./antigravity-interactions.ts";
 import { type AntigravityClient, AntigravityRuntime } from "./antigravity-runtime.ts";
 import { AntigravityWorkspace } from "./antigravity-workspace.ts";
@@ -485,6 +486,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						extensionRunnerRef.current?.getUIContext().select(title, choices, { signal }) ??
 						Promise.resolve(undefined),
 					workspace: (request, signal) => antigravityWorkspace.handle(request, signal),
+					instructions: readAntigravityInstructions(session.resourceLoader, agentDir),
 				};
 				return antigravity
 					? antigravity.stream(model, context, requestOptions, client)

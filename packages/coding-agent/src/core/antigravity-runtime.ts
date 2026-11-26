@@ -1,5 +1,6 @@
 // A Pi session's live agy ACP conversation: agy is the agent, Pi shows and records its turns.
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { type AgentToolCallOutcome, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
@@ -29,6 +30,7 @@ import {
 	acpChoices,
 	isAntigravityAuthRequired,
 } from "./antigravity-acp.ts";
+import { type AntigravityInstructions, installAntigravityInstructions } from "./antigravity-instructions.ts";
 import {
 	type AcpFormRequest,
 	type AcpPlanEntry,
@@ -88,6 +90,8 @@ export interface AntigravityClient {
 	workspace?: (request: AntigravityWorkspaceRequest, signal: AbortSignal) => Promise<unknown>;
 	/** Pi tools agy may call over MCP: those from extensions and the SDK, never Pi's built-in tools. */
 	toolNames?: readonly string[];
+	/** Pi's global AGENTS.md and skills, written as agy's global rule and skill files before agy starts. */
+	instructions?: AntigravityInstructions;
 }
 
 /** What a host stores to resume a conversation in a new agy process. */
@@ -125,7 +129,8 @@ export const ANTIGRAVITY_SESSION_ONLY =
 
 /**
  * A Pi session's live Antigravity conversation. agy owns its instructions, context, and tools;
- * Pi sends only what the user enters each turn and records agy's replies and tool calls.
+ * Pi sends only what the user enters each turn and records agy's replies and tool calls. The
+ * user's global AGENTS.md and Pi skills reach agy only as its own native rule and skill files.
  */
 export class AntigravityRuntime {
 	private readonly cwd: string;
@@ -327,6 +332,8 @@ export class AntigravityRuntime {
 		signal: AbortSignal,
 	): Promise<Conversation> {
 		await this.close();
+		// agy reads its global rules and skills when it starts, so Pi writes its own there first.
+		if (client.instructions) await installAntigravityInstructions(client.instructions, homedir());
 		if (tools.length > 0) {
 			if (!client.executeTool) throw new Error("Antigravity requires a Pi session to execute custom tools");
 			this.toolServer = await openAntigravityTools(tools, () => this.activeTurn?.executeTool);
@@ -342,7 +349,7 @@ export class AntigravityRuntime {
 		if (this.toolServer && !agentCapabilities?.mcpCapabilities?.http) {
 			throw new Error("Antigravity CLI does not support ACP HTTP MCP servers. Update agy.");
 		}
-		// agy keeps its own instructions: Pi sends no system prompt and no transcript.
+		// Beyond its native files, agy keeps its own instructions: Pi sends no system prompt and no transcript.
 		const sessionParams = { cwd: this.cwd, mcpServers: this.toolServer ? [this.toolServer.config] : [] };
 		const saved = reply !== undefined && this.saved?.reply === reply ? this.saved : undefined;
 		const resumed = saved && (await this.resume(acp, agentCapabilities, sessionParams, saved.sessionId, signal));

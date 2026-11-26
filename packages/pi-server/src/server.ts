@@ -66,6 +66,7 @@ import {
 	ANTIGRAVITY_PROVIDER,
 	type AntigravityCallback,
 	type AntigravityClient,
+	type AntigravityInstructions,
 	type AntigravityRuntime,
 	logoutAntigravity,
 } from "@earendil-works/pi-coding-agent/antigravity";
@@ -144,8 +145,11 @@ interface StreamRequestBody {
 	requestKind?: "api" | "simple" | "deferred";
 	deferredHandle?: DeferredHandle;
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	/** A turn of the Pi session's agy conversation, with the client's UI, workspace, and Pi tools. */
-	antigravity?: { questions: boolean; cwd?: string; tools?: string[] };
+	/**
+	 * A turn of the Pi session's agy conversation, with the client's UI, workspace, Pi tools, and the
+	 * instructions PiServer writes as agy's native files on this host.
+	 */
+	antigravity?: { questions: boolean; cwd?: string; tools?: string[]; instructions?: AntigravityInstructions };
 }
 
 interface SessionSyncBody {
@@ -1684,6 +1688,7 @@ async function handleStream(
 					if (!res.destroyed && !res.writableEnded) writeServerSentEvent(res, "antigravity_compaction", update);
 				},
 				toolNames: agy.tools ?? [],
+				instructions: agy.instructions,
 			};
 			agyStream = runtime.stream(
 				resolvedModel,
