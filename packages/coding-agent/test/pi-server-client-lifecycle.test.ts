@@ -73,10 +73,11 @@ describe("pi-server client resource lifecycle", () => {
 	});
 
 	it.each(["success", "http-error", "recovered", "recovery-error", "aborted", "cancel-error"] as const)(
-		"releases ephemeral tracking after %s while preserving unconfirmed cancellation",
+		"keeps no session for an ephemeral request after %s while preserving unconfirmed cancellation",
 		async (outcome) => {
 			const controller = new AbortController();
 			let sessionId = "";
+			let ephemeral: boolean | undefined;
 			let initCount = 0;
 			let streamCount = 0;
 			let abortCount = 0;
@@ -87,11 +88,11 @@ describe("pi-server client resource lifecycle", () => {
 					const body = JSON.parse((init?.body as string | undefined) ?? "{}") as {
 						sessionId?: string;
 						runId?: string;
+						ephemeral?: boolean;
 					};
 					if (path === "/api/session/init") {
-						sessionId = body.sessionId!;
 						initCount++;
-						return Response.json({ sessionId });
+						return Response.json({ sessionId: body.sessionId });
 					}
 					if (path.endsWith("/abort")) {
 						abortCount++;
@@ -106,6 +107,8 @@ describe("pi-server client resource lifecycle", () => {
 					if (path === "/api/stream") {
 						streamCount++;
 						if (streamCount === 1) {
+							sessionId = body.sessionId!;
+							ephemeral = body.ephemeral;
 							if (outcome === "http-error") return Response.json({ error: "rejected" }, { status: 400 });
 							if (outcome === "aborted" || outcome === "cancel-error") controller.abort();
 							if (outcome !== "success")
@@ -135,11 +138,14 @@ describe("pi-server client resource lifecycle", () => {
 				await cancelPiServerOperations(sessionId);
 				expect(abortCount).toBe(2);
 			}
+			// The request without a session ID asked PiServer for no session.
+			expect(ephemeral).toBe(true);
+			expect(initCount).toBe(0);
 			const next = await streamPiServer(model, context, { sessionId });
 			for await (const _event of next) {
-				// Drain the request using the previous ephemeral session identity.
+				// Drain a session request under the previous ephemeral identity.
 			}
-			expect(initCount).toBe(2);
+			expect(initCount).toBe(1);
 		},
 	);
 });

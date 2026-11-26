@@ -305,6 +305,11 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
 	/** Send the context as a delta against PiServer's per-session message store; omitted, it goes inline. */
 	contextStore?: PiServerContextStoreMode;
+	/**
+	 * A one-off request under its own request ID, such as a branch summary: it skips session init and
+	 * PiServer keeps no session or viewer thread for it. Requests without a session ID always are.
+	 */
+	ephemeral?: boolean;
 	/** The Pi session's agy client; the stream then runs a turn of its agy conversation. */
 	antigravity?: AntigravityClient;
 	/** The Pi workspace agy's file and terminal requests run in. */
@@ -1260,7 +1265,8 @@ export async function streamPiServer(
 	assertNoCustomPiServerFetch(options?.apiOptions);
 	const sessionId = options?.sessionId ?? randomUUID();
 	const runId = randomUUID();
-	const isEphemeralSession = options?.sessionId === undefined;
+	// A one-off request needs no server session, so this client tracks nothing for it either.
+	const ephemeral = options?.ephemeral === true || options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const agy = options?.antigravity;
 	if (agy) antigravitySessions.add(sessionId);
@@ -1403,12 +1409,13 @@ export async function streamPiServer(
 		};
 		try {
 			const request = createPiServerRequest(options?.signal);
-			if (!agy) await ensureSessionInit(sessionId, context, request);
+			if (!agy && !ephemeral) await ensureSessionInit(sessionId, context, request);
 			if (observeTiming) sessionInitMs = Math.round(performance.now() - startedAt);
 
 			const makeBody = () => ({
 				sessionId,
 				runId,
+				...(ephemeral ? { ephemeral: true } : {}),
 				...(observeTiming ? { observeTiming: true } : {}),
 				model,
 				options:
@@ -1456,7 +1463,12 @@ export async function streamPiServer(
 					response = await request.postJson("/api/stream", makeBody());
 					failure = response.ok ? { details: "", code: undefined } : await readPiServerFailure(response);
 				}
-				if (!agy && !options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
+				if (
+					!agy &&
+					!ephemeral &&
+					!options?.signal?.aborted &&
+					isRecoverableMissingServerState(response, failure.code)
+				) {
 					resetSessionTracking(sessionId);
 					fullContext = true;
 					await ensureSessionInit(sessionId, context, request);
@@ -1745,7 +1757,6 @@ export async function streamPiServer(
 			});
 			stream.end();
 		} finally {
-			if (isEphemeralSession) resetSessionTracking(sessionId);
 			try {
 				await finishPiServerOperation(
 					operation,
@@ -2030,6 +2041,8 @@ async function postPiServerModelOperation<T, TModel extends AnyModel>(
 			...body,
 			sessionId,
 			runId,
+			// The operation ID is this request's own, so PiServer keeps no viewer thread for it.
+			ephemeral: true,
 			callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 		});
 		if (!response.ok) return await readPiServerJson<T>(response, "pi-server model operation failed");

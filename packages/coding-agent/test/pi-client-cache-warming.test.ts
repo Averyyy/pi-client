@@ -12,6 +12,7 @@ import {
 	getCurrentTools,
 	lazyStream,
 	type Model,
+	normalizeContext,
 	type ProviderHeaders,
 	type SimpleStreamOptions,
 	type TranscriptContext,
@@ -20,7 +21,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/provid
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiServer } from "../../pi-server/src/server.ts";
-import { clearAllSessions, getOrCreateSession } from "../../pi-server/src/session-store.ts";
+import { clearAllSessions, getOrCreateSession, getSession } from "../../pi-server/src/session-store.ts";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { CacheWarmer } from "../src/core/cache-warmer.ts";
@@ -203,7 +204,8 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		);
 		servers.push(backend);
 		const backendUrl = await listen(backend);
-		const requests: { path: string; bytes: number; context?: unknown }[] = [];
+		type RecordedBody = { sessionId?: string; context?: unknown; ephemeral?: boolean };
+		const requests: ({ path: string; bytes: number } & RecordedBody)[] = [];
 		let rejected = 0;
 		const proxy = createServer(async (request, response) => {
 			const chunks: Buffer[] = [];
@@ -213,11 +215,16 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 				request.url === "/api/request/chunk"
 					? (JSON.parse(body.toString("utf8")) as { target: string }).target
 					: request.url;
+			// Direct stream and session-init bodies are small enough to inspect; chunked ones are not.
+			const recorded =
+				request.url === "/api/stream" || request.url === "/api/session/init"
+					? (JSON.parse(body.toString("utf8")) as RecordedBody)
+					: undefined;
 			requests.push({
 				path: request.url ?? "/",
 				bytes: body.length,
-				...(request.url === "/api/stream"
-					? { context: (JSON.parse(body.toString("utf8")) as { context?: unknown }).context }
+				...(recorded
+					? { sessionId: recorded.sessionId, context: recorded.context, ephemeral: recorded.ephemeral }
 					: {}),
 			});
 			if (body.length > 65536) {
@@ -774,6 +781,23 @@ describe("pi-client cache warming through a 65536-byte HTTP proxy", () => {
 		expect(stored).not.toContain("Name this coding session");
 		expect(stored).not.toContain("Write the bug report in Markdown");
 		expect(requests.every((request) => request.bytes <= 65536)).toBe(true);
+	});
+
+	it("keeps requests under their own ID out of PiServer's sessions", async () => {
+		const { session, runtime, requests } = await fixture({ mode: "off" });
+		await session.prompt("hello");
+		const ask = normalizeContext({ messages: [{ role: "user", content: "Summarize", timestamp: 1 }] });
+		// A branch summary runs under its own request ID; an extension completion has none.
+		await (await session.agent.streamFunction(model, ask, { sessionId: "branch-summary" })).result();
+		await runtime.streamSimple(model, ask).result();
+		const streams = requests.filter((request) => request.path === "/api/stream");
+		expect(streams.map((request) => request.ephemeral)).toEqual([undefined, true, true]);
+		expect(streams[1]).toMatchObject({ sessionId: "branch-summary", context: undefined });
+		expect(
+			requests.filter((request) => request.path === "/api/session/init").map((request) => request.sessionId),
+		).toEqual([session.sessionId]);
+		expect(getSession("branch-summary")).toBeUndefined();
+		expect(getSession(streams[2].sessionId!)).toBeUndefined();
 	});
 
 	it("keeps off mode inactive and cancels an idle schedule immediately when disabled", async () => {

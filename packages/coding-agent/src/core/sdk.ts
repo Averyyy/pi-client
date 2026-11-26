@@ -574,6 +574,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: undefined,
 					ownerSessionId: activeAgentSession?.sessionId ?? options?.sessionId,
 					contextStore,
+					// Summaries under their own request ID belong to no PiServer session.
+					ephemeral: options?.sessionId !== sessionManager.getSessionId(),
 					onHistoryReconciled: activeAgentSession
 						? (snapshot: PiServerHistorySnapshot) => activeAgentSession.reconcilePiServerHistory(snapshot)
 						: undefined,
