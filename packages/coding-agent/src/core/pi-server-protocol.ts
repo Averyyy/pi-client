@@ -69,12 +69,21 @@ export function hashPiServerSessionEntries(entries: SessionTreeEntry[]): string 
 }
 
 /**
+ * How a stream request uses the session's context store. "record" keeps the request's new messages
+ * and its reply for later turns. "read" only rebuilds the context from stored messages, for requests
+ * whose context later turns never extend: cache warm replays and one-off requests.
+ */
+export type PiServerContextStoreMode = "record" | "read";
+
+/**
  * A stream context the server rebuilds from its per-session message store: `base` names a
  * prefix the server already holds, and each later item is a message or the hash of a stored one.
  */
 export interface PiServerContextDelta {
 	base?: string;
 	messages: (Message | string)[];
+	/** Defaults to "record", which older clients rely on. */
+	store?: PiServerContextStoreMode;
 }
 
 export const PI_SERVER_EMPTY_CONTEXT_HASH = createHash("sha256").update("pi-context-v1").digest("hex");

@@ -54,6 +54,7 @@ import {
 	hashPiServerStaticContext,
 	PI_SERVER_EMPTY_CONTEXT_HASH,
 	type PiServerContextDelta,
+	type PiServerContextStoreMode,
 	type PiServerProviderCallbackRequest,
 } from "./pi-server-protocol.ts";
 import { ChunkRequest } from "./pi-server-request.ts";
@@ -302,8 +303,13 @@ export interface PiServerStreamOptions extends SimpleStreamOptions, PiServerAcco
 	ephemeralMessages?: Message[];
 	contextOverlay?: Message[];
 	onHistoryReconciled?: (snapshot: PiServerHistorySnapshot) => void | Promise<void>;
-	/** Send the context as a delta against PiServer's per-session message store. */
-	incrementalContext?: boolean;
+	/** Send the context as a delta against PiServer's per-session message store; omitted, it goes inline. */
+	contextStore?: PiServerContextStoreMode;
+	/**
+	 * A one-off request under its own request ID, such as a branch summary: it skips session init and
+	 * PiServer keeps no session or viewer thread for it. Requests without a session ID always are.
+	 */
+	ephemeral?: boolean;
 	/** The Pi session's agy client; the stream then runs a turn of its agy conversation. */
 	antigravity?: AntigravityClient;
 	/** The Pi workspace agy's file and terminal requests run in. */
@@ -1238,7 +1244,7 @@ export function streamPiServerAntigravity(
 	return streamPiServer({ ...model, headers: undefined }, context, {
 		antigravity: client,
 		antigravityCwd: options?.antigravityCwd,
-		incrementalContext: true,
+		contextStore: "record",
 		sessionId: options?.sessionId,
 		ownerSessionId: options?.sessionId,
 		signal: options?.signal,
@@ -1259,12 +1265,16 @@ export async function streamPiServer(
 	assertNoCustomPiServerFetch(options?.apiOptions);
 	const sessionId = options?.sessionId ?? randomUUID();
 	const runId = randomUUID();
-	const isEphemeralSession = options?.sessionId === undefined;
+	// A one-off request needs no server session, so this client tracks nothing for it either.
+	const ephemeral = options?.ephemeral === true || options?.sessionId === undefined;
 	const operation = registerPiServerOperation(options?.ownerSessionId ?? sessionId, sessionId, runId, options?.signal);
 	const agy = options?.antigravity;
 	if (agy) antigravitySessions.add(sessionId);
 	const contextMessages = [...(context.messages as Message[]), ...(options?.ephemeralMessages ?? [])];
-	const contextHashes = options?.incrementalContext
+	const contextStore = options?.contextStore;
+	// Only a recorded context teaches this client which prefixes and replies PiServer holds.
+	const recordContext = contextStore === "record";
+	const contextHashes = contextStore
 		? contextMessages.map((message) => hashPiServerContextJson(JSON.stringify(message)))
 		: undefined;
 	const contextPrefixes = contextHashes && buildPiServerContextPrefixes(contextHashes);
@@ -1399,12 +1409,13 @@ export async function streamPiServer(
 		};
 		try {
 			const request = createPiServerRequest(options?.signal);
-			if (!agy) await ensureSessionInit(sessionId, context, request);
+			if (!agy && !ephemeral) await ensureSessionInit(sessionId, context, request);
 			if (observeTiming) sessionInitMs = Math.round(performance.now() - startedAt);
 
 			const makeBody = () => ({
 				sessionId,
 				runId,
+				...(ephemeral ? { ephemeral: true } : {}),
 				...(observeTiming ? { observeTiming: true } : {}),
 				model,
 				options:
@@ -1424,14 +1435,17 @@ export async function streamPiServer(
 					: undefined,
 				...(contextHashes && contextPrefixes
 					? {
-							context: fullContext
-								? { messages: contextMessages }
-								: encodePiServerContext(
-										contextMessages,
-										contextHashes,
-										contextPrefixes,
-										contextKnowledge.get(sessionId),
-									),
+							context: {
+								...(fullContext
+									? { messages: contextMessages }
+									: encodePiServerContext(
+											contextMessages,
+											contextHashes,
+											contextPrefixes,
+											contextKnowledge.get(sessionId),
+										)),
+								store: contextStore,
+							},
 						}
 					: { contextOverlay: options?.contextOverlay ?? contextMessages }),
 			});
@@ -1449,7 +1463,12 @@ export async function streamPiServer(
 					response = await request.postJson("/api/stream", makeBody());
 					failure = response.ok ? { details: "", code: undefined } : await readPiServerFailure(response);
 				}
-				if (!agy && !options?.signal?.aborted && isRecoverableMissingServerState(response, failure.code)) {
+				if (
+					!agy &&
+					!ephemeral &&
+					!options?.signal?.aborted &&
+					isRecoverableMissingServerState(response, failure.code)
+				) {
 					resetSessionTracking(sessionId);
 					fullContext = true;
 					await ensureSessionInit(sessionId, context, request);
@@ -1469,7 +1488,9 @@ export async function streamPiServer(
 
 			await ensurePiServerEventStream(response);
 			streamOpened = true;
-			if (contextHashes && contextPrefixes) rememberPiServerContext(sessionId, contextHashes, contextPrefixes);
+			if (recordContext && contextHashes && contextPrefixes) {
+				rememberPiServerContext(sessionId, contextHashes, contextPrefixes);
+			}
 			const reader = response.body!.getReader();
 			const decoder = new TextDecoder();
 			const parser = new ServerSentEventParser();
@@ -1484,7 +1505,7 @@ export async function streamPiServer(
 							>[0],
 						);
 						// PiServer stored these results; the next context references them by hash.
-						const known = contextHashes && contextKnowledge.get(sessionId);
+						const known = recordContext ? contextKnowledge.get(sessionId) : undefined;
 						for (const result of known ? executedToolResults : []) {
 							known!.messages.add(hashPiServerContextJson(JSON.stringify(result)));
 						}
@@ -1587,7 +1608,7 @@ export async function streamPiServer(
 					}
 					if (finalMessage) recordTiming(finalMessage);
 					if (event.type === "done" || event.type === "error") terminalReceived = true;
-					if (event.type === "done" && contextHashes) {
+					if (event.type === "done" && recordContext) {
 						// PiServer stored this reply with the level the agent loop records on it.
 						const reply = { ...event.message, thinkingLevel: options?.reasoning ?? "off" };
 						contextKnowledge.get(sessionId)?.messages.add(hashPiServerContextJson(JSON.stringify(reply)));
@@ -1736,7 +1757,6 @@ export async function streamPiServer(
 			});
 			stream.end();
 		} finally {
-			if (isEphemeralSession) resetSessionTracking(sessionId);
 			try {
 				await finishPiServerOperation(
 					operation,
@@ -2021,6 +2041,8 @@ async function postPiServerModelOperation<T, TModel extends AnyModel>(
 			...body,
 			sessionId,
 			runId,
+			// The operation ID is this request's own, so PiServer keeps no viewer thread for it.
+			ephemeral: true,
 			callbacks: { onPayload: options?.onPayload !== undefined, onResponse: options?.onResponse !== undefined },
 		});
 		if (!response.ok) return await readPiServerJson<T>(response, "pi-server model operation failed");

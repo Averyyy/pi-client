@@ -61,8 +61,8 @@ describe("server request activity", () => {
 		return fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
 	}
 
-	async function thread(): Promise<ViewerThread | undefined> {
-		const response = await fetch(`${base}/viewer/api/threads/${sessionId}`, { headers: { Cookie: cookie } });
+	async function thread(id = sessionId): Promise<ViewerThread | undefined> {
+		const response = await fetch(`${base}/viewer/api/threads/${id}`, { headers: { Cookie: cookie } });
 		if (response.status === 404) return undefined;
 		expect(response.status).toBe(200);
 		return ((await response.json()) as { thread: ViewerThread }).thread;
@@ -126,6 +126,41 @@ describe("server request activity", () => {
 		server.closeAllConnections();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 		expect(new ViewerStore(directory).get(sessionId)?.lastActiveAt).toBe(200);
+	});
+
+	it("keeps no session, persisted file, or viewer thread for an ephemeral one-off stream", async () => {
+		const stream = createAssistantMessageEventStream();
+		stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent> {
+			yield { type: "done", reason: "stop", message: fauxAssistantMessage("Summary") };
+		};
+		const dispatch = vi.spyOn(models, "streamSimple").mockReturnValue(stream);
+		const before = readdirSync(directory);
+		// A branch summary runs under its own request ID and never initializes a session.
+		const response = await post("/api/stream", {
+			sessionId,
+			runId: "one-off",
+			model,
+			ephemeral: true,
+			contextOverlay: [{ role: "user", content: "Summarize the branch", timestamp: 1 }],
+		});
+		expect(await response.text()).toContain('"type":"done"');
+		expect(dispatch.mock.calls[0][1].messages).toEqual([
+			{ role: "user", content: "Summarize the branch", timestamp: 1 },
+		]);
+		expect(getSession(sessionId)).toBeUndefined();
+		expect(await thread()).toBeUndefined();
+		expect(readdirSync(directory)).toEqual(before);
+	});
+
+	it("rejects an ephemeral stream that references the stored context or sends none", async () => {
+		for (const body of [{ context: { messages: [] } }, {}]) {
+			const response = await post("/api/stream", { sessionId, runId: "one-off", model, ephemeral: true, ...body });
+			expect(response.status).toBe(400);
+			expect(((await response.json()) as { error: string }).error).toBe(
+				"An ephemeral request sends its context as contextOverlay",
+			);
+		}
+		expect(getSession(sessionId)).toBeUndefined();
 	});
 
 	it("does not count completed replays, history reads, synchronization or metadata", async () => {
@@ -274,7 +309,7 @@ describe("server request activity", () => {
 	);
 
 	it.each(["image", "classifier"] as const)(
-		"records %s execution without an observer and excludes operation replay",
+		"records %s execution without an observer and excludes operation replay and one-off operations",
 		async (kind) => {
 			const image: ImageModel<"test-images"> = {
 				type: "image",
@@ -342,6 +377,11 @@ describe("server request activity", () => {
 			expect((await thread())?.lastActiveAt).toBe(200);
 			expect(kind === "image" ? generate : classify).toHaveBeenCalledTimes(1);
 			expect(getSession(sessionId)).toBeUndefined();
+			// pi-client runs every operation under its own request ID and marks it ephemeral.
+			const oneOff = randomUUID();
+			await (await post(endpoint, { ...body, sessionId: oneOff, ephemeral: true })).text();
+			expect(kind === "image" ? generate : classify).toHaveBeenCalledTimes(2);
+			expect(await thread(oneOff)).toBeUndefined();
 		},
 	);
 

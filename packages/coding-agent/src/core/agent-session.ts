@@ -208,6 +208,17 @@ export function markRuntimeStreamFunction(streamFn: StreamFn, modelRuntime: Mode
 	runtimeStreamFunctions.set(streamFn, modelRuntime);
 }
 
+/**
+ * Marks the options of Pi's own one-off requests (session naming, summaries, bug reports). They
+ * may reuse the session ID for provider cache affinity, but they are not conversation turns: the
+ * session's stream function must not keep their prompt cache warm or store their context. A symbol
+ * survives option copies and wrapper stream functions and never reaches a serialized request.
+ */
+export const oneOffRequest: unique symbol = Symbol("oneOffRequest");
+
+/** Stream options as the session's stream function receives them. */
+export type SessionStreamOptions = SimpleStreamOptions & { [oneOffRequest]?: true };
+
 // ============================================================================
 // Skill Block Parsing
 // ============================================================================
@@ -670,6 +681,11 @@ export class AgentSession {
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
+	/** The agent's current stream function, for Pi's own one-off requests. */
+	private readonly _streamOneOff: StreamFn = (model, context, options) => {
+		const marked: SessionStreamOptions = { ...options, [oneOffRequest]: true };
+		return this.agent.streamFunction(model, context, marked);
+	};
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -2528,7 +2544,7 @@ export class AgentSession {
 
 		this._sessionNameAbortController = new AbortController();
 		try {
-			const stream = await this.agent.streamFunction(
+			const stream = await this._streamOneOff(
 				model,
 				normalizeContext({
 					systemPrompt: this.systemPrompt,
@@ -3864,7 +3880,7 @@ export class AgentSession {
 					customInstructions,
 					this._compactionAbortController.signal,
 					thinkingLevel,
-					this.agent.streamFunction,
+					this._streamOneOff,
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
@@ -4290,7 +4306,7 @@ export class AgentSession {
 					undefined,
 					abortController.signal,
 					thinkingLevel,
-					this.agent.streamFunction,
+					this._streamOneOff,
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
@@ -5355,7 +5371,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
+					streamFn: this._streamOneOff,
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});
@@ -5660,7 +5676,7 @@ export class AgentSession {
 			messages: this.messages,
 			hint: options.hint,
 			signal: options.signal,
-			streamFn: this.agent.streamFunction,
+			streamFn: this._streamOneOff,
 			retry: this.settingsManager.getRetrySettings(),
 			sessionId: this.sessionId,
 		});

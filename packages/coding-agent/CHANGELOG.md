@@ -17,6 +17,9 @@
 
 ### Fixed
 
+- Sent pi-server cache warm replays as a reference to the server's stored context instead of uploading the whole conversation on every refresh.
+- Kept automatic session naming, bug-report summaries, and other one-off requests under the session ID from replacing or stopping the conversation's cache warming, and from recording their messages in pi-server's session context store.
+- Stopped branch summaries, requests without a session ID, and image or classifier operations from creating a persisted empty pi-server session and viewer thread each; they skip session init and mark themselves `ephemeral`. Update pi-server together with pi-client: an older pi-server rejects these requests for lacking a session.
 - Applied client `models.json` overrides to Devin models discovered by PiServer and Antigravity models advertised by the local CLI.
 - Preserved queued image resizing across provisional message selection and delivery retries.
 - Preserved Anthropic message threads through pi-server cache warming and tool-result continuations, and released provider state when server sessions are deleted.

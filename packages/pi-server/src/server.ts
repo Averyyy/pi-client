@@ -134,6 +134,11 @@ interface StreamRequestBody {
 	contextOverlay?: Message[];
 	/** The session's context as a delta against the server's context store. */
 	context?: PiServerContextDelta;
+	/**
+	 * A one-off request under its own request ID, such as a branch summary or an extension
+	 * completion. It sends its context inline, and PiServer keeps no session or viewer thread for it.
+	 */
+	ephemeral?: boolean;
 	observeProviderStreamEvents?: boolean;
 	observeTiming?: boolean;
 	requestKind?: "api" | "simple" | "deferred";
@@ -1433,7 +1438,16 @@ async function handleStream(
 		sendError(res, 400, "Antigravity requires a context", PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
-	const session = agy ? undefined : getOrCreateSession(body.sessionId);
+	if (body.ephemeral && (agy || body.context !== undefined || !Array.isArray(body.contextOverlay))) {
+		sendError(
+			res,
+			400,
+			"An ephemeral request sends its context as contextOverlay",
+			PiServerErrorCode.INVALID_REQUEST,
+		);
+		return;
+	}
+	const session = agy || body.ephemeral ? undefined : getOrCreateSession(body.sessionId);
 
 	if (session && body.staticContext) {
 		setStaticContext(body.sessionId, body.staticContext);
@@ -1460,6 +1474,10 @@ async function handleStream(
 	}
 	if (body.context !== undefined && !Array.isArray(body.context?.messages)) {
 		sendError(res, 400, "context.messages must be an array", PiServerErrorCode.INVALID_REQUEST);
+		return;
+	}
+	if (body.context?.store !== undefined && body.context.store !== "record" && body.context.store !== "read") {
+		sendError(res, 400, 'context.store must be "record" or "read"', PiServerErrorCode.INVALID_REQUEST);
 		return;
 	}
 
@@ -1500,7 +1518,13 @@ async function handleStream(
 		return;
 	}
 
-	const contextOverlay = body.context ? config.contexts.resolve(body.sessionId, body.context) : body.contextOverlay;
+	// Warm replays and one-off requests only reference stored messages; later turns never extend them.
+	const recordContext = body.context !== undefined && body.context.store !== "read";
+	const contextOverlay = !body.context
+		? body.contextOverlay
+		: recordContext
+			? config.contexts.resolve(body.sessionId, body.context)
+			: config.contexts.read(body.sessionId, body.context);
 	if (body.context && !contextOverlay) {
 		sendError(res, 409, "PiServer does not hold this context prefix", PiServerErrorCode.CONTEXT_NOT_FOUND);
 		return;
@@ -1617,8 +1641,8 @@ async function handleStream(
 	let agyStream: ReturnType<AntigravityRuntime["stream"]> | undefined;
 	// Results the client produced through callbacks; the client already holds them.
 	const clientResults = new Set<string>();
-	const activityVersion = config.requestVersion;
-	recordSessionActivity(config, body.sessionId, activityVersion);
+	const activityVersion = body.ephemeral ? undefined : config.requestVersion;
+	if (activityVersion !== undefined) recordSessionActivity(config, body.sessionId, activityVersion);
 	try {
 		if (timing) timing.providerDispatchMs = performance.now() - requestStartedAt;
 		if (agy) {
@@ -1683,7 +1707,7 @@ async function handleStream(
 		logFailure("dispatch", err);
 		const message = err instanceof Error ? err.message : String(err);
 		failStreamRun(run, message);
-		recordSessionActivity(config, body.sessionId, activityVersion);
+		if (activityVersion !== undefined) recordSessionActivity(config, body.sessionId, activityVersion);
 		settleRun(run);
 		sendTiming();
 		writeStreamError(res, message);
@@ -1717,7 +1741,7 @@ async function handleStream(
 						const results = agyStream.executedToolResults;
 						run.executedToolResults = results;
 						// The next turn references these by hash instead of uploading them again.
-						if (body.context) config.contexts.add(body.sessionId, results);
+						if (recordContext) config.contexts.add(body.sessionId, results);
 						if (event.type === "done") agySession?.complete();
 						writeServerSentEvent(
 							res,
@@ -1739,7 +1763,7 @@ async function handleStream(
 					terminalSeen = true;
 					// The agent loop records the requested level on its copy of the reply (agent-loop.ts).
 					// Store that copy so the next turn references it; a different projection is uploaded instead.
-					if (body.context) {
+					if (recordContext) {
 						config.contexts.add(body.sessionId, [
 							{ ...event.message, thinkingLevel: body.options?.reasoning ?? "off" },
 						]);
@@ -1765,7 +1789,7 @@ async function handleStream(
 			if (run?.status === "running") {
 				failStreamRun(run, run.cancelRequested ? "Stream run aborted" : "Stream ended before a terminal event");
 			}
-			recordSessionActivity(config, body.sessionId, activityVersion);
+			if (activityVersion !== undefined) recordSessionActivity(config, body.sessionId, activityVersion);
 			settleRun(run);
 			sendTiming();
 			endStreamResponse(res);
@@ -2010,28 +2034,27 @@ const CLASSIFIER_APIS: Record<string, ProviderClassifier> = {
 	"openai-decisions": openAIDecisionsApi(),
 };
 
-interface ImageOperationBody {
+interface ModelOperationBody {
 	callbacks?: { onPayload?: boolean; onResponse?: boolean };
 	sessionId: string;
 	runId: string;
+	/** A one-off operation under its own request ID: PiServer records no viewer activity for it. */
+	ephemeral?: boolean;
+}
+
+interface ImageOperationBody extends ModelOperationBody {
 	model: ImageModel<ImageApi>;
 	context: ImagesContext;
 	options?: ImagesOptions & { authSource?: "server-account" };
 }
 
-interface ClassifierOperationBody {
-	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	sessionId: string;
-	runId: string;
+interface ClassifierOperationBody extends ModelOperationBody {
 	model: ClassifierModel<ClassifierApi>;
 	context: ClassifierContext;
 	options?: ClassifierOptions & { authSource?: "server-account" };
 }
 
-interface DeferredCancelBody {
-	callbacks?: { onPayload?: boolean; onResponse?: boolean };
-	sessionId: string;
-	runId: string;
+interface DeferredCancelBody extends ModelOperationBody {
 	model: Model<string>;
 	handle: DeferredHandle;
 	options?: DeferredCancelOptions & { authSource?: "server-account" };
@@ -2103,8 +2126,10 @@ async function handleModelOperation(
 	};
 	try {
 		if (!run.operationResult) {
-			activityVersion = config.requestVersion;
-			recordSessionActivity(config, body.sessionId, activityVersion);
+			if (!body.ephemeral) {
+				activityVersion = config.requestVersion;
+				recordSessionActivity(config, body.sessionId, activityVersion);
+			}
 			const callbacks = createProviderCallbacks<AnyModel>(run, res, body.callbacks);
 			const options = {
 				onPayload: callbacks.onPayload,

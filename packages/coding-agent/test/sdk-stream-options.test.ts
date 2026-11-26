@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { CacheWarmer } from "../src/core/cache-warmer.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -157,12 +158,18 @@ describe("createAgentSession stream options", () => {
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
 		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
-		let providerCalls = 0;
+		const calls: { context: unknown; maxTokens?: number }[] = [];
 		modelRegistry.registerProvider(model.provider, {
 			api: model.api,
-			streamSimple: () => {
-				providerCalls++;
-				return createDoneStream(model.api, 100_000);
+			streamSimple: (_model, context, options) => {
+				// The session name request declares the agent's tools, whose execute functions cannot be cloned.
+				calls.push({ context: JSON.parse(JSON.stringify(context)), maxTokens: options?.maxTokens });
+				// A turn records its reply from the done event; automatic session naming needs that reply.
+				const stream = createAssistantMessageEventStream();
+				const message = createDoneMessage(model.api, 100_000);
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end(message);
+				return stream;
 			},
 		});
 		const sessionManager = SessionManager.inMemory(cwd);
@@ -177,7 +184,8 @@ describe("createAgentSession stream options", () => {
 		});
 		return {
 			session,
-			providerCalls: () => providerCalls,
+			calls,
+			providerCalls: () => calls.length,
 			dispose: () => {
 				session.dispose();
 				modelRegistry.unregisterProvider(model.provider);
@@ -197,6 +205,29 @@ describe("createAgentSession stream options", () => {
 			expect(fixture.session.cacheWarmingStatus?.nextWarmAt).toBeGreaterThan(Date.now());
 			fixture.session.agent.state.messages = fixture.session.agent.state.messages.slice(1);
 			expect(fixture.session.cacheWarmingStatus?.reason).toBe("conversation context changed");
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("keeps warming the conversation request after one-off requests under the session ID", async () => {
+		const fixture = await createCacheWarmingSession();
+		try {
+			await fixture.session.prompt("test");
+			// The first turn then asks for a session name under the session ID.
+			expect(fixture.calls).toHaveLength(2);
+			await fixture.session.summarizeForBugReport({ signal: new AbortController().signal });
+			expect(fixture.calls).toHaveLength(3);
+			expect(fixture.session.cacheWarmingStatus).toMatchObject({ state: "scheduled", decision: { phase: "idle" } });
+
+			// Fire the scheduled refresh now instead of waiting most of the cache lifetime.
+			const warmer = (fixture.session as unknown as { _cacheWarmer: CacheWarmer })._cacheWarmer as unknown as {
+				run?: { timer?: ReturnType<typeof setTimeout> };
+				refresh(run: object): Promise<void>;
+			};
+			clearTimeout(warmer.run?.timer);
+			await warmer.refresh(warmer.run!);
+			expect(fixture.calls[3]).toEqual({ context: fixture.calls[0].context, maxTokens: 1 });
 		} finally {
 			fixture.dispose();
 		}
