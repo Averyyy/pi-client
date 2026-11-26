@@ -1,6 +1,7 @@
 // A Pi session's live agy ACP conversation: agy is the agent, Pi shows and records its turns.
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { type AgentToolCallOutcome, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
@@ -20,6 +21,7 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { McpError } from "@earendil-works/pi-mcp";
+import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import {
 	type AcpConfigOption,
@@ -333,7 +335,13 @@ export class AntigravityRuntime {
 	): Promise<Conversation> {
 		await this.close();
 		// agy reads its global rules and skills when it starts, so Pi writes its own there first.
-		if (client.instructions) await installAntigravityInstructions(client.instructions, homedir());
+		if (client.instructions) {
+			await installAntigravityInstructions(
+				client.instructions,
+				homedir(),
+				join(getAgentDir(), "antigravity-skills.json"),
+			);
+		}
 		if (tools.length > 0) {
 			if (!client.executeTool) throw new Error("Antigravity requires a Pi session to execute custom tools");
 			this.toolServer = await openAntigravityTools(tools, () => this.activeTurn?.executeTool);
