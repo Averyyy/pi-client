@@ -310,10 +310,10 @@ describe("totalTokens field", () => {
 
 	describe.skipIf(!hasCloudflareWorkersAICredentials())("Cloudflare Workers AI", () => {
 		it(
-			"@cf/moonshotai/kimi-k2.6 - should return totalTokens equal to sum of components",
+			"@cf/zai-org/glm-5.3 - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+				const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 				console.log(`\nCloudflare Workers AI / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, {

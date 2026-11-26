@@ -6,6 +6,10 @@
 
 - Errors in input, context, agent preparation, and provider request/header transformation handlers stop the affected request instead of continuing with original or partially transformed data.
 
+### Changed
+
+- The default model for `cloudflare-workers-ai` and `cloudflare-ai-gateway` is now `@cf/zai-org/glm-5.3`, because Cloudflare deprecated Workers AI Kimi K2.6 and K2.7 Code
+
 ### Added
 
 - Published pi-client project metadata, committed conversation history, and run/tool activity to the server's independent viewer.

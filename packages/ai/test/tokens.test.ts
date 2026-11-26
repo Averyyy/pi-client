@@ -162,7 +162,7 @@ describe("Token Statistics on Abort", () => {
 	});
 
 	describe.skipIf(!hasCloudflareWorkersAICredentials())("Cloudflare Workers AI Provider", () => {
-		const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+		const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
 			await testTokensOnAbort(llm);
