@@ -2,6 +2,7 @@ import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
+import { keyText } from "../src/modes/interactive/components/keybinding-hints.ts";
 import {
 	BranchSummaryStatusIndicator,
 	CompactionStatusIndicator,
@@ -92,6 +93,24 @@ describe("status indicators", () => {
 			expect(stripAnsi(editor.render(120)[0]!)).toBe("─".repeat(120));
 		} finally {
 			for (const indicator of indicators) indicator.dispose();
+		}
+	});
+
+	it("names the configured compaction model after the compaction label", () => {
+		initTheme("dark");
+		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
+		const cancel = `(${keyText("app.interrupt")} to cancel)`;
+		const cases = [
+			[new CompactionStatusIndicator(tui, "manual", "summary-1"), `Compacting context... (summary-1) ${cancel}`],
+			[new CompactionStatusIndicator(tui, "threshold", "summary-1"), `Auto-compacting... (summary-1) ${cancel}`],
+			[new CompactionStatusIndicator(tui, "manual"), `Compacting context... ${cancel}`],
+		] as const;
+		try {
+			for (const [indicator, label] of cases) {
+				expect(stripAnsi(indicator.render(120)[1]!)).toContain(label);
+			}
+		} finally {
+			for (const [indicator] of cases) indicator.dispose();
 		}
 	});
 

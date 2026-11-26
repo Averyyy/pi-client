@@ -133,7 +133,11 @@ The `entry` value uses a persisted [session entry type](session-format.md#entry-
 {"type":"compaction_start","reason":"threshold"}
 ```
 
-`reason` is `"manual"`, `"threshold"`, or `"overflow"`.
+`reason` is `"manual"`, `"threshold"`, or `"overflow"`. When the `compaction.model` setting selects a summary model, `model` carries its ID:
+
+```json
+{"type":"compaction_start","reason":"manual","model":"claude-haiku-4-5"}
+```
 
 `compaction_end` contains the result when compaction succeeds:
 
@@ -177,7 +181,7 @@ Compaction and branch-summary retry emit:
 {"type":"summarization_retry_finished"}
 ```
 
-For a branch summary, `source` is `"branchSummary"` and `reason` is absent. The `reason` on a compaction retry is `"manual"`, `"threshold"`, or `"overflow"`.
+For a branch summary, `source` is `"branchSummary"` and `reason` is absent. The `reason` on a compaction retry is `"manual"`, `"threshold"`, or `"overflow"`; `model` matches the one on `compaction_start`.
 
 ## RPC-only events
 

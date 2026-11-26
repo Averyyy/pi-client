@@ -120,6 +120,8 @@ describe("AgentSession compaction model overrides", () => {
 			await harness.session.prompt("continue");
 		}
 		expect(requests).toEqual(path === "manual" ? [expectedModel] : [expectedModel, "chat"]);
+		// The status indicator names only a model that compaction.model selects.
+		expect(harness.eventsOfType("compaction_start")[0]?.model).toBe(selection === "none" ? undefined : expectedModel);
 		expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe("summary");
 		expect(harness.session.model?.id).toBe("chat");
 	});

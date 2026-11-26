@@ -274,7 +274,12 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| {
+			type: "compaction_start";
+			reason: "manual" | "threshold" | "overflow";
+			/** ID of the model `compaction.model` selects; absent when the session model summarizes. */
+			model?: string;
+	  }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "message_committed"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
@@ -302,6 +307,8 @@ export type AgentSessionEvent =
 			type: "summarization_retry_attempt_start";
 			source: "compaction";
 			reason: "manual" | "threshold" | "overflow";
+			/** ID of the model `compaction.model` selects; absent when the session model summarizes. */
+			model?: string;
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "bash_execution_update"; id?: string; delta: string };
@@ -3619,6 +3626,11 @@ export class AgentSession {
 		return model;
 	}
 
+	/** The summary model's ID for status display when `compaction.model` selects it. */
+	private _compactionModelLabel(summaryModel: Model<string>): string | undefined {
+		return this.settingsManager.getCompactionModel() === "none" ? undefined : summaryModel.id;
+	}
+
 	private async _buildCompactionCacheInput(
 		model: Model<any>,
 		preparation?: CompactionPreparation,
@@ -3749,7 +3761,6 @@ export class AgentSession {
 		this._emitWorkingStateChanged();
 
 		try {
-			this._emit({ type: "compaction_start", reason: "manual" });
 			const model = this.model;
 			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
@@ -3757,6 +3768,8 @@ export class AgentSession {
 
 			const settings = this.settingsManager.getCompactionSettings(model);
 			const summaryModel = this._getCompactionModel(model);
+			const summaryModelLabel = this._compactionModelLabel(summaryModel);
+			this._emit({ type: "compaction_start", reason: "manual", model: summaryModelLabel });
 			const serverRequest =
 				isPiServerMode() && (isVirtualModel(summaryModel) || summaryModel.provider !== ANTIGRAVITY_PROVIDER)
 					? await this._getSummarizationRequestAuth(summaryModel, this._compactionAbortController.signal)
@@ -3883,7 +3896,7 @@ export class AgentSession {
 					this._streamOneOff,
 					env,
 					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual", model: summaryModelLabel }),
 					undefined,
 					cacheInput.cachePrefixContext,
 					cacheInput.cacheOptions,
@@ -4169,13 +4182,14 @@ export class AgentSession {
 				return false;
 			}
 			const summaryModel = this._getCompactionModel(model);
+			const summaryModelLabel = this._compactionModelLabel(summaryModel);
 			this._cacheWarmer?.cancel();
 
 			if (isPiServerMode() && (isVirtualModel(summaryModel) || summaryModel.provider !== ANTIGRAVITY_PROVIDER)) {
 				abortController = new AbortController();
 				this._autoCompactionAbortController = abortController;
 				this._emitWorkingStateChanged();
-				this._emit({ type: "compaction_start", reason });
+				this._emit({ type: "compaction_start", reason, model: summaryModelLabel });
 				abortController.signal.throwIfAborted();
 				if (this._cacheWarmer) {
 					// A warm replay can update static context. Confirm its remote cancellation
@@ -4249,7 +4263,7 @@ export class AgentSession {
 				abortController = new AbortController();
 				this._autoCompactionAbortController = abortController;
 				this._emitWorkingStateChanged();
-				this._emit({ type: "compaction_start", reason });
+				this._emit({ type: "compaction_start", reason, model: summaryModelLabel });
 			}
 			abortController.signal.throwIfAborted();
 
@@ -4309,7 +4323,7 @@ export class AgentSession {
 					this._streamOneOff,
 					env,
 					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason }),
+					this._summarizationRetryCallbacks({ source: "compaction", reason, model: summaryModelLabel }),
 					undefined,
 					cacheInput.cachePrefixContext,
 					cacheInput.cacheOptions,
@@ -5004,7 +5018,9 @@ export class AgentSession {
 	 * the TUI needs to render the retry and recreate the underlying indicator.
 	 */
 	private _summarizationRetryCallbacks(
-		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
+		source:
+			| { source: "branchSummary" }
+			| { source: "compaction"; reason: "manual" | "threshold" | "overflow"; model?: string },
 	): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
