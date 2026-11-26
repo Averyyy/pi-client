@@ -21,7 +21,7 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 let home: string;
-const rule = () => join(home, ".gemini", "config", "rules", "pi-agents.md");
+const rule = () => join(home, ".gemini", "config", "rules", "avery-ui-agents.md");
 const skills = () => join(home, ".gemini", "antigravity-cli", "skills");
 const skillFile = (name: string) => join(skills(), name, "SKILL.md");
 const ledger = () => join(home, ".pi", "agent", "antigravity-skills.json");

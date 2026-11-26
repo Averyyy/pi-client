@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathsEqual } from "../utils/paths.ts";
+import { ANTIGRAVITY_CLIENT_NAME } from "./antigravity-acp.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 
 /**
@@ -38,7 +39,10 @@ export async function installAntigravityInstructions(
 	ledger: string,
 ): Promise<void> {
 	await Promise.all([
-		writeRule(instructions.agentsFile, join(home, ".gemini", "config", "rules", "pi-agents.md")),
+		writeRule(
+			instructions.agentsFile,
+			join(home, ".gemini", "config", "rules", `${ANTIGRAVITY_CLIENT_NAME}-agents.md`),
+		),
 		writeSkills(instructions.skills, join(home, ".gemini", "antigravity-cli", "skills"), ledger),
 	]);
 }

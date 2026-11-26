@@ -204,7 +204,7 @@ describe("Antigravity ACP", () => {
 					method: "initialize",
 					params: {
 						protocolVersion: 1,
-						clientInfo: { name: "pi", title: "Pi" },
+						clientInfo: { name: "avery-ui", title: "Avery UI" },
 						clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
 					},
 				},
@@ -623,7 +623,7 @@ describe("Antigravity ACP", () => {
 			await session.prompt("first");
 			const gemini = join(cwd, "home", ".gemini");
 			// agy reads the project's AGENTS.md itself; Pi adds only the global one.
-			expect(readFileSync(join(gemini, "config", "rules", "pi-agents.md"), "utf8")).toBe("Global rules");
+			expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toBe("Global rules");
 			expect(readdirSync(join(gemini, "antigravity-cli", "skills"))).toEqual(["review"]);
 			expect(readFileSync(join(gemini, "antigravity-cli", "skills", "review", "SKILL.md"), "utf8")).toContain(
 				`read its instructions in \`${skillPath("review")}\``,
@@ -673,7 +673,7 @@ describe("Antigravity ACP", () => {
 		);
 		expect((await stream.result()).stopReason).toBe("stop");
 		const gemini = join(cwd, "home", ".gemini");
-		expect(readFileSync(join(gemini, "config", "rules", "pi-agents.md"), "utf8")).toContain("Client rules");
+		expect(readFileSync(join(gemini, "config", "rules", "avery-ui-agents.md"), "utf8")).toContain("Client rules");
 		// The declaration points at the client's file, which agy reads through the client's workspace.
 		expect(readFileSync(join(gemini, "antigravity-cli", "skills", "deploy", "SKILL.md"), "utf8")).toContain(
 			"`/client/.pi/agent/skills/deploy/SKILL.md`",
@@ -968,7 +968,7 @@ describe("Antigravity ACP", () => {
 			expect(trace()).toContainEqual(
 				expect.objectContaining({
 					method: "session/new",
-					params: { cwd, mcpServers: [expect.objectContaining({ name: "pi" })] },
+					params: { cwd, mcpServers: [expect.objectContaining({ name: "avery-ui" })] },
 				}),
 			);
 			expect(trace().find((entry) => entry.method === "mock/tools/list")?.result).toMatchObject({
